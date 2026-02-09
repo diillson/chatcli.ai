@@ -1,30 +1,56 @@
-# ChatCLI Docs (Mintlify)
+# clawd.bot
 
-Este repositório contém a documentação do ChatCLI usando Mintlify.
+Landing page for [Moltbot](https://github.com/moltbot/moltbot) — your personal AI assistant.
 
-## Rodar local
+**Live**: [clawd.bot](https://clawd.bot)
+
+## Pages
+
+- `/` — Main landing page with Quick Start, features, and testimonials
+- `/integrations` — Visual grid of all supported chat providers, AI models, platforms, and tools
+- `/shoutouts` — Community testimonials and mentions
+
+## Tech Stack
+
+- [Astro](https://astro.build/) — Static site generator
+- GitHub Pages — Hosting
+- Custom CSS — No framework, just vibes
+
+## Development
 
 ```bash
-npm i -g mintlify
-mintlify dev
+bun install
+bun run dev
 ```
 
-## Estrutura
+## Build
 
-- `docs/` conteúdos em MDX
-- `docs/images/` imagens
-- `mint.json` configuração do site
-
-## Idiomas
-
-- `pt-BR` é o idioma padrão.
-- `en/` contém placeholders enquanto a tradução não é finalizada.
+```bash
+bun run build
+bun run preview
+```
 
 ## Deploy
 
-O deploy é feito automaticamente via Mintlify GitHub App.
+Automatically deployed to GitHub Pages on push to `main`.
 
-## Domínio
+## Install Scripts
 
-Configurar no painel da Mintlify: `chatcli.edilsonfreitas.com`.
+The landing page hosts installer scripts:
 
+- **macOS/Linux**: `curl -fsSL --proto '=https' --tlsv1.2 https://clawd.bot/install.sh | bash`
+- **macOS/Linux (CLI only, no onboarding)**: `curl -fsSL --proto '=https' --tlsv1.2 https://clawd.bot/install-cli.sh | bash`
+- **Windows**: `iwr -useb https://clawd.bot/install.ps1 | iex`
+
+These scripts:
+1. Install Homebrew (macOS) or detect package managers (Windows)
+2. Install Node.js 22+ if needed
+3. Install openclaw globally via npm
+4. Run `openclaw doctor --non-interactive` for migrations (upgrades only)
+5. Prompt to run `openclaw onboard` (new installs)
+
+## Related
+
+- [Moltbot](https://github.com/moltbot/moltbot) — Main repository
+- [Docs](https://docs.clawd.bot) — Documentation
+- [Discord](https://discord.gg/clawd) — Community
