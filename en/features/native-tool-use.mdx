@@ -1,0 +1,153 @@
+---
+title: "Native Tool Use (Structured API)"
+sidebarTitle: "Native Tool Use"
+description: "Tool calls via native OpenAI and Anthropic APIs, with cache_control support for KV cache optimization."
+icon: "wrench"
+---
+
+ChatCLI supports **tool calls via native API** for OpenAI and Anthropic, replacing the XML-embedded-in-prompt approach with structured API calls. This improves accuracy, reduces token consumption, and enables cache optimizations.
+
+---
+
+## Why Native Tool Use?
+
+| Aspect | XML in Prompt | Native API |
+|:--------|:-------------|:-----------|
+| Accuracy | Depends on the model parsing XML | Structured by the API, unambiguous |
+| Tokens | XML consumes context window tokens | Separate fields, more efficient |
+| Cache | No optimization | `cache_control:ephemeral` on Anthropic |
+| Validation | Manual | Automatic by the provider API |
+| Compatibility | Any provider | OpenAI and Anthropic (others continue with XML) |
+
+---
+
+## Architecture
+
+### ToolAwareClient Interface
+
+The `ToolAwareClient` interface extends the base `LLMClient` with tool support:
+
+```go
+type ToolAwareClient interface {
+    LLMClient
+    SendPromptWithTools(ctx context.Context, prompt string, history []models.Message,
+        tools []models.ToolDefinition, maxTokens int) (*models.LLMResponse, error)
+    SupportsNativeTools() bool
+}
+```
+
+### Automatic Detection
+
+Detection is done via type assertion, with no configuration required:
+
+```go
+if client.IsToolAware(c) {
+    tac, _ := client.AsToolAware(c)
+    resp, err := tac.SendPromptWithTools(ctx, prompt, history, tools, maxTokens)
+    // resp.ToolCalls contains the structured calls
+}
+```
+
+<Info>Providers that do not implement `ToolAwareClient` continue to work normally via `SendPrompt`.</Info>
+
+---
+
+## Data Types
+
+<AccordionGroup>
+  <Accordion title="ToolDefinition" icon="cube">
+    Defines a tool available to the model:
+
+    ```go
+    type ToolDefinition struct {
+        Type     string          `json:"type"`     // "function"
+        Function ToolFunctionDef `json:"function"`
+    }
+
+    type ToolFunctionDef struct {
+        Name        string                 `json:"name"`
+        Description string                 `json:"description"`
+        Parameters  map[string]interface{} `json:"parameters"` // JSON Schema
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="ToolCall and ToolResult" icon="arrow-right-arrow-left">
+    Represent a tool call by the model and its result:
+
+    ```go
+    type ToolCall struct {
+        ID        string                 `json:"id"`
+        Type      string                 `json:"type"`       // "function"
+        Name      string                 `json:"name"`
+        Arguments map[string]interface{} `json:"arguments"`
+    }
+
+    type ToolResult struct {
+        ToolCallID string `json:"tool_call_id"`
+        Content    string `json:"content"`
+        IsError    bool   `json:"is_error,omitempty"`
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="LLMResponse" icon="reply">
+    Unified response that can contain text and/or tool calls:
+
+    ```go
+    type LLMResponse struct {
+        Content    string     `json:"content"`
+        ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+        Usage      *UsageInfo `json:"usage,omitempty"`
+        StopReason string     `json:"stop_reason,omitempty"`
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Provider Implementations
+
+<Tabs>
+  <Tab title="OpenAI">
+    Uses the `tools` field in the Chat Completions API:
+
+    - Sends tools as a `tools` array with `tool_choice: "auto"`
+    - Processes `tool_calls` in `choices[0].message`
+    - `tool` messages in the history link results to the `tool_call_id`
+  </Tab>
+
+  <Tab title="Anthropic (Claude)">
+    Uses the `tools` field in the Messages API with cache optimization:
+
+    - Sends tools in the `tools` field of the request
+    - System prompt includes `cache_control: { type: "ephemeral" }` for KV cache reuse
+    - Tool results are sent as `tool_result` content blocks in `user` messages
+    - Supports all authentication types (API key, OAuth token)
+  </Tab>
+</Tabs>
+
+### ContentBlock with Cache Control
+
+For Anthropic, the system prompt is split into blocks with cache control:
+
+```go
+type ContentBlock struct {
+    Type         string        `json:"type"`
+    Text         string        `json:"text"`
+    CacheControl *CacheControl `json:"cache_control,omitempty"`
+}
+
+type CacheControl struct {
+    Type string `json:"type"` // "ephemeral"
+}
+```
+
+<Tip>The `cache_control:ephemeral` tells Anthropic that the system prompt block can be cached between requests, significantly reducing latency and cost in long conversations.</Tip>
+
+---
+
+## Fallback Integration
+
+The fallback chain (`llm/fallback`) supports `SendPromptWithTools` automatically. Providers without native tool use support are skipped in the tool call chain but remain available for plain text requests.

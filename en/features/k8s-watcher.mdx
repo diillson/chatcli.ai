@@ -1,0 +1,402 @@
+---
+title: "Kubernetes Monitoring (K8s Watcher)"
+sidebarTitle: "K8s Watcher"
+description: "Monitor multiple Kubernetes deployments simultaneously with Prometheus metrics, context budget management, and AI analysis."
+icon: "binoculars"
+---
+
+The **K8s Watcher** allows ChatCLI to monitor **multiple deployments simultaneously**, collecting infrastructure and application metrics, logs, events, and pod status. The context is automatically injected into LLM prompts with **intelligent budget management** to avoid exceeding the context window.
+
+---
+
+## Architecture
+
+<Tabs>
+  <Tab title="Single-Target (legacy)">
+    ```text
+    ChatCLI -> ResourceWatcher -> 6 Collectors -> ObservabilityStore -> Summarizer -> LLM
+    ```
+  </Tab>
+  <Tab title="Multi-Target (current)">
+    ```text
+                            |-> ResourceWatcher[0] -> Store[0] --|
+    ChatCLI -> MultiWatcher-|-> ResourceWatcher[1] -> Store[1] --|-> MultiSummarizer -> LLM
+                            +-> ResourceWatcher[N] -> Store[N] --+   (budget-controlled)
+    ```
+  </Tab>
+</Tabs>
+
+Each `ResourceWatcher` has its own collectors (including an optional `PrometheusCollector`) and all share **a single Kubernetes clientset**, minimizing connections.
+
+---
+
+## Usage Modes
+
+<Tabs>
+  <Tab title="Single Deployment (legacy)">
+    ```bash
+    chatcli watch --deployment myapp --namespace production
+    chatcli watch --deployment myapp -p "Is the deployment healthy?"
+    ```
+  </Tab>
+  <Tab title="Multiple Deployments (YAML)">
+    ```bash
+    chatcli watch --config targets.yaml
+    chatcli watch --config targets.yaml -p "Which deployments need attention?"
+    ```
+  </Tab>
+  <Tab title="Server with Watcher">
+    ```bash
+    # Multi-target
+    chatcli server --watch-config targets.yaml
+
+    # Single-target (legacy)
+    chatcli server --watch-deployment myapp --watch-namespace production
+    ```
+
+    Clients connected via `chatcli connect` receive the K8s context automatically.
+  </Tab>
+</Tabs>
+
+---
+
+## Multi-Target Configuration File
+
+```yaml
+# targets.yaml
+interval: "30s"           # Collection interval
+window: "2h"              # Time window of retained data
+maxLogLines: 100          # Log lines per pod per cycle
+maxContextChars: 32000     # Maximum character budget for LLM context
+
+targets:
+  - deployment: api-gateway
+    namespace: production
+    metricsPort: 9090                                        # Prometheus port
+    metricsFilter: ["http_requests_total", "http_request_duration_*"]
+
+  - deployment: auth-service
+    namespace: production
+    metricsPort: 9090
+
+  - deployment: worker
+    namespace: batch
+    # No metricsPort = Prometheus disabled for this target
+
+  - deployment: frontend
+    namespace: production
+    metricsPort: 3000
+    metricsPath: "/custom-metrics"                           # Custom path
+    metricsFilter: ["next_*", "react_render_*"]
+```
+
+### Target Fields
+
+| Field | Description | Required |
+|-------|-------------|:--------:|
+| `deployment` | Deployment name | Yes |
+| `namespace` | Namespace (default: `default`) | No |
+| `metricsPort` | Prometheus endpoint port (0 = disabled) | No |
+| `metricsPath` | HTTP path for metrics (default: `/metrics`) | No |
+| `metricsFilter` | Glob filters for metrics (empty = all) | No |
+
+---
+
+## Complete Flags
+
+### `chatcli watch`
+
+| Flag | Description | Default | Env Var |
+|------|-------------|---------|---------|
+| `--config` | Multi-target YAML file | | |
+| `--deployment` | Single deployment (legacy) | | `CHATCLI_WATCH_DEPLOYMENT` |
+| `--namespace` | Deployment namespace | `default` | `CHATCLI_WATCH_NAMESPACE` |
+| `--interval` | Interval between collections | `30s` | `CHATCLI_WATCH_INTERVAL` |
+| `--window` | Data time window | `2h` | `CHATCLI_WATCH_WINDOW` |
+| `--max-log-lines` | Log lines per pod | `100` | `CHATCLI_WATCH_MAX_LOG_LINES` |
+| `--kubeconfig` | Kubeconfig path | Auto-detected | `CHATCLI_KUBECONFIG` |
+| `--provider` | LLM provider | `.env` | `LLM_PROVIDER` |
+| `--model` | LLM model | `.env` | |
+| `-p <prompt>` | One-shot: send and exit | | |
+| `--max-tokens` | Token limit in response | | |
+
+### `chatcli server` (watcher flags)
+
+| Flag | Description | Default | Env Var |
+|------|-------------|---------|---------|
+| `--watch-config` | Multi-target YAML file | | `CHATCLI_WATCH_CONFIG` |
+| `--watch-deployment` | Single deployment (legacy) | | `CHATCLI_WATCH_DEPLOYMENT` |
+| `--watch-namespace` | Namespace | `default` | `CHATCLI_WATCH_NAMESPACE` |
+| `--watch-interval` | Collection interval | `30s` | `CHATCLI_WATCH_INTERVAL` |
+| `--watch-window` | Observation window | `2h` | `CHATCLI_WATCH_WINDOW` |
+| `--watch-max-log-lines` | Max log lines | `100` | `CHATCLI_WATCH_MAX_LOG_LINES` |
+| `--watch-kubeconfig` | Kubeconfig path | Auto-detected | `CHATCLI_KUBECONFIG` |
+
+---
+
+## What Is Collected
+
+### Collectors per Target
+
+| Collector | Data Collected |
+|-----------|---------------|
+| **Deployment** | Replicas (ready/available/updated), strategy, conditions |
+| **Pod Status** | Phase, readiness, restarts, termination info, container status |
+| **Events** | K8s events (Warning/Normal), message, reason, timestamp |
+| **Logs** | Last N lines per container per pod |
+| **Metrics** | CPU and memory per pod (via metrics-server) |
+| **HPA** | Min/max replicas, current metrics, desired replicas |
+| **Prometheus** | Application metrics from the pod `/metrics` endpoint |
+
+### Prometheus Collector (New)
+
+The `PrometheusCollector` scrapes Prometheus metrics directly from pods:
+
+- Discovers deployment pods and selects **1 Ready pod**
+- Makes HTTP GET to `http://podIP:port/path` (timeout: 5s)
+- Parses the Prometheus text exposition format (stdlib, no dependencies)
+- Filters by configured **glob patterns**
+- Ignores NaN, Inf, and comment lines
+
+**Glob filter examples:**
+
+```yaml
+metricsFilter:
+  - "http_requests_*"          # All HTTP metrics
+  - "process_*"                # Process metrics
+  - "go_goroutines"            # Specific metric
+  - "*_duration_seconds_*"     # Any duration metric
+```
+
+---
+
+## Context Budget Management (MultiSummarizer)
+
+With multiple targets, the **MultiSummarizer** ensures the context does not exceed the LLM window:
+
+### Algorithm
+
+<Steps>
+  <Step title="Scores each target">
+    `0 = healthy`, `1 = warning`, `2 = critical`
+    - **Critical**: CrashLoopBackOff, OOMKilled, critical alerts
+    - **Warning**: replicas &lt; desired, error logs, warning alerts
+    - **Healthy**: everything ok
+  </Step>
+  <Step title="Sorts by priority">
+    Critical first, then warning, then healthy.
+  </Step>
+  <Step title="Allocates context">
+    - Score >= 1 -- full context (~1-3 KB per target)
+    - Score == 0 -- compact one-liner (~80 chars per target)
+  </Step>
+  <Step title="Compresses if exceeding maxContextChars">
+    Compresses healthy targets first.
+  </Step>
+  <Step title="Omits if still exceeding">
+    Omits healthy targets when necessary.
+  </Step>
+</Steps>
+
+### Example with 20 Targets (2 with issues)
+
+```text
+[K8s Multi-Watcher: 20 targets monitored]
+
+--- Targets Requiring Attention ---
+
+[K8s Context: deployment/api-gateway in namespace/production]
+Collected at: 2026-02-15T10:30:00Z
+
+## Deployment Status
+  Replicas: 2/3 ready, 3 updated, 2 available
+  Strategy: RollingUpdate
+
+## Pods (3 total)
+  Total restarts: 12 (delta in window: 8)
+  - api-gateway-abc12: Running [Ready] restarts=0 cpu=45m mem=128Mi
+  - api-gateway-def34: Running [Ready] restarts=0 cpu=52m mem=135Mi
+  - api-gateway-ghi56: Running [NOT READY] restarts=8 cpu=12m mem=95Mi
+    Last terminated: OOMKilled (exit code 137) at 2026-02-15T10:28:00Z
+
+## Application Metrics (4)
+  http_request_duration_seconds_sum: 8453
+  http_requests_total: 1.542e+06
+  process_resident_memory_bytes: 1.34e+08
+  go_goroutines: 245
+
+## Active Alerts (2)
+  [CRITICAL] CrashLoopBackOff: pod/api-gateway-ghi56
+  [CRITICAL] OOMKilled: pod/api-gateway-ghi56
+
+## Recent Error Logs (3)
+  [10:27:45] api-gateway-ghi56/app: OutOfMemoryError: heap space
+  [10:27:46] api-gateway-ghi56/app: Shutting down...
+  [10:28:00] api-gateway-ghi56/app: Process exited with code 137
+
+--- Healthy Targets ---
+- production/auth-service: 3/3 pods ready | healthy | 0 alerts | 42 snapshots
+- production/frontend: 2/2 pods ready | healthy | 0 alerts | 42 snapshots
+- production/backend: 5/5 pods ready | healthy | 0 alerts | 42 snapshots
+- batch/worker: 3/3 pods ready | healthy | 0 alerts | 42 snapshots
+... (16 compact targets)
+```
+
+**Total budget**: ~2 KB (detail) + 18 x 80 chars (compact) = ~3.5 KB, within the 8 KB limit.
+
+---
+
+## Anomaly Detection
+
+| Anomaly | Condition | Severity |
+|---------|-----------|----------|
+| **CrashLoopBackOff** | Pod with more than 5 restarts | Critical |
+| **OOMKilled** | Container terminated due to lack of memory | Critical |
+| **PodNotReady** | Pod is not in the Ready state | Warning |
+| **DeploymentFailing** | Deployment with Available=False | Critical |
+
+Alerts are included in the context sent to the LLM and influence the **budget priority** of the MultiSummarizer.
+
+---
+
+## Observability Store
+
+Collected data is stored in a **ring buffer** per target with a configurable time window:
+
+- **Snapshots**: Complete periodic state (pods, deployment, HPA, events, metrics, app metrics)
+- **Logs**: Recent logs from each pod with classification (info/warning/error)
+- **Alerts**: Detected anomalies with severity and timestamps
+
+### Automatic Rotation
+
+Data older than the time window (`--window`) is automatically discarded, keeping memory usage constant regardless of the number of targets.
+
+---
+
+## `/watch` Command
+
+Inside interactive ChatCLI (local or remote), use `/watch` to see the status:
+
+<Tabs>
+  <Tab title="Single-Target">
+    ```text
+    /watch
+    K8s Watcher Active
+      Deployment:  myapp
+      Namespace:   production
+      Snapshots:   42
+      Pods:        3
+      Alerts:      1
+    ```
+  </Tab>
+  <Tab title="Multi-Target">
+    ```text
+    /watch
+    K8s Multi-Watcher Active
+      Watching 20 targets: 18 healthy, 1 warning, 1 critical
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## One-Shot with K8s Context
+
+```bash
+# Single deployment
+chatcli watch --deployment myapp -p "Is the deployment healthy?"
+
+# Multi-target
+chatcli watch --config targets.yaml -p "Summarize the status of all deployments"
+
+# Via remote server
+chatcli connect myserver:50051 -p "Why are the pods restarting?"
+```
+
+---
+
+## Example Questions
+
+```text
+> Is the deployment healthy?
+> Which deployments need attention?
+> Why is pod xyz restarting?
+> Analyze the HTTP metrics of api-gateway. Is the latency acceptable?
+> Compare the auth-service state with 30 minutes ago
+> What warning events occurred in the last hour?
+> Based on the Prometheus metrics, do I need to scale any deployment?
+> Summarize the status of all targets for a team report
+```
+
+---
+
+## Requirements
+
+- **Kubernetes Cluster**: Access via kubeconfig or in-cluster config
+- **RBAC Permissions**: Read access to pods, events, logs, deployments, HPA, ingresses
+- **metrics-server** (optional): For CPU/memory collection
+- **Prometheus endpoints** (optional): Apps that expose `/metrics` in Prometheus text format
+
+### RBAC
+
+<Tabs>
+  <Tab title="Single-namespace (Role + RoleBinding)">
+    ```yaml
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: chatcli-watcher
+      namespace: production
+    rules:
+      - apiGroups: [""]
+        resources: ["pods", "pods/log", "events", "services", "endpoints"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["autoscaling"]
+        resources: ["horizontalpodautoscalers"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["networking.k8s.io"]
+        resources: ["ingresses"]
+        verbs: ["get", "list"]
+      - apiGroups: ["metrics.k8s.io"]
+        resources: ["pods"]
+        verbs: ["get", "list"]
+    ```
+  </Tab>
+  <Tab title="Multi-namespace (ClusterRole + ClusterRoleBinding)">
+    When targets are in different namespaces, use `ClusterRole` + `ClusterRoleBinding` with the same rules. The Operator handles this automatically.
+  </Tab>
+</Tabs>
+
+---
+
+## AIOps Integration
+
+K8s Watcher alerts automatically feed into the Operator's **AIOps pipeline**. When the Operator detects alerts via `GetAlerts` RPC, it creates Anomaly CRs that are correlated into Issues, analyzed by AI, and automatically remediated.
+
+```text
+Alerts detected by Watcher -> Anomaly -> Issue -> AIInsight -> RemediationPlan -> Resolution
+```
+
+See [AIOps Platform](/features/aiops-platform) for the complete flow.
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Server Mode" icon="server" href="/features/server-mode">
+    Configure the server with watcher
+  </Card>
+  <Card title="K8s Operator" icon="dharmachakra" href="/features/k8s-operator">
+    K8s Operator (AIOps)
+  </Card>
+  <Card title="AIOps Platform" icon="brain" href="/features/aiops-platform">
+    AIOps Platform (deep-dive)
+  </Card>
+  <Card title="Deploy on Kubernetes" icon="docker" href="/getting-started/docker-deployment">
+    Deploy on Kubernetes
+  </Card>
+</CardGroup>

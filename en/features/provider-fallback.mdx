@@ -1,0 +1,158 @@
+---
+title: "Provider Fallback"
+sidebarTitle: "Provider Fallback"
+description: "Configure automatic failover between LLM providers with intelligent error classification, exponential cooldown, and health monitoring."
+icon: "rotate"
+---
+
+ChatCLI supports an **automatic failover chain** between LLM providers. When the primary provider fails (rate limit, timeout, server error), the system automatically tries the next provider in the chain, completely transparently.
+
+---
+
+## How It Works
+
+The fallback chain is an ordered list of providers. Each request traverses the list until it succeeds or all options are exhausted:
+
+```text
+Request -> OpenAI (primary)
+             | failed (rate limit)
+           Claude (secondary)
+             | failed (timeout)
+           Google AI (tertiary)
+             | success
+           Response returned to user
+```
+
+---
+
+## Configuration
+
+<Tabs>
+  <Tab title="Environment Variables">
+    ```bash
+    # Ordered list of providers (first = highest priority)
+    export CHATCLI_FALLBACK_PROVIDERS="OPENAI,CLAUDEAI,GOOGLEAI,COPILOT"
+
+    # Specific model per provider (optional)
+    export CHATCLI_FALLBACK_MODEL_OPENAI="gpt-4o"
+    export CHATCLI_FALLBACK_MODEL_CLAUDEAI="claude-sonnet-4-20250514"
+    export CHATCLI_FALLBACK_MODEL_GOOGLEAI="gemini-2.0-flash"
+    export CHATCLI_FALLBACK_MODEL_COPILOT="gpt-4o"
+
+    # Retry and cooldown control
+    export CHATCLI_FALLBACK_MAX_RETRIES="2"       # attempts per provider
+    export CHATCLI_FALLBACK_COOLDOWN_BASE="30s"    # base cooldown
+    export CHATCLI_FALLBACK_COOLDOWN_MAX="5m"      # maximum cooldown
+    ```
+  </Tab>
+  <Tab title="Server Flags">
+    ```bash
+    chatcli server \
+      --fallback-providers OPENAI,CLAUDEAI,GOOGLEAI,COPILOT \
+      --fallback-max-retries 2 \
+      --fallback-cooldown-base 30s \
+      --fallback-cooldown-max 5m
+    ```
+  </Tab>
+  <Tab title="Helm Chart">
+    ```yaml
+    # values.yaml
+    fallback:
+      enabled: true
+      providers:
+        - name: OPENAI
+          model: gpt-4o
+        - name: CLAUDEAI
+          model: claude-sonnet-4-20250514
+        - name: GOOGLEAI
+          model: gemini-2.0-flash
+        - name: COPILOT
+          model: gpt-4o
+      maxRetries: 2
+      cooldownBase: "30s"
+      cooldownMax: "5m"
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Classification
+
+The system automatically classifies each failure to decide the strategy:
+
+| Class | Behavior | Examples |
+|:-------|:-------------|:---------|
+| `rate_limit` | Waits for backoff, then retries | HTTP 429, "too many requests" |
+| `timeout` | Retries up to maxRetries | Deadline exceeded, connection timeout |
+| `server_error` | Retries up to maxRetries | HTTP 500, 502, 503 |
+| `auth_error` | **Does not retry** — advances in the chain | HTTP 401, 403, "invalid api key" |
+| `model_not_found` | **Does not retry** — advances in the chain | HTTP 404, "model not found" |
+| `context_too_long` | **Does not retry** — advances in the chain | "context length exceeded" |
+
+---
+
+## Exponential Cooldown
+
+After consecutive failures, the provider enters cooldown with exponential backoff:
+
+| Consecutive Failures | Cooldown |
+|:------------------:|:--------:|
+| 1 | 30s |
+| 2 | 60s |
+| 3 | 120s |
+| 4 | 240s |
+| 5+ | 300s (max) |
+
+<Note>Authentication errors receive immediate maximum cooldown (5m). A successful request clears all cooldown for the provider. Use `ResetCooldowns()` to clear manually (e.g., after updating credentials).</Note>
+
+---
+
+## Health Monitoring
+
+The chain tracks the state of each provider in real time:
+
+```go
+health := chain.GetHealth()
+for _, h := range health {
+    fmt.Printf("Provider: %s, Available: %v, Fails: %d, Cooldown: %v\n",
+        h.Name, h.Available, h.ConsecutiveFails, h.CooldownUntil)
+}
+```
+
+Fields tracked per provider:
+
+| Field | Description |
+|:------|:----------|
+| `Available` | Whether the provider is available for requests |
+| `ConsecutiveFails` | Number of consecutive failures |
+| `LastErrorClass` | Type of the last failure |
+| `CooldownUntil` | When the cooldown expires |
+| `LastErrorAt` | Timestamp of the last failure |
+
+---
+
+## Tool Use with Fallback
+
+The fallback chain also supports `SendPromptWithTools` for providers that implement the `ToolAwareClient` interface. Providers without native tool use support are automatically skipped in the tool call chain.
+
+---
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Order by cost-effectiveness" icon="ranking-star">
+    Place the cheapest/fastest provider first in the chain.
+  </Card>
+  <Card title="Diversify providers" icon="shuffle">
+    Mix providers from different companies for real resilience.
+  </Card>
+  <Card title="Configure models per provider" icon="sliders">
+    Use models with equivalent capabilities to maintain quality.
+  </Card>
+  <Card title="Monitor health" icon="heart-pulse">
+    Regularly check if any provider is in persistent cooldown.
+  </Card>
+</CardGroup>
+
+<Warning>Each provider in the chain needs its own configured API key. Make sure to configure the keys for all providers listed in `CHATCLI_FALLBACK_PROVIDERS`.</Warning>

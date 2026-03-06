@@ -1,0 +1,691 @@
+---
+title: "Agentic AI and Plugin System"
+sidebarTitle: "Agentic AI & Plugins"
+description: "Transform ChatCLI into an extensible automation platform. Create custom tools that the AI can use autonomously to execute complex end-to-end workflows."
+icon: "puzzle-piece"
+---
+
+## From Assistant to Agent: A Paradigm Shift
+
+Most AI tools for the command line work as **assistants**: you ask, they answer. ChatCLI goes further, transforming the AI into an **autonomous agent** that doesn't just respond, but **acts**.
+
+The Plugin System and Agentic AI bring this vision to life:
+
+- **You**: Define the objective and provide the tools (plugins)
+- **The Agent**: Orchestrates execution, connecting perception, reasoning, and action to solve complex problems
+
+<Note>This is not just a feature -- it is the foundation for a new way of interacting with your development environment.</Note>
+
+---
+
+## Plugin System Architecture
+
+### Automatic Discovery and Loading
+
+ChatCLI uses an **intelligent plugin manager** that:
+
+<Steps>
+  <Step title="Monitors the directory">
+    Monitors `~/.chatcli/plugins/` using `fsnotify`
+  </Step>
+  <Step title="Detects changes">
+    Detects changes in real time (file creation, modification, removal)
+  </Step>
+  <Step title="Applies debounce">
+    Applies a 500ms debounce to avoid multiple reloads
+  </Step>
+  <Step title="Validates the contract">
+    Validates each plugin's contract before loading it
+  </Step>
+  <Step title="Reloads automatically">
+    Reloads automatically without needing to restart ChatCLI
+  </Step>
+</Steps>
+
+```go
+// Events that trigger hot reload:
+// - Write:  Existing file modified
+// - Create: New plugin added
+// - Remove: Plugin deleted
+// - Rename: Plugin renamed
+```
+
+### Remote Plugins (Server-Side)
+
+When connected to a server via `chatcli connect`, the client automatically discovers plugins available on the server. These plugins appear in `/plugin list` with the `[remote]` tag and are executed on the server via gRPC -- no need to install anything locally.
+
+```bash
+> /plugin list
+Installed Plugins (4):
+  @coder          - Complete engineering suite               [builtin]
+  @hello          - Example plugin                          [local]
+  @k8s-diagnose   - K8s cluster diagnostics                 [remote]
+  @dockerhub      - Query Docker Hub tags                   [remote]
+```
+
+<Info>The agent can use remote plugins the same way as local plugins -- execution is transparent. When disconnecting, remote plugins are automatically removed from the listing.</Info>
+
+### Builtin Plugins
+
+Some essential plugins come embedded in the ChatCLI binary and appear with the `[builtin]` tag. The main one is `@coder`, which provides the engineering suite for the `/coder` mode. Builtin plugins require no installation and cannot be uninstalled. If you install a custom version in `~/.chatcli/plugins/` with the same name, it takes precedence over the builtin.
+
+### Flexible Plugin Lookup
+
+The system accepts both invocation forms:
+
+<Tabs>
+  <Tab title="With @ (canonical form)">
+    ```bash
+    /agent @hello world
+    ```
+  </Tab>
+  <Tab title="Without @ (convenient shortcut)">
+    ```bash
+    /agent hello world
+    ```
+  </Tab>
+</Tabs>
+
+Internally, the manager normalizes automatically:
+
+```go
+func (m *Manager) GetPlugin(name string) (Plugin, bool) {
+    p, ok := m.plugins[name]
+    if !ok {
+        p, ok = m.plugins["@"+name]  // Automatic fallback
+    }
+    return p, ok
+}
+```
+
+---
+
+## Agent Configuration
+
+### Environment Variables
+
+Configure agent behavior through environment variables:
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `CHATCLI_AGENT_PLUGIN_MAX_TURNS` | integer | `50` | Maximum number of ReAct cycle iterations. Prevents infinite loops (max: 200). |
+| `CHATCLI_AGENT_PLUGIN_TIMEOUT` | duration | `15m` | Time limit for each plugin execution. Accepts Go format (`30s`, `5m`, `1h`). |
+| `CHATCLI_AGENT_CMD_TIMEOUT` | duration | `10m` | Timeout for shell commands executed via `@command` (max: 1h). |
+| `CHATCLI_AGENT_DENYLIST` | string | - | Regular expressions separated by `;` to block dangerous commands. |
+| `CHATCLI_AGENT_ALLOW_SUDO` | boolean | `false` | Allows `sudo` commands without automatic blocking (use with caution). |
+| `CHATCLI_AGENT_PARALLEL_MODE` | boolean | `false` | Enables multi-agent orchestration with parallel agents. |
+| `CHATCLI_AGENT_MAX_WORKERS` | integer | `4` | Maximum workers (goroutines) running agents in parallel. |
+| `CHATCLI_AGENT_WORKER_MAX_TURNS` | integer | `10` | Maximum turns of the mini ReAct loop for each worker agent. |
+| `CHATCLI_AGENT_WORKER_TIMEOUT` | duration | `5m` | Timeout per individual worker agent. |
+
+<Tip>When `CHATCLI_AGENT_PARALLEL_MODE=true`, the orchestrator LLM can dispatch 12 specialist agents (FileAgent, CoderAgent, ShellAgent, GitAgent, SearchAgent, PlannerAgent, ReviewerAgent, TesterAgent, RefactorAgent, DiagnosticsAgent, FormatterAgent, DepsAgent) in parallel. See the [full documentation](/features/multi-agent-orchestration).</Tip>
+
+---
+
+## The ReAct Cycle: Reasoning and Action
+
+The AgentMode implements the ReAct (Reasoning and Acting) framework, a transparent iterative loop:
+
+<Steps>
+  <Step title="Reasoning (Thought)">
+    The agent analyzes the objective and verbalizes its plan:
+
+    ```xml
+    <pensamento>
+    O objetivo e analisar a performance de uma funcao Go.
+    Isso requer profiling. Olhando minhas ferramentas, vejo
+    @go-bench-gen e @go-bench-run. O primeiro passo logico
+    e gerar o arquivo de benchmark.
+    </pensamento>
+    ```
+  </Step>
+  <Step title="Action (Tool Call)">
+    The AI formalizes its decision in a structured call:
+
+    ```xml
+    <tool_call name="@go-bench-gen" args="main.go MinhaFuncao" />
+    ```
+  </Step>
+  <Step title="Execution (Plugin Invocation)">
+    ChatCLI intercepts and executes the plugin:
+
+    ```text
+    Agent is using tool: @go-bench-gen main.go MinhaFuncao
+       Configured timeout: 15m
+       Directory: /home/user/projeto
+    ```
+  </Step>
+  <Step title="Observation (Feedback)">
+    The result is formatted and returned to the AI:
+
+    ```text
+    --- Tool Result ---
+    Generated file: main_bench_test.go
+    Benchmark created: BenchmarkMinhaFuncao
+    ```
+  </Step>
+  <Step title="Reiteration">
+    The cycle restarts until the objective is achieved or the turn limit is reached.
+  </Step>
+</Steps>
+
+---
+
+## Plugin Management with `/plugin`
+
+### Available Commands
+
+| Command | Description |
+|---------|-------------|
+| `/plugin list` | Lists all installed plugins with metadata |
+| `/plugin install <url>` | Installs a plugin from a Git repository (compiled languages) |
+| `/plugin show <name>` | Displays description and usage syntax |
+| `/plugin inspect <name>` | Shows raw metadata, path, and permissions |
+| `/plugin uninstall <name>` | Removes a plugin from the system |
+| `/plugin reload` | Forces a manual reload (rarely needed) |
+
+### Usage Example
+
+<Tabs>
+  <Tab title="List plugins">
+    ```bash
+    > /plugin list
+    Installed Plugins (3):
+      @go-bench-gen  - Generates Go benchmark files
+      @go-bench-run  - Runs benchmarks and profiling
+      @dockerhub     - Queries Docker Hub tags
+    ```
+  </Tab>
+  <Tab title="View details">
+    ```bash
+    > /plugin show @go-bench-gen
+    Plugin: @go-bench-gen
+    Description: Generates Go benchmark files from existing functions
+    Usage: @go-bench-gen <file.go> <FunctionName>
+    Version: 1.2.0
+    ```
+  </Tab>
+  <Tab title="Inspect metadata">
+    ```bash
+    > /plugin inspect @go-bench-gen
+    Detailed Inspection:
+       Path: /home/user/.chatcli/plugins/go-bench-gen
+       Permissions: -rwxr-xr-x
+       Size: 2.3 MB
+
+       Metadata (JSON):
+       {
+         "name": "@go-bench-gen",
+         "description": "Generates Go benchmark files",
+         "usage": "@go-bench-gen <file.go> <FunctionName>",
+         "version": "1.2.0"
+       }
+    ```
+  </Tab>
+</Tabs>
+
+### Installing Plugins
+
+```bash
+> /plugin install https://github.com/user/chatcli-plugin-k8s.git
+```
+
+<Warning>You are about to install third-party code that will be executed on your machine. Review the source code before proceeding.</Warning>
+
+```text
+Repository: https://github.com/user/chatcli-plugin-k8s.git
+Confirm installation? (y/N): y
+
+Cloning repository...
+Go project detected, compiling...
+Plugin @k8s installed successfully!
+```
+
+---
+
+## Creating Plugins: The Complete Guide
+
+### The Plugin Contract
+
+Every plugin must follow these rules:
+
+<Steps>
+  <Step title="Be an Executable">
+    - Compiled binary (Go, Rust, C++) or
+    - Script with shebang (`#!/usr/bin/env python3`, `#!/bin/bash`)
+    - Located in `~/.chatcli/plugins/`
+    - Execute permission required (`chmod +x`)
+
+    ```bash
+    ls -l ~/.chatcli/plugins/
+    -rwxr-xr-x  1 user  staff  2.3M  my-plugin   # Correct (x = executable)
+    -rw-r--r--  1 user  staff  1.8M  other       # Missing execute permission
+    ```
+  </Step>
+  <Step title="Respond to the --metadata Contract (Required)">
+    When invoked with `--metadata`, the plugin MUST print valid JSON to `stdout`:
+
+    ```json
+    {
+      "name": "@my-plugin",
+      "description": "Clear description of what the plugin does",
+      "usage": "@my-plugin <arg1> [--flag]",
+      "version": "1.0.0"
+    }
+    ```
+
+    All fields are required:
+
+    - `name`: Must start with `@`
+    - `description`: Used by the AI to decide when to use the tool
+    - `usage`: Invocation syntax
+    - `version`: Semantic versioning
+  </Step>
+  <Step title="Implement --schema (Optional, but Recommended)">
+    The schema helps the AI understand the plugin's parameters:
+
+    ```json
+    {
+      "parameters": [
+        {
+          "name": "cluster-name",
+          "type": "string",
+          "required": true,
+          "description": "Kubernetes cluster name"
+        },
+        {
+          "name": "namespace",
+          "type": "string",
+          "required": false,
+          "default": "default",
+          "description": "Target namespace"
+        }
+      ]
+    }
+    ```
+  </Step>
+  <Step title="Communication via Standard I/O">
+    | Channel | Usage | Description |
+    |---------|-------|-------------|
+    | `stdout` | Result | Main output sent to the AI |
+    | `stderr` | Logs/Progress | Status messages, warnings, and errors |
+    | `stdin` | Data input | Large text blocks (e.g., generated code) |
+    | `args` | Parameters | Command-line arguments |
+
+    **Golden Rule:** `stdout` for the final result only, `stderr` for everything else (logs, progress, errors).
+  </Step>
+</Steps>
+
+---
+
+## Complete Example: `@hello` Plugin in Go
+
+This example demonstrates all best practices:
+
+```go
+// ~/.chatcli/plugins-src/hello/main.go
+package main
+
+import (
+    "encoding/json"
+    "flag"
+    "fmt"
+    "os"
+    "time"
+)
+
+// Metadata defines the structure for --metadata
+type Metadata struct {
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    Usage       string `json:"usage"`
+    Version     string `json:"version"`
+}
+
+// Schema defines the structure for --schema
+type Schema struct {
+    Parameters []Parameter `json:"parameters"`
+}
+
+type Parameter struct {
+    Name        string `json:"name"`
+    Type        string `json:"type"`
+    Required    bool   `json:"required"`
+    Description string `json:"description"`
+    Default     string `json:"default,omitempty"`
+}
+
+// logf sends progress messages to stderr (visible to the user)
+func logf(format string, v ...interface{}) {
+    fmt.Fprintf(os.Stderr, format, v...)
+}
+
+func main() {
+    // Discovery flags
+    metadataFlag := flag.Bool("metadata", false, "Displays plugin metadata")
+    schemaFlag := flag.Bool("schema", false, "Displays parameter schema")
+    flag.Parse()
+
+    // Respond to --metadata
+    if *metadataFlag {
+        meta := Metadata{
+            Name:        "@hello",
+            Description: "Example plugin that demonstrates the stdout/stderr flow",
+            Usage:       "@hello [your-name]",
+            Version:     "1.0.0",
+        }
+        jsonMeta, _ := json.Marshal(meta)
+        fmt.Println(string(jsonMeta)) // stdout for ChatCLI
+        return
+    }
+
+    // Respond to --schema
+    if *schemaFlag {
+        schema := Schema{
+            Parameters: []Parameter{
+                {
+                    Name:        "name",
+                    Type:        "string",
+                    Required:    false,
+                    Description: "Name of the person to greet",
+                    Default:     "World",
+                },
+            },
+        }
+        jsonSchema, _ := json.Marshal(schema)
+        fmt.Println(string(jsonSchema)) // stdout for ChatCLI
+        return
+    }
+
+    // Main plugin logic
+    logf("Plugin 'hello' started!\n") // stderr = visible progress
+
+    time.Sleep(2 * time.Second) // Simulate work
+    logf("   Performing a time-consuming task...\n")
+    time.Sleep(2 * time.Second)
+
+    name := "World"
+    if len(flag.Args()) > 0 {
+        name = flag.Args()[0]
+    }
+
+    logf("Task completed!\n") // stderr = progress feedback
+
+    // Final result to stdout (will be sent to the AI)
+    fmt.Printf("Hello, %s! The current time is %s.", name, time.Now().Format(time.RFC1123))
+}
+```
+
+### Compilation and Installation
+
+<Steps>
+  <Step title="Compile">
+    ```bash
+    cd ~/.chatcli/plugins-src/hello
+    go build -o hello main.go
+    ```
+  </Step>
+  <Step title="Grant execute permission (CRITICAL!)">
+    ```bash
+    chmod +x hello
+    ```
+  </Step>
+  <Step title="Move to the plugins directory">
+    ```bash
+    mv hello ~/.chatcli/plugins/
+    ```
+  </Step>
+  <Step title="Verify installation">
+    ```bash
+    > /plugin list
+    Installed Plugins (1):
+      @hello  - Example plugin that demonstrates the stdout/stderr flow
+    ```
+  </Step>
+</Steps>
+
+### Testing the Plugin
+
+```bash
+# Inside ChatCLI
+> /agent @hello Edilson
+```
+
+```text
+# Terminal output (stderr):
+Plugin 'hello' started!
+   Performing a time-consuming task...
+Task completed!
+```
+
+<Info>The AI responds based on the plugin's stdout. Example: "The plugin returned: Hello, Edilson! The current time is Mon, 02 Jan 2024 14:30:00 UTC."</Info>
+
+---
+
+## Debugging Plugins
+
+<AccordionGroup>
+  <Accordion title="Check if the Plugin Was Loaded">
+    Run `/plugin list`. If the plugin does not appear:
+
+    1. Check permissions: `ls -l ~/.chatcli/plugins/` -- Must show `-rwxr-xr-x` (with 'x')
+    2. Test the `--metadata` contract: `~/.chatcli/plugins/your-plugin --metadata` -- Must return valid JSON
+    3. Enable debug logs in `.env`:
+
+    ```bash
+    LOG_LEVEL=debug
+    ENV=dev
+    ```
+  </Accordion>
+
+  <Accordion title="Test Plugin Manually">
+    Before using in the agent, test directly:
+
+    - Test metadata: `~/.chatcli/plugins/your-plugin --metadata`
+    - Test schema: `~/.chatcli/plugins/your-plugin --schema`
+    - Test execution: `~/.chatcli/plugins/your-plugin arg1 arg2`
+  </Accordion>
+
+  <Accordion title="Resolve Timeout Issues">
+    If the plugin is being interrupted:
+
+    - Increase timeout globally: `export CHATCLI_AGENT_PLUGIN_TIMEOUT=30m`
+    - Or in `.env`: `CHATCLI_AGENT_PLUGIN_TIMEOUT=30m`
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Advanced Example: Docker Hub Plugin
+
+This example demonstrates integration with an external API:
+
+```go
+// chatcli-plugin-dockerhub/main.go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "strings"
+    "time"
+)
+
+type Metadata struct {
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    Usage       string `json:"usage"`
+    Version     string `json:"version"`
+}
+
+type DockerHubResponse struct {
+    Results []struct {
+        Name string `json:"name"`
+    } `json:"results"`
+}
+
+func main() {
+    if len(os.Args) > 1 && os.Args[1] == "--metadata" {
+        meta := Metadata{
+            Name:        "@dockerhub",
+            Description: "Queries available tags of an image on Docker Hub",
+            Usage:       "@dockerhub <image>",
+            Version:     "1.0.0",
+        }
+        jsonMeta, _ := json.Marshal(meta)
+        fmt.Println(string(jsonMeta))
+        return
+    }
+
+    if len(os.Args) < 2 {
+        fmt.Fprintln(os.Stderr, "Error: Image name is required.")
+        fmt.Fprintln(os.Stderr, "Usage: @dockerhub <image>")
+        os.Exit(1)
+    }
+
+    imageName := os.Args[1]
+    fmt.Fprintf(os.Stderr, "Querying tags for '%s'...\n", imageName)
+
+    // Docker Hub API call
+    url := fmt.Sprintf("https://hub.docker.com/v2/repositories/library/%s/tags?page_size=25", imageName)
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Get(url)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
+        os.Exit(1)
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    var apiResponse DockerHubResponse
+    if err := json.Unmarshal(body, &apiResponse); err != nil {
+        fmt.Fprintf(os.Stderr, "Response parsing error: %v\n", err)
+        os.Exit(1)
+    }
+
+    // Extract tags
+    var tags []string
+    for _, result := range apiResponse.Results {
+        tags = append(tags, result.Name)
+    }
+
+    fmt.Fprintf(os.Stderr, "%d tags found\n", len(tags))
+
+    // Final result to stdout (for the AI)
+    fmt.Println(strings.Join(tags, "\n"))
+}
+```
+
+### Use Case
+
+```bash
+> /agent deploy the latest alpine version of redis
+```
+
+The agent will:
+
+1. Use `@dockerhub redis` to list tags
+2. Filter tags with "alpine"
+3. Select the most recent version
+4. Run `docker run redis:<alpine-tag>`
+5. Validate that the container is running
+
+---
+
+## Supported Languages
+
+Any language that can create an executable, interact with standard I/O (stdin/stdout/stderr), and process command-line arguments.
+
+### Recommendations by Use Case
+
+| Language | Best For | Advantages |
+|----------|----------|------------|
+| Go | Production plugins | Static binaries, fast, portable |
+| Rust | Critical performance | Memory safety, speed |
+| Python | Rapid prototyping | Rich ecosystem, easy debugging |
+| Bash | System scripts | Native shell integration |
+| Node.js | API integrations | NPM, async/await |
+
+---
+
+## Security and Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Input Validation" icon="shield-check">
+    Always validate arguments before processing. Use `os.Exit(1)` to signal errors to ChatCLI.
+  </Card>
+  <Card title="Error Handling" icon="bug">
+    A non-zero exit code signals an error to ChatCLI. Send error messages via `stderr`.
+  </Card>
+  <Card title="Internal Timeouts" icon="clock">
+    Use `context.WithTimeout` to prevent external operations from blocking the plugin indefinitely.
+  </Card>
+  <Card title="Informative Logs" icon="list-check">
+    Send progress via `stderr` so the user can follow the plugin's execution in real time.
+  </Card>
+</CardGroup>
+
+```go
+// Input Validation
+if len(os.Args) < 2 {
+    fmt.Fprintln(os.Stderr, "Error: Insufficient arguments")
+    os.Exit(1)
+}
+
+// Error Handling
+if err != nil {
+    fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+    os.Exit(1) // Exit code != 0 signals error to ChatCLI
+}
+
+// Internal Timeouts
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+```
+
+---
+
+## Plugins in /coder Mode
+
+The [/coder](/core-concepts/coder-mode) mode is specialized in software engineering and uses the [@coder](/features/coder-plugin) plugin to execute its actions. `@coder` is a **builtin plugin** -- it comes embedded in ChatCLI and works without installation.
+
+In `/coder`, the AI emits tool calls in a strict format:
+
+- First, it writes a short `reasoning` block (2 to 6 lines)
+- Then, it emits only one `tool_call` with JSON args
+
+Examples of actual calls (that the AI emits in /coder):
+
+```xml
+<tool_call name="@coder" args='{"cmd":"tree","args":{"dir":"."}}'/>
+<tool_call name="@coder" args='{"cmd":"read","args":{"file":"cli/agent_mode.go"}}'/>
+<tool_call name="@coder" args='{"cmd":"test","args":{"dir":"."}}'/>
+```
+
+See more at [Coder Mode](/core-concepts/coder-mode) and [Plugin @coder](/features/coder-plugin).
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Plugin Examples" icon="code" href="https://github.com/diillson/chatcli/tree/main/plugins-examples">
+    Explore the example plugins in the repository
+  </Card>
+  <Card title="Create Your First Plugin" icon="plus">
+    Follow the `@hello` template on this page to get started
+  </Card>
+  <Card title="Share with the Community" icon="share-nodes">
+    Publish plugins on GitHub for the ChatCLI ecosystem
+  </Card>
+  <Card title="Contribute" icon="hands-helping">
+    Contribute plugins to the ChatCLI ecosystem
+  </Card>
+</CardGroup>
+
+---
+
+The plugin system is your gateway to true automation. Start building your tools and transform your terminal into a teammate.

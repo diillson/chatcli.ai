@@ -1,0 +1,675 @@
+---
+title: "AIOps Platform (Deep-Dive)"
+sidebarTitle: "AIOps Platform"
+description: "Detailed architecture of the autonomous AIOps platform: complete pipeline of detection, correlation, AI analysis, and automatic remediation on Kubernetes."
+icon: "brain"
+---
+
+The ChatCLI **AIOps Platform** is an autonomous system that detects problems in Kubernetes, analyzes root causes with AI, and executes automatic remediations -- all orchestrated by native Kubernetes CRDs.
+
+This page covers the internal architecture in depth. For configuration and usage examples, see [K8s Operator](/features/k8s-operator).
+
+---
+
+## Pipeline Overview
+
+```mermaid
+sequenceDiagram
+    participant Server as ChatCLI Server
+    participant WB as WatcherBridge
+    participant AR as AnomalyReconciler
+    participant CE as CorrelationEngine
+    participant IR as IssueReconciler
+    participant AIR as AIInsightReconciler
+    participant LLM as LLM Provider
+    participant RR as RemediationReconciler
+    participant K8s as Kubernetes API
+
+    loop every 30 seconds
+        WB->>Server: GetAlerts(namespace)
+        Server-->>WB: alerts[]
+        WB->>K8s: Creates Anomaly CRs (dedup SHA256)
+    end
+
+    AR->>K8s: Watch Anomaly CRs
+    AR->>CE: Correlates anomalies
+    CE-->>AR: risk score + severity + incident ID
+    AR->>K8s: Creates/updates Issue CR (with signalType)
+
+    IR->>K8s: Watch Issue CRs
+    IR->>K8s: Creates AIInsight CR (state: Analyzing)
+
+    AIR->>K8s: Watch AIInsight CRs
+    AIR->>K8s: Collects K8s context (pods, events, revisions)
+    AIR->>Server: AnalyzeIssue(context + k8s_context)
+    Server->>LLM: Structured prompt with K8s context
+    LLM-->>Server: JSON (analysis + actions)
+    Server-->>AIR: AnalyzeIssueResponse
+    AIR->>K8s: Updates AIInsight.Status
+
+    IR->>K8s: Checks AIInsight ready
+    alt Manual Runbook exists
+        IR->>K8s: Creates RemediationPlan (from manual Runbook)
+    else AI has suggested actions
+        IR->>K8s: Generates auto Runbook (reusable)
+        IR->>K8s: Creates RemediationPlan (from auto-generated Runbook)
+    else None available
+        IR->>K8s: Creates agentic RemediationPlan (AgenticMode=true)
+        Note over IR,K8s: AI decides each action step-by-step
+    end
+
+    RR->>K8s: Watch RemediationPlan CRs
+
+    alt Standard mode (Runbook)
+        RR->>K8s: Executes actions sequentially (Scale/Restart/Rollback/Patch/AdjustResources/DeletePod)
+    else Agentic mode
+        loop Each step (max 10, timeout 10min)
+            RR->>Server: AgenticStep(context + history)
+            Server->>LLM: Prompt with K8s context + history
+            LLM-->>Server: JSON (reasoning + next_action or resolved)
+            Server-->>RR: AgenticStepResponse
+            RR->>K8s: Executes suggested action
+            RR->>K8s: Records observation in AgenticHistory
+        end
+    end
+    RR->>K8s: Updates RemediationPlan.Status
+
+    IR->>K8s: Checks result
+    alt Success
+        IR->>K8s: Issue -> Resolved + invalidates dedup
+    else Agentic success
+        IR->>K8s: Issue -> Resolved + PostMortem CR + auto Runbook
+    else Failure + remaining attempts
+        IR->>K8s: Issue -> Analyzing (re-analysis with failure context)
+        AIR->>Server: Re-analysis with failure_context
+        Note over AIR,Server: AI suggests different strategy
+    else Max attempts
+        IR->>K8s: Issue -> Escalated + invalidates dedup
+    end
+```
+
+---
+
+## Internal Components
+
+### 1. WatcherBridge (`watcher_bridge.go`)
+
+The WatcherBridge is the pipeline entry point. It implements the controller-runtime `manager.Runnable` interface and runs as a manager-managed goroutine.
+
+**Responsibilities:**
+
+| Function | Description |
+|----------|-------------|
+| `Start()` | Starts the polling loop (30s) with cancelable context |
+| `poll()` | Queries GetAlerts and creates Anomaly CRs |
+| `discoverAndConnect()` | Discovers server via Instance CRs in the cluster |
+| `createAnomaly()` | Converts alert -> Anomaly CR with reference labels |
+| `alertHash()` | SHA256(type\|deployment\|namespace) for dedup |
+| `InvalidateDedupForResource()` | Removes dedup entries for a deployment+namespace |
+| `sanitizeK8sName()` | Ensures valid names for K8s objects (63 chars, lowercase, no special characters) |
+
+**SHA256 Dedup:**
+
+```text
+hash = SHA256(alertType | deployment | namespace)
+```
+
+- **No temporal component**: A continuous problem (e.g., CrashLoopBackOff) generates only one Anomaly
+- **TTL**: 2 hours -- expired hashes are pruned automatically
+- **Invalidation**: When an Issue reaches a terminal state (Resolved/Escalated), dedup entries for the affected resource are invalidated, allowing immediate recurrence detection
+- **Result**: Avoids duplicates during an active problem; detects recurrence after resolution
+
+**Server Discovery:**
+
+<Steps>
+  <Step title="Lists Instance CRs in the cluster">
+  </Step>
+  <Step title="Selects the first Instance with Status.Ready=true">
+  </Step>
+  <Step title="Connects via gRPC insecure (10s timeout)">
+  </Step>
+  <Step title="Retry">
+    If the connection fails, retries on the next poll cycle.
+  </Step>
+</Steps>
+
+### 2. AnomalyReconciler (`anomaly_controller.go`)
+
+Watches Anomaly CRs and correlates them into Issues.
+
+**Flow:**
+
+<Steps>
+  <Step title="Receives Anomaly CR">
+    Newly created Anomaly with `Status.Correlated = false`.
+  </Step>
+  <Step title="Groups anomalies">
+    Calls `CorrelationEngine.FindRelatedAnomalies()` to group.
+  </Step>
+  <Step title="Calculates risk score and severity">
+  </Step>
+  <Step title="Creates or updates Issue CR">
+  </Step>
+  <Step title="Marks Anomaly as correlated">
+    Sets `Correlated = true` with reference to the Issue.
+  </Step>
+</Steps>
+
+### 3. CorrelationEngine (`correlation.go`)
+
+Correlation engine that groups anomalies into incidents.
+
+**Correlation Algorithm:**
+
+```text
+For each new anomaly:
+  1. Generates incident_id = hash(resource_kind + resource_name + namespace + signal_type)
+  2. Searches for existing Issue with the same incident_id
+  3. If exists -> adds anomaly to Issue, recalculates risk score
+  4. If not exists -> creates new Issue
+```
+
+**Risk Scoring:**
+
+| Signal | Weight | Justification |
+|--------|--------|---------------|
+| `oom_kill` | 30 | Indicates severe memory problem |
+| `error_rate` | 25 | Direct impact on users |
+| `deploy_failing` | 25 | Service unavailability |
+| `latency_spike` | 20 | Performance degradation |
+| `pod_restart` | 20 | Pod instability |
+| `pod_not_ready` | 20 | Reduced capacity |
+
+**Severity Classification:**
+
+```text
+risk_score >= 80 -> Critical
+risk_score >= 60 -> High
+risk_score >= 40 -> Medium
+risk_score <  40 -> Low
+```
+
+**Example**: A deployment with `oom_kill` (30) + `pod_restart` (20) = risk 50 -> **Medium**. If adding `error_rate` (25) = risk 75 -> **High**.
+
+**Source Mapping:**
+
+| Anomaly Source | Issue Source |
+|---------------|-------------|
+| `watcher` | `watcher` |
+| `prometheus` | `prometheus` |
+| `manual` | `manual` |
+
+### 4. IssueReconciler (`issue_controller.go`)
+
+Manages the complete lifecycle of an Issue through a state machine.
+
+**States and Transitions:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detected : Anomaly correlated
+
+    state "Detected" as D {
+        state "Add finalizer" as D1
+        state "Create AIInsight" as D2
+        state "Set detectedAt" as D3
+        D1 --> D2
+        D2 --> D3
+    }
+
+    D --> Analyzing : AIInsight created
+
+    state "Analyzing" as A {
+        state "Await Analysis" as A1
+        state "Search manual Runbook" as A2
+        state "Generate Runbook from AI" as A3
+        state "Create agentic plan" as A4
+        A1 --> A2 : Analysis populated
+        A2 --> A3 : No manual Runbook
+        A3 --> A4 : No AI actions
+    }
+
+    A --> Remediating : RemediationPlan created (via Runbook or agentic)
+
+    state "Remediating" as R {
+        state "Await execution" as R1
+        state "Verify result" as R2
+        R1 --> R2
+    }
+
+    R --> Resolved : RemediationPlan completed (invalidates dedup)
+    R --> A : Retry (re-analysis with failure context)
+    R --> Escalated : Max attempts (invalidates dedup)
+
+    note right of Resolved : Agentic resolution generates\nPostMortem CR + Runbook
+
+    Resolved --> [*]
+    Escalated --> [*]
+```
+
+<AccordionGroup>
+  <Accordion title="handleDetected()">
+    1. Sets `detectedAt` and `maxRemediationAttempts` (default: 3)
+    2. Creates AIInsight CR with owner reference (Issue -> AIInsight)
+    3. Transitions to `Analyzing`
+    4. Requeues after 10 seconds
+  </Accordion>
+  <Accordion title="handleAnalyzing()">
+    1. Checks if AIInsight has `Analysis` populated
+    2. Searches for matching manual Runbook (`findMatchingRunbook` -- tiered matching)
+    3. If manual Runbook found -> `createRemediationPlan()` (manual has precedence)
+    4. If no manual Runbook but AIInsight has `SuggestedActions` -> `generateRunbookFromAI()` -> `createRemediationPlan()` using the auto-generated Runbook
+    5. If none -> `createAgenticRemediationPlan()` (AgenticMode=true, no pre-defined actions -- AI decides each step)
+    6. Transitions to `Remediating`
+  </Accordion>
+  <Accordion title="findMatchingRunbook() -- Tiered Matching">
+    - **Tier 1**: SignalType + Severity + ResourceKind (exact match, preferred)
+    - **Tier 2**: Severity + ResourceKind (fallback when signal doesn't match)
+    - `SignalType` resolved from: `issue.Spec.SignalType` -> fallback `issue.Labels["platform.chatcli.io/signal"]`
+  </Accordion>
+  <Accordion title="generateRunbookFromAI()">
+    - Materializes `SuggestedActions` from AI as a reusable Runbook CR
+    - Name: `auto-{signal}-{severity}-{kind}` (sanitized)
+    - Labels: `platform.chatcli.io/auto-generated=true`
+    - Trigger: SignalType + Severity + ResourceKind (for future reuse)
+    - Uses `CreateOrUpdate` for idempotency
+  </Accordion>
+  <Accordion title="handleRemediating()">
+    1. Finds the most recent RemediationPlan (`findLatestRemediationPlan`)
+    2. If `Completed` -> Issue `Resolved` + invalidates dedup for the resource
+       - If agentic plan: generates **PostMortem CR** (timeline, root cause, impact, lessons) + **reusable Runbook** from successful steps
+    3. If `Failed` and remaining attempts -> **re-analysis**: collects failure evidence (`collectFailureEvidence`), clears AIInsight analysis, returns to `Analyzing` state with failure context
+    4. If `Failed` and max attempts -> `Escalated` + invalidates dedup for the resource
+  </Accordion>
+</AccordionGroup>
+
+**Retry with Strategy Escalation:**
+- Each retry triggers AI re-analysis with context from previous failures
+- AI receives `previous_failure_context` with evidence from failed attempts
+- The prompt instructs: "Do not repeat the same actions. Analyze why they failed and suggest a fundamentally different approach"
+- Generates new auto-generated Runbook with different strategy (name includes attempt)
+
+**Remediation Priority:**
+
+```text
+1. Existing manual Runbook (tiered match: SignalType+Severity+Kind -> Severity+Kind)
+2. AI auto-generated Runbook (materialized as reusable CR)
+3. Escalation (last resort)
+```
+
+### 5. AIInsightReconciler (`aiinsight_controller.go`)
+
+Watches AIInsight CRs and calls the `AnalyzeIssue` RPC to populate the analysis.
+
+**Flow:**
+
+<Steps>
+  <Step title="Checks existing analysis">
+    Checks if `Status.Analysis` is already populated (skip if yes).
+  </Step>
+  <Step title="Checks connectivity">
+    Checks if server is connected (requeue 15s if not).
+  </Step>
+  <Step title="Fetches context">
+    Fetches parent Issue for context.
+  </Step>
+  <Step title="Collects K8s context">
+    Collects K8s context via `KubernetesContextBuilder` (deployment, pods, events, revisions).
+  </Step>
+  <Step title="Reads failure context">
+    Reads failure context from annotation `platform.chatcli.io/failure-context` (if re-analysis).
+  </Step>
+  <Step title="Builds request">
+    Builds `AnalyzeIssueRequest` with Issue data + K8s context + failure context.
+  </Step>
+  <Step title="Calls AnalyzeIssue RPC">
+    Calls `AnalyzeIssue` RPC via `ServerClient`.
+  </Step>
+  <Step title="Populates status">
+    Populates `Status.Analysis`, `Confidence`, `Recommendations`, `SuggestedActions`. Clears `failure-context` annotation after re-analysis completes.
+  </Step>
+</Steps>
+
+**KubernetesContextBuilder (`k8s_context.go`):**
+
+Collects 4 sections of real cluster context (max 8000 chars):
+- **Deployment Status**: replicas (desired/ready/updated/unavailable), conditions, container images + resources
+- **Pod Details** (up to 5 pods, unhealthy first): phase, restart count, container states (Waiting/Terminated with reason + exit code)
+- **Recent Events** (last 15): type, reason, message, count
+- **Revision History**: Last 5 revisions (ReplicaSets) with image diff between revisions
+
+**AnalyzeIssueRequest:**
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `issue_name` | Issue.Name | Issue name |
+| `namespace` | Issue.Namespace | Namespace |
+| `resource_kind` | Issue.Spec.Resource.Kind | Resource type (Deployment) |
+| `resource_name` | Issue.Spec.Resource.Name | Deployment name |
+| `signal_type` | Issue.Spec.SignalType / labels | Signal type |
+| `severity` | Issue.Spec.Severity | Severity |
+| `description` | Issue.Spec.Description | Problem description |
+| `risk_score` | Issue.Spec.RiskScore | Risk score |
+| `provider` | AIInsight.Spec.Provider | LLM provider |
+| `model` | AIInsight.Spec.Model | LLM model |
+| `kubernetes_context` | KubernetesContextBuilder | Deployment status, pods, events, revisions |
+| `previous_failure_context` | Annotation on AIInsight | Evidence from previous attempts (retries) |
+
+### 6. RemediationReconciler (`remediation_controller.go`)
+
+Executes the actions defined in a RemediationPlan.
+
+**Supported Actions:**
+
+| Type | What It Does | Parameters |
+|------|-------------|-----------|
+| `ScaleDeployment` | `kubectl scale deployment/<name> --replicas=N` | `replicas` (required) |
+| `RestartDeployment` | `kubectl rollout restart deployment/<name>` | -- |
+| `RollbackDeployment` | Rollback to previous, healthy, or specific revision | `toRevision` (optional: `previous`, `healthy`, number) |
+| `PatchConfig` | Updates key(s) in a ConfigMap | `configmap`, `key=value` |
+| `AdjustResources` | Adjusts CPU/memory requests/limits | `memory_limit`, `memory_request`, `cpu_limit`, `cpu_request`, `container` |
+| `DeletePod` | Removes the sickest pod (CrashLoop > restarts) | `pod` (optional -- auto-selects) |
+| `Custom` | **Blocked** -- requires manual approval | -- |
+
+<Warning>
+Safety Checks: Scale to 0 replicas is blocked. AdjustResources limit cannot be less than request. DeletePod refuses to delete if only 1 pod exists (prevents total outage). Custom actions are blocked. A pre-flight snapshot records the previous state for reference.
+</Warning>
+
+**Execution Flow (Standard):**
+
+```text
+Pending -> Executing -> (executes actions sequentially) -> Verifying -> Completed | Failed
+```
+
+**Execution Flow (Agentic):**
+
+```text
+Pending -> Executing -> (agentic loop: AI decides -> executes -> observes -> repeat)
+  -> Verifying -> Completed | Failed
+
+Each reconcile = 1 step of the agentic loop:
+  1. Refresh K8s context (KubernetesContextBuilder)
+  2. Send history + context -> AgenticStep RPC
+  3. AI responds: {reasoning, resolved, next_action}
+  4. If resolved=true -> Verifying (+ annotations with PostMortem data)
+  5. If next_action -> execute -> record observation -> requeue 5s
+  6. If observation-only -> record -> requeue 10s
+  Safety: max 10 steps, timeout 10 minutes
+```
+
+### 7. ServerClient (`grpc_client.go`)
+
+Shared gRPC client between WatcherBridge and AIInsightReconciler.
+
+| Method | Description |
+|--------|-------------|
+| `NewServerClient()` | Creates instance (no connection) |
+| `Connect(addr)` | Connects via gRPC insecure (10s timeout) |
+| `GetAlerts(namespace)` | Fetches alerts from the watcher |
+| `AnalyzeIssue(req)` | Sends issue for AI analysis |
+| `AgenticStep(req)` | Executes one step of the agentic loop (context + history -> next action) |
+| `IsConnected()` | Checks if connection is active |
+| `Close()` | Closes gRPC connection |
+
+---
+
+## Server and Operator Interaction
+
+### GetAlerts RPC
+
+The server exposes K8s Watcher alerts via gRPC:
+
+```protobuf
+rpc GetAlerts(GetAlertsRequest) returns (GetAlertsResponse);
+
+message AlertInfo {
+  string alert_type = 1;    // HighRestartCount, OOMKilled, PodNotReady, DeploymentFailing
+  string deployment = 2;
+  string namespace = 3;
+  string message = 4;
+  string severity = 5;
+  int64 timestamp = 6;
+}
+```
+
+The server handler iterates over the `ObservabilityStore` of each MultiWatcher target, filters by namespace if specified, and returns active alerts.
+
+### AnalyzeIssue RPC
+
+The server receives the Issue context and calls the LLM for analysis:
+
+```protobuf
+rpc AnalyzeIssue(AnalyzeIssueRequest) returns (AnalyzeIssueResponse);
+
+message SuggestedAction {
+  string name = 1;
+  string action = 2;
+  string description = 3;
+  map<string, string> params = 4;
+}
+
+message AnalyzeIssueResponse {
+  string analysis = 1;
+  float confidence = 2;
+  repeated string recommendations = 3;
+  string provider = 4;
+  string model = 5;
+  repeated SuggestedAction suggested_actions = 6;
+}
+```
+
+**Structured Prompt:**
+
+The server builds a prompt that includes:
+
+1. Issue context (name, namespace, resource, severity, risk score, description)
+2. List of available actions (`ScaleDeployment`, `RestartDeployment`, `RollbackDeployment`, `PatchConfig`)
+3. Instructions to return structured JSON with `analysis`, `confidence`, `recommendations`, and `actions` fields
+
+**Response Parsing:**
+
+1. Removes markdown codeblocks (`` ```json ... ``` ``)
+2. Parses JSON into `analysisResult`
+3. Clamps confidence between 0.0 and 1.0
+4. If parsing fails -> uses raw response as analysis with confidence 0.5
+
+### AgenticStep RPC
+
+The server receives the Issue context, history of previous steps, and updated K8s context, and decides the next action:
+
+```protobuf
+rpc AgenticStep(AgenticStepRequest) returns (AgenticStepResponse);
+
+message AgenticStepRequest {
+  string issue_name = 1;
+  string namespace = 2;
+  string resource_kind = 3;
+  string resource_name = 4;
+  string signal_type = 5;
+  string severity = 6;
+  string description = 7;
+  int32 risk_score = 8;
+  string provider = 9;
+  string model = 10;
+  string kubernetes_context = 11;   // refreshed at each step
+  repeated AgenticHistoryEntry history = 12;
+  int32 max_steps = 13;
+  int32 current_step = 14;
+}
+
+message AgenticStepResponse {
+  string reasoning = 1;              // AI reasoning (recorded in history)
+  bool resolved = 2;                 // true = problem resolved
+  SuggestedAction next_action = 3;   // null when resolved=true
+  // Fields below only populated when resolved=true:
+  string postmortem_summary = 4;
+  string root_cause = 5;
+  string impact = 6;
+  repeated string lessons_learned = 7;
+  repeated string prevention_actions = 8;
+}
+```
+
+**AgenticStep Prompt:**
+
+The server builds a structured prompt with:
+
+1. **Role + Issue details**: incident context (type, severity, resource)
+2. **Kubernetes context**: real cluster state (refreshed at each step via KubernetesContextBuilder)
+3. **Tool definitions**: 6 available mutating actions + "Observe" (no action, wait for next context)
+4. **Conversation history**: each previous step formatted with reasoning -> action -> observation
+5. **Instructions**: respond JSON, budget (step N of M), safety rules
+
+When `resolved=true`, the response includes data for PostMortem generation (summary, root_cause, impact, lessons_learned, prevention_actions).
+
+---
+
+## PostMortem Generation
+
+When an agentic remediation resolves an Issue, the `IssueReconciler` automatically generates:
+
+### PostMortem CR
+
+Created via `generatePostMortem()`:
+
+| Field | Source |
+|-------|--------|
+| `timeline` | Issue.DetectedAt + each step from AgenticHistory + resolved |
+| `actionsExecuted` | Steps with Action != nil (includes result) |
+| `summary` | Annotation `platform.chatcli.io/postmortem-summary` (AI-generated) |
+| `rootCause` | Annotation `platform.chatcli.io/root-cause` |
+| `impact` | Annotation `platform.chatcli.io/impact` |
+| `lessonsLearned` | Annotation `platform.chatcli.io/lessons-learned` |
+| `preventionActions` | Annotation `platform.chatcli.io/prevention-actions` |
+| `duration` | Calculated: resolvedAt - detectedAt |
+
+The PostMortem CR is owned by the Issue (cascade delete).
+
+### Auto-generated Runbook (Agentic)
+
+Created via `generateAgenticRunbook()`:
+
+- **Name**: `agentic-{signal}-{severity}-{kind}` (sanitized)
+- **Steps**: only steps with successful actions
+- **Labels**: `auto-generated=true`, `source=agentic`
+- Uses `CreateOrUpdate` (reused for future incidents of the same type)
+
+---
+
+## Operator Prometheus Metrics
+
+The operator exposes Prometheus metrics for observability:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `chatcli_operator_issues_total` | Counter | Total issues by severity and state |
+| `chatcli_operator_issue_resolution_duration_seconds` | Histogram | Duration from detection to resolution |
+| `chatcli_operator_active_issues` | Gauge | Number of unresolved issues |
+
+---
+
+## Tests
+
+The operator has 96 tests (125 with subtests) covering all components:
+
+| Component | Tests | Coverage |
+|-----------|-------|---------|
+| InstanceReconciler | 15 | CRUD, watcher, persistence, replicas, RBAC, deletion, deepcopy |
+| AnomalyReconciler | 4 | Creation, correlation, attachment to existing Issue |
+| IssueReconciler | 12 | State machine, AI fallback, retry, agentic plan, PostMortem generation |
+| RemediationReconciler | 16 | All action types, safety checks, agentic loop (first step, resolved, max steps, timeout, action failed, observation) |
+| AIInsightReconciler | 12 | Connectivity, mock RPC, analysis parsing, withAuth, TLS/token |
+| PostMortemReconciler | 2 | State initialization, terminal state |
+| WatcherBridge | 22 | Alert mapping, SHA256 dedup, hash, pruning, Anomaly creation, buildConnectionOpts (TLS, token, both) |
+| CorrelationEngine | 4 | Risk scoring, severity, incident ID, related anomalies |
+| Pipeline (E2E) | 3 | Complete flow: Anomaly->Issue->Insight->Plan->Resolved, escalation, correlation |
+| MapActionType | 6 | All string->enum mappings |
+
+### Run Tests
+
+```bash
+cd operator
+go test ./... -v
+```
+
+---
+
+## Ownership Diagram (Garbage Collection)
+
+```mermaid
+graph TD
+    INST[Instance CR] -->|owns| DEP[Deployment]
+    INST -->|owns| SVC[Service]
+    INST -->|owns| CM[ConfigMap]
+    INST -->|owns| SA[ServiceAccount]
+    INST -->|owns| PVC[PVC]
+
+    ISS[Issue CR] -->|owns| INSIGHT[AIInsight CR]
+    ISS -->|owns| PLAN[RemediationPlan CR]
+    ISS -->|owns| PM[PostMortem CR]
+
+    style INST fill:#89b4fa,color:#000
+    style ISS fill:#fab387,color:#000
+    style INSIGHT fill:#89b4fa,color:#000
+    style PLAN fill:#a6e3a1,color:#000
+    style PM fill:#cba6f7,color:#000
+```
+
+- **Instance** is the owner of all Kubernetes resources it creates (Deployment, Service, ConfigMap, SA, PVC)
+- **Issue** is the owner of AIInsight, RemediationPlan, and PostMortem (cascade delete)
+- Anomalies are independent (no owner) to preserve history
+
+---
+
+## AIOps Deployment Checklist
+
+<Steps>
+  <Step title="Install CRDs">
+    `kubectl apply -f operator/config/crd/bases/`
+  </Step>
+  <Step title="Install operator RBAC">
+    `kubectl apply -f operator/config/rbac/role.yaml`
+  </Step>
+  <Step title="Deploy the operator">
+    `kubectl apply -f operator/config/manager/manager.yaml`
+  </Step>
+  <Step title="Create Secret with API keys">
+    Create the Secret with the API keys for your chosen LLM provider.
+  </Step>
+  <Step title="Create Instance CR">
+    Create the Instance CR with `watcher.enabled: true` and configured targets.
+  </Step>
+  <Step title="Verify server">
+    `kubectl get instances` -- confirm that the ChatCLI server is running.
+  </Step>
+  <Step title="Verify AIOps pipeline">
+    - `kubectl get anomalies -A` -- anomalies being detected
+    - `kubectl get issues -A` -- issues being created
+    - `kubectl get aiinsights -A` -- AI analyzing
+  </Step>
+  <Step title="(Optional) Create manual Runbooks">
+    Create manual Runbooks for specific scenarios.
+  </Step>
+  <Step title="Monitor metrics">
+    Monitor operator metrics via Prometheus.
+  </Step>
+</Steps>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="K8s Operator" icon="dharmachakra" href="/features/k8s-operator">
+    Configuration and examples
+  </Card>
+  <Card title="K8s Watcher" icon="binoculars" href="/features/k8s-watcher">
+    Collection and budget details
+  </Card>
+  <Card title="Server Mode" icon="server" href="/features/server-mode">
+    GetAlerts, AnalyzeIssue, and AgenticStep RPCs
+  </Card>
+  <Card title="K8s Monitoring" icon="book" href="/cookbook/k8s-monitoring">
+    Recipe: K8s Monitoring with AI
+  </Card>
+</CardGroup>

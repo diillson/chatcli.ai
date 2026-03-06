@@ -1,0 +1,267 @@
+---
+title: "Coder Mode Security (Governance)"
+sidebarTitle: "Coder Mode Security (Governance)"
+description: "Understand how the governance and permissions system of the Coder Mode works."
+icon: "shield-halved"
+---
+
+ChatCLI was designed to be a powerful tool, but power requires control. In **Coder Mode** (`/coder`), the AI has the ability to read, write, create, and execute commands on your system. To ensure you are always in control, we implemented a governance system inspired by ClaudeCode.
+
+---
+
+## How Does It Work?
+
+Every time the AI suggests an action (such as creating a file or running a script), ChatCLI checks your local security rules before executing.
+
+### The 3 Permission States
+
+<CardGroup cols={3}>
+  <Card title="Allow (Permitted)" icon="circle-check">
+    The action is executed automatically, without interruption. Ideal for read commands (`read`, `tree`, `search`) and read-only Git operations (`git-status`, `git-diff`, `git-log`, `git-changed`, `git-branch`).
+  </Card>
+  <Card title="Deny (Blocked)" icon="circle-xmark">
+    The action is silently blocked (or with an error for the AI). Ideal for protecting sensitive files or destructive commands.
+  </Card>
+  <Card title="Ask (Prompt)" icon="circle-question">
+    ChatCLI pauses and displays an interactive menu for you to decide. This is the **default** for unconfigured actions.
+  </Card>
+</CardGroup>
+
+---
+
+## Interactive Approval Menu
+
+When an action falls into the "Ask" state, you will see a security box with contextual information about the action:
+
+```text
++========================================================+
+|              SECURITY CHECK                             |
++========================================================+
+ Action: Write file
+         file: main.go
+ Rule:   no rule for '@coder write'
+ --------------------------------------------------------
+ Choice:
+   [y] Yes, execute (once)
+   [a] Always allow (@coder write)
+   [n] No, skip
+   [d] Always block (@coder write)
+
+ > _
+```
+
+The prompt displays the **action in human language** (e.g., "Write file", "Execute shell command", "Modify file (patch)") and the **parsed details** from the JSON arguments, instead of showing raw JSON.
+
+#### Recognized Action Types
+
+| Subcommand | Prompt Label | Details Displayed |
+|------------|-------------|-------------------|
+| `exec` | Execute shell command | `$ <command>`, `dir: <cwd>` |
+| `test` | Run tests | `$ <command>`, `dir: <cwd>` |
+| `write` | Write file | `file: <path>` |
+| `patch` | Modify file (patch) | `file: <path>` |
+| `read` | Read file | `file: <path>` |
+| `search` | Search code | `term: <pattern>`, `dir: <path>` |
+| `tree` | List directory structure | `dir: <path>` |
+
+### Prompt with Context in Parallel Mode
+
+When the action is requested by a **multi-agent mode worker**, the prompt includes additional information about which agent is making the request:
+
+```text
++========================================================+
+|              SECURITY CHECK                             |
++========================================================+
+ Agent:  shell
+ Task:   Run auth module tests
+ --------------------------------------------------------
+ Action: Execute shell command
+         $ go test ./pkg/auth/...
+ Rule:   no rule for '@coder exec'
+ --------------------------------------------------------
+```
+
+<Info>This allows you to know **exactly** which agent is requesting the action and why, facilitating informed security decisions.</Info>
+
+### Options
+
+<Steps>
+  <Step title="y (Yes)">
+    Executes only this time. Next time, it will ask again.
+  </Step>
+  <Step title="a (Always)">
+    Creates a permanent **ALLOW** rule for this command (e.g., allows all writes with `@coder write`).
+  </Step>
+  <Step title="n (No)">
+    Skips execution. The AI receives an error informing that the user denied.
+  </Step>
+  <Step title="d (Deny)">
+    Creates a permanent **DENY** rule. The action will be automatically blocked in the future.
+  </Step>
+</Steps>
+
+<Note>For `exec` commands, the "Always" and "Deny Forever" options are not available, as each execution is unique and requires individual approval.</Note>
+
+---
+
+## Rule Management
+
+Rules are saved locally in `~/.chatcli/coder_policy.json`. You can edit this file manually if desired, but the interactive menu is the easiest way to configure.
+The matching uses the effective @coder subcommand even when `args` is JSON (e.g., `{"cmd":"read"}` becomes `@coder read`).
+
+### Local Policy (Per Project)
+
+You can add a local policy in the project directory:
+
+- Local: `./coder_policy.json`
+- Global: `~/.chatcli/coder_policy.json`
+
+<Tabs>
+  <Tab title="With merge (local + global)">
+    If `merge: true`, local rules **merge** with global ones (local overrides matching patterns).
+
+    ```json
+    {
+      "merge": true,
+      "rules": [
+        { "pattern": "@coder write", "action": "ask" },
+        { "pattern": "@coder exec --cmd 'rm -rf'", "action": "deny" }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Without merge (local only)">
+    If `merge: false` or absent, **only** the local policy is used.
+
+    ```json
+    {
+      "rules": [
+        { "pattern": "@coder read", "action": "allow" },
+        { "pattern": "@coder write", "action": "ask" }
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Policy Example (coder_policy.json)
+
+```json
+{
+  "rules": [
+    {
+      "pattern": "@coder read",
+      "action": "allow"
+    },
+    {
+      "pattern": "@coder git-status",
+      "action": "allow"
+    },
+    {
+      "pattern": "@coder write",
+      "action": "ask"
+    },
+    {
+      "action": "deny",
+      "pattern": "@coder exec --cmd 'rm -rf'"
+    }
+  ]
+}
+```
+
+---
+
+## Word Boundary Matching
+
+The policy system uses **word boundary matching**, ensuring that rules do not partially match different subcommands:
+
+| Rule | Command | Result |
+|------|---------|--------|
+| `@coder read` = allow | `@coder read file.txt` | Allowed |
+| `@coder read` = allow | `@coder readlink /tmp` | **Does not match** (falls to Ask) |
+| `@coder read --file /etc` = deny | `@coder read --file /etc/passwd` | Deny (path-prefix match) |
+
+<Tip>This means `@coder read` will **never** allow `@coder readlink` or `@coder readwrite` accidentally.</Tip>
+
+---
+
+## Command Validation (50+ Patterns)
+
+Beyond policy governance, `@coder exec` validates each command against **50+ regex patterns** that detect:
+
+<CardGroup cols={2}>
+  <Card title="Data destruction" icon="trash">
+    `rm -rf`, `dd if=`, `mkfs`, `drop database`
+  </Card>
+  <Card title="Remote execution" icon="globe">
+    `curl | bash`, `base64 | sh`
+  </Card>
+  <Card title="Code injection" icon="syringe">
+    `python -c`, `eval`, `$(curl ...)`
+  </Card>
+  <Card title="Process substitution" icon="arrows-left-right">
+    `<(cmd)`, `>(cmd)`
+  </Card>
+  <Card title="Kernel manipulation" icon="microchip">
+    `insmod`, `modprobe`, `rmmod`
+  </Card>
+  <Card title="Evasion" icon="mask">
+    `${IFS;cmd}`, `VAR=x; bash`
+  </Card>
+</CardGroup>
+
+You can add custom patterns via `CHATCLI_AGENT_DENYLIST`:
+
+```bash
+export CHATCLI_AGENT_DENYLIST="terraform destroy;kubectl delete namespace"
+```
+
+<Info>For the complete list of ChatCLI security protections, see the [Security and Hardening documentation](/features/security).</Info>
+
+---
+
+## Best Practices
+
+<Steps>
+  <Step title="Start with Caution">
+    Keep write commands (`write`, `patch`, `exec`) as `ask` until you feel confident in the agent.
+  </Step>
+  <Step title="Allow Reads">
+    Generally, it is safe to give "Always" for `coder read`, `coder tree`, `coder search`, and read-only Git (`git-status`, `git-diff`, `git-log`).
+  </Step>
+  <Step title="Be Specific">
+    Matching uses word boundary for subcommand prefixes and path-prefix for arguments. You can allow `coder exec --cmd 'ls` but block `coder exec --cmd 'rm`.
+  </Step>
+  <Step title="Safe Exec">
+    `@coder exec` blocks dangerous patterns by default (50+ rules). Use `--allow-unsafe` only when necessary.
+  </Step>
+</Steps>
+
+---
+
+## Governance in Multi-Agent Mode (Parallel)
+
+Security policies are **fully respected** by multi-agent mode workers. When `/coder` or `/agent` operates in parallel mode, each worker checks the `coder_policy.json` rules before executing any action.
+
+### Behavior
+
+| Rule | Worker Action |
+|------|---------------|
+| **allow** | Action executed automatically by the worker |
+| **deny** | Action blocked; the worker receives `[BLOCKED BY POLICY]` and continues its flow |
+| **ask** | The worker **pauses**, the progress spinner is suspended, and the security prompt is displayed |
+
+<Note>Security prompts from multiple workers are **serialized** -- only one prompt at a time is displayed, avoiding visual overlap. Rules created during the session (via "Always" or "Deny") are immediately visible to all subsequent workers.</Note>
+
+---
+
+## Coder Mode UI
+
+You can control the style and banner of `/coder` via environment variables:
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `CHATCLI_CODER_UI` | `full` (default), `minimal` | Interface style |
+| `CHATCLI_CODER_BANNER` | `true` (default), `false` | Show/hide the cheat sheet |
+
+<Tip>These settings appear in `/status` and `/config`.</Tip>
