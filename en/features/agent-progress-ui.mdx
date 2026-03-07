@@ -1,0 +1,290 @@
+---
+title: "Live Agent Progress"
+sidebarTitle: "Live Progress"
+description: "Real-time display of each agent's status during parallel execution: progress, completions, errors and replanning — all visible in the terminal."
+icon: "chart-bar"
+---
+
+When the dispatcher executes multiple agents in parallel, the terminal displays a **real-time progress panel** showing the state of each individual agent. This eliminates the uncertainty of "is it still running?" without having to check logs.
+
+## What You See
+
+During parallel execution, the terminal renders a multi-line display updated every **100ms**:
+
+```text
+⋮ [claude-sonnet-4-6] [14s] [████████░░░░░░░░░░░░] 2/4 agents (50%)
+  ✓ [file]   Read all .go files in pkg/coder/engine/ ─ completed (2.1s)
+  ⋯ [search] Find references to handleRead and... ─ running...
+  ✗ [shell]  Run lint on modified files ─ failed (1.3s) exit code 1
+  ○ [coder]  Refactor read/write separation ─ pending
+```
+
+### Display Elements
+
+| Element | Description |
+|---------|-------------|
+| Spinner (`⋮ ⋯ ⋰ ⋱`) | Rotating animation confirming the process is active |
+| `[model]` | LLM provider/model used by workers |
+| `[time]` | Total elapsed time since dispatch started |
+| Progress bar | Visual representation of completion percentage |
+| `N/M agents (X%)` | Count and percentage of finished agents |
+
+### Per-Agent Status Icons
+
+| Icon | Status | Description |
+|------|--------|-------------|
+| `○` | Pending | Agent waiting for semaphore slot (max workers reached) |
+| `⋯` | Running | Agent actively executing (animated spinner) |
+| `✓` | Completed | Agent finished successfully (shows duration) |
+| `✗` | Failed | Agent finished with error (shows duration + message) |
+
+---
+
+## Internal Architecture
+
+The live progress system uses **3 independent goroutines** communicating via shared state protected by a mutex:
+
+```text
+┌─────────────────────────┐
+│  Worker Goroutines (N×) │   Dispatcher goroutines
+│  executeAgent()         │   Each agent runs isolated
+│                         │
+│  On start/finish        │──── sends AgentEvent ────┐
+└─────────────────────────┘                          │
+                                                     ▼
+                                        ┌────────────────────────┐
+                                        │  Consumer Goroutine    │
+                                        │  for evt := range      │
+                                        │      progressCh        │
+                                        │                        │
+                                        │  MarkStarted()         │
+                                        │  MarkCompleted()       │──── writes ─────┐
+                                        │  MarkFailed()          │   (with mutex)  │
+                                        └────────────────────────┘                 │
+                                                                                   ▼
+                                                                   ┌──────────────────────┐
+┌─────────────────────────┐                                        │  AgentProgressState  │
+│  Timer Goroutine        │                                        │  (thread-safe)       │
+│  Ticker every 100ms     │──── reads state ──────────────────────►│                      │
+│                         │     and renders                        │  Agents[0]: Running  │
+│  FormatDispatchProgress │◄──── snapshot with mutex ──────────────│  Agents[1]: Complete │
+│  ()                     │                                        │  Agents[2]: Failed   │
+└─────────────────────────┘                                        │  Agents[3]: Pending  │
+                                                                   └──────────────────────┘
+```
+
+### Detailed Flow
+
+<Steps>
+  <Step title="Initialization">
+    `agent_mode.go` creates an `AgentProgressState` with N slots (one per agent) and a buffered `progressCh` channel with capacity `N×2`.
+  </Step>
+  <Step title="Consumer Goroutine">
+    A dedicated goroutine consumes events from `progressCh` and updates the shared state via `Mark*()` methods protected by a mutex.
+  </Step>
+  <Step title="Timer Display">
+    The `turnTimer` starts with a callback that, every 100ms:
+    1. Clears previous terminal lines (`ClearLines`)
+    2. Reads the `AgentProgressState` (acquiring the mutex)
+    3. Renders the updated multi-line display
+  </Step>
+  <Step title="Dispatch with Events">
+    `DispatchWithProgress()` executes agents and sends `AgentEvent` on the channel as each agent starts and finishes.
+  </Step>
+  <Step title="Finalization">
+    After all agents complete, the timer stops, the display is cleared, and final results are rendered as timeline cards.
+  </Step>
+</Steps>
+
+---
+
+## Event Types
+
+The dispatcher emits three event types via the progress channel:
+
+```go
+type AgentEventType int
+
+const (
+    AgentEventStarted   AgentEventType = iota  // agent started executing
+    AgentEventCompleted                        // agent finished successfully
+    AgentEventFailed                           // agent finished with error
+)
+```
+
+Each event carries full context:
+
+```go
+type AgentEvent struct {
+    Type     AgentEventType
+    CallID   string         // unique agent call ID (ac-1, ac-2...)
+    Agent    AgentType      // agent type (file, coder, shell...)
+    Task     string         // task description
+    Duration time.Duration  // execution time (only on Completed/Failed)
+    Error    error          // error (only on Failed)
+    Index    int            // position in batch (0-based)
+    Total    int            // total agents in batch
+}
+```
+
+---
+
+## Thread Safety
+
+`AgentProgressState` is accessed concurrently by two goroutines:
+
+1. **Consumer goroutine** — writes (via `MarkStarted`, `MarkCompleted`, `MarkFailed`)
+2. **Timer goroutine** — reads (via `FormatDispatchProgress`)
+
+Synchronization is handled by an internal `sync.Mutex`:
+
+```go
+type AgentProgressState struct {
+    mu        sync.Mutex
+    Total     int
+    Agents    []AgentSlot
+    StartTime time.Time
+}
+```
+
+Every public method acquires the mutex before reading or writing. `FormatDispatchProgress` also acquires the mutex and takes a complete state snapshot before formatting the output string.
+
+<Warning>The `progressCh` channel uses a buffer of `N×2` (where N = number of agents) to prevent workers from blocking when sending events if the consumer is momentarily busy.</Warning>
+
+---
+
+## Terminal Rendering
+
+The multi-line display uses **ANSI escape sequences** to update the terminal in-place:
+
+| Operation | Escape Sequence | Description |
+|-----------|-----------------|-------------|
+| Clear line | `\r\033[K` | Return to start and erase line |
+| Move up N lines | `\033[A\033[K` (×N) | Move cursor up and clear each line |
+
+On each timer tick (100ms), the callback:
+
+1. Emits `ClearLines(prevLines)` to erase the previous display
+2. Calls `FormatDispatchProgress()` which returns the updated multi-line string
+3. Prints the new string
+4. Updates `prevLines` for the next cycle
+
+<Info>The maximum latency between a state change event and its display in the terminal is **100ms** — imperceptible to the user.</Info>
+
+---
+
+## Interaction with Policy Prompts
+
+When a worker needs security approval (policy "ask"), the system:
+
+1. **Pauses the timer** — the progress display stops updating
+2. **Shows the security prompt** — with agent context
+3. **After response** — resumes the timer and the display continues updating
+
+This prevents the spinner and security prompt from overlapping in the terminal.
+
+---
+
+## Full Lifecycle
+
+```text
+[Before dispatch]
+╭── 🚀 MULTI-AGENT DISPATCH
+│  Dispatching 4 agents
+╰────────────────────────
+
+╭── 🤖 [file] #1
+│  Read all .go files in pkg/coder/engine/
+╰────────────────────────
+
+╭── 🤖 [search] #2
+│  Find references to handleRead and handleWrite
+╰────────────────────────
+
+[During dispatch — updated every 100ms]
+⋮ [claude-sonnet-4-6] [3s] [░░░░░░░░░░░░░░░░░░░░] 0/4 agents (0%)
+  ⋯ [file]   Read all .go files in pkg/coder/... ─ running...
+  ⋯ [search] Find references to handleRead... ─ running...
+  ○ [shell]  Run lint on modified files ─ pending
+  ○ [coder]  Refactor read/write separation ─ pending
+
+... 5 seconds later ...
+
+⋰ [claude-sonnet-4-6] [8s] [██████████░░░░░░░░░░] 2/4 agents (50%)
+  ✓ [file]   Read all .go files... ─ completed (2.1s)
+  ✓ [search] Find references... ─ completed (4.8s)
+  ⋯ [shell]  Run lint... ─ running...
+  ⋯ [coder]  Refactor read/write... ─ running...
+
+... finished ...
+
+[After dispatch — result cards]
+╭── ✅ [file] OK (2.1s, 3 tool calls)
+│  Files read: engine.go, reader.go, writer.go
+╰────────────────────────
+
+╭── ✅ [search] OK (4.8s, 5 tool calls)
+│  Found 12 references across 4 files
+╰────────────────────────
+
+╭── ❌ [shell] FAILED
+│  exit code 1: unused variable 'tmp' in engine.go:42
+╰────────────────────────
+
+╭── ✅ [coder] OK (12.3s, 8 tool calls, 3 parallel)
+│  Refactored read/write into separate files
+╰────────────────────────
+
+╭── 📊 SUMMARY
+│  3/4 agents completed | 16 tool calls executed | 3 parallel goroutines | 14.1s total
+╰────────────────────────
+```
+
+---
+
+## Code Components
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| `AgentEvent` / `AgentEventType` | `cli/agent/workers/types.go` | Progress event types |
+| `DispatchWithProgress()` | `cli/agent/workers/dispatcher.go` | Dispatcher that emits events via channel |
+| `AgentProgressState` | `cli/metrics/display.go` | Thread-safe state for each agent |
+| `FormatDispatchProgress()` | `cli/metrics/display.go` | Multi-line display rendering |
+| `ClearLines()` | `cli/metrics/display.go` | Terminal line clearing |
+| Integration | `cli/agent_mode.go` | Consumer + timer + dispatch orchestration |
+
+---
+
+## Comparison: Before vs After
+
+<Tabs>
+  <Tab title="Before (Static Spinner)">
+    ```text
+    ⋮ [claude-sonnet-4-6] [32s] Aguardando 4 agents...
+
+    (No information about:
+     - Which agent is running
+     - Which already finished
+     - Whether there was an error
+     - How much is left)
+    ```
+
+    The user only knew something was happening because the spinner was rotating. To confirm agents were actually running, they had to open ChatCLI logs in another terminal.
+  </Tab>
+  <Tab title="After (Live Progress)">
+    ```text
+    ⋰ [claude-sonnet-4-6] [14s] [████████░░░░░░░░░░░░] 2/4 agents (50%)
+      ✓ [file]   Read all .go files... ─ completed (2.1s)
+      ✓ [search] Find references... ─ completed (4.8s)
+      ⋯ [shell]  Run lint... ─ running...
+      ○ [coder]  Refactor read/write... ─ pending
+    ```
+
+    The user sees in real time:
+    - Progress bar with percentage
+    - Individual status of each agent
+    - Duration of each completed agent
+    - Immediate errors with message
+    - Total elapsed time
+  </Tab>
+</Tabs>
