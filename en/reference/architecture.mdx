@@ -1,7 +1,7 @@
 ---
 title: "Architecture and Code Structure"
 sidebarTitle: "Architecture"
-description: "Overview of ChatCLI's internal architecture, package structure, and technologies used."
+description: "Complete reference of ChatCLI's internal architecture: main struct, startup flow, message pipelines, tool parsing, compaction, checkpoints, provider registry, and memory worker."
 icon: "sitemap"
 ---
 
@@ -16,6 +16,7 @@ chatcli/
 |   |-- cli.go                 # Main ChatCLI struct + Start() (~923 lines)
 |   |-- cli_helpers.go         # Helper methods extracted from cli.go
 |   |-- cli_history.go         # History management methods
+|   |-- cli_llm.go             # processLLMRequest + spinner
 |   |-- cli_mode.go            # Mode switching logic
 |   |-- cli_output.go          # Output formatting methods
 |   |-- cli_prompt.go          # Prompt building methods
@@ -25,7 +26,7 @@ chatcli/
 |   |-- agent_mode_helpers.go  # Agent mode helper methods
 |   |-- agent_mode_tools.go    # Agent tool handling
 |   |-- agent_mode_ui.go       # Agent UI rendering
-|   |-- agent_mode_execution.go # Agent execution loop
+|   |-- agent_tool_sanitizer.go # Argument sanitization pipeline
 |   |-- command_handler.go     # Slash command routing (~185 lines)
 |   |-- command_handler_session.go  # Session commands
 |   |-- command_handler_context.go  # Context commands
@@ -39,8 +40,10 @@ chatcli/
 |   |-- compact_command.go     # Guided history compaction
 |   |-- history_compactor.go   # 3-level compaction pipeline
 |   |-- history_trimmer.go     # Near-lossless trimming (level 1)
+|   |-- memory_worker.go       # Background memory worker
 |   |-- agent/                 # Multi-agent system
 |   |   |-- workers/           # 12 specialist agents
+|   |   |-- toolcall_parser.go # Stateful tool call parser
 |   |   |-- ui_renderer.go     # UI rendering
 |   |   +-- dispatcher.go      # Async dispatcher
 |   |-- bus/                   # Internal message bus
@@ -91,6 +94,424 @@ chatcli/
 
 ---
 
+## Main Struct: ChatCLI
+
+The `ChatCLI` struct in `cli/cli.go` is the heart of the system. Its most important fields are organized by responsibility:
+
+### LLM and Provider
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `Client` | `client.LLMClient` | Active LLM provider client |
+| `manager` | `manager.LLMManager` | Provider manager (creates clients, lists available) |
+| `Provider` | `string` | Active provider name (e.g., `"ANTHROPIC"`, `"OPENAI"`) |
+| `Model` | `string` | Active model (e.g., `"claude-sonnet-4-20250514"`) |
+
+### History and Compaction
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `history` | `[]models.Message` | Unified conversation history (shared across all modes) |
+| `historyCompactor` | `*HistoryCompactor` | 3-level compaction pipeline |
+| `historyManager` | `*HistoryManager` | Command history persistence to disk |
+
+### Execution Control
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `isExecuting` | `atomic.Bool` | Atomic flag: `true` while waiting for LLM response |
+| `operationCancel` | `context.CancelFunc` | Cancels the in-flight LLM operation (Ctrl+C) |
+| `processingDone` | `chan struct{}` | Signals processing completion to the main loop |
+| `interactionState` | `InteractionState` | Interaction state: `Normal`, `SwitchingProvider`, `Processing`, `AgentMode` |
+| `executionProfile` | `ExecutionProfile` | Execution profile: `Normal`, `Agent`, `Coder` |
+
+### Subsystems
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `agentMode` | `*AgentMode` | Agent mode instance (ReAct loop) |
+| `pluginManager` | `*plugins.Manager` | Plugin manager (built-in + external) |
+| `commandHandler` | `*CommandHandler` | Slash command router |
+| `contextHandler` | `*ContextHandler` | Context manager (`/context`) |
+| `personaHandler` | `*PersonaHandler` | Persona/agent manager |
+| `skillHandler` | `*SkillHandler` | Skill registry and execution |
+| `contextBuilder` | `*workspace.ContextBuilder` | Combines bootstrap + memory into system prompt |
+| `memoryStore` | `*workspace.MemoryStore` | Facade for the structured memory system |
+| `memWorker` | `*memoryWorker` | Background memory extraction worker |
+
+### Auxiliary State
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `checkpoints` | `[]conversationCheckpoint` | History restore points (max 20) |
+| `messageQueue` | `[]string` | FIFO queue of messages typed during processing (type-ahead) |
+| `lastEscTime` | `time.Time` | Esc+Esc detection for rewind menu |
+| `sessionManager` | `*SessionManager` | Save/load sessions to disk |
+
+---
+
+## Startup Flow
+
+The diagram below shows the complete boot sequence, from `main.go` to the interactive loop:
+
+```text
+main.go
+  |
+  +-- Check subcommands (server, connect, watch)
+  +-- cli.PreprocessArgs() + cli.Parse() -> opts
+  +-- i18n.Init()
+  +-- godotenv.Load(.env)
+  +-- utils.InitializeLogger() -> zap.Logger
+  +-- config.InitGlobal() + config.Global.Load()
+  |
+  +-- manager.NewLLMManager(logger)
+  |     +-- Providers auto-register via init() in registry
+  |     +-- Manager iterates providers, checks env vars, creates clients
+  |
+  +-- cli.NewChatCLI(manager, logger)
+  |     +-- plugins.NewManager() -> registers built-in (CoderPlugin)
+  |     +-- configureProviderAndModel() (config.Global + env)
+  |     +-- manager.GetClient(provider, model) -> LLMClient
+  |     +-- NewSessionManager()
+  |     +-- NewContextHandler()
+  |     +-- detectProjectDir(): walks up looking for .agent or .git
+  |     +-- workspace.NewBootstrapLoader(workspaceDir, globalDir)
+  |     +-- workspace.NewMemoryStore(memDir)
+  |     +-- workspace.NewContextBuilder(bootstrap, memory)
+  |     +-- memoryWorker.start() (background goroutine)
+  |     +-- NewPersonaHandler() + SetProjectDir()
+  |     +-- NewSkillHandler()
+  |     +-- NewCommandHandler(cli)
+  |     +-- NewAgentMode(cli, logger)
+  |     +-- historyManager.LoadHistory() (command history)
+  |
+  +-- chatCLI.ApplyOverrides(provider, model) (CLI flags)
+  +-- HandleOneShotOrFatal(ctx, opts) -> returns if -p flag
+  +-- handleGracefulShutdown(cancel, logger)
+  +-- chatCLI.Start(ctx)
+        +-- PrintWelcomeScreen()
+        +-- Loop: prompt.New() with panic/recover for mode switching
+```
+
+### detectProjectDir()
+
+Walks up from the current working directory to the filesystem root looking for project markers:
+1. `.agent/` (explicit ChatCLI marker) -- takes priority
+2. `.git/` (common convention)
+
+Returns the project root path, or `""` if no marker is found.
+
+---
+
+## Message Flow: Chat Mode
+
+In normal interactive mode, each user message follows this pipeline:
+
+```text
+User types text
+       |
+       v
+  executor(in string)
+       |
+       +-- Paste detection (BracketedPasteParser)
+       +-- Append to commandHistory
+       +-- Check / commands (routing via CommandHandler)
+       +-- Check /run, /agent, /coder -> panic(agentModeRequest)
+       |
+       v
+  processLLMRequest(in)
+       |
+       +-- Suppress animation (go-prompt manages spinner in prefix)
+       +-- Start spinner goroutine (250ms tick + SIGWINCH)
+       +-- saveCheckpoint() (deep copy of history)
+       +-- Append user message to history
+       +-- BuildPromptMessages() (system prompt + attached contexts)
+       +-- Client.SendPrompt(ctx, prompt, history, maxTokens)
+       |
+       v
+  LLM Response
+       |
+       +-- Append response to history
+       +-- Render via Glamour (markdown)
+       +-- memWorker.nudge() (trigger memory extraction)
+       +-- Drain messageQueue (type-ahead)
+```
+
+### Type-ahead (messageQueue)
+
+Messages typed while the LLM is processing are stored in a FIFO queue (`messageQueue`). After each response, the system drains the queue and processes each message sequentially, eliminating the need to re-type.
+
+---
+
+## Message Flow: Agent/Coder Mode
+
+Entering agent mode uses a `panic/recover` mechanism to exit the go-prompt loop:
+
+```text
+User types "/agent QUERY" or "/coder QUERY" or "/run QUERY"
+       |
+       v
+  executor() -> panic(agentModeRequest)
+       |
+       v
+  Start() recover -> detects agentModeRequest
+       +-- restoreTerminal() (in coder mode)
+       |
+       v
+  agentMode.Run(ctx, query, additionalContext, systemPromptOverride)
+       |
+       v
+  === SETUP ===
+  1. saveCheckpoint()
+  2. System prompt composition:
+     |-- If active persona: Persona + FormatInstructions (Coder or Agent)
+     |-- If none: Default prompt (CoderSystemPrompt or Agent default)
+  3. Prepend workspace context (SOUL.md, USER.md, IDENTITY.md, RULES.md, MEMORY.md)
+     |-- Smart retrieval: extracts keywords from last 3 messages
+  4. Append tool context (description of available plugins)
+  5. Append orchestrator prompt (if multi-agent enabled)
+       |
+       v
+  === ReAct LOOP ===
+  For each turn (up to maxTurns):
+       |
+       +-- Build turn history with anchor reminder
+       +-- Check token budget -> compact if > 60%
+       +-- Client.SendPrompt(ctx, systemInstruction, turnHistory, 0)
+       |
+       v
+  Parse response (reasoning, explanation, tool_calls, agent_calls, commands)
+       |
+       +-- Priority 0: agent_calls -> dispatch to parallel workers
+       +-- Priority 1: tool_calls -> sanitize args -> security check -> execute plugin -> accumulate output
+       +-- Priority 2: command blocks (legacy format)
+       +-- Priority 3: final response (no actions = loop ends)
+       |
+       v
+  Inject batch results into history -> next turn
+```
+
+### Anchor Reminder
+
+At each turn, the agent injects a short reminder into the history to keep the LLM focused on the original task. This prevents drift in long conversations.
+
+---
+
+## Tool Call Parsing
+
+The parser in `cli/agent/toolcall_parser.go` uses a **stateful scanner** (not regex) for robustness:
+
+### Supported Formats
+
+```xml
+<!-- XML self-closing -->
+<tool_call name="@coder" args="--file main.go --content '...'" />
+
+<!-- XML paired -->
+<tool_call name="@coder" args="..."></tool_call>
+
+<!-- JSON fallback -->
+{"tool_call":"@coder","args":{"file":"main.go"}}
+```
+
+### Scanner Algorithm
+
+1. Search for `<tool_call` case-insensitively
+2. Verify the next char is whitespace or `>` (not part of another tag like `<tool_caller>`)
+3. `scanTagEnd()`: advance forward respecting quotes (single and double)
+   - Inside quotes, `>` is treated as literal text
+   - Supports HTML entities (`&gt;`, `&quot;`, etc.)
+4. Extract `name` and `args` attributes regardless of order
+5. If self-closing fails, try paired tags with `</tool_call>`
+6. Fallback to JSON: try `parseJSONToolCalls()` in parallel
+
+### Why Not Regex?
+
+Tool arguments frequently contain `>`, `"`, and nested JSON. Regex cannot distinguish `>` inside a quoted attribute from `>` that closes the tag. The stateful scanner solves this by tracking quote state.
+
+---
+
+## Argument Sanitization Pipeline
+
+After parsing, each tool call goes through a 7-step pipeline in `agent_tool_sanitizer.go`:
+
+```text
+Raw args from LLM
+       |
+  1. HTML unescape (&quot; -> ", &#10; -> \n, &gt; -> >)
+  2. Line normalization (CRLF -> LF)
+  3. Line continuation handling (backslash + newline -> space)
+  3b. JSON-ish string unescape (if detected)
+  4. Bogus backslash+space removal (outside quotes)
+  4b. Fix unbalanced quotes with trailing backslash
+  5. Remove trailing dangling backslashes
+  6. Normalize multiple spaces (preserve inside quotes)
+  7. Coder-specific semantic fixes (if applicable)
+       |
+       v
+  Format detection:
+  +-- If valid JSON -> buildArgvFromJSONMap()
+  +-- If CLI-style -> splitToolArgsMultiline()
+       |
+       v
+  Clean args ready for execution
+```
+
+---
+
+## History Compaction (3 Levels)
+
+The `HistoryCompactor` in `cli/history_compactor.go` manages history size through a progressive pipeline:
+
+```text
+History exceeds token budget
+       |
+       v
+  LEVEL 1: Trimming (near-lossless)
+  |-- Remove injected context messages (>3000 chars)
+  |-- Remove <reasoning> blocks from assistant
+  |-- Compact verbose XML in tool outputs
+  |-- Deduplicate identical consecutive messages
+  |-- Truncate overly long tool outputs
+  |
+  +-- If within budget -> return
+       |
+       v
+  LEVEL 2: Structured summarization
+  |-- Split history into: [system | middle (summarize) | recent (keep)]
+  |-- Preserve the 8 most recent messages verbatim
+  |-- Send middle block to LLM with fact-extraction prompt
+  |-- Result: single "summary" message replacing the block
+  |-- Independent timeout (10 min) to avoid blocking the flow
+  |
+  +-- If within budget -> return
+       |
+       v
+  LEVEL 3: Emergency truncation
+  |-- Last resort: drops middle messages without summarization
+  |-- Keeps system messages + recent messages
+  |-- Logs warning for visibility
+```
+
+### Agent Mode Trigger
+
+In agent mode, compaction is checked at each turn of the ReAct loop. The trigger fires when token usage exceeds **60% of the model's budget**.
+
+---
+
+## Checkpoint/Rewind System
+
+`rewind.go` implements a history snapshot system:
+
+### Structure
+
+```go
+type conversationCheckpoint struct {
+    Timestamp time.Time
+    Label     string           // auto-generated summary of last user message
+    History   []models.Message // deep copy of history at checkpoint time
+    MsgCount  int              // number of messages at checkpoint
+}
+```
+
+### Behavior
+
+- **When saved**: Before each LLM call (`saveCheckpoint()`)
+- **Limit**: Maximum of 20 checkpoints (FIFO -- oldest are discarded)
+- **Deep copy**: Each checkpoint contains a complete, independent copy of the history
+- **Trigger**: Press **Esc+Esc** (two Esc presses within 500ms) to open the rewind menu
+- **Restore**: The user selects a checkpoint, and the history is replaced with the saved copy
+
+---
+
+## Provider Registry
+
+### Auto-registration Pattern
+
+Each LLM provider auto-registers via `init()` in the `llm/registry` package:
+
+```text
+llm/openai/register.go      -> init() { registry.Register(ProviderInfo{...}) }
+llm/claudeai/register.go    -> init() { registry.Register(ProviderInfo{...}) }
+llm/googleai/register.go    -> init() { registry.Register(ProviderInfo{...}) }
+llm/xai/register.go         -> init() { registry.Register(ProviderInfo{...}) }
+llm/ollama/register.go      -> init() { registry.Register(ProviderInfo{...}) }
+llm/copilot/register.go     -> init() { registry.Register(ProviderInfo{...}) }
+```
+
+### ProviderInfo
+
+```go
+type ProviderInfo struct {
+    Name         string           // unique key (e.g., "OPENAI")
+    DisplayName  string           // display name (e.g., "OpenAI")
+    Factory      ProviderFactory  // function that creates LLMClient from ProviderConfig
+    EnvKeys      []string         // environment variables for API key discovery
+    RequiresAuth bool             // whether OAuth authentication is needed
+}
+```
+
+### Discovery Flow
+
+```text
+manager.NewLLMManager(logger)
+       |
+       +-- registry.List() -> names of all registered providers
+       +-- For each provider:
+       |     +-- Check EnvKeys (os.Getenv)
+       |     +-- If key found or RequiresAuth: mark as available
+       +-- GetClient(provider, model):
+             +-- registry.Get(provider) -> ProviderInfo
+             +-- info.Factory(ProviderConfig{...}) -> LLMClient
+```
+
+This pattern eliminates `switch/case` blocks. To add a new provider, just create a package with `register.go` and implement the `LLMClient` interface.
+
+---
+
+## Memory Worker (Background Process)
+
+The `memoryWorker` in `cli/memory_worker.go` extracts memories from the conversation in the background:
+
+### Parameters
+
+| Constant | Value | Description |
+| --- | --- | --- |
+| `memoryMinNewMessages` | 4 | Minimum new messages to trigger |
+| `memoryCooldown` | 2 min | Minimum time between extractions |
+| `memoryExtractTimeout` | 60s | Timeout for the LLM extraction call |
+| `compactionCheckInterval` | 6h | How often to check for compaction |
+| `dailyCleanupInterval` | 24h | How often to clean up daily notes |
+
+### Triggers
+
+1. **nudge()**: Called after each LLM response. If there are >= 4 new messages and cooldown has expired, runs extraction
+2. **3-minute ticker**: The background loop checks periodically (for long sessions where the user types infrequently)
+3. **Compaction ticker (6h)**: Consolidates old facts with low scores
+4. **Cleanup ticker (24h)**: Removes expired daily notes
+
+### Extraction Pipeline
+
+```text
+nudge() or ticker
+       |
+       v
+  maybeExtract()
+       +-- Check: >= 4 new messages && cooldown expired
+       +-- Send recent conversation to LLM with extraction prompt
+       +-- LLM returns structured JSON with categories:
+       |     - DAILY: daily notes (ephemeral)
+       |     - LONGTERM: permanent facts
+       |     - PROFILE_UPDATE: user profile updates
+       |     - TOPICS: recurring topics
+       |     - PROJECTS: active projects
+       |
+       +-- Results stored in structured JSON files
+       +-- PatternDetector records usage patterns
+```
+
+---
+
 ## Main Components
 
 ### CLI and Modes
@@ -107,10 +528,6 @@ The `ChatCLI` struct in `cli/cli.go` is the central point (~923 lines after deco
 Mode switching uses a `panic/recover` mechanism to exit the go-prompt loop.
 
 ChatCLI uses a **unified history** (`cli.history`) shared across all modes. When switching modes, the full context is preserved. The `/compact` and `/rewind` commands operate directly on this single history.
-
-### Provider Registry
-
-Each LLM provider auto-registers via `init()` in the `llm/registry` package. This eliminates `switch/case` blocks and makes adding new providers easy -- just create the package and implement the `LLMClient` interface.
 
 ### Message Bus
 
@@ -160,5 +577,7 @@ The orchestration system in `cli/agent/workers` manages 12 specialist agents run
 - **Unified history** -- A single message array shared across chat, agent, and coder modes
 - **Checkpoint/rewind** -- Deep copy of history before each LLM call, with selective restore
 - **3-level compaction** -- Near-lossless trimming, structured summarization, emergency truncation
+- **Type-ahead queue** -- Messages typed during processing are queued and drained automatically
 - **Workspace context injection** -- Bootstrap + memory automatically injected into every system prompt
-- **Unified system prompt with caching** -- Attached contexts (`/context attach`) now flow through the system prompt via `SystemParts` with `CacheControl` hints in the Message model, enabling provider-level prompt caching (Anthropic `cache_control: ephemeral`, OpenAI automatic caching, Google context caching). Previously, attached contexts were injected as user messages, which prevented caching across turns
+- **Unified system prompt with caching** -- Attached contexts (`/context attach`) flow through the system prompt via `SystemParts` with `CacheControl` hints, enabling provider-level prompt caching (Anthropic `cache_control: ephemeral`, OpenAI automatic caching, Google context caching)
+- **Background memory extraction** -- Worker goroutine extracts and consolidates memories from the conversation without blocking the main flow

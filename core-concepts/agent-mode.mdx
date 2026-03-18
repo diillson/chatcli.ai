@@ -47,6 +47,93 @@ sequenceDiagram
 
 ---
 
+## Como o Agente Funciona Internamente
+
+O coração do modo agente é um **loop ReAct** (Reason + Act) implementado na função `processAIResponseAndAct()`. Esse loop permite que a IA raciocine sobre o problema, execute ações e use os resultados para decidir os próximos passos.
+
+### O Loop ReAct
+
+Cada turno do agente segue esta sequência:
+
+1. **Construção do histórico** — O histórico de conversa é montado com um _anchor reminder_ (lembrete de formato) anexado ao final. Esse anchor reforça para a IA o formato de resposta esperado, evitando que ela "esqueça" as instruções ao longo de conversas longas.
+2. **Chamada ao LLM** — O histórico completo é enviado ao provedor de IA configurado.
+3. **Parse da resposta** — A resposta é analisada para extrair raciocínio, explicações, chamadas de ferramentas e comandos.
+4. **Execução das ações** — Ferramentas e comandos são executados com os devidos controles de segurança.
+5. **Injeção de feedback** — O resultado da execução é injetado de volta no histórico como mensagem de contexto.
+6. **Próximo turno** — O loop retorna ao passo 1, até que a IA conclua a tarefa ou o limite de turnos seja atingido.
+
+O número máximo de turnos é configurável (padrão: **50**, máximo: **200**). Quando o limite é atingido, o agente encerra o loop e exibe o último estado ao usuário.
+
+### Composição do System Prompt
+
+O system prompt do agente é montado dinamicamente a partir de várias fontes:
+
+- **Contexto do workspace** — Arquivos bootstrap como `SOUL.md`, `USER.md` e memória persistente
+- **Descrição das ferramentas** — Lista completa dos plugins disponíveis e seus parâmetros
+- **Persona ativa** — Se uma persona customizada estiver configurada, ela é incluída
+- **Instruções de formato** — As `AgentFormatInstructions` que definem o formato esperado da resposta
+
+<Info>
+Os modos `/agent`, `/coder` e `/run` compartilham o mesmo loop ReAct. A diferença está apenas nas instruções de prompt — o `/coder` usa o `CoderSystemPrompt` que enfatiza edição de código, enquanto `/agent` usa instruções voltadas para execução de tarefas gerais.
+</Info>
+
+---
+
+## Formato de Resposta da IA
+
+A resposta do LLM é parseada para identificar múltiplos elementos estruturados. Cada tipo de bloco tem um comportamento diferente na interface:
+
+| Elemento | Tag/Formato | Comportamento na UI |
+| --- | --- | --- |
+| **Raciocínio** | `<reasoning>...</reasoning>` | Exibido como card com icone de "cérebro" — pensamento interno da IA |
+| **Explicação** | `<explanation>...</explanation>` | Exibido como card fixado — explicação voltada ao usuário |
+| **Resumo final** | `<final_summary>...</final_summary>` | Resumo de encerramento da tarefa |
+| **Chamada de ferramenta** | `<tool_call>...</tool_call>` | Invocação de plugin (file_edit, web_search, etc.) |
+| **Multi-agente** | `<agent_call>...</agent_call>` | Despacha sub-tarefas para agentes paralelos (3+ tarefas independentes) |
+| **Comando shell** | `` ```execute:shell `` ou `` ```bash `` | Bloco de comando para execução (formato legado) |
+| **Texto livre** | Texto sem tags | Exibido como resposta de chat normal |
+
+<Note>
+O parser é **stateful** (não baseado em regex) para lidar corretamente com tags XML que contenham atributos entre aspas com caracteres especiais.
+</Note>
+
+---
+
+## Cancelamento e Ctrl+C
+
+O agente suporta cancelamento gracioso em qualquer ponto da execução:
+
+- **Durante chamada ao LLM** — `Ctrl+C` cancela a requisição via `context.WithCancel()`. A resposta parcial recebida até aquele momento é descartada.
+- **Verificação por turno** — No início de cada turno do loop ReAct, o agente verifica `context.Done()`. Se o contexto foi cancelado, o loop encerra imediatamente.
+- **Tratamento de sinais** — `SIGINT` e `SIGTERM` são capturados pela função `runWithCancellation()`, que coordena o shutdown gracioso.
+- **Fila type-ahead** — Mensagens digitadas pelo usuário durante o processamento da IA são enfileiradas e processadas assim que o turno atual terminar. Isso evita perda de input.
+
+<Tip>
+Se a IA estiver "travada" em um loop longo, pressione `Ctrl+C` uma vez para cancelar o turno atual. Você pode então reformular sua instrução.
+</Tip>
+
+---
+
+## Histórico e Compactação
+
+O agente gerencia automaticamente o tamanho do histórico de conversa para evitar estourar o limite de tokens do modelo.
+
+### Estratégia de Compactação
+
+Quando o histórico ultrapassa **60% do budget de tokens** do modelo, a compactação é ativada em 3 níveis progressivos:
+
+1. **Trimming** — Mensagens de contexto injetadas (resultados de ferramentas, outputs de comandos) com mais de 3000 caracteres são truncadas, preservando início e fim.
+2. **Sumarização** — Mensagens intermediárias são resumidas pela própria IA, mantendo os pontos-chave.
+3. **Truncamento de emergência** — Se os níveis anteriores não forem suficientes, as mensagens mais antigas são removidas.
+
+Em todos os níveis, as **8 mensagens mais recentes** são sempre preservadas para manter o contexto imediato.
+
+### Checkpoint e /rewind
+
+No início de cada interação do agente, um **checkpoint** do histórico é salvo. Isso permite usar `/rewind` (ou `Esc+Esc`) para retornar ao estado exato anterior à última ação do agente.
+
+---
+
 ## Interface do Plano de Ação
 
 Após o planejamento, você verá uma tela dedicada com duas visualizações (alterne com `p`):
@@ -121,6 +208,53 @@ O modo agente compartilha o **mesmo historico de conversa** que o chat e o coder
 - Usar `/rewind` (ou Esc+Esc) para voltar a um ponto anterior da conversa
 
 Alem disso, o agente recebe automaticamente o **contexto do workspace** (arquivos bootstrap como SOUL.md, USER.md, e memoria persistente) no system prompt.
+
+---
+
+## Configuração do Modo Agente
+
+O comportamento do agente pode ser ajustado via variáveis de ambiente:
+
+| Variável | Padrão | Descrição |
+| --- | --- | --- |
+| `CHATCLI_AGENT_PLUGIN_MAX_TURNS` | `50` | Número máximo de turnos do loop ReAct. Máximo permitido: **200**. |
+| `CHATCLI_AGENT_CMD_TIMEOUT` | `10m` | Timeout para execução de comandos shell. Máximo: **1 hora**. |
+| `CHATCLI_AGENT_PLUGIN_TIMEOUT` | `15m` | Timeout para execução de plugins (file_edit, web_search, etc.). |
+| `CHATCLI_AGENT_DENYLIST` | _(vazio)_ | Padrões regex separados por `;` para bloquear comandos. Ex: `rm\s+-rf;curl.*\|.*sh` |
+| `CHATCLI_AGENT_ALLOW_SUDO` | `false` | Se `true`, permite execução de comandos com `sudo`. |
+| `CHATCLI_AGENT_PARALLEL_MODE` | `false` | Habilita despacho multi-agente via `<agent_call>` para tarefas paralelas. |
+
+<CodeGroup>
+```bash Exemplo: Limitar turnos e timeout
+export CHATCLI_AGENT_PLUGIN_MAX_TURNS=100
+export CHATCLI_AGENT_CMD_TIMEOUT=30m
+```
+
+```bash Exemplo: Bloquear padrões perigosos
+export CHATCLI_AGENT_DENYLIST="rm\s+-rf\s+/;curl.*\|.*bash;wget.*\|.*sh"
+```
+</CodeGroup>
+
+---
+
+## One-Shot Mode (flag -p)
+
+O modo one-shot permite execução **não-interativa** de uma única instrução, ideal para scripts e automação:
+
+```bash
+chatcli -p "liste todos os containers Docker parados"
+```
+
+### Como funciona
+
+1. A instrução é enviada ao LLM como um único turno (sem loop ReAct).
+2. Uma **animação de pensamento** é exibida enquanto a IA processa.
+3. Se a flag `--auto-execute` estiver ativa, o primeiro bloco de comando da resposta é executado automaticamente — mas apenas após passar pela verificação de comandos perigosos.
+4. O resultado é exibido e o processo encerra.
+
+<Warning>
+O one-shot com `--auto-execute` **não** pede confirmação para comandos seguros. Certifique-se de confiar na instrução antes de usar essa combinação em scripts.
+</Warning>
 
 ---
 

@@ -38,8 +38,8 @@ Os nomes dos arquivos sao **exatos e case-sensitive**. O ChatCLI busca apenas `A
 Os arquivos sao buscados em dois niveis, com o workspace tendo prioridade:
 
 <Steps>
-  <Step title="Workspace (./)">
-    Configuracoes especificas do projeto. Tem **prioridade** sobre o global.
+  <Step title="Workspace (raiz do projeto)">
+    Configuracoes especificas do projeto. Tem **prioridade** sobre o global. A raiz do projeto e detectada automaticamente (veja abaixo).
   </Step>
   <Step title="Global (~/.chatcli/)">
     Configuracoes padrao do usuario. Serve como **fallback** quando o arquivo nao existe no workspace.
@@ -47,6 +47,31 @@ Os arquivos sao buscados em dois niveis, com o workspace tendo prioridade:
 </Steps>
 
 Se o mesmo arquivo existe em ambos os niveis, o do workspace prevalece. Arquivos globais servem como fallback.
+
+#### Deteccao Automatica do Workspace
+
+O ChatCLI usa `detectProjectDir()` para encontrar a raiz real do projeto. Em vez de usar simplesmente o diretorio atual (CWD), ele **sobe na arvore de diretorios** procurando marcadores de projeto:
+
+1. Verifica se o diretorio atual contem `.git/` ou `.agent/`
+2. Se nao encontrar, sobe para o diretorio pai e repete
+3. Continua ate encontrar um marcador ou chegar na raiz do filesystem
+4. Se nenhum marcador for encontrado, usa o CWD como fallback
+
+Isso significa que voce pode rodar o ChatCLI de **qualquer subdiretorio** do projeto e os arquivos bootstrap na raiz serao encontrados normalmente.
+
+<Info>
+Marcadores reconhecidos: `.git` (repositorio Git) e `.agent` (marcador explicito do ChatCLI). Basta um deles existir para definir a raiz do workspace.
+</Info>
+
+#### Cenarios de Exemplo
+
+| CWD ao iniciar | Marcador encontrado | Workspace detectado | Arquivos carregados |
+|:----------------|:--------------------|:--------------------|:--------------------|
+| `~/project/` | `~/project/.git` | `~/project/` | `~/project/SOUL.md`, etc. |
+| `~/project/src/pkg/` | `~/project/.git` | `~/project/` | `~/project/SOUL.md` (sobe 2 niveis) |
+| `~/project/src/pkg/` | nenhum | `~/project/src/pkg/` | Apenas globais (`~/.chatcli/`) |
+| `~/monorepo/services/api/` | `~/monorepo/.git` | `~/monorepo/` | `~/monorepo/SOUL.md`, etc. |
+| `~/tmp/` | nenhum | `~/tmp/` | Apenas globais (`~/.chatcli/`) |
 
 ### Exemplos Detalhados
 
@@ -150,6 +175,8 @@ Se o mesmo arquivo existe em ambos os niveis, o do workspace prevalece. Arquivos
 
 ### Onde Colocar os Arquivos
 
+"Raiz do projeto" significa o diretorio que contem `.git/` ou `.agent/` -- detectado automaticamente pelo `detectProjectDir()`, nao necessariamente o CWD.
+
 ```text
 # Configuracao GLOBAL (vale para todos os projetos)
 ~/.chatcli/SOUL.md
@@ -159,12 +186,17 @@ Se o mesmo arquivo existe em ambos os niveis, o do workspace prevalece. Arquivos
 ~/.chatcli/AGENTS.md
 
 # Configuracao por PROJETO (override do global)
-./SOUL.md          # Na raiz do projeto
-./USER.md          # Na raiz do projeto
-./RULES.md         # Na raiz do projeto (regras do projeto)
-./IDENTITY.md      # Na raiz do projeto (raro)
-./AGENTS.md        # Na raiz do projeto (agents do projeto)
+# "Raiz do projeto" = diretorio com .git/ ou .agent/
+<raiz-do-projeto>/SOUL.md          # Na raiz do projeto
+<raiz-do-projeto>/USER.md          # Na raiz do projeto
+<raiz-do-projeto>/RULES.md         # Na raiz do projeto (regras do projeto)
+<raiz-do-projeto>/IDENTITY.md      # Na raiz do projeto (raro)
+<raiz-do-projeto>/AGENTS.md        # Na raiz do projeto (agents do projeto)
 ```
+
+<Warning>
+`CHATCLI_BOOTSTRAP_DIR` substitui apenas o diretorio **global** (`~/.chatcli/`), nao a deteccao do workspace. Arquivos na raiz do projeto (detectada via `.git` ou `.agent`) continuam tendo prioridade sobre os globais, independentemente de `CHATCLI_BOOTSTRAP_DIR`.
+</Warning>
 
 <Tip>
 A estrategia recomendada: `SOUL.md` e `IDENTITY.md` globais (sao sobre o assistente), `USER.md` e `RULES.md` por projeto (sao sobre o contexto de trabalho).
@@ -286,6 +318,25 @@ Em vez de injetar toda a memoria no system prompt, o ChatCLI usa **retrieval int
 Fatos acessados pelo retriever tem seu score incrementado automaticamente, criando um ciclo virtuoso: quanto mais um fato e util, mais ele aparece.
 </Info>
 
+### Configuracao da Memoria
+
+O sistema de memoria possui parametros configuraveis via variaveis de ambiente:
+
+| Variavel | Padrao | Descricao |
+|----------|--------|-----------|
+| `CHATCLI_MEMORY_MAX_SIZE` | `32768` (32KB) | Tamanho maximo do MEMORY.md renderizado |
+| `CHATCLI_MEMORY_RETENTION_DAYS` | `30` | Dias de retencao de notas diarias antes da limpeza |
+| `CHATCLI_MEMORY_MAX_FACTS` | `500` | Numero maximo de fatos no FactIndex |
+| `CHATCLI_MEMORY_RETRIEVAL_BUDGET` | `4000` | Maximo de caracteres de memoria injetados no system prompt |
+
+Alem das variaveis de ambiente, o struct `Config` interno define valores padrao adicionais:
+
+| Parametro | Valor Padrao | Descricao |
+|-----------|--------------|-----------|
+| `CompactionInterval` | 24 horas | Intervalo minimo entre compactacoes completas |
+| `DecayHalfLifeDays` | 30.0 | Meia-vida do decay temporal dos scores de fatos |
+| Intervalo de verificacao | 6 horas | Frequencia com que o sistema checa se precisa compactar |
+
 ### Como as Memorias sao Criadas
 
 O worker em background agora extrai **5 tipos de informacao** (antes eram apenas 2):
@@ -297,6 +348,21 @@ O worker em background agora extrai **5 tipos de informacao** (antes eram apenas
 5. **PROJECTS** -- Projetos em que se trabalhou
 
 O worker dispara apos 4+ mensagens novas com cooldown de 2 minutos, e tambem a cada 3 minutos em sessoes longas.
+
+#### Processo de Extracao
+
+O Memory Worker segue este fluxo interno:
+
+1. **EnhancedExtractionPrompt**: Envia o historico recente da conversa para o LLM com um prompt estruturado solicitando extracao de informacoes
+2. **Resposta esperada**: O LLM retorna texto com headers de secao bem definidos:
+   - `## DAILY` -- Resumo do que foi feito na sessao
+   - `## LONGTERM` -- Fatos novos para memoria de longo prazo
+   - `## PROFILE_UPDATE` -- Atualizacoes de perfil do usuario
+   - `## TOPICS` -- Topicos tecnicos identificados
+   - `## PROJECTS` -- Projetos mencionados ou trabalhados
+3. **ParseEnhancedResponse()**: Faz o parse da resposta e extrai cada secao individualmente
+4. **Deduplicacao**: Cada fato recebe um ID unico via hash SHA-256 do conteudo. Fatos com hash identico a um ja existente sao descartados automaticamente
+5. **Merge de perfil**: Atualizacoes de `PROFILE_UPDATE` sao **mescladas** (merged) com o perfil existente, nunca substituidas por completo
 
 ### Compactacao Automatica
 
@@ -458,6 +524,16 @@ Secoes vazias (arquivos inexistentes) sao **omitidas automaticamente** — apena
     CHATCLI_BOOTSTRAP_DIR=/path/to/bootstrap/files
     CHATCLI_MEMORY_ENABLED=true
     ```
+
+    | Variavel | Padrao | Descricao |
+    |----------|--------|-----------|
+    | `CHATCLI_BOOTSTRAP_ENABLED` | `true` | Ativa/desativa o carregamento dos arquivos bootstrap |
+    | `CHATCLI_BOOTSTRAP_DIR` | `~/.chatcli/` | Diretorio alternativo para os arquivos bootstrap **globais**. Use quando quiser manter seus arquivos (SOUL.md, RULES.md, etc.) em outro local, por exemplo um repositorio versionado ou diretorio compartilhado entre maquinas |
+    | `CHATCLI_MEMORY_ENABLED` | `true` | Ativa/desativa o sistema de memoria persistente |
+
+    <Note>
+      `CHATCLI_BOOTSTRAP_DIR` substitui apenas o diretorio **global** (`~/.chatcli/`). Arquivos na raiz do projeto (detectada via `.git` ou `.agent`) continuam tendo prioridade sobre os globais.
+    </Note>
   </Tab>
   <Tab title="Via Helm Chart">
     ```yaml

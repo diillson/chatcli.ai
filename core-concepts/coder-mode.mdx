@@ -93,6 +93,176 @@ O formato de resposta do assistente no `/coder` é obrigatório:
   </Step>
 </Steps>
 
+### Validação e Enforcement do Contrato
+
+Quando a IA viola o contrato de saída, o ChatCLI detecta automaticamente e injeta uma mensagem de feedback de correção de formato. O turno é reprocessado até que o formato esteja correto. As regras de enforcement são:
+
+| Violação Detectada | Feedback Injetado |
+| --- | --- |
+| `tool_call` usa uma tool **diferente** de `@coder` | Erro de formato — apenas `@coder` é permitido no modo `/coder` |
+| `tool_call` ausente mas blocos de código presentes | "Blocos de código não são permitidos, use `@coder`" |
+| `<reasoning>` ausente antes de `tool_call` | "Reasoning obrigatório antes de qualquer tool_call" |
+| Comandos shell soltos detectados (ex: `$ go test`) | "Use `@coder exec`, não comandos diretos" |
+
+<Warning>
+Se a IA insistir em violar o contrato após múltiplas tentativas, o ChatCLI aborta o turno e exibe um aviso ao usuário. Isso raramente acontece com modelos modernos.
+</Warning>
+
+Internamente, a validação ocorre em `agent_coder_validation.go` — um módulo dedicado que inspeciona cada resposta da IA antes de executar qualquer tool_call. A sequência é:
+
+1. **Parse** da resposta — extrai `<reasoning>`, `<tool_call>`, blocos de código e texto solto
+2. **Checagem de reasoning** — se `<tool_call>` existe mas `<reasoning>` não, rejeita
+3. **Checagem de tool name** — se o `name` do `tool_call` não é `@coder`, rejeita
+4. **Checagem de code blocks** — se há blocos de código (` ``` `) na resposta, rejeita
+5. **Checagem de shell patterns** — detecta padrões como `$ cmd`, `> cmd`, `run: cmd`
+6. Se qualquer checagem falha, injeta feedback e **retenta o turno** (até 3 tentativas)
+
+---
+
+## Diferença Interna entre /coder e /agent
+
+Ambos os modos usam o **mesmo loop ReAct** (`processAIResponseAndAct`). A diferença está na configuração, não na arquitetura:
+
+| Aspecto | `/coder` | `/agent` |
+| --- | --- | --- |
+| **System Prompt** | `CoderSystemPrompt` (completo) ou `CoderFormatInstructions` (quando persona ativa) | `AgentFormatInstructions` |
+| **Formato de saída** | Estrito: `<reasoning>` + `<tool_call name="@coder">` apenas | Flexível: qualquer tool, blocos `execute`, texto livre |
+| **Validação** | Ativa (`isCoderMode=true`) — rejeita violações | Desativada — aceita qualquer formato válido |
+| **Contexto de tools** | Compacto: apenas flags obrigatórias, 1-2 exemplos por subcomando | Completo: todas as flags, múltiplos exemplos |
+| **Histórico** | Compartilhado (unified history) | Compartilhado (unified history) |
+| **Multi-agent** | Suporta `<agent_call>` | Suporta `<agent_call>` |
+| **Anchor de formato** | Lembrete de `<reasoning>` + `@coder` a cada turno | Lembrete de `tool_call` e `execute` a cada turno |
+
+<Info>
+Na prática, `/coder` é o `/agent` com **guardrails adicionais**. Se você mudar de `/agent` para `/coder` no meio da conversa, o histórico é mantido — apenas as regras de validação e o system prompt mudam.
+</Info>
+
+O flag `isCoderMode` é o que ativa todas as diferenças. Quando `true`:
+- O validador de contrato é executado em cada resposta
+- O contexto de tools é reduzido para economizar tokens
+- O anchor de formato é específico para `@coder`
+- O system prompt inclui regras de base64 encoding
+
+---
+
+## Task Tracker e Progresso
+
+Quando a IA inclui um bloco `<reasoning>` com tarefas numeradas (ex: "1. Ler arquivos\n2. Aplicar patch\n3. Rodar testes"), o **TaskTracker** faz o parse automaticamente e cria um `TaskPlan`:
+
+### Como funciona
+
+1. **Parse**: Cada linha numerada vira uma `Task` com status inicial `Pending`
+2. **Tracking**: Conforme tool_calls são executados, o status da tarefa atual é atualizado
+3. **Renderização**: O progresso aparece abaixo do reasoning como linhas compactas de status
+
+### Status de cada tarefa
+
+| Status | Significado |
+| --- | --- |
+| `Pending` | Aguardando execução |
+| `InProgress` | Sendo executada no turno atual |
+| `Completed` | Tool_call executado com sucesso |
+| `Failed` | Tool_call retornou erro |
+
+### Replanejamento automático
+
+Se **3 ou mais tarefas falham** consecutivamente, o TaskTracker sinaliza `NeedsReplan = true`. O ChatCLI então injeta uma mensagem de sistema pedindo à IA para **reformular seu plano** antes de continuar.
+
+O TaskTracker também calcula uma **assinatura (hash)** do plano. Se a IA mudar seu plano entre turnos (ex: adicionar ou remover tarefas), o tracker detecta a mudança e reinicia o tracking com o novo plano.
+
+<Tip>
+O TaskTracker é puramente informativo para o usuário — ele não bloqueia a execução. Mesmo que o progresso mostre "Failed", a IA pode decidir ignorar o erro e continuar.
+</Tip>
+
+---
+
+## Requisitos de Codificação Base64
+
+Para operações de escrita e patch, o system prompt do `/coder` exige codificação base64:
+
+### Por que base64?
+
+Conteúdo de código frequentemente contém caracteres que conflitam com o formato JSON dos args:
+- Aspas duplas e simples
+- Quebras de linha
+- Barras invertidas (escapes)
+- Indentação com tabs vs. espaços
+
+Quando a IA tenta enviar código como texto puro em JSON, o parse falha ou o conteúdo é corrompido. Base64 elimina esse problema completamente.
+
+### Regras de encoding
+
+| Operação | Regra |
+| --- | --- |
+| `write --content` | **Obrigatório**: conteúdo deve ser base64, com `--encoding base64` |
+| `patch --search / --replace` | **Recomendado** para conteúdo multiline: usar base64 |
+| `patch --diff` | Usar `--diff-encoding base64` para diffs em base64 |
+| `read`, `search`, `tree` | Não se aplica (saída é sempre texto) |
+
+### Flag `--encoding`
+
+A flag `--encoding` controla a interpretação do conteúdo:
+- `text` (padrão): conteúdo é interpretado como texto literal
+- `base64`: conteúdo é decodificado de base64 antes de ser escrito
+
+```
+# Exemplo: escrita com base64
+@coder write --file main.go --content "cGFja2FnZSBtYWluCg==" --encoding base64
+
+# Exemplo: patch com diff em base64
+@coder patch --diff "LS0tIGEvbWFpbi5nbw..." --diff-encoding base64
+```
+
+---
+
+## Composição do System Prompt no /coder
+
+O system prompt é montado em camadas, na seguinte ordem:
+
+<Steps>
+  <Step title="Camada 1: Persona ou CoderSystemPrompt">
+    Se uma **persona customizada** está ativa (ex: `--persona senior-go`), o prompt da persona é usado como base. Caso contrário, o `CoderSystemPrompt` padrão é utilizado.
+  </Step>
+  <Step title="Camada 2: CoderFormatInstructions">
+    Quando uma persona está ativa, as `CoderFormatInstructions` são **anexadas** ao prompt da persona. Isso garante que a persona respeite o contrato de saída do `/coder`. Quando não há persona, as instruções já estão embutidas no `CoderSystemPrompt`.
+  </Step>
+  <Step title="Camada 3: Contexto do Workspace">
+    Arquivos de contexto do projeto são injetados via `contextBuilder`:
+    - `SOUL.md` — personalidade e diretrizes globais
+    - `USER.md` — preferências do usuário
+    - `RULES.md` — regras específicas do projeto
+  </Step>
+  <Step title="Camada 4: Contexto de Tools">
+    O schema compacto do `@coder` é incluído: lista de subcomandos, flags obrigatórias e 1-2 exemplos por subcomando. No modo `/coder`, esse contexto é **reduzido** comparado ao `/agent` para economizar tokens.
+  </Step>
+  <Step title="Camada 5: Prompt do Orquestrador Multi-Agent">
+    Se o modo paralelo está ativo (`CHATCLI_AGENT_PARALLEL_MODE=true`), o prompt do orquestrador multi-agent é anexado com a lista de agents disponíveis e instruções de despacho.
+  </Step>
+</Steps>
+
+---
+
+## Anchor de Formato (Lembrete Per-Turn)
+
+A cada turno do loop ReAct, um **lembrete curto de formato** é anexado ao histórico de mensagens. Isso evita que a IA "esqueça" as regras de formato em conversas longas.
+
+### No modo /coder
+
+O anchor lembra:
+- Formato obrigatório: `<reasoning>` seguido de `<tool_call name="@coder">`
+- Proibição de blocos de código e comandos diretos
+- Exigência de base64 para escrita de arquivos
+
+### No modo /agent
+
+O anchor lembra:
+- Formato de `tool_call` e blocos `execute`
+- Ferramentas disponíveis no turno atual
+
+<Info>
+O anchor é uma técnica de **prompt engineering** para manter aderência ao formato. Sem ele, modelos tendem a "derivar" para texto livre após 10-15 turnos de conversa. O anchor é curto (3-5 linhas) para não consumir tokens excessivos.
+</Info>
+
 ---
 
 ## Ferramentas e Dependência
@@ -180,5 +350,17 @@ Se perceber que a IA esta fazendo operacoes sequenciais que poderiam ser paralel
   </Accordion>
   <Accordion title="Existe limite de leitura?">
     Sim. Use `read --max-bytes`, `--head` ou `--tail` para controlar o tamanho da saída.
+  </Accordion>
+  <Accordion title="Como o /coder lida com erros de formato da IA?">
+    O ChatCLI valida **cada resposta** da IA contra o contrato de saída. Se uma violação é detectada (ex: bloco de código direto, tool errada, reasoning ausente), uma mensagem de feedback de correção é injetada no histórico e o turno é reprocessado. A IA recebe até 3 tentativas para corrigir o formato. Na prática, modelos modernos acertam no primeiro ou segundo turno.
+  </Accordion>
+  <Accordion title="Posso usar /coder com uma persona customizada?">
+    Sim. Quando uma persona está ativa (ex: `--persona senior-go`), o prompt da persona é usado como base e as `CoderFormatInstructions` são **automaticamente anexadas**. Isso garante que a persona respeite o contrato de saída do `/coder` sem perder sua personalidade customizada.
+  </Accordion>
+  <Accordion title="O que é o Task Tracker?">
+    É um módulo que faz parse de tarefas numeradas no bloco `<reasoning>` da IA (ex: "1. Ler arquivos\n2. Aplicar patch"). Cada tarefa recebe um status (Pending, InProgress, Completed, Failed) que é atualizado conforme os tool_calls são executados. O progresso é exibido na interface. Se 3+ tarefas falham, o ChatCLI solicita à IA que reformule seu plano.
+  </Accordion>
+  <Accordion title="Por que base64 é obrigatório para write?">
+    Código-fonte frequentemente contém aspas, quebras de linha, barras invertidas e outros caracteres que conflitam com JSON. Quando a IA envia código como texto puro nos args do tool_call, o parse JSON pode falhar ou o conteúdo ser corrompido. Base64 codifica o conteúdo de forma segura, eliminando 100% dos problemas de escaping.
   </Accordion>
 </AccordionGroup>

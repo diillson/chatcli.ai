@@ -76,6 +76,118 @@ Removes the stored OAuth credentials for the specified provider.
 
 ---
 
+## Technical Details of OAuth Flows
+
+This section describes how each OAuth flow works internally, including URLs, parameters, and ChatCLI behavior.
+
+### Anthropic OAuth (PKCE + Manual Code)
+
+The Anthropic flow uses OAuth 2.0 with PKCE (Proof Key for Code Exchange) and a manual copy-paste mechanism for the authorization code.
+
+<Steps>
+  <Step title="PKCE generation and browser launch">
+    ChatCLI generates a random `code_verifier` and computes the `code_challenge` using SHA-256 (method `S256`). The browser opens to the authorization URL with the required parameters.
+  </Step>
+  <Step title="User authorizes in browser">
+    The user logs into Claude and authorizes access. The console page displays a code in the format `code#state`.
+  </Step>
+  <Step title="User pastes code in terminal">
+    ChatCLI prompts the user to paste the displayed code. The portion after the `#` is the `state` parameter, used in the token exchange.
+  </Step>
+  <Step title="Code exchanged for tokens">
+    ChatCLI sends the code, state, and code_verifier to the token endpoint and receives an access_token + refresh_token.
+  </Step>
+</Steps>
+
+| Parameter | Value |
+|-----------|-------|
+| Auth URL | `https://claude.ai/oauth/authorize` |
+| Token URL | `https://console.anthropic.com/v1/oauth/token` |
+| Redirect URI | `https://console.anthropic.com/oauth/code/callback` |
+| Client ID | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
+| Scopes | `org:create_api_key user:profile user:inference` |
+| PKCE Method | `S256` (SHA-256 code challenge) |
+
+<Warning>
+The token exchange uses a plain `http.Client` (no custom transport) to avoid TLS fingerprinting issues with Cloudflare. The `User-Agent: claude-cli/2.1.2 (external, cli)` header is required. Using an HTTP client with `LoggingTransport` or a custom transport causes rejection by Anthropic's CDN.
+</Warning>
+
+Token refresh also uses the plain `http.Client` and the same `User-Agent`, for the same reason.
+
+---
+
+### OpenAI Codex OAuth (PKCE + Localhost Callback)
+
+The OpenAI flow uses OAuth 2.0 with PKCE and a local HTTP server to automatically capture the callback.
+
+<Steps>
+  <Step title="Local server starts on port 1455">
+    ChatCLI starts an HTTP server at `http://localhost:1455` to receive the OAuth callback.
+  </Step>
+  <Step title="Browser opens to authorization page">
+    The browser opens to the OpenAI authorization URL with the PKCE challenge and a `state` parameter for CSRF validation.
+  </Step>
+  <Step title="User authorizes in browser">
+    After login and authorization, the browser redirects to `http://localhost:1455/auth/callback` with the authorization code.
+  </Step>
+  <Step title="CSRF validation and token exchange">
+    The local server validates the `state` parameter against the originally generated value (CSRF protection), exchanges the code for tokens, and shuts down the server.
+  </Step>
+</Steps>
+
+| Parameter | Value |
+|-----------|-------|
+| Auth URL | `https://auth.openai.com/oauth/authorize` |
+| Token URL | `https://auth.openai.com/oauth/token` |
+| Redirect URI | `http://localhost:1455/auth/callback` |
+| Client ID | `app_EMoamEEZ73f0CkXaXp7hrann` (overridable via `CHATCLI_OPENAI_CLIENT_ID`) |
+| Scopes | `openid profile email offline_access` |
+| PKCE Method | `S256` |
+
+<Tip>Token refresh is automatic and uses the standard HTTP client with logging.</Tip>
+
+---
+
+### GitHub Copilot Device Flow (RFC 8628)
+
+GitHub Copilot uses the **Device Authorization Grant** (RFC 8628), a flow designed for devices without an integrated browser, such as CLI terminals.
+
+<Steps>
+  <Step title="Request device code">
+    ChatCLI requests a `device_code` and a `user_code` from the GitHub endpoint.
+  </Step>
+  <Step title="Display code in terminal">
+    ChatCLI displays the `user_code` and the verification URL (`https://github.com/login/device`) to the user.
+  </Step>
+  <Step title="User authorizes in browser">
+    The user visits the URL, enters the `user_code`, and authorizes ChatCLI access.
+  </Step>
+  <Step title="Polling until authorization">
+    ChatCLI polls the token endpoint every 5 seconds until it receives the access token or a terminal error.
+  </Step>
+</Steps>
+
+| Parameter | Value |
+|-----------|-------|
+| Device Code URL | `https://github.com/login/device/code` |
+| Token Polling URL | `https://github.com/login/oauth/access_token` |
+| Client ID | `Ov23lifEydOk2Non90tJ` (overridable via `CHATCLI_COPILOT_CLIENT_ID`) |
+| Scope | `read:user` |
+| Max Timeout | 15 minutes |
+
+**Polling responses:**
+
+| Response | Action |
+|----------|--------|
+| `authorization_pending` | Continue polling normally |
+| `slow_down` | Increase interval by +5 seconds |
+| `expired_token` | Fail — the device code has expired |
+| `access_denied` | Fail — the user denied access |
+
+<Info>GitHub Copilot tokens are non-expiring and do not have a refresh token. They persist until manually revoked on the GitHub settings page.</Info>
+
+---
+
 ## Complete Flow: From Zero to First Prompt
 
 If you are starting **without any configured credentials**, follow these steps:
@@ -132,15 +244,87 @@ OAuth credentials are saved with **AES-256-GCM encryption** at:
 ~/.chatcli/auth-profiles.json
 ```
 
-The encryption key is automatically generated and stored at `~/.chatcli/.auth-key` (permission 0600). Unencrypted data from previous versions is transparently migrated on first read.
+### Encryption Details
 
-The file contains access tokens, refresh tokens, and metadata for each provider. Tokens are automatically renewed when they expire. Additionally, if a request fails with a 401 error (expired token), ChatCLI automatically attempts to refresh the token using the refresh token, recreates the client, and retries the request — all transparently to the user.
+| Aspect | Detail |
+|--------|--------|
+| Algorithm | AES-256-GCM (authenticated encryption) |
+| Key file | `~/.chatcli/.auth-key` (32 random bytes) |
+| Key permission | `0o600` (owner read/write only) |
+| Encrypted format | `chatcli-enc:v1:` + Base64(nonce + ciphertext) |
+| Key generation | Automatic on first use |
+
+The encryption key is automatically generated and stored at `~/.chatcli/.auth-key`. Unencrypted data from previous versions is automatically detected (absence of the `chatcli-enc:v1:` prefix) and migrated to the encrypted format on the next save.
+
+Each stored profile contains:
+- **Access token** (encrypted)
+- **Refresh token** (encrypted, when applicable)
+- **Expiry** (timestamp in milliseconds)
+- **Account ID** and **email** from the provider
+- **Provider type** (anthropic, openai-codex, github-copilot)
 
 To customize the storage directory, set the environment variable:
 
 ```bash
 export CHATCLI_AUTH_DIR="~/.config/chatcli/auth"
 ```
+
+---
+
+## Automatic Token Refresh
+
+ChatCLI automatically renews expired tokens in two layers:
+
+<CardGroup cols={2}>
+  <Card title="Proactive Refresh" icon="clock">
+    When resolving credentials for a request, ChatCLI checks if the token is expired (`IsExpired()`) or about to expire (`IsExpiringSoon()` with a **5-minute** margin). If so, the refresh is executed **before** the request.
+  </Card>
+  <Card title="Reactive Refresh" icon="rotate">
+    If a request returns an **HTTP 401** error, ChatCLI invalidates the credential cache, performs the token refresh, recreates the HTTP client, and retries the request automatically — all transparent to the user.
+  </Card>
+</CardGroup>
+
+<Info>The 5-minute safety margin before actual expiry prevents race conditions where the token expires between the check and the request being sent.</Info>
+
+GitHub Copilot tokens (Device Flow) **do not expire** and do not have a refresh token — they persist until manually revoked.
+
+---
+
+## External CLI Sync
+
+ChatCLI can import credentials from external CLIs via `SyncExternalCliCreds()`:
+
+| External CLI | Paths Checked | Imported Profile |
+|-------------|---------------|------------------|
+| **Claude Code** | `~/.claude/credentials.json` or `~/.claude.json` | `anthropic-oauth-sync` |
+| **OpenAI Codex CLI** | `~/.codex/credentials.json` or `~/.codex/auth.json` | `openai-codex-sync` |
+
+<Note>Import only occurs if the external credentials are **fresher** than those already stored. This ensures that a login performed directly in ChatCLI is not overwritten by stale data from another CLI.</Note>
+
+---
+
+## Credential Resolution Priority
+
+When determining which credential to use for a provider, ChatCLI follows this priority order:
+
+<Steps>
+  <Step title="Auth-profiles store (OAuth/Token)">
+    OAuth credentials stored in `auth-profiles.json`, including profiles synced from external CLIs. Automatic refresh is applied at this layer.
+  </Step>
+  <Step title="Environment variables">
+    Variables such as `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GITHUB_COPILOT_TOKEN`.
+  </Step>
+</Steps>
+
+**Prefix system:** credential values may include prefixes that signal the type to the provider:
+
+| Prefix | Meaning |
+|--------|---------|
+| `oauth:` | Token obtained via OAuth flow |
+| `apikey:` | Traditional API key |
+| `token:` | Generic token (e.g., Copilot) |
+
+---
 
 ### Advanced Configuration
 
@@ -159,7 +343,10 @@ export CHATCLI_AUTH_DIR="~/.config/chatcli/auth"
     Check that the callback port is not in use by another application. The OpenAI callback server needs port **1455** to capture the return.
   </Accordion>
   <Accordion title="Code does not appear after authorizing (Anthropic)">
-    The Anthropic flow redirects to the console page that displays the authorization code. Copy the displayed code and paste it in the terminal when prompted.
+    The Anthropic flow redirects to the console page that displays the authorization code in the format `code#state`. Copy **the full text** (including the part after the `#`) and paste it in the terminal when prompted. ChatCLI separates the code from the state automatically.
+  </Accordion>
+  <Accordion title="Anthropic: 403 error or connection refused during token exchange">
+    This typically occurs when a custom HTTP client (with LoggingTransport) is used. ChatCLI uses a plain `http.Client` for Anthropic token exchange to avoid TLS fingerprinting by Cloudflare. If you are developing, ensure that the `exchangeAnthropicToken` function uses a client without a custom transport.
   </Accordion>
   <Accordion title="Provider does not appear in /switch after login">
     Run `/auth status` to verify that the token was saved correctly. If needed, try `/auth logout <provider>` followed by `/auth login <provider>`.
@@ -167,9 +354,12 @@ export CHATCLI_AUTH_DIR="~/.config/chatcli/auth"
   <Accordion title="GitHub Copilot: authorization denied by user">
     Make sure your GitHub account has an active Copilot subscription (Individual, Business, or Enterprise). Check at https://github.com/settings/copilot if Copilot is enabled.
   </Accordion>
+  <Accordion title="GitHub Copilot: device code expired">
+    The device code has limited validity. If polling exceeds **15 minutes** without authorization, the code expires. Run `/auth login github-copilot` again to generate a new code.
+  </Accordion>
   <Accordion title="Expired token">
     OAuth tokens are automatically renewed in two ways:
-    - **Proactively**: when resolving credentials, if the token is expired, a refresh is attempted before the request.
+    - **Proactively**: when resolving credentials, if the token is expired or within the 5-minute margin, a refresh is attempted before the request.
     - **Reactively**: if a request returns a 401 error, ChatCLI invalidates the credential cache, attempts to refresh the OAuth token, recreates the client, and retries the request automatically.
 
     If both attempts fail (e.g., refresh token is also expired), log in again with `/auth login`.

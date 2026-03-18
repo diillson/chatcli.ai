@@ -76,6 +76,118 @@ Remove as credenciais OAuth armazenadas para o provedor específicado.
 
 ---
 
+## Detalhes Técnicos dos Fluxos OAuth
+
+Esta seção descreve como cada fluxo OAuth funciona internamente, incluindo URLs, parâmetros e comportamento do ChatCLI.
+
+### Anthropic OAuth (PKCE + Código Manual)
+
+O fluxo da Anthropic usa OAuth 2.0 com PKCE (Proof Key for Code Exchange) e um mecanismo de cópia manual do código de autorização.
+
+<Steps>
+  <Step title="Geração do PKCE e abertura do navegador">
+    O ChatCLI gera um `code_verifier` aleatório e calcula o `code_challenge` usando SHA-256 (método `S256`). O navegador abre na URL de autorização com os parâmetros necessários.
+  </Step>
+  <Step title="Usuário autoriza no navegador">
+    O usuário faz login no Claude e autoriza o acesso. A página do console exibe um código no formato `código#state`.
+  </Step>
+  <Step title="Usuário cola o código no terminal">
+    O ChatCLI solicita que o usuário cole o código exibido. A parte após o `#` é o parâmetro `state`, utilizado na troca de tokens.
+  </Step>
+  <Step title="Troca do código por tokens">
+    O ChatCLI envia o código, o state e o code_verifier para o endpoint de tokens e recebe access_token + refresh_token.
+  </Step>
+</Steps>
+
+| Parâmetro | Valor |
+|-----------|-------|
+| Auth URL | `https://claude.ai/oauth/authorize` |
+| Token URL | `https://console.anthropic.com/v1/oauth/token` |
+| Redirect URI | `https://console.anthropic.com/oauth/code/callback` |
+| Client ID | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
+| Scopes | `org:create_api_key user:profile user:inference` |
+| PKCE Method | `S256` (SHA-256 code challenge) |
+
+<Warning>
+A troca de tokens usa um `http.Client` puro (sem transporte customizado) para evitar problemas de fingerprinting TLS com o Cloudflare. O header `User-Agent: claude-cli/2.1.2 (external, cli)` é obrigatório. Usar um HTTP client com `LoggingTransport` ou transporte customizado causa rejeição pela CDN da Anthropic.
+</Warning>
+
+O refresh de tokens também usa o `http.Client` puro e o mesmo `User-Agent`, pela mesma razão.
+
+---
+
+### OpenAI Codex OAuth (PKCE + Callback Localhost)
+
+O fluxo da OpenAI usa OAuth 2.0 com PKCE e um servidor HTTP local para capturar o callback automaticamente.
+
+<Steps>
+  <Step title="Servidor local inicia na porta 1455">
+    O ChatCLI inicia um servidor HTTP em `http://localhost:1455` para receber o callback OAuth.
+  </Step>
+  <Step title="Navegador abre na página de autorização">
+    O navegador abre na URL de autorização da OpenAI com o PKCE challenge e um parâmetro `state` para validação CSRF.
+  </Step>
+  <Step title="Usuário autoriza no navegador">
+    Após login e autorização, o navegador redireciona para `http://localhost:1455/auth/callback` com o código de autorização.
+  </Step>
+  <Step title="Validação CSRF e troca de tokens">
+    O servidor local valida o parâmetro `state` contra o valor gerado originalmente (proteção CSRF), troca o código por tokens e encerra o servidor.
+  </Step>
+</Steps>
+
+| Parâmetro | Valor |
+|-----------|-------|
+| Auth URL | `https://auth.openai.com/oauth/authorize` |
+| Token URL | `https://auth.openai.com/oauth/token` |
+| Redirect URI | `http://localhost:1455/auth/callback` |
+| Client ID | `app_EMoamEEZ73f0CkXaXp7hrann` (sobrescrevível via `CHATCLI_OPENAI_CLIENT_ID`) |
+| Scopes | `openid profile email offline_access` |
+| PKCE Method | `S256` |
+
+<Tip>O refresh de tokens é automático e utiliza o HTTP client padrão com logging.</Tip>
+
+---
+
+### GitHub Copilot Device Flow (RFC 8628)
+
+O GitHub Copilot usa o **Device Authorization Grant** (RFC 8628), um fluxo projetado para dispositivos sem navegador integrado, como terminais CLI.
+
+<Steps>
+  <Step title="Requisição do device code">
+    O ChatCLI solicita um `device_code` e um `user_code` ao endpoint do GitHub.
+  </Step>
+  <Step title="Exibição do código no terminal">
+    O ChatCLI exibe o `user_code` e a URL de verificação (`https://github.com/login/device`) para o usuário.
+  </Step>
+  <Step title="Usuário autoriza no navegador">
+    O usuário acessa a URL, insere o `user_code` e autoriza o acesso do ChatCLI.
+  </Step>
+  <Step title="Polling até autorização">
+    O ChatCLI faz polling no endpoint de tokens a cada 5 segundos até receber o access token ou um erro terminal.
+  </Step>
+</Steps>
+
+| Parâmetro | Valor |
+|-----------|-------|
+| Device Code URL | `https://github.com/login/device/code` |
+| Token Polling URL | `https://github.com/login/oauth/access_token` |
+| Client ID | `Ov23lifEydOk2Non90tJ` (sobrescrevível via `CHATCLI_COPILOT_CLIENT_ID`) |
+| Scope | `read:user` |
+| Timeout máximo | 15 minutos |
+
+**Respostas do polling:**
+
+| Resposta | Ação |
+|----------|------|
+| `authorization_pending` | Continua polling normalmente |
+| `slow_down` | Aumenta o intervalo em +5 segundos |
+| `expired_token` | Falha — o device code expirou |
+| `access_denied` | Falha — o usuário negou acesso |
+
+<Info>Tokens do GitHub Copilot são não-expirantes e não possuem refresh token. São persistentes até revogação manual na página de configurações do GitHub.</Info>
+
+---
+
 ## Fluxo Completo: Do Zero ao Primeiro Prompt
 
 Se você está começando **sem nenhuma credencial configurada**, siga estes passos:
@@ -132,15 +244,87 @@ As credenciais OAuth são salvas com **criptografia AES-256-GCM** em:
 ~/.chatcli/auth-profiles.json
 ```
 
-A chave de criptografia é gerada automaticamente e armazenada em `~/.chatcli/.auth-key` (permissão 0600). Dados não-criptografados de versões anteriores são migrados transparentemente na primeira leitura.
+### Detalhes de Criptografia
 
-O arquivo contém tokens de acesso, tokens de refresh e metadados de cada provedor. Os tokens são renovados automaticamente quando expiram. Além disso, se um request falhar com erro 401 (token expirado), o ChatCLI automaticamente tenta renovar o token usando o refresh token, recria o cliente e retenta o request — tudo transparente para o usuário.
+| Aspecto | Detalhe |
+|---------|---------|
+| Algoritmo | AES-256-GCM (authenticated encryption) |
+| Arquivo da chave | `~/.chatcli/.auth-key` (32 bytes aleatórios) |
+| Permissão da chave | `0o600` (somente leitura/escrita pelo dono) |
+| Formato criptografado | `chatcli-enc:v1:` + Base64(nonce + ciphertext) |
+| Geração da chave | Automática na primeira utilização |
+
+A chave de criptografia é gerada automaticamente e armazenada em `~/.chatcli/.auth-key`. Dados não-criptografados de versões anteriores são detectados automaticamente (ausência do prefixo `chatcli-enc:v1:`) e migrados para o formato criptografado na próxima gravação.
+
+Cada perfil armazenado contém:
+- **Access token** (criptografado)
+- **Refresh token** (criptografado, quando aplicável)
+- **Expiry** (timestamp em milissegundos)
+- **Account ID** e **email** do provedor
+- **Tipo de provedor** (anthropic, openai-codex, github-copilot)
 
 Para personalizar o diretório de armazenamento, defina a variável de ambiente:
 
 ```bash
 export CHATCLI_AUTH_DIR="~/.config/chatcli/auth"
 ```
+
+---
+
+## Renovação Automática de Tokens
+
+O ChatCLI renova tokens expirados automaticamente em duas camadas:
+
+<CardGroup cols={2}>
+  <Card title="Renovação Proativa" icon="clock">
+    Ao resolver credenciais para um request, o ChatCLI verifica se o token está expirado (`IsExpired()`) ou prestes a expirar (`IsExpiringSoon()` com margem de **5 minutos**). Se sim, o refresh é executado **antes** do request.
+  </Card>
+  <Card title="Renovação Reativa" icon="rotate">
+    Se um request retornar erro **HTTP 401**, o ChatCLI invalida o cache de credenciais, executa o refresh do token, recria o cliente HTTP e retenta o request automaticamente — tudo transparente para o usuário.
+  </Card>
+</CardGroup>
+
+<Info>A margem de segurança de 5 minutos antes da expiração real evita race conditions em que o token expira entre a verificação e o envio do request.</Info>
+
+Tokens do GitHub Copilot (Device Flow) **não expiram** e não possuem refresh token — são persistentes até revogação manual.
+
+---
+
+## Sincronização com CLIs Externos
+
+O ChatCLI pode importar credenciais de CLIs externos via `SyncExternalCliCreds()`:
+
+| CLI Externo | Caminhos Verificados | Perfil Importado |
+|-------------|---------------------|------------------|
+| **Claude Code** | `~/.claude/credentials.json` ou `~/.claude.json` | `anthropic-oauth-sync` |
+| **OpenAI Codex CLI** | `~/.codex/credentials.json` ou `~/.codex/auth.json` | `openai-codex-sync` |
+
+<Note>A importação só ocorre se as credenciais externas forem **mais recentes** que as já armazenadas. Isso garante que um login feito diretamente no ChatCLI não seja sobrescrito por dados antigos de outro CLI.</Note>
+
+---
+
+## Prioridade de Resolução de Credenciais
+
+Ao determinar qual credencial usar para um provedor, o ChatCLI segue esta ordem de prioridade:
+
+<Steps>
+  <Step title="Auth-profiles store (OAuth/Token)">
+    Credenciais OAuth armazenadas em `auth-profiles.json`, incluindo perfis sincronizados de CLIs externos. O refresh automático é aplicado nesta camada.
+  </Step>
+  <Step title="Variáveis de ambiente">
+    Variáveis como `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` e `GITHUB_COPILOT_TOKEN`.
+  </Step>
+</Steps>
+
+**Sistema de prefixos:** o valor das credenciais pode incluir prefixos que indicam o tipo ao provedor:
+
+| Prefixo | Significado |
+|---------|-------------|
+| `oauth:` | Token obtido via fluxo OAuth |
+| `apikey:` | Chave de API tradicional |
+| `token:` | Token genérico (ex: Copilot) |
+
+---
 
 ### Configuração Avançada
 
@@ -159,7 +343,10 @@ export CHATCLI_AUTH_DIR="~/.config/chatcli/auth"
     Verifique se a porta de callback não está em uso por outra aplicação. O servidor de callback da OpenAI precisa da porta **1455** para capturar o retorno.
   </Accordion>
   <Accordion title="Código não aparece após autorizar (Anthropic)">
-    O fluxo da Anthropic redireciona para a página do console que exibe o código de autorização. Copie o código exibido e cole no terminal quando solicitado.
+    O fluxo da Anthropic redireciona para a página do console que exibe o código de autorização no formato `código#state`. Copie **o texto completo** (incluindo a parte após o `#`) e cole no terminal quando solicitado. O ChatCLI separa o código do state automaticamente.
+  </Accordion>
+  <Accordion title="Anthropic: erro 403 ou conexão recusada na troca de tokens">
+    Isso geralmente ocorre quando um HTTP client customizado (com LoggingTransport) é usado. O ChatCLI usa um `http.Client` puro para a troca de tokens da Anthropic, evitando fingerprinting TLS pelo Cloudflare. Se você estiver desenvolvendo, certifique-se de que a função `exchangeAnthropicToken` usa um client sem transporte customizado.
   </Accordion>
   <Accordion title="Provedor não aparece no /switch após login">
     Execute `/auth status` para verificar se o token foi salvo corretamente. Se necessário, tente `/auth logout <provedor>` seguido de `/auth login <provedor>`.
@@ -167,9 +354,12 @@ export CHATCLI_AUTH_DIR="~/.config/chatcli/auth"
   <Accordion title="GitHub Copilot: authorization denied by user">
     Certifique-se de que sua conta GitHub possui uma assinatura ativa do Copilot (Individual, Business ou Enterprise). Verifique em https://github.com/settings/copilot se o Copilot está habilitado.
   </Accordion>
+  <Accordion title="GitHub Copilot: device code expirado">
+    O device code tem validade limitada. Se o polling exceder **15 minutos** sem autorização, o código expira. Execute `/auth login github-copilot` novamente para gerar um novo código.
+  </Accordion>
   <Accordion title="Token expirado">
     Os tokens OAuth são renovados automaticamente de duas formas:
-    - **Proativamente**: ao resolver credenciais, se o token estiver expirado, o refresh é tentado antes do request.
+    - **Proativamente**: ao resolver credenciais, se o token estiver expirado ou dentro da margem de 5 minutos, o refresh é tentado antes do request.
     - **Reativamente**: se um request retornar erro 401, o ChatCLI invalida o cache de credenciais, tenta renovar o token OAuth, recria o cliente e retenta o request automaticamente.
 
     Se ambas as tentativas falharem (ex: refresh token também expirado), faça login novamente com `/auth login`.

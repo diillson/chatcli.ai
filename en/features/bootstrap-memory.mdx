@@ -38,8 +38,8 @@ File names are **exact and case-sensitive**. ChatCLI only looks for `AGENTS.md`,
 Files are searched at two levels, with the workspace taking priority:
 
 <Steps>
-  <Step title="Workspace (./)">
-    Project-specific configurations. Takes **priority** over global.
+  <Step title="Workspace (project root)">
+    Project-specific configurations. Takes **priority** over global. The project root is detected automatically (see below).
   </Step>
   <Step title="Global (~/.chatcli/)">
     User default configurations. Serves as a **fallback** when the file does not exist in the workspace.
@@ -47,6 +47,31 @@ Files are searched at two levels, with the workspace taking priority:
 </Steps>
 
 If the same file exists at both levels, the workspace version prevails. Global files serve as fallback.
+
+#### Automatic Workspace Detection
+
+ChatCLI uses `detectProjectDir()` to find the real project root. Instead of simply using the current directory (CWD), it **walks up the directory tree** looking for project markers:
+
+1. Checks if the current directory contains `.git/` or `.agent/`
+2. If not found, moves to the parent directory and repeats
+3. Continues until a marker is found or it reaches the filesystem root
+4. If no marker is found, falls back to the CWD
+
+This means you can run ChatCLI from **any subdirectory** of your project and bootstrap files at the root will be found normally.
+
+<Info>
+Recognized markers: `.git` (Git repository) and `.agent` (explicit ChatCLI marker). Only one needs to exist to define the workspace root.
+</Info>
+
+#### Example Scenarios
+
+| CWD at startup | Marker found | Detected workspace | Files loaded |
+|:----------------|:-------------|:-------------------|:-------------|
+| `~/project/` | `~/project/.git` | `~/project/` | `~/project/SOUL.md`, etc. |
+| `~/project/src/pkg/` | `~/project/.git` | `~/project/` | `~/project/SOUL.md` (walks up 2 levels) |
+| `~/project/src/pkg/` | none | `~/project/src/pkg/` | Global only (`~/.chatcli/`) |
+| `~/monorepo/services/api/` | `~/monorepo/.git` | `~/monorepo/` | `~/monorepo/SOUL.md`, etc. |
+| `~/tmp/` | none | `~/tmp/` | Global only (`~/.chatcli/`) |
 
 ### Detailed Examples
 
@@ -150,6 +175,8 @@ If the same file exists at both levels, the workspace version prevails. Global f
 
 ### Where to Place Files
 
+"Project root" means the directory containing `.git/` or `.agent/` -- automatically detected by `detectProjectDir()`, not necessarily the CWD.
+
 ```text
 # GLOBAL configuration (applies to all projects)
 ~/.chatcli/SOUL.md
@@ -159,12 +186,17 @@ If the same file exists at both levels, the workspace version prevails. Global f
 ~/.chatcli/AGENTS.md
 
 # Per-PROJECT configuration (overrides global)
-./SOUL.md          # In project root
-./USER.md          # In project root
-./RULES.md         # In project root (project rules)
-./IDENTITY.md      # In project root (rare)
-./AGENTS.md        # In project root (project agents)
+# "Project root" = directory with .git/ or .agent/
+<project-root>/SOUL.md          # In project root
+<project-root>/USER.md          # In project root
+<project-root>/RULES.md         # In project root (project rules)
+<project-root>/IDENTITY.md      # In project root (rare)
+<project-root>/AGENTS.md        # In project root (project agents)
 ```
+
+<Warning>
+`CHATCLI_BOOTSTRAP_DIR` only overrides the **global** directory (`~/.chatcli/`), not the workspace detection. Project-level files (detected via `.git` or `.agent`) still take priority over global ones, regardless of `CHATCLI_BOOTSTRAP_DIR`.
+</Warning>
 
 <Tip>
 Recommended strategy: `SOUL.md` and `IDENTITY.md` global (they're about the assistant), `USER.md` and `RULES.md` per-project (they're about the work context).
@@ -286,6 +318,25 @@ Instead of dumping all memory into the system prompt, ChatCLI uses **intelligent
 Facts accessed by the retriever automatically get their scores bumped, creating a virtuous cycle: the more useful a fact is, the more it appears.
 </Info>
 
+### Memory Configuration
+
+The memory system has tunable parameters via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHATCLI_MEMORY_MAX_SIZE` | `32768` (32KB) | Max size of rendered MEMORY.md |
+| `CHATCLI_MEMORY_RETENTION_DAYS` | `30` | Daily note retention before cleanup |
+| `CHATCLI_MEMORY_MAX_FACTS` | `500` | Max facts in the FactIndex |
+| `CHATCLI_MEMORY_RETRIEVAL_BUDGET` | `4000` | Max chars of memory injected in system prompt |
+
+In addition to environment variables, the internal `Config` struct defines additional defaults:
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `CompactionInterval` | 24 hours | Minimum interval between full compactions |
+| `DecayHalfLifeDays` | 30.0 | Temporal decay half-life for fact scores |
+| Check interval | 6 hours | How often the system checks if compaction is needed |
+
 ### How Memories Are Created
 
 The background worker now extracts **5 types of information** (previously only 2):
@@ -297,6 +348,21 @@ The background worker now extracts **5 types of information** (previously only 2
 5. **PROJECTS** -- Projects worked on
 
 The worker fires after 4+ new messages with a 2-minute cooldown, and also every 3 minutes during long sessions.
+
+#### Extraction Process
+
+The Memory Worker follows this internal flow:
+
+1. **EnhancedExtractionPrompt**: Sends the recent conversation history to the LLM with a structured prompt requesting information extraction
+2. **Expected output**: The LLM returns text with well-defined section headers:
+   - `## DAILY` -- Summary of what was done in the session
+   - `## LONGTERM` -- New facts for long-term memory
+   - `## PROFILE_UPDATE` -- User profile updates
+   - `## TOPICS` -- Technical topics identified
+   - `## PROJECTS` -- Projects mentioned or worked on
+3. **ParseEnhancedResponse()**: Parses the response and extracts each section individually
+4. **Deduplication**: Each fact receives a unique ID via SHA-256 content hash. Facts with a hash matching an existing one are automatically discarded
+5. **Profile merging**: `PROFILE_UPDATE` changes are **merged** with the existing profile, never fully replaced
 
 ### Automatic Compaction
 
@@ -458,6 +524,16 @@ Empty sections (missing files) are **automatically omitted** — only what exist
     CHATCLI_BOOTSTRAP_DIR=/path/to/bootstrap/files
     CHATCLI_MEMORY_ENABLED=true
     ```
+
+    | Variable | Default | Description |
+    |----------|---------|-------------|
+    | `CHATCLI_BOOTSTRAP_ENABLED` | `true` | Enable/disable bootstrap file loading |
+    | `CHATCLI_BOOTSTRAP_DIR` | `~/.chatcli/` | Alternative directory for **global** bootstrap files. Use this when you want to keep your files (SOUL.md, RULES.md, etc.) in another location, such as a versioned repository or a directory shared across machines |
+    | `CHATCLI_MEMORY_ENABLED` | `true` | Enable/disable the persistent memory system |
+
+    <Note>
+      `CHATCLI_BOOTSTRAP_DIR` only overrides the **global** directory (`~/.chatcli/`). Project-level files (detected via `.git` or `.agent` markers) still take priority over global ones.
+    </Note>
   </Tab>
   <Tab title="Via Helm Chart">
     ```yaml
