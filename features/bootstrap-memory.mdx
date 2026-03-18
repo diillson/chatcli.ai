@@ -183,7 +183,26 @@ Os arquivos bootstrap usam cache baseado em mtime (modification time):
 
 ## Memoria Persistente
 
-O sistema de memoria mantem contexto entre sessoes do ChatCLI, permitindo que o agente "lembre" de fatos, decisoes e padroes ao longo do tempo.
+O sistema de memoria mantem contexto entre sessoes do ChatCLI usando **armazenamento estruturado** com multiplos componentes que aprendem sobre voce e seu trabalho ao longo do tempo.
+
+### Arquitetura do Sistema
+
+```text
+Conversa -> memoryWorker (3min) -> LLM extraction -> ProcessExtraction()
+                                                          |
+                    +───────────+───────────+──────────────+────────────+
+                    v           v           v              v            v
+              FactIndex    Profile    TopicTracker  ProjectTracker  DailyNote
+              (scored)     (JSON)     (JSON)        (JSON)          (.md)
+                    |
+                    v
+              Compactor (6h check, 24h cycle)
+              |-- Level 1: Score-based pruning + archive
+              +-- Level 2: LLM consolidation
+                    |
+                    v
+              MEMORY.md (regenerado, nunca source of truth)
+```
 
 ### Estrutura de Armazenamento
 
@@ -191,80 +210,126 @@ Toda a memoria fica em `~/.chatcli/memory/`:
 
 ```text
 ~/.chatcli/memory/
-|-- MEMORY.md              # Memoria de longo prazo (fatos persistentes)
+|-- MEMORY.md              # Resumo legivel (regenerado do FactIndex)
+|-- memory_index.json      # Fatos com scores de relevancia
+|-- user_profile.json      # Perfil do usuario (nome, role, expertise)
+|-- topics.json            # Topicos recorrentes com frequencia
+|-- projects.json          # Projetos ativos com contexto
+|-- usage_stats.json       # Padroes de uso e estatisticas
+|-- memory_archive.json    # Fatos arquivados (baixo score)
 |-- 202603/                # Notas diarias de marco 2026
-|   |-- 20260301.md        # Notas de 1 de marco
-|   |-- 20260302.md        # Notas de 2 de marco
-|   +-- 20260306.md        # Notas de hoje
-+-- 202602/                # Notas diarias de fevereiro 2026
-    +-- 20260228.md        # Notas de 28 de fevereiro
+|   |-- 20260301.md
+|   +-- 20260306.md
++-- 202602/
+    +-- 20260228.md
 ```
+
+### Componentes
+
+<AccordionGroup>
+  <Accordion title="FactIndex -- Memoria de Longo Prazo" icon="database">
+    Substitui o antigo MEMORY.md append-only. Cada fato tem:
+    - **ID unico** por hash SHA-256 do conteudo (deduplicacao automatica)
+    - **Categoria**: architecture, pattern, preference, gotcha, project, personal
+    - **Score temporal**: `(1 + log(accessCount)) * exp(-days * ln2 / halfLife)`
+    - **Tags** para busca por keywords
+
+    Fatos mais acessados e recentes tem scores maiores. Fatos antigos e nunca acessados decaem naturalmente.
+  </Accordion>
+  <Accordion title="UserProfile -- Perfil do Usuario" icon="user">
+    Detectado automaticamente pela IA durante a extracao:
+    - Nome, role, nivel de expertise
+    - Idioma preferido e estilo de comunicacao
+    - Comandos mais usados (top 10)
+    - Preferencias gerais
+
+    Veja com `/memory profile`.
+  </Accordion>
+  <Accordion title="TopicTracker -- Topicos Recorrentes" icon="tags">
+    Rastreia topicos tecnicos discutidos:
+    - Frequencia de mencoes
+    - Recencia (topicos recentes pesam mais)
+    - Links com fatos relacionados
+
+    Veja com `/memory topics`.
+  </Accordion>
+  <Accordion title="ProjectTracker -- Projetos" icon="folder-open">
+    Rastreia projetos em que voce trabalha:
+    - Nome, path, descricao
+    - Tecnologias usadas
+    - Status (active, paused, completed)
+    - Ultima atividade
+
+    Veja com `/memory projects`.
+  </Accordion>
+  <Accordion title="PatternDetector -- Padroes de Uso" icon="chart-line">
+    Analisa como voce usa o ChatCLI:
+    - Sessoes totais e duracao media
+    - Horas de pico de atividade
+    - Features preferidas (chat, agent, coder)
+    - Erros comuns e resolucoes
+
+    Veja com `/memory stats`.
+  </Accordion>
+</AccordionGroup>
+
+### Smart Retrieval
+
+Em vez de injetar toda a memoria no system prompt, o ChatCLI usa **retrieval inteligente**:
+
+1. Extrai keywords das ultimas mensagens da conversa
+2. Busca fatos relevantes no FactIndex por keyword match + score temporal
+3. Respeita um budget configuravel (padrao: 4000 caracteres)
+4. Prioriza: Perfil > Projetos > Topicos > Fatos relevantes > Notas recentes
 
 <Info>
-As notas diarias ficam **diretamente** em subdiretorios `YYYYMM/` dentro de `~/.chatcli/memory/`, nomeadas como `YYYYMMDD.md`. Nao existe subdiretorio `daily/`.
+Fatos acessados pelo retriever tem seu score incrementado automaticamente, criando um ciclo virtuoso: quanto mais um fato e util, mais ele aparece.
 </Info>
-
-### MEMORY.md — Memoria de Longo Prazo
-
-O `~/.chatcli/memory/MEMORY.md` armazena fatos persistentes que o agente recebe em **toda interacao**:
-
-```markdown
-# Decisoes Arquiteturais
-
-- Usamos go-prompt v0.2.6 para TUI interativa
-- Charmbracelet (glamour, lipgloss) apenas para styling, nao para TUI
-- Message bus desacoplado via cli/bus para I/O do agente
-
-# Padroes do Projeto
-
-- json.Compact recebe *bytes.Buffer, nao *strings.Builder
-- embed.FS sempre usa / nos caminhos, nunca filepath.Join
-- Parsers stateful > regex para XML com atributos especiais
-```
-
-### Notas Diarias — Journaling Temporal
-
-As notas diarias registram o que aconteceu em cada dia. O ChatCLI carrega automaticamente as **ultimas 3 notas** no prompt.
-
-Cada entrada recebe um **timestamp automatico** (hora:minuto):
-
-```markdown
-## 14:32
-
-Implementado fallback chain para provedores LLM.
-Adicionado suporte a MCP via stdio/SSE.
-47 arquivos alterados, +4920 linhas.
-
-## 16:15
-
-Decisao: usar init() auto-registration para provedores no registry.
-Decisao: cache_control:ephemeral para otimizacao de KV cache na Anthropic.
-```
 
 ### Como as Memorias sao Criadas
 
-As memorias sao gravadas **automaticamente** por um worker em background. O usuario nao precisa fazer nada.
+O worker em background agora extrai **5 tipos de informacao** (antes eram apenas 2):
 
-#### Anotacao Automatica (Background Memory Worker)
+1. **DAILY** -- O que foi feito (arquivos, comandos, erros, tarefas)
+2. **LONGTERM** -- Fatos novos para lembrar permanentemente
+3. **PROFILE_UPDATE** -- Informacoes sobre o usuario (nome, role, expertise)
+4. **TOPICS** -- Topicos tecnicos discutidos
+5. **PROJECTS** -- Projetos em que se trabalhou
 
-O ChatCLI roda um **worker em background** que analisa periodicamente o historico da conversa e usa a IA para extrair anotacoes:
+O worker dispara apos 4+ mensagens novas com cooldown de 2 minutos, e tambem a cada 3 minutos em sessoes longas.
 
-1. **Apos cada resposta da IA** (em qualquer modo: chat, agent, coder), o worker e "cutucado"
-2. Se houver **4+ novas mensagens** desde a ultima extracao e pelo menos **2 minutos** desde a ultima execucao, o worker dispara
-3. O worker envia as mensagens novas para a IA com um prompt de extracao estruturada
-4. A IA retorna dois blocos: **DAILY** (o que foi feito) e **LONGTERM** (fatos novos para lembrar)
-5. Os resultados sao gravados automaticamente em `MEMORY.md` e na nota diaria
-6. Um indicador sutil `⟳ updating memory...` aparece brevemente (apenas quando o prompt esta ocioso)
+### Compactacao Automatica
 
-O worker tambem roda periodicamente a cada 3 minutos, capturando anotacoes mesmo em sessoes longas de agent/coder.
+O sistema executa compactacao periodica para evitar crescimento descontrolado:
 
-<Info>
-O processo e totalmente transparente — voce nao precisa intervir. A IA decide sozinha o que e importante anotar. Fatos ja existentes no MEMORY.md nao sao duplicados.
-</Info>
+<Steps>
+  <Step title="Verificacao (a cada 6 horas)">
+    Checa se o numero de fatos ultrapassa 80% do limite ou se passaram 24h desde a ultima compactacao.
+  </Step>
+  <Step title="Compactacao LLM (preferida)">
+    Envia todos os fatos para a IA com instrucoes para: merge duplicatas, remover obsoletos, consolidar relacionados.
+  </Step>
+  <Step title="Fallback Score-based">
+    Se a chamada LLM falhar, arquiva fatos com score abaixo de 0.1 em `memory_archive.json`.
+  </Step>
+  <Step title="Limpeza de Notas Diarias">
+    Remove notas mais antigas que o periodo de retencao (padrao: 30 dias).
+  </Step>
+  <Step title="Regeneracao do MEMORY.md">
+    Reescreve MEMORY.md a partir do FactIndex -- sempre atualizado, nunca source of truth.
+  </Step>
+</Steps>
 
-#### Comando `/memory` — Consultar e Carregar Notas
+### Migracao Automatica
 
-Use `/memory` para ver e carregar anotacoes:
+Ao iniciar pela primeira vez com o novo sistema, o ChatCLI detecta se existe um `MEMORY.md` legado (sem `memory_index.json`) e migra automaticamente:
+
+1. Cada linha/bullet e convertida em um fato individual
+2. Categorias sao detectadas pelos headers do markdown
+3. Tags sao extraidas por keywords tecnicas
+4. O arquivo original e salvo como `MEMORY.md.bak`
+
+### Comando `/memory`
 
 | Subcomando | Descricao |
 |------------|-----------|
@@ -273,55 +338,52 @@ Use `/memory` para ver e carregar anotacoes:
 | `/memory 2026-03-04` | Mostra notas de uma data especifica |
 | `/memory week` | Mostra notas dos ultimos 7 dias |
 | `/memory longterm` | Mostra o conteudo do MEMORY.md |
-| `/memory list` | Lista todos os arquivos de memoria |
-| `/memory load <data>` | **Carrega** notas de um dia no contexto da conversa atual |
-
-O `/memory load` e especialmente util para **retomar trabalho de dias anteriores**:
-
-```bash
-/memory load yesterday
-```
-
-Isso injeta as notas de ontem na conversa, permitindo que a IA continue de onde parou.
+| `/memory list` | Lista todos os arquivos de memoria (inclui JSONs estruturados) |
+| `/memory load <data>` | Carrega notas de um dia no contexto da conversa |
+| `/memory profile` | Mostra o perfil do usuario detectado |
+| `/memory topics` | Mostra topicos rastreados com frequencia |
+| `/memory projects` | Mostra projetos rastreados com status |
+| `/memory stats` | Estatisticas completas (sessoes, horas de pico, erros, features) |
+| `/memory facts [categoria]` | Lista fatos com scores (filtro por categoria) |
+| `/memory compact` | Forca compactacao imediata (LLM + cleanup de notas) |
 
 <AccordionGroup>
-  <Accordion title="O que vai no MEMORY.md vs notas diarias?" icon="layer-group">
-    - **MEMORY.md**: Fatos **estaveis e duradouros** — decisoes arquiteturais, padroes do projeto, convencoes de equipe, preferencias confirmadas. Acumulativo ao longo de muitas sessoes.
-    - **Notas diarias** (`YYYYMM/YYYYMMDD.md`): Registros **temporais e especificos** — o que foi feito naquele dia, erros encontrados, arquivos modificados, tarefas em progresso.
+  <Accordion title="O que vai em cada componente?" icon="layer-group">
+    - **FactIndex**: Fatos estaveis e duradouros -- decisoes, padroes, gotchas, preferencias
+    - **UserProfile**: Quem voce e -- nome, role, expertise, idioma
+    - **TopicTracker**: Sobre o que voce fala -- Go, Docker, K8s, etc.
+    - **ProjectTracker**: Em que voce trabalha -- chatcli, meu-app, etc.
+    - **PatternDetector**: Como voce trabalha -- horarios, features, erros comuns
+    - **Notas diarias**: O que aconteceu hoje -- temporal e especifico
   </Accordion>
   <Accordion title="Posso editar as memorias manualmente?" icon="file-pen">
-    Sim! Os arquivos sao Markdown puro — edite com qualquer editor:
+    Sim! Todos os arquivos sao JSON ou Markdown puro:
 
     ```bash
-    # Editar memoria de longo prazo
-    vim ~/.chatcli/memory/MEMORY.md
+    # Ver perfil
+    cat ~/.chatcli/memory/user_profile.json | jq .
 
-    # Editar/criar nota de hoje
+    # Ver fatos com scores
+    cat ~/.chatcli/memory/memory_index.json | jq '.[0:5]'
+
+    # Editar nota de hoje
     vim ~/.chatcli/memory/$(date +%Y%m)/$(date +%Y%m%d).md
-
-    # Ver todas as notas
-    find ~/.chatcli/memory/ -name "*.md" -type f | sort
     ```
 
-    As alteracoes sao captadas automaticamente na proxima interacao (cache invalida por mtime).
+    Alteracoes em JSONs sao carregadas na proxima inicializacao. O MEMORY.md e regenerado e nao deve ser editado diretamente.
   </Accordion>
-  <Accordion title="Quais informacoes a IA extrai automaticamente?" icon="brain">
-    O worker de extracao pede para a IA identificar:
+  <Accordion title="Como funciona o scoring de fatos?" icon="chart-simple">
+    Cada fato tem um score calculado por:
 
-    **Notas diarias (DAILY):**
-    - Arquivos lidos, modificados ou criados (com paths)
-    - Comandos executados e seus resultados
-    - Erros encontrados e como foram resolvidos
-    - Tarefas completas ou em progresso
+    ```
+    score = (1 + log(1 + accessCount)) * exp(-daysSinceAccess * ln(2) / halfLifeDays)
+    ```
 
-    **Memoria de longo prazo (LONGTERM):**
-    - Decisoes arquiteturais tomadas
-    - Padroes ou convencoes descobertos/estabelecidos
-    - Preferencias expressas pelo usuario
-    - Insights sobre estrutura do projeto
-    - Gotchas e restricoes tecnicas
+    - **accessCount**: Quantas vezes o fato foi usado pelo retriever
+    - **daysSinceAccess**: Dias desde o ultimo acesso
+    - **halfLifeDays**: Meia-vida do decay (padrao: 30 dias)
 
-    Se nao houver nada novo para anotar, a IA simplesmente pula.
+    Fatos acessados frequentemente e recentemente tem score alto. Fatos nunca acessados decaem para ~0 apos 3-4 meias-vidas.
   </Accordion>
 </AccordionGroup>
 

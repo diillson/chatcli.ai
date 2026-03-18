@@ -183,7 +183,26 @@ Bootstrap files use mtime-based (modification time) caching:
 
 ## Persistent Memory
 
-The memory system maintains context across ChatCLI sessions, allowing the agent to "remember" facts, decisions, and patterns over time.
+The memory system maintains context across ChatCLI sessions using **structured storage** with multiple components that learn about you and your work over time.
+
+### System Architecture
+
+```text
+Conversation -> memoryWorker (3min) -> LLM extraction -> ProcessExtraction()
+                                                              |
+                    +───────────+───────────+─────────────────+────────────+
+                    v           v           v                 v            v
+              FactIndex    Profile    TopicTracker    ProjectTracker  DailyNote
+              (scored)     (JSON)     (JSON)          (JSON)          (.md)
+                    |
+                    v
+              Compactor (6h check, 24h cycle)
+              |-- Level 1: Score-based pruning + archive
+              +-- Level 2: LLM consolidation
+                    |
+                    v
+              MEMORY.md (regenerated, never source of truth)
+```
 
 ### Storage Structure
 
@@ -191,80 +210,126 @@ All memory lives in `~/.chatcli/memory/`:
 
 ```text
 ~/.chatcli/memory/
-|-- MEMORY.md              # Long-term memory (persistent facts)
+|-- MEMORY.md              # Human-readable summary (regenerated from FactIndex)
+|-- memory_index.json      # Facts with relevance scores
+|-- user_profile.json      # User profile (name, role, expertise)
+|-- topics.json            # Recurring topics with frequency
+|-- projects.json          # Active projects with context
+|-- usage_stats.json       # Usage patterns and statistics
+|-- memory_archive.json    # Archived facts (low score)
 |-- 202603/                # Daily notes for March 2026
-|   |-- 20260301.md        # Notes from March 1st
-|   |-- 20260302.md        # Notes from March 2nd
-|   +-- 20260306.md        # Today's notes
-+-- 202602/                # Daily notes for February 2026
-    +-- 20260228.md        # Notes from February 28th
+|   |-- 20260301.md
+|   +-- 20260306.md
++-- 202602/
+    +-- 20260228.md
 ```
+
+### Components
+
+<AccordionGroup>
+  <Accordion title="FactIndex -- Long-Term Memory" icon="database">
+    Replaces the old append-only MEMORY.md. Each fact has:
+    - **Unique ID** via SHA-256 content hash (automatic deduplication)
+    - **Category**: architecture, pattern, preference, gotcha, project, personal
+    - **Temporal score**: `(1 + log(accessCount)) * exp(-days * ln2 / halfLife)`
+    - **Tags** for keyword search
+
+    Frequently accessed and recent facts get higher scores. Old, never-accessed facts naturally decay.
+  </Accordion>
+  <Accordion title="UserProfile -- User Profile" icon="user">
+    Automatically detected by the AI during extraction:
+    - Name, role, expertise level
+    - Preferred language and communication style
+    - Most used commands (top 10)
+    - General preferences
+
+    View your profile with `/memory profile`.
+  </Accordion>
+  <Accordion title="TopicTracker -- Recurring Topics" icon="tags">
+    Tracks technical topics discussed:
+    - Mention frequency
+    - Recency (recent topics weigh more)
+    - Links to related facts
+
+    View with `/memory topics`.
+  </Accordion>
+  <Accordion title="ProjectTracker -- Projects" icon="folder-open">
+    Tracks projects you work on:
+    - Name, path, description
+    - Technologies used
+    - Status (active, paused, completed)
+    - Last activity
+
+    View with `/memory projects`.
+  </Accordion>
+  <Accordion title="PatternDetector -- Usage Patterns" icon="chart-line">
+    Analyzes how you use ChatCLI:
+    - Total sessions and average duration
+    - Peak activity hours
+    - Preferred features (chat, agent, coder)
+    - Common errors and resolutions
+
+    View with `/memory stats`.
+  </Accordion>
+</AccordionGroup>
+
+### Smart Retrieval
+
+Instead of dumping all memory into the system prompt, ChatCLI uses **intelligent retrieval**:
+
+1. Extracts keywords from the last few conversation messages
+2. Searches relevant facts in FactIndex by keyword match + temporal score
+3. Respects a configurable budget (default: 4000 characters)
+4. Prioritizes: Profile > Projects > Topics > Relevant facts > Recent notes
 
 <Info>
-Daily notes are stored **directly** in `YYYYMM/` subdirectories under `~/.chatcli/memory/`, named as `YYYYMMDD.md`. There is no `daily/` subdirectory.
+Facts accessed by the retriever automatically get their scores bumped, creating a virtuous cycle: the more useful a fact is, the more it appears.
 </Info>
-
-### MEMORY.md — Long-Term Memory
-
-`~/.chatcli/memory/MEMORY.md` stores persistent facts the agent receives in **every interaction**:
-
-```markdown
-# Architectural Decisions
-
-- We use go-prompt v0.2.6 for interactive TUI
-- Charmbracelet (glamour, lipgloss) only for styling, not for TUI
-- Decoupled message bus via cli/bus for agent I/O
-
-# Project Patterns
-
-- json.Compact takes *bytes.Buffer, not *strings.Builder
-- embed.FS always uses / in paths, never filepath.Join
-- Stateful parsers > regex for XML with special attributes
-```
-
-### Daily Notes — Temporal Journaling
-
-Daily notes record what happened each day. ChatCLI automatically loads the **last 3 notes** into the prompt.
-
-Each entry gets an **automatic timestamp** (hour:minute):
-
-```markdown
-## 14:32
-
-Implemented fallback chain for LLM providers.
-Added MCP support via stdio/SSE.
-47 files changed, +4920 lines.
-
-## 16:15
-
-Decision: use init() auto-registration for providers in the registry.
-Decision: cache_control:ephemeral for KV cache optimization on Anthropic.
-```
 
 ### How Memories Are Created
 
-Memories are written **automatically** by a background worker. You don't need to do anything.
+The background worker now extracts **5 types of information** (previously only 2):
 
-#### Automatic Annotation (Background Memory Worker)
+1. **DAILY** -- What was done (files, commands, errors, tasks)
+2. **LONGTERM** -- New facts to remember permanently
+3. **PROFILE_UPDATE** -- Information about the user (name, role, expertise)
+4. **TOPICS** -- Technical topics discussed
+5. **PROJECTS** -- Projects worked on
 
-ChatCLI runs a **background worker** that periodically analyzes conversation history and uses the AI to extract annotations:
+The worker fires after 4+ new messages with a 2-minute cooldown, and also every 3 minutes during long sessions.
 
-1. **After each AI response** (in any mode: chat, agent, coder), the worker is nudged
-2. If there are **4+ new messages** since the last extraction and at least **2 minutes** since the last run, the worker fires
-3. The worker sends the new messages to the AI with a structured extraction prompt
-4. The AI returns two blocks: **DAILY** (what was done) and **LONGTERM** (new facts to remember)
-5. Results are automatically saved to `MEMORY.md` and the daily note
-6. A subtle `⟳ updating memory...` indicator briefly appears (only when the prompt is idle)
+### Automatic Compaction
 
-The worker also runs periodically every 3 minutes, capturing annotations even during long agent/coder sessions.
+The system runs periodic compaction to prevent uncontrolled growth:
 
-<Info>
-The process is completely transparent — you don't need to intervene. The AI decides on its own what's important to annotate. Facts already in MEMORY.md are not duplicated.
-</Info>
+<Steps>
+  <Step title="Check (every 6 hours)">
+    Checks if the fact count exceeds 80% of the limit or if 24h have passed since the last compaction.
+  </Step>
+  <Step title="LLM Compaction (preferred)">
+    Sends all facts to the AI with instructions to: merge duplicates, remove obsolete, consolidate related. Preserves original metadata.
+  </Step>
+  <Step title="Score-based Fallback">
+    If the LLM call fails, archives facts with scores below 0.1 to `memory_archive.json`.
+  </Step>
+  <Step title="Daily Note Cleanup">
+    Removes notes older than the retention period (default: 30 days). Empty directories are cleaned up.
+  </Step>
+  <Step title="MEMORY.md Regeneration">
+    Rewrites MEMORY.md from the FactIndex -- always up-to-date, never the source of truth.
+  </Step>
+</Steps>
 
-#### `/memory` Command — View and Load Notes
+### Automatic Migration
 
-Use `/memory` to view and load annotations:
+When starting for the first time with the new system, ChatCLI detects if a legacy `MEMORY.md` exists (without `memory_index.json`) and migrates automatically:
+
+1. Each line/bullet is converted to an individual fact
+2. Categories are detected from markdown headers
+3. Tags are extracted by technical keywords
+4. The original file is saved as `MEMORY.md.bak`
+
+### `/memory` Command
 
 | Subcommand | Description |
 |------------|-------------|
@@ -273,55 +338,52 @@ Use `/memory` to view and load annotations:
 | `/memory 2026-03-04` | Show notes from a specific date |
 | `/memory week` | Show notes from the last 7 days |
 | `/memory longterm` | Show MEMORY.md content |
-| `/memory list` | List all memory files |
-| `/memory load <date>` | **Load** a day's notes into the current conversation context |
-
-`/memory load` is especially useful for **resuming work from previous days**:
-
-```bash
-/memory load yesterday
-```
-
-This injects yesterday's notes into the conversation, allowing the AI to continue where it left off.
+| `/memory list` | List all memory files (includes structured JSONs) |
+| `/memory load <date>` | Load a day's notes into conversation context |
+| `/memory profile` | Show detected user profile |
+| `/memory topics` | Show tracked topics with frequency |
+| `/memory projects` | Show tracked projects with status |
+| `/memory stats` | Full statistics (sessions, peak hours, errors, features) |
+| `/memory facts [category]` | List facts with scores (filter by category) |
+| `/memory compact` | Force immediate compaction (LLM + note cleanup) |
 
 <AccordionGroup>
-  <Accordion title="What goes in MEMORY.md vs daily notes?" icon="layer-group">
-    - **MEMORY.md**: **Stable and long-lasting** facts — architectural decisions, project patterns, team conventions, confirmed preferences. Accumulates across many sessions.
-    - **Daily notes** (`YYYYMM/YYYYMMDD.md`): **Temporal and specific** records — what was done that day, errors found, files modified, tasks in progress.
+  <Accordion title="What goes in each component?" icon="layer-group">
+    - **FactIndex**: Stable, long-lasting facts -- decisions, patterns, gotchas, preferences
+    - **UserProfile**: Who you are -- name, role, expertise, language
+    - **TopicTracker**: What you talk about -- Go, Docker, K8s, etc.
+    - **ProjectTracker**: What you work on -- chatcli, my-app, etc.
+    - **PatternDetector**: How you work -- schedules, features, common errors
+    - **Daily notes**: What happened today -- temporal and specific
   </Accordion>
   <Accordion title="Can I edit memories manually?" icon="file-pen">
-    Yes! The files are plain Markdown — edit with any editor:
+    Yes! All files are plain JSON or Markdown:
 
     ```bash
-    # Edit long-term memory
-    vim ~/.chatcli/memory/MEMORY.md
+    # View profile
+    cat ~/.chatcli/memory/user_profile.json | jq .
 
-    # Edit/create today's note
+    # View facts with scores
+    cat ~/.chatcli/memory/memory_index.json | jq '.[0:5]'
+
+    # Edit today's note
     vim ~/.chatcli/memory/$(date +%Y%m)/$(date +%Y%m%d).md
-
-    # List all notes
-    find ~/.chatcli/memory/ -name "*.md" -type f | sort
     ```
 
-    Changes are picked up automatically on the next interaction (cache invalidates by mtime).
+    JSON changes are loaded on next startup. MEMORY.md is regenerated and should not be edited directly.
   </Accordion>
-  <Accordion title="What information does the AI extract automatically?" icon="brain">
-    The extraction worker asks the AI to identify:
+  <Accordion title="How does fact scoring work?" icon="chart-simple">
+    Each fact has a score calculated by:
 
-    **Daily notes (DAILY):**
-    - Files read, modified or created (with paths)
-    - Commands executed and their outcomes
-    - Errors encountered and how they were resolved
-    - Tasks completed or in progress
+    ```
+    score = (1 + log(1 + accessCount)) * exp(-daysSinceAccess * ln(2) / halfLifeDays)
+    ```
 
-    **Long-term memory (LONGTERM):**
-    - Architectural decisions made
-    - Patterns or conventions discovered/established
-    - User preferences expressed
-    - Insights about project structure
-    - Gotchas and technical constraints
+    - **accessCount**: How many times the fact was used by the retriever
+    - **daysSinceAccess**: Days since last access
+    - **halfLifeDays**: Decay half-life (default: 30 days)
 
-    If there's nothing new to annotate, the AI simply skips.
+    Frequently and recently accessed facts get high scores. Never-accessed facts decay to ~0 after 3-4 half-lives.
   </Accordion>
 </AccordionGroup>
 
