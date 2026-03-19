@@ -1,0 +1,434 @@
+---
+title: "AIOps: Setup Produção Completo"
+sidebarTitle: "AIOps Production Setup"
+description: "Guia passo a passo para configurar a plataforma AIOps do ChatCLI em produção com todos os componentes: notificações, SLOs, aprovações, chaos engineering e observabilidade."
+icon: "rocket"
+---
+
+Este cookbook cobre a configuração completa da plataforma AIOps do ChatCLI para um ambiente de produção real — desde a instalação até a validação com chaos engineering.
+
+---
+
+## Pré-requisitos
+
+<Check>Cluster Kubernetes 1.25+</Check>
+<Check>Helm 3.x instalado</Check>
+<Check>Prometheus Operator (para ServiceMonitor)</Check>
+<Check>Grafana (para dashboards)</Check>
+<Check>Pelo menos uma API key de LLM (OpenAI, Claude, Google AI)</Check>
+
+---
+
+## 1. Instalar o Operator
+
+<Steps>
+  <Step title="Instalar CRDs via Helm">
+    ```bash
+    helm install chatcli-operator ./deploy/helm/chatcli/ \
+      --namespace chatcli-system \
+      --create-namespace \
+      --set operator.image.tag=latest
+    ```
+  </Step>
+
+  <Step title="Verificar CRDs instalados">
+    ```bash
+    kubectl get crd | grep platform.chatcli.io
+    ```
+
+    Devem aparecer 16 CRDs:
+    ```
+    aiinsights.platform.chatcli.io
+    anomalies.platform.chatcli.io
+    approvalpolicies.platform.chatcli.io
+    approvalrequests.platform.chatcli.io
+    auditevents.platform.chatcli.io
+    chaosexperiments.platform.chatcli.io
+    clusterregistrations.platform.chatcli.io
+    escalationpolicies.platform.chatcli.io
+    incidentslas.platform.chatcli.io
+    instances.platform.chatcli.io
+    issues.platform.chatcli.io
+    notificationpolicies.platform.chatcli.io
+    postmortems.platform.chatcli.io
+    remediationplans.platform.chatcli.io
+    runbooks.platform.chatcli.io
+    servicelevelobjectives.platform.chatcli.io
+    ```
+  </Step>
+
+  <Step title="Criar Secret com API Keys">
+    ```bash
+    kubectl create secret generic chatcli-api-keys \
+      --namespace chatcli-system \
+      --from-literal=ANTHROPIC_API_KEY=sk-ant-xxx \
+      --from-literal=OPENAI_API_KEY=sk-xxx
+    ```
+  </Step>
+</Steps>
+
+---
+
+## 2. Criar Instância ChatCLI
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-prod
+  namespace: chatcli-system
+spec:
+  replicas: 2
+  provider: CLAUDEAI
+  model: claude-sonnet-4-20250514
+  server:
+    port: 50051
+    metricsPort: 9090
+    tls:
+      enabled: true
+      secretName: chatcli-tls
+    token:
+      name: chatcli-auth
+      key: token
+  apiKeys:
+    name: chatcli-api-keys
+  watcher:
+    enabled: true
+    targets:
+      - deployment: api-gateway
+        namespace: production
+        metricsPort: 8080
+        metricsPath: /metrics
+      - deployment: payment-service
+        namespace: production
+        metricsPort: 8080
+      - deployment: user-service
+        namespace: production
+    interval: "30s"
+    window: "2h"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  persistence:
+    enabled: true
+    size: 5Gi
+```
+
+---
+
+## 3. Configurar Notificações
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: NotificationPolicy
+metadata:
+  name: prod-notifications
+  namespace: chatcli-system
+spec:
+  enabled: true
+  channels:
+    - name: slack-incidents
+      type: slack
+      config:
+        webhook_url: "https://hooks.slack.com/services/T.../B.../xxx"
+        channel: "#incidents"
+    - name: pagerduty-critical
+      type: pagerduty
+      config:
+        routing_key: "R0xxxxxxxxxxxxxxxxxxxx"
+    - name: email-management
+      type: email
+      config:
+        smtp_host: smtp.gmail.com
+        smtp_port: "587"
+        from: aiops@company.com
+        to: "sre-team@company.com,management@company.com"
+      secretRef:
+        name: smtp-credentials
+  rules:
+    - name: critical-to-pagerduty
+      severities: [critical]
+      states: [Detected, Escalated]
+      channels: [pagerduty-critical, slack-incidents]
+    - name: high-to-slack
+      severities: [critical, high]
+      states: [Detected, Analyzing, Remediating, Resolved, Escalated]
+      channels: [slack-incidents]
+    - name: escalations-to-email
+      states: [Escalated]
+      channels: [email-management]
+  throttle:
+    maxPerHour: 20
+    deduplicationWindow: "5m"
+```
+
+---
+
+## 4. Configurar Escalação
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: EscalationPolicy
+metadata:
+  name: prod-escalation
+  namespace: chatcli-system
+spec:
+  enabled: true
+  severities: [critical, high]
+  levels:
+    - name: L1-OnCall
+      timeoutMinutes: 5
+      targets:
+        - type: oncall
+          name: primary-oncall
+      notifyChannels: [slack-incidents, pagerduty-critical]
+      repeatIntervalMinutes: 5
+    - name: L2-SeniorSRE
+      timeoutMinutes: 15
+      targets:
+        - type: team
+          name: sre-senior
+      notifyChannels: [slack-incidents, pagerduty-critical]
+    - name: L3-Engineering-Lead
+      timeoutMinutes: 30
+      targets:
+        - type: user
+          name: eng-lead@company.com
+      notifyChannels: [slack-incidents, email-management]
+```
+
+---
+
+## 5. Definir SLOs
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: api-gateway-availability
+  namespace: chatcli-system
+spec:
+  serviceName: api-gateway
+  description: "API Gateway deve manter 99.9% de disponibilidade"
+  enabled: true
+  indicator:
+    type: availability
+    metricSource: issues
+    resource:
+      kind: Deployment
+      name: api-gateway
+      namespace: production
+  target:
+    percentage: 99.9
+    window: "30d"
+  alertPolicy:
+    pageOnBudgetExhausted: true
+    notificationPolicyRef: prod-notifications
+    burnRateWindows:
+      - shortWindow: "1h"
+        longWindow: "6h"
+        burnRateThreshold: 14.4
+        severity: critical
+      - shortWindow: "6h"
+        longWindow: "72h"
+        burnRateThreshold: 6
+        severity: high
+      - shortWindow: "24h"
+        longWindow: "72h"
+        burnRateThreshold: 3
+        severity: medium
+```
+
+---
+
+## 6. Definir SLAs
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: p1-sla
+  namespace: chatcli-system
+spec:
+  severity: critical
+  responseTime: "5m"
+  resolutionTime: "1h"
+  escalationPolicyRef: prod-escalation
+  notificationPolicyRef: prod-notifications
+  businessHoursOnly: false
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: p2-sla
+  namespace: chatcli-system
+spec:
+  severity: high
+  responseTime: "15m"
+  resolutionTime: "4h"
+  escalationPolicyRef: prod-escalation
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
+    startHour: 9
+    endHour: 18
+    workDays: ["Monday","Tuesday","Wednesday","Thursday","Friday"]
+```
+
+---
+
+## 7. Configurar Aprovações
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ApprovalPolicy
+metadata:
+  name: prod-approvals
+  namespace: chatcli-system
+spec:
+  enabled: true
+  defaultMode: manual
+  rules:
+    - name: auto-low-confidence
+      match:
+        severities: [low]
+        actionTypes: [RestartDeployment, DeletePod]
+      mode: auto
+      autoApproveConditions:
+        minConfidence: 0.95
+        maxSeverity: low
+        historicalSuccessRate: 0.90
+    - name: quorum-production-rollback
+      match:
+        severities: [critical, high]
+        actionTypes: [RollbackDeployment, ScaleDeployment]
+        namespaces: [production]
+      mode: quorum
+      requiredApprovers: 2
+      timeoutMinutes: 15
+      changeWindow:
+        timezone: "America/Sao_Paulo"
+        allowedDays: ["Monday","Tuesday","Wednesday","Thursday","Friday"]
+        startHour: 9
+        endHour: 17
+    - name: manual-resource-changes
+      match:
+        actionTypes: [AdjustResources, PatchConfig]
+      mode: manual
+      timeoutMinutes: 30
+```
+
+---
+
+## 8. Instalar Grafana Dashboards
+
+```bash
+# Criar ConfigMap com dashboards
+kubectl create configmap chatcli-grafana-dashboards \
+  --from-file=deploy/grafana/ \
+  -n monitoring \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Adicionar label para Grafana sidecar auto-discovery
+kubectl label configmap chatcli-grafana-dashboards \
+  grafana_dashboard=1 -n monitoring
+
+# Instalar ServiceMonitors
+kubectl apply -f deploy/grafana/dashboards-configmap.yaml
+```
+
+---
+
+## 9. Validar com Chaos Engineering
+
+<Warning>
+Execute chaos experiments apenas em ambientes com redundância. Nunca em single-replica deployments.
+</Warning>
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: validate-api-gateway-resilience
+  namespace: chatcli-system
+spec:
+  experimentType: pod_kill
+  target:
+    kind: Deployment
+    name: api-gateway
+    namespace: production
+  duration: "2m"
+  parameters:
+    count: "1"
+  dryRun: true  # Teste primeiro em dry-run!
+  enabled: true
+  safetyChecks:
+    minHealthyPods: 2
+    maxConcurrentExperiments: 1
+    abortOnIssueDetected: true
+    requireApproval: true
+    blockedNamespaces: ["kube-system", "monitoring"]
+  postExperiment:
+    verifyRecovery: true
+    recoveryTimeout: "5m"
+    runRemediationTest: false
+```
+
+<Steps>
+  <Step title="Executar em DryRun">
+    ```bash
+    kubectl apply -f chaos-experiment.yaml
+    kubectl get chaos -w
+    ```
+  </Step>
+  <Step title="Verificar resultado">
+    ```bash
+    kubectl get chaos validate-api-gateway-resilience -o yaml
+    ```
+  </Step>
+  <Step title="Executar de verdade (após validação)">
+    Edite `dryRun: false` e reaplique.
+  </Step>
+</Steps>
+
+---
+
+## 10. Acessar o Dashboard
+
+```bash
+# Port-forward para o REST API + Web UI
+kubectl port-forward svc/chatcli-prod 8090:8090 -n chatcli-system
+
+# Abrir no browser
+open http://localhost:8090
+```
+
+O dashboard web mostra:
+- Overview com stats em tempo real
+- Incidents com filtros e ações (acknowledge, snooze)
+- SLOs com error budget e burn rates
+- Approvals pendentes
+- PostMortems com timeline
+- Clusters federados
+- Audit log pesquisável
+
+---
+
+## Checklist de Produção
+
+<Check>Operator instalado com 16 CRDs</Check>
+<Check>Instance criada com TLS e auth</Check>
+<Check>Watcher monitorando deployments alvo</Check>
+<Check>NotificationPolicy com Slack + PagerDuty</Check>
+<Check>EscalationPolicy L1→L2→L3</Check>
+<Check>SLOs com burn rate alerting (Google SRE model)</Check>
+<Check>SLAs com response/resolution time por severity</Check>
+<Check>ApprovalPolicy com auto/quorum para produção</Check>
+<Check>Grafana dashboards instalados</Check>
+<Check>Chaos experiment validado em dry-run</Check>
+<Check>Web Dashboard acessível</Check>
+<Check>REST API com autenticação configurada</Check>

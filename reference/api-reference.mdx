@@ -1,0 +1,1821 @@
+---
+title: "API REST Reference"
+sidebarTitle: "API REST"
+description: "Referência completa da API REST do AIOps Platform — todos os endpoints, parâmetros e exemplos."
+icon: "code"
+---
+
+A **API REST do AIOps Platform** permite integrar qualquer sistema externo com a plataforma de operações autônomas do ChatCLI. Todos os endpoints seguem convenções RESTful e retornam JSON.
+
+A API é servida pelo Web Dashboard na porta `8090` (configurável via `CHATCLI_AIOPS_PORT`).
+
+---
+
+## Autenticação
+
+<AccordionGroup>
+  <Accordion title="X-API-Key Header">
+    Todas as requisições autenticadas devem incluir o header `X-API-Key`:
+
+    ```bash
+    curl -H "X-API-Key: seu-token-aqui" http://localhost:8090/api/v1/incidents
+    ```
+
+    As chaves são configuradas via ConfigMap `chatcli-api-keys` no namespace do operator:
+
+    ```yaml
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: chatcli-api-keys
+    data:
+      keys.json: |
+        {
+          "keys": [
+            {"key": "ops-key-abc123", "role": "operator", "description": "CI/CD pipeline"},
+            {"key": "view-key-xyz789", "role": "viewer", "description": "Dashboard read-only"},
+            {"key": "admin-key-root01", "role": "admin", "description": "Platform admin"}
+          ]
+        }
+    ```
+  </Accordion>
+
+  <Accordion title="Roles e Permissões">
+    | Role | Leitura | Ack/Snooze | Aprovar/Rejeitar | CRUD Runbooks | Audit Export |
+    |------|---------|------------|-----------------|---------------|-------------|
+    | `viewer` | Sim | Nao | Nao | Nao | Nao |
+    | `operator` | Sim | Sim | Sim | Nao | Nao |
+    | `admin` | Sim | Sim | Sim | Sim | Sim |
+  </Accordion>
+
+  <Accordion title="Modo Desenvolvimento">
+    Quando nenhuma chave de API está configurada (ConfigMap ausente), a API opera em **modo dev** — todas as requisições são permitidas sem autenticação.
+
+    <Warning>
+      Nunca use modo dev em produção. Configure ao menos uma chave de API antes de expor o serviço.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Rate Limiting">
+    A API aplica rate limiting de **100 requisições por minuto** por IP.
+
+    Quando o limite é excedido, a API retorna:
+
+    ```json
+    {
+      "error": "rate limit exceeded",
+      "retry_after_seconds": 42
+    }
+    ```
+
+    | Header | Descrição |
+    |--------|-----------|
+    | `X-RateLimit-Limit` | Limite por janela (100) |
+    | `X-RateLimit-Remaining` | Requisições restantes |
+    | `X-RateLimit-Reset` | Timestamp Unix do reset da janela |
+    | `Retry-After` | Segundos até o reset (apenas quando excedido) |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Formato de Resposta
+
+Todas as respostas seguem o envelope padrão:
+
+**Sucesso (item único):**
+```json
+{
+  "data": { ... }
+}
+```
+
+**Sucesso (lista com paginação):**
+```json
+{
+  "data": [ ... ],
+  "pagination": {
+    "page": 1,
+    "pageSize": 20,
+    "total": 142,
+    "totalPages": 8
+  }
+}
+```
+
+**Erro:**
+```json
+{
+  "error": "mensagem descritiva do erro",
+  "code": "NOT_FOUND"
+}
+```
+
+---
+
+## Health
+
+Endpoints de health check não requerem autenticação.
+
+### GET /healthz
+
+Verifica se o servidor está vivo.
+
+<ParamField header="Authorization" type="none">
+  Nenhuma autenticação necessária.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "status": "ok",
+  "timestamp": "2026-03-19T14:30:00Z"
+}
+```
+
+```bash
+curl http://localhost:8090/healthz
+```
+
+### GET /readyz
+
+Verifica se o servidor está pronto para receber tráfego (conectado ao cluster, reconcilers ativos).
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "status": "ready",
+  "checks": {
+    "kubernetes": "connected",
+    "reconcilers": "running",
+    "grpc_server": "listening"
+  },
+  "timestamp": "2026-03-19T14:30:00Z"
+}
+```
+
+**Resposta `503 Service Unavailable`:**
+
+```json
+{
+  "status": "not_ready",
+  "checks": {
+    "kubernetes": "connected",
+    "reconcilers": "starting",
+    "grpc_server": "not_listening"
+  },
+  "timestamp": "2026-03-19T14:30:00Z"
+}
+```
+
+```bash
+curl http://localhost:8090/readyz
+```
+
+---
+
+## Incidents
+
+Gerenciamento de incidentes detectados pelo pipeline AIOps.
+
+### GET /api/v1/incidents
+
+Lista todos os incidentes com filtros e paginação.
+
+**Role mínimo:** `viewer`
+
+<ParamField query="severity" type="string">
+  Filtrar por severidade. Valores: `critical`, `high`, `medium`, `low`.
+</ParamField>
+
+<ParamField query="state" type="string">
+  Filtrar por estado. Valores: `detected`, `analyzing`, `remediating`, `resolved`, `escalated`.
+</ParamField>
+
+<ParamField query="namespace" type="string">
+  Filtrar por namespace Kubernetes.
+</ParamField>
+
+<ParamField query="page" type="integer" default="1">
+  Número da página.
+</ParamField>
+
+<ParamField query="pageSize" type="integer" default="20">
+  Itens por página. Máximo: 100.
+</ParamField>
+
+<ParamField query="from" type="string">
+  Data/hora de início no formato ISO 8601. Ex: `2026-03-01T00:00:00Z`.
+</ParamField>
+
+<ParamField query="to" type="string">
+  Data/hora de fim no formato ISO 8601.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "name": "issue-crashloop-api-server-production",
+      "namespace": "production",
+      "state": "remediating",
+      "severity": "critical",
+      "riskScore": 75,
+      "signalType": "pod_restart",
+      "resource": {
+        "kind": "Deployment",
+        "name": "api-server"
+      },
+      "description": "Pod api-server-7d4f8b6c9-x2k4m em CrashLoopBackOff (15 restarts)",
+      "detectedAt": "2026-03-19T14:10:00Z",
+      "acknowledgedAt": null,
+      "resolvedAt": null,
+      "remediationAttempts": 1,
+      "maxRemediationAttempts": 3,
+      "labels": {
+        "platform.chatcli.io/signal": "pod_restart",
+        "platform.chatcli.io/severity": "critical"
+      }
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "pageSize": 20,
+    "total": 42,
+    "totalPages": 3
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/incidents?severity=critical&state=remediating&page=1&pageSize=10"
+```
+
+### GET /api/v1/incidents/{name}
+
+Retorna detalhes completos de um incidente específico.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do incidente (Issue CR name).
+</ParamField>
+
+<ParamField query="namespace" type="string" default="default">
+  Namespace do incidente.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "issue-crashloop-api-server-production",
+    "namespace": "production",
+    "state": "remediating",
+    "severity": "critical",
+    "riskScore": 75,
+    "signalType": "pod_restart",
+    "resource": {
+      "kind": "Deployment",
+      "name": "api-server"
+    },
+    "description": "Pod api-server-7d4f8b6c9-x2k4m em CrashLoopBackOff (15 restarts)",
+    "detectedAt": "2026-03-19T14:10:00Z",
+    "acknowledgedAt": null,
+    "resolvedAt": null,
+    "remediationAttempts": 1,
+    "maxRemediationAttempts": 3,
+    "analysis": {
+      "rootCause": "OOM Kill causado por memory leak no handler /api/v1/export",
+      "confidence": 0.92,
+      "recommendations": [
+        "Aumentar memory limit para 1Gi",
+        "Investigar endpoint /api/v1/export para memory leak",
+        "Adicionar pprof profiling"
+      ],
+      "provider": "claude",
+      "model": "claude-sonnet-4-20250514"
+    },
+    "remediationPlan": {
+      "name": "plan-issue-crashloop-api-server-production-1",
+      "state": "executing",
+      "agenticMode": false,
+      "actions": [
+        {
+          "name": "adjust-memory",
+          "type": "AdjustResources",
+          "params": {"memory_limit": "1Gi", "memory_request": "512Mi"},
+          "result": "pending"
+        }
+      ]
+    },
+    "anomalies": [
+      "anomaly-pod-restart-api-server-production-a1b2c3",
+      "anomaly-oom-kill-api-server-production-d4e5f6"
+    ],
+    "labels": {
+      "platform.chatcli.io/signal": "pod_restart",
+      "platform.chatcli.io/severity": "critical",
+      "platform.chatcli.io/incident-id": "abc123def456"
+    }
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/incidents/issue-crashloop-api-server-production?namespace=production"
+```
+
+### POST /api/v1/incidents/{name}/acknowledge
+
+Marca um incidente como reconhecido (acknowledged).
+
+**Role mínimo:** `operator`
+
+<ParamField path="name" type="string" required>
+  Nome do incidente.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "issue-crashloop-api-server-production",
+    "state": "remediating",
+    "acknowledgedAt": "2026-03-19T14:35:00Z",
+    "acknowledgedBy": "operator:ops-key-abc123"
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/incidents/issue-crashloop-api-server-production/acknowledge"
+```
+
+### POST /api/v1/incidents/{name}/snooze
+
+Suspende notificações de um incidente por uma duração especificada.
+
+**Role mínimo:** `operator`
+
+<ParamField path="name" type="string" required>
+  Nome do incidente.
+</ParamField>
+
+<ParamField body="duration" type="string" required>
+  Duração do snooze. Formato Go duration: `30m`, `1h`, `2h30m`, `24h`.
+</ParamField>
+
+**Request body:**
+
+```json
+{
+  "duration": "1h"
+}
+```
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "issue-crashloop-api-server-production",
+    "snoozedUntil": "2026-03-19T15:35:00Z",
+    "snoozeDuration": "1h"
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: ops-key-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": "1h"}' \
+  "http://localhost:8090/api/v1/incidents/issue-crashloop-api-server-production/snooze"
+```
+
+### GET /api/v1/incidents/{name}/timeline
+
+Retorna a timeline completa de um incidente — desde a detecção até a resolução.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do incidente.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "issue-crashloop-api-server-production",
+    "events": [
+      {
+        "timestamp": "2026-03-19T14:10:00Z",
+        "type": "detected",
+        "description": "Anomalia detectada: CrashLoopBackOff no pod api-server-7d4f8b6c9-x2k4m"
+      },
+      {
+        "timestamp": "2026-03-19T14:10:12Z",
+        "type": "correlated",
+        "description": "Correlacionado com anomalia OOM Kill — risk score atualizado para 75 (Critical)"
+      },
+      {
+        "timestamp": "2026-03-19T14:10:30Z",
+        "type": "analysis_started",
+        "description": "AIInsight criado — análise por IA iniciada (claude/claude-sonnet-4-20250514)"
+      },
+      {
+        "timestamp": "2026-03-19T14:11:05Z",
+        "type": "analysis_completed",
+        "description": "Causa raiz identificada: OOM Kill por memory leak (confidence: 0.92)"
+      },
+      {
+        "timestamp": "2026-03-19T14:11:10Z",
+        "type": "remediation_started",
+        "description": "RemediationPlan criado: AdjustResources (memory_limit: 1Gi)"
+      },
+      {
+        "timestamp": "2026-03-19T14:11:45Z",
+        "type": "action_executed",
+        "description": "AdjustResources executado com sucesso — deployment atualizado"
+      },
+      {
+        "timestamp": "2026-03-19T14:13:00Z",
+        "type": "resolved",
+        "description": "Incidente resolvido automaticamente — pods healthy"
+      }
+    ],
+    "duration": "2m60s"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/incidents/issue-crashloop-api-server-production/timeline"
+```
+
+### GET /api/v1/incidents/{name}/remediation
+
+Retorna detalhes da remediação de um incidente, incluindo o plano, ações executadas e resultados.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do incidente.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "incidentName": "issue-crashloop-api-server-production",
+    "plans": [
+      {
+        "name": "plan-issue-crashloop-api-server-production-1",
+        "state": "completed",
+        "agenticMode": false,
+        "runbookRef": "auto-pod-restart-critical-deployment",
+        "actions": [
+          {
+            "name": "adjust-memory",
+            "type": "AdjustResources",
+            "description": "Aumentar memory limit para 1Gi",
+            "params": {"memory_limit": "1Gi", "memory_request": "512Mi"},
+            "result": "success",
+            "executedAt": "2026-03-19T14:11:45Z",
+            "preflightSnapshot": {
+              "memory_limit": "256Mi",
+              "memory_request": "128Mi"
+            }
+          }
+        ],
+        "startedAt": "2026-03-19T14:11:10Z",
+        "completedAt": "2026-03-19T14:13:00Z"
+      }
+    ],
+    "totalAttempts": 1,
+    "maxAttempts": 3
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/incidents/issue-crashloop-api-server-production/remediation"
+```
+
+---
+
+## SLOs
+
+Gerenciamento de Service Level Objectives.
+
+### GET /api/v1/slos
+
+Lista todos os SLOs configurados.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "name": "api-availability",
+      "namespace": "production",
+      "target": 99.9,
+      "current": 99.85,
+      "window": "30d",
+      "sliType": "availability",
+      "service": "api-server",
+      "state": "at_risk",
+      "burnRate": {
+        "1h": 2.4,
+        "6h": 1.8,
+        "24h": 1.2,
+        "72h": 0.9
+      }
+    },
+    {
+      "name": "api-latency-p99",
+      "namespace": "production",
+      "target": 99.0,
+      "current": 99.45,
+      "window": "30d",
+      "sliType": "latency",
+      "service": "api-server",
+      "state": "healthy",
+      "burnRate": {
+        "1h": 0.3,
+        "6h": 0.5,
+        "24h": 0.4,
+        "72h": 0.3
+      }
+    }
+  ]
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/slos"
+```
+
+### GET /api/v1/slos/{name}
+
+Retorna detalhes de um SLO específico.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do SLO.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "api-availability",
+    "namespace": "production",
+    "target": 99.9,
+    "current": 99.85,
+    "window": "30d",
+    "sliType": "availability",
+    "service": "api-server",
+    "state": "at_risk",
+    "errorBudget": {
+      "total": 43.2,
+      "remaining": 8.6,
+      "consumed": 34.6,
+      "consumedPercent": 80.1
+    },
+    "burnRate": {
+      "1h": 2.4,
+      "6h": 1.8,
+      "24h": 1.2,
+      "72h": 0.9
+    },
+    "alerts": [
+      {
+        "window": "1h",
+        "burnRate": 2.4,
+        "threshold": 14.4,
+        "firing": false
+      },
+      {
+        "window": "6h",
+        "burnRate": 1.8,
+        "threshold": 6.0,
+        "firing": false
+      }
+    ],
+    "history": [
+      {"date": "2026-03-18", "value": 99.92},
+      {"date": "2026-03-17", "value": 99.97},
+      {"date": "2026-03-16", "value": 99.88}
+    ]
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/slos/api-availability"
+```
+
+### GET /api/v1/slos/{name}/budget
+
+Retorna o error budget detalhado de um SLO.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do SLO.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "api-availability",
+    "target": 99.9,
+    "window": "30d",
+    "budget": {
+      "totalMinutes": 43.2,
+      "remainingMinutes": 8.6,
+      "consumedMinutes": 34.6,
+      "consumedPercent": 80.1,
+      "projectedExhaustion": "2026-03-22T06:00:00Z",
+      "burnRateMultiple": 1.8,
+      "recommendation": "Error budget consumido a 80%. Considere congelar deploys até recuperação."
+    }
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/slos/api-availability/budget"
+```
+
+---
+
+## Runbooks
+
+CRUD de runbooks de remediação.
+
+### GET /api/v1/runbooks
+
+Lista todos os runbooks disponíveis.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "name": "restart-on-crashloop",
+      "namespace": "chatcli-system",
+      "description": "Reinicia deployment em CrashLoopBackOff",
+      "trigger": {
+        "signalType": "pod_restart",
+        "severity": "high",
+        "resourceKind": "Deployment"
+      },
+      "steps": [
+        {
+          "name": "restart-deployment",
+          "action": "RestartDeployment",
+          "description": "Reinicia o deployment afetado"
+        }
+      ],
+      "autoGenerated": false,
+      "timesUsed": 12,
+      "lastUsedAt": "2026-03-18T20:15:00Z"
+    },
+    {
+      "name": "auto-pod-restart-critical-deployment",
+      "namespace": "chatcli-system",
+      "description": "Runbook auto-gerado pela IA para pod_restart/Critical/Deployment",
+      "trigger": {
+        "signalType": "pod_restart",
+        "severity": "critical",
+        "resourceKind": "Deployment"
+      },
+      "steps": [
+        {
+          "name": "adjust-memory",
+          "action": "AdjustResources",
+          "description": "Aumentar memory limit",
+          "params": {"memory_limit": "1Gi", "memory_request": "512Mi"}
+        }
+      ],
+      "autoGenerated": true,
+      "timesUsed": 3,
+      "lastUsedAt": "2026-03-19T14:13:00Z",
+      "labels": {
+        "platform.chatcli.io/auto-generated": "true"
+      }
+    }
+  ]
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/runbooks"
+```
+
+### GET /api/v1/runbooks/{name}
+
+Retorna detalhes de um runbook específico.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do runbook.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "restart-on-crashloop",
+    "namespace": "chatcli-system",
+    "description": "Reinicia deployment em CrashLoopBackOff",
+    "trigger": {
+      "signalType": "pod_restart",
+      "severity": "high",
+      "resourceKind": "Deployment"
+    },
+    "steps": [
+      {
+        "name": "restart-deployment",
+        "action": "RestartDeployment",
+        "description": "Reinicia o deployment afetado"
+      }
+    ],
+    "approvalRequired": false,
+    "autoGenerated": false,
+    "createdAt": "2026-02-15T10:00:00Z",
+    "updatedAt": "2026-03-01T08:30:00Z",
+    "timesUsed": 12,
+    "lastUsedAt": "2026-03-18T20:15:00Z"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/runbooks/restart-on-crashloop"
+```
+
+### POST /api/v1/runbooks
+
+Cria um novo runbook.
+
+**Role mínimo:** `admin`
+
+**Request body:**
+
+```json
+{
+  "name": "scale-on-high-cpu",
+  "namespace": "chatcli-system",
+  "description": "Escala deployment quando CPU alta",
+  "trigger": {
+    "signalType": "latency_spike",
+    "severity": "high",
+    "resourceKind": "Deployment"
+  },
+  "steps": [
+    {
+      "name": "scale-up",
+      "action": "ScaleDeployment",
+      "description": "Aumenta replicas para 5",
+      "params": {"replicas": "5"}
+    }
+  ],
+  "approvalRequired": true
+}
+```
+
+**Resposta `201 Created`:**
+
+```json
+{
+  "data": {
+    "name": "scale-on-high-cpu",
+    "namespace": "chatcli-system",
+    "createdAt": "2026-03-19T15:00:00Z",
+    "message": "Runbook criado com sucesso"
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: admin-key-root01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "scale-on-high-cpu",
+    "namespace": "chatcli-system",
+    "description": "Escala deployment quando CPU alta",
+    "trigger": {
+      "signalType": "latency_spike",
+      "severity": "high",
+      "resourceKind": "Deployment"
+    },
+    "steps": [
+      {
+        "name": "scale-up",
+        "action": "ScaleDeployment",
+        "description": "Aumenta replicas para 5",
+        "params": {"replicas": "5"}
+      }
+    ],
+    "approvalRequired": true
+  }' \
+  "http://localhost:8090/api/v1/runbooks"
+```
+
+### PUT /api/v1/runbooks/{name}
+
+Atualiza um runbook existente.
+
+**Role mínimo:** `admin`
+
+<ParamField path="name" type="string" required>
+  Nome do runbook a atualizar.
+</ParamField>
+
+**Request body:** Mesmo formato do POST (corpo completo do RunbookSpec).
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "scale-on-high-cpu",
+    "namespace": "chatcli-system",
+    "updatedAt": "2026-03-19T16:00:00Z",
+    "message": "Runbook atualizado com sucesso"
+  }
+}
+```
+
+```bash
+curl -X PUT -H "X-API-Key: admin-key-root01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "scale-on-high-cpu",
+    "namespace": "chatcli-system",
+    "description": "Escala deployment quando CPU alta (atualizado)",
+    "trigger": {
+      "signalType": "latency_spike",
+      "severity": "high",
+      "resourceKind": "Deployment"
+    },
+    "steps": [
+      {
+        "name": "scale-up",
+        "action": "ScaleDeployment",
+        "description": "Aumenta replicas para 8",
+        "params": {"replicas": "8"}
+      }
+    ],
+    "approvalRequired": false
+  }' \
+  "http://localhost:8090/api/v1/runbooks/scale-on-high-cpu"
+```
+
+### DELETE /api/v1/runbooks/{name}
+
+Remove um runbook.
+
+**Role mínimo:** `admin`
+
+<ParamField path="name" type="string" required>
+  Nome do runbook a remover.
+</ParamField>
+
+<Warning>
+  Runbooks auto-gerados (`platform.chatcli.io/auto-generated=true`) podem ser recriados automaticamente pela IA em futuras remediações.
+</Warning>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "scale-on-high-cpu",
+    "message": "Runbook removido com sucesso"
+  }
+}
+```
+
+```bash
+curl -X DELETE -H "X-API-Key: admin-key-root01" \
+  "http://localhost:8090/api/v1/runbooks/scale-on-high-cpu"
+```
+
+---
+
+## Approvals
+
+Gerenciamento de aprovações para ações que requerem intervenção humana.
+
+### GET /api/v1/approvals
+
+Lista aprovações pendentes ou históricas.
+
+**Role mínimo:** `viewer`
+
+<ParamField query="state" type="string">
+  Filtrar por estado. Valores: `pending`, `approved`, `rejected`, `expired`.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "name": "approval-custom-action-api-server-production",
+      "namespace": "production",
+      "state": "pending",
+      "incidentRef": "issue-crashloop-api-server-production",
+      "action": {
+        "type": "Custom",
+        "description": "Executar script de migração de schema",
+        "params": {"script": "/opt/scripts/migrate.sh"}
+      },
+      "requestedAt": "2026-03-19T14:20:00Z",
+      "expiresAt": "2026-03-19T15:20:00Z",
+      "requestedBy": "ai-insight-controller"
+    }
+  ]
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/approvals?state=pending"
+```
+
+### GET /api/v1/approvals/{name}
+
+Retorna detalhes de uma aprovação específica.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome da aprovação.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "approval-custom-action-api-server-production",
+    "namespace": "production",
+    "state": "pending",
+    "incidentRef": "issue-crashloop-api-server-production",
+    "action": {
+      "type": "Custom",
+      "description": "Executar script de migração de schema",
+      "params": {"script": "/opt/scripts/migrate.sh"}
+    },
+    "context": {
+      "severity": "critical",
+      "riskScore": 85,
+      "aiConfidence": 0.78,
+      "aiReasoning": "Schema desatualizado causando falhas no ORM. Migração resolve o problema."
+    },
+    "requestedAt": "2026-03-19T14:20:00Z",
+    "expiresAt": "2026-03-19T15:20:00Z",
+    "requestedBy": "ai-insight-controller",
+    "decision": null
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/approvals/approval-custom-action-api-server-production"
+```
+
+### POST /api/v1/approvals/{name}/approve
+
+Aprova uma ação pendente.
+
+**Role mínimo:** `operator`
+
+<ParamField path="name" type="string" required>
+  Nome da aprovação.
+</ParamField>
+
+<ParamField body="approver" type="string" required>
+  Identificador de quem aprova.
+</ParamField>
+
+<ParamField body="reason" type="string">
+  Motivo da aprovação.
+</ParamField>
+
+**Request body:**
+
+```json
+{
+  "approver": "sre-team:joao.silva",
+  "reason": "Script de migração revisado e testado em staging"
+}
+```
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "approval-custom-action-api-server-production",
+    "state": "approved",
+    "decision": {
+      "approver": "sre-team:joao.silva",
+      "reason": "Script de migração revisado e testado em staging",
+      "decidedAt": "2026-03-19T14:25:00Z"
+    }
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: ops-key-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"approver": "sre-team:joao.silva", "reason": "Script revisado e testado em staging"}' \
+  "http://localhost:8090/api/v1/approvals/approval-custom-action-api-server-production/approve"
+```
+
+### POST /api/v1/approvals/{name}/reject
+
+Rejeita uma ação pendente.
+
+**Role mínimo:** `operator`
+
+<ParamField path="name" type="string" required>
+  Nome da aprovação.
+</ParamField>
+
+<ParamField body="approver" type="string" required>
+  Identificador de quem rejeita.
+</ParamField>
+
+<ParamField body="reason" type="string" required>
+  Motivo da rejeição.
+</ParamField>
+
+**Request body:**
+
+```json
+{
+  "approver": "sre-team:joao.silva",
+  "reason": "Script não testado adequadamente. Precisa de validação em staging."
+}
+```
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "approval-custom-action-api-server-production",
+    "state": "rejected",
+    "decision": {
+      "approver": "sre-team:joao.silva",
+      "reason": "Script não testado adequadamente. Precisa de validação em staging.",
+      "decidedAt": "2026-03-19T14:25:00Z"
+    }
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: ops-key-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"approver": "sre-team:joao.silva", "reason": "Script não testado adequadamente."}' \
+  "http://localhost:8090/api/v1/approvals/approval-custom-action-api-server-production/reject"
+```
+
+---
+
+## PostMortems
+
+Consulta e gerenciamento de post-mortems gerados automaticamente.
+
+### GET /api/v1/postmortems
+
+Lista todos os post-mortems.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "name": "postmortem-issue-crashloop-api-server-production",
+      "namespace": "production",
+      "state": "open",
+      "incidentRef": "issue-crashloop-api-server-production",
+      "summary": "OOM Kill causou CrashLoopBackOff no api-server. Resolvido via ajuste de memory limits.",
+      "duration": "2m60s",
+      "createdAt": "2026-03-19T14:13:00Z",
+      "source": "agentic"
+    }
+  ]
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/postmortems"
+```
+
+### GET /api/v1/postmortems/{name}
+
+Retorna detalhes completos de um post-mortem.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do post-mortem.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "postmortem-issue-crashloop-api-server-production",
+    "namespace": "production",
+    "state": "open",
+    "incidentRef": "issue-crashloop-api-server-production",
+    "summary": "OOM Kill causou CrashLoopBackOff no api-server. Resolvido via ajuste de memory limits.",
+    "rootCause": "Memory leak no handler /api/v1/export causava crescimento contínuo de heap até atingir o limit de 256Mi, resultando em OOM Kill pelo kernel.",
+    "impact": "Indisponibilidade parcial do api-server por 3 minutos. 2 pods afetados de 3 réplicas.",
+    "timeline": [
+      {"timestamp": "2026-03-19T14:10:00Z", "event": "Anomalia detectada: CrashLoopBackOff"},
+      {"timestamp": "2026-03-19T14:10:12Z", "event": "Correlação com OOM Kill — Issue criado (Critical)"},
+      {"timestamp": "2026-03-19T14:11:05Z", "event": "Análise IA: memory leak identificado (confidence: 0.92)"},
+      {"timestamp": "2026-03-19T14:11:45Z", "event": "AdjustResources executado: memory_limit 256Mi -> 1Gi"},
+      {"timestamp": "2026-03-19T14:13:00Z", "event": "Pods healthy — incidente resolvido"}
+    ],
+    "actionsExecuted": [
+      {
+        "action": "AdjustResources",
+        "params": {"memory_limit": "1Gi", "memory_request": "512Mi"},
+        "result": "success"
+      }
+    ],
+    "lessonsLearned": [
+      "Memory limits devem considerar picos de uso, não apenas consumo médio",
+      "Endpoint /api/v1/export precisa de streaming para evitar acúmulo em memória"
+    ],
+    "preventionActions": [
+      "Implementar pprof profiling contínuo",
+      "Adicionar alerta para memory usage > 80% do limit",
+      "Refatorar /api/v1/export para usar streaming"
+    ],
+    "duration": "2m60s",
+    "createdAt": "2026-03-19T14:13:00Z",
+    "source": "agentic"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/postmortems/postmortem-issue-crashloop-api-server-production"
+```
+
+### POST /api/v1/postmortems/{name}/review
+
+Marca um post-mortem como em revisão.
+
+**Role mínimo:** `operator`
+
+<ParamField path="name" type="string" required>
+  Nome do post-mortem.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "postmortem-issue-crashloop-api-server-production",
+    "state": "in_review",
+    "reviewStartedAt": "2026-03-19T16:00:00Z"
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/postmortems/postmortem-issue-crashloop-api-server-production/review"
+```
+
+### POST /api/v1/postmortems/{name}/close
+
+Fecha um post-mortem após revisão.
+
+**Role mínimo:** `operator`
+
+<ParamField path="name" type="string" required>
+  Nome do post-mortem.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "postmortem-issue-crashloop-api-server-production",
+    "state": "closed",
+    "closedAt": "2026-03-19T17:00:00Z"
+  }
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/postmortems/postmortem-issue-crashloop-api-server-production/close"
+```
+
+---
+
+## Analytics
+
+Métricas agregadas e tendências da plataforma AIOps.
+
+### GET /api/v1/analytics/summary
+
+Retorna um resumo geral da plataforma.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "totalIncidents": 342,
+    "activeIncidents": 5,
+    "resolvedIncidents": 312,
+    "escalatedIncidents": 25,
+    "autoRemediatedPercent": 91.2,
+    "avgResolutionTime": "4m32s",
+    "incidentsBySeverity": {
+      "critical": 48,
+      "high": 112,
+      "medium": 134,
+      "low": 48
+    },
+    "incidentsByState": {
+      "detected": 1,
+      "analyzing": 2,
+      "remediating": 2,
+      "resolved": 312,
+      "escalated": 25
+    },
+    "topSignals": [
+      {"signal": "pod_restart", "count": 98},
+      {"signal": "oom_kill", "count": 76},
+      {"signal": "error_rate", "count": 65},
+      {"signal": "latency_spike", "count": 58},
+      {"signal": "deploy_failing", "count": 45}
+    ],
+    "period": "30d"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/analytics/summary"
+```
+
+### GET /api/v1/analytics/mttd
+
+Retorna o Mean Time to Detect (tempo médio de detecção).
+
+**Role mínimo:** `viewer`
+
+<ParamField query="window" type="string" default="30d">
+  Janela de tempo. Valores: `7d`, `14d`, `30d`, `90d`.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "mttd": "12s",
+    "mttdSeconds": 12.4,
+    "window": "30d",
+    "samples": 342,
+    "trend": "stable",
+    "history": [
+      {"date": "2026-03-19", "mttdSeconds": 11.2},
+      {"date": "2026-03-18", "mttdSeconds": 13.5},
+      {"date": "2026-03-17", "mttdSeconds": 12.1}
+    ]
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/analytics/mttd?window=30d"
+```
+
+### GET /api/v1/analytics/mttr
+
+Retorna o Mean Time to Resolve (tempo médio de resolução).
+
+**Role mínimo:** `viewer`
+
+<ParamField query="window" type="string" default="30d">
+  Janela de tempo. Valores: `7d`, `14d`, `30d`, `90d`.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "mttr": "4m32s",
+    "mttrSeconds": 272.0,
+    "window": "30d",
+    "samples": 312,
+    "trend": "improving",
+    "bySeverity": {
+      "critical": {"mttr": "3m15s", "mttrSeconds": 195.0},
+      "high": {"mttr": "4m48s", "mttrSeconds": 288.0},
+      "medium": {"mttr": "5m20s", "mttrSeconds": 320.0},
+      "low": {"mttr": "6m10s", "mttrSeconds": 370.0}
+    },
+    "history": [
+      {"date": "2026-03-19", "mttrSeconds": 250.0},
+      {"date": "2026-03-18", "mttrSeconds": 280.0},
+      {"date": "2026-03-17", "mttrSeconds": 265.0}
+    ]
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/analytics/mttr?window=30d"
+```
+
+### GET /api/v1/analytics/trends
+
+Retorna tendências de incidentes ao longo do tempo.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "daily": [
+      {
+        "date": "2026-03-19",
+        "total": 8,
+        "resolved": 7,
+        "escalated": 1,
+        "avgResolutionSeconds": 245.0,
+        "bySeverity": {"critical": 2, "high": 3, "medium": 2, "low": 1}
+      },
+      {
+        "date": "2026-03-18",
+        "total": 12,
+        "resolved": 11,
+        "escalated": 1,
+        "avgResolutionSeconds": 310.0,
+        "bySeverity": {"critical": 3, "high": 4, "medium": 3, "low": 2}
+      }
+    ],
+    "window": "30d"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/analytics/trends"
+```
+
+### GET /api/v1/analytics/top-resources
+
+Retorna os recursos com mais incidentes.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "resources": [
+      {
+        "kind": "Deployment",
+        "name": "api-server",
+        "namespace": "production",
+        "incidentCount": 28,
+        "lastIncident": "2026-03-19T14:10:00Z",
+        "topSignals": ["pod_restart", "oom_kill"],
+        "avgResolutionSeconds": 195.0
+      },
+      {
+        "kind": "Deployment",
+        "name": "payment-service",
+        "namespace": "production",
+        "incidentCount": 15,
+        "lastIncident": "2026-03-18T22:30:00Z",
+        "topSignals": ["error_rate", "latency_spike"],
+        "avgResolutionSeconds": 340.0
+      }
+    ],
+    "window": "30d",
+    "limit": 10
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/analytics/top-resources"
+```
+
+### GET /api/v1/analytics/remediation-stats
+
+Retorna estatísticas de remediação.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "total": 337,
+    "successful": 312,
+    "failed": 25,
+    "successRate": 92.6,
+    "byType": {
+      "RestartDeployment": {"total": 98, "successful": 95, "rate": 96.9},
+      "AdjustResources": {"total": 76, "successful": 72, "rate": 94.7},
+      "RollbackDeployment": {"total": 52, "successful": 48, "rate": 92.3},
+      "ScaleDeployment": {"total": 45, "successful": 43, "rate": 95.6},
+      "DeletePod": {"total": 38, "successful": 36, "rate": 94.7},
+      "PatchConfig": {"total": 18, "successful": 14, "rate": 77.8},
+      "Agentic": {"total": 10, "successful": 4, "rate": 40.0}
+    },
+    "avgDurationSeconds": 85.2,
+    "durationPercentiles": {
+      "p50": 62.0,
+      "p90": 180.0,
+      "p99": 420.0
+    },
+    "window": "30d"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/analytics/remediation-stats"
+```
+
+---
+
+## Clusters
+
+Informações sobre clusters Kubernetes gerenciados.
+
+### GET /api/v1/clusters
+
+Lista todos os clusters monitorados.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "name": "production-us-east-1",
+      "status": "healthy",
+      "provider": "EKS",
+      "version": "1.29",
+      "nodes": 12,
+      "activeIncidents": 2,
+      "instanceRef": "chatcli-production",
+      "lastSyncAt": "2026-03-19T14:30:00Z"
+    },
+    {
+      "name": "staging-eu-west-1",
+      "status": "degraded",
+      "provider": "EKS",
+      "version": "1.29",
+      "nodes": 4,
+      "activeIncidents": 5,
+      "instanceRef": "chatcli-staging",
+      "lastSyncAt": "2026-03-19T14:29:55Z"
+    }
+  ]
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/clusters"
+```
+
+### GET /api/v1/clusters/{name}
+
+Retorna detalhes de um cluster específico.
+
+**Role mínimo:** `viewer`
+
+<ParamField path="name" type="string" required>
+  Nome do cluster.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "name": "production-us-east-1",
+    "status": "healthy",
+    "provider": "EKS",
+    "version": "1.29",
+    "nodes": 12,
+    "activeIncidents": 2,
+    "instanceRef": "chatcli-production",
+    "namespaces": ["production", "staging", "monitoring", "kube-system"],
+    "watcherTargets": [
+      {"namespace": "production", "deployments": 15, "alertsActive": 2},
+      {"namespace": "staging", "deployments": 8, "alertsActive": 0}
+    ],
+    "resources": {
+      "cpuCapacity": "48 cores",
+      "cpuUsage": "32 cores",
+      "memoryCapacity": "192Gi",
+      "memoryUsage": "128Gi"
+    },
+    "lastSyncAt": "2026-03-19T14:30:00Z"
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/clusters/production-us-east-1"
+```
+
+### GET /api/v1/clusters/global-status
+
+Retorna o status global de todos os clusters.
+
+**Role mínimo:** `viewer`
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": {
+    "totalClusters": 3,
+    "healthy": 2,
+    "degraded": 1,
+    "unreachable": 0,
+    "totalNodes": 20,
+    "totalActiveIncidents": 7,
+    "clusters": [
+      {"name": "production-us-east-1", "status": "healthy", "activeIncidents": 2},
+      {"name": "staging-eu-west-1", "status": "degraded", "activeIncidents": 5},
+      {"name": "dev-local", "status": "healthy", "activeIncidents": 0}
+    ]
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/clusters/global-status"
+```
+
+---
+
+## Audit
+
+Log de auditoria de todas as ações na plataforma.
+
+### GET /api/v1/audit
+
+Lista eventos de auditoria com filtros.
+
+**Role mínimo:** `viewer`
+
+<ParamField query="type" type="string">
+  Tipo de evento. Valores: `incident.created`, `incident.acknowledged`, `incident.resolved`, `incident.escalated`, `remediation.executed`, `remediation.failed`, `approval.approved`, `approval.rejected`, `runbook.created`, `runbook.deleted`, `api.access`.
+</ParamField>
+
+<ParamField query="severity" type="string">
+  Filtrar por severidade do evento de auditoria. Valores: `info`, `warning`, `critical`.
+</ParamField>
+
+<ParamField query="resource" type="string">
+  Filtrar por nome do recurso afetado.
+</ParamField>
+
+<ParamField query="from" type="string">
+  Data/hora de início (ISO 8601).
+</ParamField>
+
+<ParamField query="to" type="string">
+  Data/hora de fim (ISO 8601).
+</ParamField>
+
+<ParamField query="page" type="integer" default="1">
+  Número da página.
+</ParamField>
+
+<ParamField query="pageSize" type="integer" default="50">
+  Itens por página. Máximo: 200.
+</ParamField>
+
+**Resposta `200 OK`:**
+
+```json
+{
+  "data": [
+    {
+      "id": "audit-20260319-143500-001",
+      "timestamp": "2026-03-19T14:35:00Z",
+      "type": "incident.acknowledged",
+      "severity": "info",
+      "actor": "operator:ops-key-abc123",
+      "resource": "issue-crashloop-api-server-production",
+      "namespace": "production",
+      "description": "Incidente reconhecido pelo operador",
+      "metadata": {
+        "incidentState": "remediating",
+        "incidentSeverity": "critical"
+      }
+    },
+    {
+      "id": "audit-20260319-141145-001",
+      "timestamp": "2026-03-19T14:11:45Z",
+      "type": "remediation.executed",
+      "severity": "warning",
+      "actor": "system:remediation-controller",
+      "resource": "plan-issue-crashloop-api-server-production-1",
+      "namespace": "production",
+      "description": "AdjustResources executado: memory_limit 256Mi -> 1Gi",
+      "metadata": {
+        "actionType": "AdjustResources",
+        "result": "success",
+        "deployment": "api-server"
+      }
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "pageSize": 50,
+    "total": 1247,
+    "totalPages": 25
+  }
+}
+```
+
+```bash
+curl -H "X-API-Key: ops-key-abc123" \
+  "http://localhost:8090/api/v1/audit?type=remediation.executed&from=2026-03-19T00:00:00Z&pageSize=20"
+```
+
+### GET /api/v1/audit/export
+
+Exporta o log de auditoria completo em formato CSV ou JSON.
+
+**Role mínimo:** `admin`
+
+<ParamField query="format" type="string" default="json">
+  Formato de exportação. Valores: `json`, `csv`.
+</ParamField>
+
+<ParamField query="from" type="string">
+  Data/hora de início (ISO 8601).
+</ParamField>
+
+<ParamField query="to" type="string">
+  Data/hora de fim (ISO 8601).
+</ParamField>
+
+**Resposta `200 OK` (JSON):**
+
+```json
+{
+  "data": {
+    "exportedAt": "2026-03-19T15:00:00Z",
+    "totalRecords": 1247,
+    "format": "json",
+    "records": [
+      {
+        "id": "audit-20260319-143500-001",
+        "timestamp": "2026-03-19T14:35:00Z",
+        "type": "incident.acknowledged",
+        "severity": "info",
+        "actor": "operator:ops-key-abc123",
+        "resource": "issue-crashloop-api-server-production",
+        "namespace": "production",
+        "description": "Incidente reconhecido pelo operador"
+      }
+    ]
+  }
+}
+```
+
+**Resposta `200 OK` (CSV):**
+
+O header `Content-Type` será `text/csv` e o body conterá o CSV com colunas:
+`id,timestamp,type,severity,actor,resource,namespace,description`
+
+```bash
+# Exportar como JSON
+curl -H "X-API-Key: admin-key-root01" \
+  "http://localhost:8090/api/v1/audit/export?format=json&from=2026-03-01T00:00:00Z" \
+  -o audit-export.json
+
+# Exportar como CSV
+curl -H "X-API-Key: admin-key-root01" \
+  "http://localhost:8090/api/v1/audit/export?format=csv&from=2026-03-01T00:00:00Z" \
+  -o audit-export.csv
+```
+
+---
+
+## Códigos de Erro
+
+| Código HTTP | Código | Descrição |
+|-------------|--------|-----------|
+| `400` | `BAD_REQUEST` | Parâmetro inválido ou corpo malformado |
+| `401` | `UNAUTHORIZED` | API key ausente ou inválida |
+| `403` | `FORBIDDEN` | Role insuficiente para a operação |
+| `404` | `NOT_FOUND` | Recurso não encontrado |
+| `409` | `CONFLICT` | Recurso já existe (ex: runbook com mesmo nome) |
+| `429` | `RATE_LIMITED` | Rate limit excedido |
+| `500` | `INTERNAL_ERROR` | Erro interno do servidor |
+| `503` | `SERVICE_UNAVAILABLE` | Servidor não está pronto (readyz falhou) |
+
+---
+
+## SDKs e Integração
+
+<CardGroup cols={2}>
+  <Card title="curl" icon="terminal">
+    Todos os exemplos nesta página usam `curl`. Copie e adapte.
+  </Card>
+  <Card title="Go Client" icon="golang">
+    Use o pacote `operator/pkg/client` para integração nativa em Go.
+  </Card>
+  <Card title="Webhook" icon="webhook">
+    Configure notificações via webhook no Instance CR (`spec.notifications`).
+  </Card>
+  <Card title="Grafana" icon="chart-mixed">
+    Consulte [Web Dashboard e Grafana](/features/aiops/web-dashboard) para dashboards pré-configurados.
+  </Card>
+</CardGroup>
