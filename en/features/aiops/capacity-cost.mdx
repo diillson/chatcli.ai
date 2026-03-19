@@ -1,0 +1,516 @@
+---
+title: "Capacity Planning and Cost Attribution"
+sidebarTitle: "Capacity & Costs"
+description: "Capacity forecasting with linear regression, noise reduction, and cost tracking with ROI."
+icon: "chart-line"
+---
+
+The ChatCLI AIOps platform includes three advanced subsystems that work together to optimize operations: **Capacity Planner** (resource exhaustion forecasting), **Noise Reducer** (intelligent alert suppression), and **Cost Tracker** (cost tracking and ROI calculation).
+
+
+
+## Capacity Planner
+
+The Capacity Planner analyzes historical CPU and memory usage trends to predict when a cluster's or namespace's resources will be exhausted -- enabling proactive action before incidents occur.
+
+### Linear Regression Algorithm
+
+The Capacity Planner uses **least-squares linear regression** to project the resource exhaustion date.
+
+```text
+Given a set of points (t_i, y_i) where:
+  t_i = normalized timestamp (hours since first point)
+  y_i = resource usage percentage (0-100)
+
+Calculates:
+  slope     = (n * sum(t*y) - sum(t) * sum(y)) / (n * sum(t^2) - sum(t)^2)
+  intercept = (sum(y) - slope * sum(t)) / n
+
+Exhaustion projection:
+  If slope > 0:
+    hours_until_full = (100 - current_usage) / slope
+    exhaustion_date  = now + hours_until_full
+```
+
+<Note>
+  The algorithm requires at least 3 data points to generate a reliable projection. With fewer than 3 points, the planner returns `trend: insufficient_data`.
+</Note>
+
+### Data Structures
+
+<AccordionGroup>
+  <Accordion title="ResourceUsage">
+    Represents a resource usage data point in time.
+
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `Timestamp` | `time.Time` | Collection timestamp |
+    | `CPUPercent` | `float64` | CPU usage percentage (0-100) |
+    | `MemoryPercent` | `float64` | Memory usage percentage (0-100) |
+    | `CPUCores` | `float64` | Absolute usage in cores |
+    | `MemoryBytes` | `int64` | Absolute usage in bytes |
+    | `Namespace` | `string` | Source namespace |
+    | `Resource` | `string` | Resource name (deployment, node) |
+  </Accordion>
+
+  <Accordion title="ResourceTrend">
+    Linear regression result for a resource.
+
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `Resource` | `string` | Resource name |
+    | `Namespace` | `string` | Namespace |
+    | `CPUSlope` | `float64` | CPU growth rate (%/hour) |
+    | `MemorySlope` | `float64` | Memory growth rate (%/hour) |
+    | `CPUIntercept` | `float64` | Regression intercept for CPU |
+    | `MemoryIntercept` | `float64` | Regression intercept for memory |
+    | `DataPoints` | `int` | Number of points used in regression |
+    | `R2Score` | `float64` | Coefficient of determination (fit quality) |
+  </Accordion>
+
+  <Accordion title="ForecastResult">
+    Exhaustion projection with recommendations.
+
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `Resource` | `string` | Resource name |
+    | `Namespace` | `string` | Namespace |
+    | `CPUExhaustionDate` | `*time.Time` | Projected CPU exhaustion date (nil if stable) |
+    | `MemoryExhaustionDate` | `*time.Time` | Projected memory exhaustion date (nil if stable) |
+    | `CPUCurrentPercent` | `float64` | Current CPU usage |
+    | `MemoryCurrentPercent` | `float64` | Current memory usage |
+    | `CPUGrowthRate` | `float64` | CPU growth rate (%/hour) |
+    | `MemoryGrowthRate` | `float64` | Memory growth rate (%/hour) |
+    | `Urgency` | `string` | Classification: `urgent`, `plan`, `stable` |
+    | `Recommendations` | `[]string` | List of recommendations |
+    | `IsBottleneck` | `bool` | Whether the resource is a bottleneck in active incidents |
+  </Accordion>
+</AccordionGroup>
+
+### Correlation with Incidents
+
+The `ResourceIsBottleneck` method checks if a resource is related to active incidents:
+
+```text
+For each active Issue (state != Resolved && state != Escalated):
+  If issue.resource.name == forecast.Resource
+  AND issue.resource.namespace == forecast.Namespace
+  Then: forecast.IsBottleneck = true
+```
+
+When `IsBottleneck = true`, the capacity recommendation is automatically prioritized and includes a reference to the active incident.
+
+### Recommendation Generation
+
+The Capacity Planner generates recommendations based on projection urgency:
+
+| Condition | Urgency | Recommendation |
+|-----------|---------|---------------|
+| Exhaustion in **less than 7 days** | `urgent` | "URGENT: `{resource}` in `{namespace}` projected to exhaust `{type}` on `{date}`. Immediate action required: scale horizontally or increase limits." |
+| Exhaustion between **7 and 30 days** | `plan` | "PLANNING: `{resource}` in `{namespace}` projected to exhaust `{type}` on `{date}`. Plan capacity increase in the coming weeks." |
+| Exhaustion in **more than 30 days** or **negative/stable slope** | `stable` | "Stable: `{resource}` in `{namespace}` shows no exhaustion trend within the 30-day horizon." |
+
+### How to Use
+
+```go
+planner := capacity.NewCapacityPlanner(k8sClient, logger)
+
+// Collect historical data and analyze trends
+forecasts, err := planner.AnalyzeResourceTrends(ctx, namespace)
+if err != nil {
+    logger.Error("capacity analysis failed", zap.Error(err))
+    return
+}
+
+for _, forecast := range forecasts {
+    if forecast.Urgency == "urgent" {
+        // Create proactive alert or incident
+        logger.Warn("resource at risk of exhaustion",
+            zap.String("resource", forecast.Resource),
+            zap.Time("cpu_exhaustion", *forecast.CPUExhaustionDate),
+        )
+    }
+}
+```
+
+<Info>
+  The Capacity Planner collects data every reconciliation cycle (30 seconds) and stores history in a ConfigMap (`chatcli-capacity-history`). The regression is recalculated every 5 minutes.
+</Info>
+
+
+
+## Noise Reducer
+
+The Noise Reducer implements four alert suppression strategies to reduce alert fatigue and improve the signal-to-noise ratio.
+
+### Strategy 1: Repetitive Suppression
+
+Suppresses identical alerts when there is accumulation without state change.
+
+```text
+Suppression condition:
+  - 5 or more identical alerts in the last 1 hour
+  - No state change (severity, resource, signal_type are the same)
+  - Identity hash: SHA256(signal_type + resource_name + namespace)
+
+Result:
+  - Alert suppressed (no new Anomaly CR generated)
+  - Suppression counter incremented
+  - Log: "repetitive alert suppressed (N occurrences in 1h)"
+```
+
+<Warning>
+  If the alert severity changes (e.g., `high` to `critical`), suppression is immediately disabled and the alert is processed normally.
+</Warning>
+
+### Strategy 2: Seasonal Patterns
+
+Identifies and suppresses alerts that occur at predictable times (e.g., cleanup jobs, scheduled deploys).
+
+**SeasonalPattern struct:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `SignalType` | `string` | Signal type (e.g., `pod_restart`) |
+| `Resource` | `string` | Resource name |
+| `Namespace` | `string` | Namespace |
+| `DayOfWeek` | `time.Weekday` | Day of the week (0=Sunday) |
+| `HourOfDay` | `int` | Hour of the day (0-23) |
+| `MinuteWindow` | `int` | Tolerance window in minutes |
+| `Occurrences` | `int` | Number of confirmed occurrences |
+| `Confidence` | `float64` | Pattern confidence (0-1) |
+| `LastSeen` | `time.Time` | Last occurrence |
+
+**Detection Algorithm:**
+
+```text
+For each alert received:
+  1. Search for existing seasonal patterns for (signal_type, resource, namespace)
+  2. For each pattern found:
+     - Check if day_of_week == pattern.DayOfWeek
+     - Check if |current_hour - pattern.HourOfDay| <= 30 minutes (tolerance window)
+     - If match: increment Occurrences, update LastSeen
+     - If Occurrences >= 3 AND Confidence >= 0.7: SUPPRESS the alert
+  3. If no existing pattern matches:
+     - Create new candidate SeasonalPattern (Occurrences=1, Confidence=0.3)
+```
+
+**How patterns are learned:**
+
+Pattern confidence grows with each confirmation:
+
+```text
+Confidence = min(1.0, 0.3 + (Occurrences - 1) * 0.15)
+
+Occurrences | Confidence | Suppress?
+     1      |    0.30    |   No
+     2      |    0.45    |   No
+     3      |    0.60    |   No
+     4      |    0.75    |   Yes (>= 0.7 and >= 3)
+     5      |    0.90    |   Yes
+     6+     |    1.00    |   Yes
+```
+
+**Practical example:**
+- ConfigMap update job runs every Monday at 03:00
+- Generates `pod_restart` alert in the `jobs` namespace
+- After 4 weeks: pattern identified (Monday, 03:00, confidence 0.75)
+- From the 5th week: alert automatically suppressed
+
+Patterns are stored in the ConfigMap `chatcli-seasonal-patterns`.
+
+### Strategy 3: Flap Detection
+
+Detects resources that oscillate between states (resolved -&gt; detected -&gt; resolved) repeatedly.
+
+```text
+Flap condition:
+  - 3 or more resolved -> detected cycles in the same 24-hour window
+  - Same resource (resource_name + namespace)
+
+Actions:
+  1. Mark resource as "flapping"
+  2. Suppress new alerts from the resource for 2 hours
+  3. Generate consolidated alert: "Resource {name} is flapping -- {N} cycles in 24h"
+  4. Recommend root cause investigation
+
+Exiting flap:
+  - If no new cycle in 2 hours: remove flap flag
+  - New alerts resume normal processing
+```
+
+### Strategy 4: Alert Fatigue Scoring
+
+Calculates an alert fatigue score (0-100) to determine if alert volume is excessive.
+
+```text
+fatigue_score = volume_score + resolve_rate_score + recency_score
+
+Where:
+  volume_score (0-40):
+    - alerts_per_hour = total_alerts_last_6h / 6
+    - volume_score = min(40, alerts_per_hour * 4)
+
+  resolve_rate_score (0-30):
+    - auto_resolve_rate = auto_resolved / total * 100
+    - If auto_resolve_rate > 90%: resolve_rate_score = 30
+    - If auto_resolve_rate > 70%: resolve_rate_score = 20
+    - If auto_resolve_rate > 50%: resolve_rate_score = 10
+    - Else: resolve_rate_score = 0
+
+  recency_score (0-30):
+    - If > 5 alerts in last 10 minutes: recency_score = 30
+    - If > 3 alerts in last 10 minutes: recency_score = 20
+    - If > 1 alert in last 10 minutes: recency_score = 10
+    - Else: recency_score = 0
+```
+
+**Classification:**
+
+| Score | Classification | Action |
+|-------|---------------|--------|
+| 0-25 | `low` | No action. Healthy volume. |
+| 26-50 | `moderate` | Warning log. Monitor trend. |
+| 51-75 | `high` | Activate aggressive suppression. Consolidate similar alerts. |
+| 76-100 | `critical` | Suppress everything except `critical` severity. Generate meta-alert for SRE. |
+
+
+
+## Cost Tracker
+
+The Cost Tracker tracks operational costs (LLM + downtime) and calculates AIOps automation ROI.
+
+### LLM Costs per Provider
+
+The cost of each LLM call is calculated based on tokens consumed and configured prices per provider:
+
+| Provider | Input Cost (per 1M tokens) | Output Cost (per 1M tokens) | Reference Model |
+|----------|---------------------------|----------------------------|-----------------|
+| `claude` | $3.00 | $15.00 | Claude Sonnet |
+| `gpt-4` | $10.00 | $30.00 | GPT-4 Turbo |
+| `default` | $1.00 | $3.00 | Any other |
+
+### Cost Configuration
+
+Prices are configurable via ConfigMap `chatcli-cost-config`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatcli-cost-config
+  namespace: chatcli-system
+data:
+  costs.json: |
+    {
+      "providers": {
+        "claude": {"input_per_million": 3.00, "output_per_million": 15.00},
+        "gpt-4": {"input_per_million": 10.00, "output_per_million": 30.00},
+        "gpt-4o": {"input_per_million": 2.50, "output_per_million": 10.00},
+        "gemini": {"input_per_million": 0.50, "output_per_million": 1.50},
+        "default": {"input_per_million": 1.00, "output_per_million": 3.00}
+      },
+      "downtime_cost_per_minute": 10.00,
+      "engineer_hourly_rate": 75.00
+    }
+```
+
+<Note>
+  If the ConfigMap does not exist, default values are used. ConfigMap updates are reflected in real time (watch on ConfigMap).
+</Note>
+
+### IncidentCost
+
+Total cost of an incident, decomposed into components:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `IncidentName` | `string` | Incident name |
+| `Namespace` | `string` | Namespace |
+| `LLMCost` | `CostBreakdown` | Cost of LLM calls |
+| `DowntimeCost` | `float64` | Downtime cost (minutes * cost/minute) |
+| `TotalCost` | `float64` | LLMCost.Total + DowntimeCost |
+| `Provider` | `string` | LLM provider used |
+| `Model` | `string` | LLM model used |
+| `Duration` | `time.Duration` | Total incident duration |
+| `AutoRemediated` | `bool` | Whether it was resolved automatically |
+
+**CostBreakdown:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `InputTokens` | `int64` | Total input tokens |
+| `OutputTokens` | `int64` | Total output tokens |
+| `InputCost` | `float64` | Input token cost |
+| `OutputCost` | `float64` | Output token cost |
+| `Total` | `float64` | InputCost + OutputCost |
+| `Calls` | `int` | Number of LLM calls |
+
+**Calculation example:**
+
+```text
+Incident: CrashLoopBackOff on api-server
+  - Provider: claude
+  - LLM calls: 2 (AnalyzeIssue + 1 AgenticStep)
+  - Input tokens: 8,500 | Output tokens: 2,200
+  - InputCost:  8,500 / 1,000,000 * $3.00  = $0.0255
+  - OutputCost: 2,200 / 1,000,000 * $15.00 = $0.0330
+  - Total LLMCost: $0.0585
+
+  - Downtime: 3 minutes
+  - DowntimeCost: 3 * $10.00 = $30.00
+
+  - TotalCost: $0.0585 + $30.00 = $30.06
+```
+
+### CostSummary
+
+Cost aggregation for a period:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Period` | `string` | Aggregation period (e.g., `30d`) |
+| `TotalLLMCost` | `float64` | Sum of all LLM costs |
+| `TotalDowntimeCost` | `float64` | Sum of all downtime costs |
+| `TotalCost` | `float64` | TotalLLMCost + TotalDowntimeCost |
+| `IncidentCount` | `int` | Total incidents in the period |
+| `AutoRemediatedCount` | `int` | Incidents resolved automatically |
+| `AvgCostPerIncident` | `float64` | TotalCost / IncidentCount |
+| `TopCostlyIncidents` | `[]IncidentCost` | Top 5 most expensive incidents |
+| `CostByProvider` | `map[string]float64` | Aggregated cost by LLM provider |
+| `CostByNamespace` | `map[string]float64` | Aggregated cost by namespace |
+| `ROI` | `ROICalculation` | Return on investment calculation |
+
+### ROI Calculation
+
+ROI is calculated by comparing automation cost with the estimated cost of manual resolution:
+
+```text
+Variables:
+  autoRemediated    = number of automatically resolved incidents
+  avgManualHours    = 2h (estimated manual resolution time per incident)
+  engineerRate      = $75/hour (configurable via ConfigMap)
+  downtimePrevented = autoRemediated * avgDowntimeMinutes
+  downtimeCostRate  = $10/minute (configurable via ConfigMap)
+
+Calculation:
+  engineerHoursSaved = autoRemediated * avgManualHours
+  laborSavings       = engineerHoursSaved * engineerRate
+  downtimeSavings    = downtimePrevented * downtimeCostRate
+  totalSavings       = laborSavings + downtimeSavings
+  totalLLMCost       = sum of all LLM costs in the period
+
+  ROI% = ((totalSavings - totalLLMCost) / totalLLMCost) * 100
+```
+
+**ROICalculation struct:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `EngineerHoursSaved` | `float64` | Engineer hours saved |
+| `LaborSavings` | `float64` | Labor savings ($) |
+| `DowntimePrevented` | `float64` | Minutes of downtime prevented |
+| `DowntimeSavings` | `float64` | Downtime savings ($) |
+| `TotalSavings` | `float64` | Total savings ($) |
+| `TotalLLMCost` | `float64` | Total LLM cost ($) |
+| `ROIPercent` | `float64` | Return on investment (%) |
+
+**Monthly ROI example:**
+
+```text
+Monthly data:
+  - 312 automatically resolved incidents
+  - Total LLM cost: $18.72
+
+Calculation:
+  engineerHoursSaved = 312 * 2h = 624 hours
+  laborSavings       = 624 * $75 = $46,800
+  downtimePrevented  = 312 * 4.5min = 1,404 minutes
+  downtimeSavings    = 1,404 * $10 = $14,040
+  totalSavings       = $46,800 + $14,040 = $60,840
+  totalLLMCost       = $18.72
+
+  ROI% = ($60,840 - $18.72) / $18.72 * 100 = 324,935%
+```
+
+<Info>
+  ROI typically exceeds 100,000% because the cost of LLM calls ($0.03-0.10 per incident) is orders of magnitude lower than the cost of manual resolution (2h of engineer time + downtime).
+</Info>
+
+
+
+## Storage Architecture (ConfigMaps)
+
+All Capacity Planner, Noise Reducer, and Cost Tracker data is persisted in ConfigMaps in the operator namespace:
+
+| ConfigMap | Data | Retention |
+|-----------|------|-----------|
+| `chatcli-capacity-history` | Historical CPU/memory usage per resource. Compact time series in JSON. | 7 days (rolling window) |
+| `chatcli-pattern-store` | Noise Reducer dedup hashes, suppression counters, flap flags. | 24 hours (automatic pruning) |
+| `chatcli-seasonal-patterns` | Learned seasonal patterns (SeasonalPattern structs in JSON). | Indefinite (patterns with Confidence &lt; 0.3 and LastSeen &gt; 30 days are removed) |
+| `chatcli-cost-ledger` | Cost records per incident (IncidentCost in JSON). Used for aggregation. | 90 days (rolling window) |
+| `chatcli-cost-config` | Per-provider pricing configuration, downtime cost, engineer rate. | Indefinite (user-managed) |
+
+<Warning>
+  ConfigMaps have a 1MB limit in Kubernetes. For clusters with high incident volume (&gt;1000/month), the Cost Tracker automatically compacts old records, keeping only daily aggregations for data older than 30 days.
+</Warning>
+
+### Storage Format
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatcli-cost-ledger
+  namespace: chatcli-system
+  labels:
+    app.kubernetes.io/component: cost-tracker
+    platform.chatcli.io/managed-by: operator
+data:
+  ledger.json: |
+    {
+      "version": 2,
+      "lastCompaction": "2026-03-19T00:00:00Z",
+      "entries": [
+        {
+          "incident": "issue-crashloop-api-server-production",
+          "namespace": "production",
+          "timestamp": "2026-03-19T14:13:00Z",
+          "llmCost": 0.0585,
+          "downtimeCost": 30.00,
+          "totalCost": 30.06,
+          "provider": "claude",
+          "autoRemediated": true,
+          "durationSeconds": 180
+        }
+      ],
+      "dailyAggregates": [
+        {
+          "date": "2026-03-18",
+          "totalLLMCost": 0.62,
+          "totalDowntimeCost": 350.00,
+          "incidentCount": 12,
+          "autoRemediatedCount": 11
+        }
+      ]
+    }
+```
+
+
+
+## Integrations
+
+<CardGroup cols={2}>
+  <Card title="REST API" icon="code" href="/en/reference/api-reference">
+    Endpoints `/api/v1/analytics/remediation-stats` and `/api/v1/analytics/summary` expose cost and capacity data.
+  </Card>
+  <Card title="Web Dashboard" icon="chart-mixed" href="/en/features/aiops/web-dashboard">
+    The Overview view displays ROI metrics and capacity projections in real time.
+  </Card>
+  <Card title="Grafana" icon="chart-area" href="/en/features/aiops/web-dashboard#grafana-dashboards">
+    The `remediation-stats.json` dashboard includes cost and ROI panels.
+  </Card>
+  <Card title="AIOps Platform" icon="brain" href="/en/features/aiops-platform">
+    Complete AIOps pipeline architecture and how these subsystems integrate.
+  </Card>
+</CardGroup>
