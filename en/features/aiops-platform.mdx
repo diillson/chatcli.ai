@@ -71,8 +71,8 @@ sequenceDiagram
     IR->>K8s: Creates AIInsight CR (state: Analyzing)
 
     AIR->>K8s: Watch AIInsight CRs
-    AIR->>K8s: Collects K8s context (pods, events, revisions)
-    AIR->>Server: AnalyzeIssue(context + k8s_context)
+    AIR->>K8s: Collects enriched context (K8s + logs + metrics + GitOps + code + cascade)
+    AIR->>Server: AnalyzeIssue(enriched_context)
     Server->>LLM: Structured prompt with K8s context
     LLM-->>Server: JSON (analysis + actions)
     Server-->>AIR: AnalyzeIssueResponse
@@ -92,7 +92,7 @@ sequenceDiagram
     RR->>K8s: Watch RemediationPlan CRs
 
     alt Standard mode (Runbook)
-        RR->>K8s: Executes actions sequentially (Scale/Restart/Rollback/Patch/AdjustResources/DeletePod)
+        RR->>K8s: Executes actions (19 types: Scale/Restart/Rollback/HelmRollback/ArgoSync/AdjustHPA/...)
     else Agentic mode
         loop Each step (max 10, timeout 10min)
             RR->>Server: AgenticStep(context + history)
@@ -363,11 +363,69 @@ Watches AIInsight CRs and calls the `AnalyzeIssue` RPC to populate the analysis.
 
 **KubernetesContextBuilder (`k8s_context.go`):**
 
-Collects 4 sections of real cluster context (max 8000 chars):
-- **Deployment Status**: replicas (desired/ready/updated/unavailable), conditions, container images + resources
-- **Pod Details** (up to 5 pods, unhealthy first): phase, restart count, container states (Waiting/Terminated with reason + exit code)
+Collects real cluster context for **Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and HPAs** (max 12000 chars):
+- **Resource Status**: replicas, conditions, containers, images + resources (each type has a dedicated context builder)
+- **StatefulSet**: replicas, update strategy, partition, PodManagementPolicy, VolumeClaimTemplates
+- **DaemonSet**: desired/current/ready/available/unavailable, nodeSelector, tolerations
+- **Job/CronJob**: active/succeeded/failed, completions, parallelism, schedule, lastSuccessful
+- **HPA**: min/max replicas, current/desired, target utilization, current metrics, maxed-out detection
+- **Pod Details** (up to 5 pods, unhealthy first): phase, restart count, container states
 - **Recent Events** (last 15): type, reason, message, count
 - **Revision History**: Last 5 revisions (ReplicaSets) with image diff between revisions
+
+**LogAnalyzer (`log_analyzer.go`):**
+
+Advanced application log analysis (beyond the basic 50-line tail):
+- **Stack Trace Extraction**: detects and extracts stack traces from **Java** (Exception/Caused by), **Go** (panic/goroutine), **Python** (Traceback), **Node.js** (Error at)
+- **Error Pattern Detection**: 24+ critical patterns categorized (crash, connectivity, dns, auth, storage, tls, database, cache, messaging)
+- **Structured Log Parsing**: extracts error/warn entries from JSON logs (fields level, msg, error, timestamp, logger)
+- **Init Container Logs**: analyzes init container logs (reveals startup failures)
+- **Sidecar Logs**: analyzes sidecar logs (istio-proxy, envoy, datadog-agent, etc.)
+- **Critical Lines**: extracts FATAL/PANIC lines with 3 lines of context before/after
+- **Temporal Window**: fetches logs by temporal window (10min before the incident), not just tail
+
+**MetricsCollector (`metrics_collector.go`):**
+
+Prometheus queries for quantitative data during analysis:
+- **CPU/Memory**: usage trends 30min before → during → 15min after the incident
+- **Request/Error Rate**: HTTP requests and 5xx per second
+- **Latency**: P50, P95, P99 histogram percentiles
+- **HPA Metrics**: current vs desired replicas, CPU target
+- **Network**: receive/transmit bytes/s
+- **Trend Analysis**: detects spikes, drops, sustained_high/low with % change calculation
+- **Enabled via**: `PROMETHEUS_URL` env var on the operator
+
+**GitOpsDetector (`gitops_detector.go`):**
+
+Detects and integrates with GitOps tools:
+- **Helm Releases**: detects via Secrets type `helm.sh/release.v1`, status (deployed/failed/pending-upgrade), chart version, previous revision for rollback
+- **ArgoCD Applications**: sync status (Synced/OutOfSync), health (Healthy/Degraded), conditions, last sync result
+- **Flux Kustomizations**: ready status, source ref, conditions, last applied
+
+**SourceCodeAnalyzer (`source_controller.go`):**
+
+Code-aware diagnostics when `SourceRepository` CRD is configured:
+- **Git Correlation**: finds commits in the 30min before the incident
+- **Suspected Commit**: identifies the most likely commit (score by temporal proximity + volume of changes)
+- **Code Extraction**: extracts code snippets referenced in stack traces (file path + line number → source code)
+- **Config Analysis**: reads Dockerfile, values.yaml, Chart.yaml for deploy context
+
+**CascadeAnalyzer (`cascade_analyzer.go`):**
+
+Cross-service cascade failure analysis:
+- **Dependency Graph**: discovers dependencies via Services + EndpointSlices
+- **Temporal Correlation**: finds active issues in the same namespace and cross-namespace within a 15-20min window
+- **Cascade Chain**: orders services by detection time (first = root cause)
+- **Root Cause Service**: identifies the service that originated the cascade
+
+**BlastRadiusPredictor (`blast_radius.go`):**
+
+Impact prediction before action execution:
+- **PDB Check**: verifies if the action would violate PodDisruptionBudgets
+- **Quota Check**: verifies ResourceQuotas (>90% used = warning)
+- **Node Capacity**: counts pods on node for cordon/drain actions
+- **Affected Services**: discovers which Services would be impacted
+- **Risk Level**: classifies as low/medium/high/critical
 
 **AnalyzeIssueRequest:**
 
@@ -383,24 +441,36 @@ Collects 4 sections of real cluster context (max 8000 chars):
 | `risk_score` | Issue.Spec.RiskScore | Risk score |
 | `provider` | AIInsight.Spec.Provider | LLM provider |
 | `model` | AIInsight.Spec.Model | LLM model |
-| `kubernetes_context` | KubernetesContextBuilder | Deployment status, pods, events, revisions |
+| `kubernetes_context` | 6 enrichers combined | K8s status (Deploy/STS/DS/Job/CronJob/HPA) + **log analysis** (stack traces, error patterns) + **Prometheus metrics** (trends) + **GitOps** (Helm/ArgoCD/Flux) + **source code** (commits, code snippets) + **cascade analysis** + **RCA enrichment** |
 | `previous_failure_context` | Annotation on AIInsight | Evidence from previous attempts (retries) |
 
 ### 6. RemediationReconciler (`remediation_controller.go`)
 
 Executes the actions defined in a RemediationPlan.
 
-**Supported Actions:**
+**Supported Actions (19 types):**
 
-| Type | What It Does | Parameters |
-|------|-------------|-----------|
-| `ScaleDeployment` | `kubectl scale deployment/<name> --replicas=N` | `replicas` (required) |
-| `RestartDeployment` | `kubectl rollout restart deployment/<name>` | -- |
-| `RollbackDeployment` | Rollback to previous, healthy, or specific revision | `toRevision` (optional: `previous`, `healthy`, number) |
-| `PatchConfig` | Updates key(s) in a ConfigMap | `configmap`, `key=value` |
-| `AdjustResources` | Adjusts CPU/memory requests/limits | `memory_limit`, `memory_request`, `cpu_limit`, `cpu_request`, `container` |
-| `DeletePod` | Removes the sickest pod (CrashLoop > restarts) | `pod` (optional -- auto-selects) |
-| `Custom` | **Blocked** -- requires manual approval | -- |
+| Category | Type | What It Does | Key Parameters |
+|----------|------|-------------|----------------|
+| Workload | `ScaleDeployment` | Adjusts replicas | `replicas` |
+| Workload | `RestartDeployment` | Rollout restart | -- |
+| Workload | `RollbackDeployment` | Rollback to previous/healthy/specific revision | `toRevision` |
+| Workload | `PatchConfig` | Updates ConfigMap | `configmap`, `key=value` |
+| Workload | `AdjustResources` | Adjusts CPU/memory | `memory_limit`, `cpu_limit`, etc. |
+| Workload | `DeletePod` | Removes the sickest pod | `pod` (auto-selects) |
+| Workload | `RestartStatefulSetPod` | Restart StatefulSet pod | `pod` (or rolling restart) |
+| GitOps | `HelmRollback` | Rollback Helm release | `revision` |
+| GitOps | `ArgoSyncApp` | Trigger ArgoCD sync | `revision` |
+| Autoscaling | `AdjustHPA` | Modifies HPA min/max/target | `minReplicas`, `maxReplicas` |
+| Infra | `CordonNode` | Marks node unschedulable | `node` |
+| Infra | `DrainNode` | Evicts pods from node | `node` |
+| Storage | `ResizePVC` | Expands PVC | `pvc`, `size` |
+| Security | `RotateSecret` | Updates Secret | `secret`, `key=value` |
+| Networking | `UpdateIngress` | Modifies Ingress | `ingress`, `backendService` |
+| Networking | `PatchNetworkPolicy` | Opens port in NetworkPolicy | `networkPolicy`, `allowPort` |
+| Advanced | `ApplyManifest` | Applies manifest from ConfigMap | `configmap`, `key` |
+| Advanced | `ExecDiagnostic` | Whitelisted diagnostic command | `command` |
+| -- | `Custom` | **Blocked** -- requires manual approval | -- |
 
 <Warning>
 Safety Checks: Scale to 0 replicas is blocked. AdjustResources limit cannot be less than request. DeletePod refuses to delete if only 1 pod exists (prevents total outage). Custom actions are blocked. A pre-flight snapshot records the previous state for reference.
@@ -494,7 +564,7 @@ message AnalyzeIssueResponse {
 The server builds a prompt that includes:
 
 1. Issue context (name, namespace, resource, severity, risk score, description)
-2. List of available actions (`ScaleDeployment`, `RestartDeployment`, `RollbackDeployment`, `PatchConfig`)
+2. List of **19 available actions** organized by category (Workload, GitOps, Autoscaling, Infra, Storage, Security, Networking, Advanced)
 3. Instructions to return structured JSON with `analysis`, `confidence`, `recommendations`, and `actions` fields
 
 **Response Parsing:**
@@ -547,7 +617,7 @@ The server builds a structured prompt with:
 
 1. **Role + Issue details**: incident context (type, severity, resource)
 2. **Kubernetes context**: real cluster state (refreshed at each step via KubernetesContextBuilder)
-3. **Tool definitions**: 6 available mutating actions + "Observe" (no action, wait for next context)
+3. **Tool definitions**: 18 available mutating actions + "Observe" (no action, wait for next context)
 4. **Conversation history**: each previous step formatted with reasoning -> action -> observation
 5. **Instructions**: respond JSON, budget (step N of M), safety rules
 
@@ -557,7 +627,7 @@ When `resolved=true`, the response includes data for PostMortem generation (summ
 
 ## PostMortem Generation
 
-When an agentic remediation resolves an Issue, the `IssueReconciler` automatically generates:
+When **any remediation** resolves an Issue (standard or agentic), the `IssueReconciler` automatically generates:
 
 ### PostMortem CR
 
@@ -573,6 +643,12 @@ Created via `generatePostMortem()`:
 | `lessonsLearned` | Annotation `platform.chatcli.io/lessons-learned` |
 | `preventionActions` | Annotation `platform.chatcli.io/prevention-actions` |
 | `duration` | Calculated: resolvedAt - detectedAt |
+
+In addition to the fields above, the PostMortem is automatically enriched with:
+- **Trending**: detection of recurring incidents (count in the last 30 days, related PostMortems)
+- **Cascade Chain**: cascade failure chain if there are correlated cross-service issues
+- **Git Correlation**: suspected commit (SHA, author, changed files, confidence)
+- **GitOps Context**: Helm/ArgoCD/Flux state at the time of the incident
 
 The PostMortem CR is owned by the Issue (cascade delete).
 
