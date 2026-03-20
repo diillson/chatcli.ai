@@ -509,6 +509,127 @@ status:
   completedAt: "2026-02-16T10:32:15Z"
 ```
 
+#### Rollback Automático e Proteção de Estado
+
+O operator implementa um **sistema de rollback automático** que garante que remediações malsucedidas não deixem o cluster em estado pior do que antes. Antes de executar qualquer ação, o estado completo do recurso é capturado em um **snapshot estruturado restaurável**.
+
+<Steps>
+  <Step title="Snapshot Pré-Remediação">
+    Antes da primeira ação, o `RollbackEngine` captura um `ResourceSnapshot` estruturado com: replicas, imagens dos containers, CPU/memory requests e limits, estado do HPA (min/max replicas), e estado do node (schedulable/unschedulable). Funciona para **Deployments, StatefulSets, DaemonSets, Nodes e HPAs**.
+  </Step>
+  <Step title="Checkpoint por Ação">
+    Em planos com múltiplas ações, um `ActionCheckpoint` é capturado **antes de cada ação individual**. Isso permite saber exatamente qual ação modificou o quê e em que ponto o plano falhou.
+  </Step>
+  <Step title="Rollback Automático em Falha de Ação">
+    Se qualquer ação falha durante a execução, o operator **automaticamente restaura** o recurso para o estado do `PreflightSnapshot`. Replicas, imagens, resources requests/limits e estado do HPA são revertidos. O plano transiciona para estado `RolledBack` (não `Failed`).
+  </Step>
+  <Step title="Rollback em Timeout de Verificação">
+    Se todas as ações executam com sucesso mas o recurso **não fica healthy dentro de 90 segundos** (verification timeout), o operator também executa rollback automático para o estado pré-remediação.
+  </Step>
+  <Step title="Verificação Pós-Falha">
+    Após o rollback, o operator verifica se o recurso voltou ao estado healthy (`PostFailureHealthy`). Essa informação é registrada no status do plano para auditoria e decisão sobre retry.
+  </Step>
+</Steps>
+
+**O que é capturado no snapshot:**
+
+| Recurso | Campos Capturados |
+|---------|-------------------|
+| **Deployment** | replicas, container images, CPU/memory requests+limits, restart annotation |
+| **StatefulSet** | replicas, container images, CPU/memory requests+limits |
+| **DaemonSet** | container images, CPU/memory requests+limits |
+| **Node** | schedulable state (para reverter cordon/drain) |
+| **HPA** | minReplicas, maxReplicas |
+
+**Exemplo de RemediationPlan com rollback executado:**
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: RemediationPlan
+metadata:
+  name: api-gateway-plan-1
+  namespace: production
+status:
+  state: RolledBack              # Ação falhou, rollback automático executado
+  result: "Action AdjustResources (index 1) failed: invalid memory_limit | Rollback: Rolled back production/api-gateway: replicas: 5 → 3; container app: memory_limit=1Gi | Post-rollback: resource healthy"
+  rollbackPerformed: true
+  rollbackResult: "Rolled back production/api-gateway: replicas: 5 → 3; container app: memory_limit=1Gi"
+  postFailureHealthy: true       # Recurso voltou ao normal após rollback
+  preflightSnapshot:
+    resourceKind: Deployment
+    resourceName: api-gateway
+    namespace: production
+    replicas: 3
+    containerImages:
+      app: "ghcr.io/myorg/api-gateway:v2.1.0"
+    containerResources:
+      app:
+        cpuRequest: "200m"
+        cpuLimit: "1000m"
+        memoryRequest: "256Mi"
+        memoryLimit: "512Mi"
+    hpaMinReplicas: 2
+    hpaMaxReplicas: 8
+    capturedAt: "2026-02-16T10:31:00Z"
+  actionCheckpoints:
+    - actionIndex: 0
+      actionType: ScaleDeployment
+      success: true
+      timestamp: "2026-02-16T10:31:05Z"
+    - actionIndex: 1
+      actionType: AdjustResources
+      success: false
+      timestamp: "2026-02-16T10:31:10Z"
+  evidence:
+    - type: preflight_snapshot
+      data: "Structured snapshot captured: kind=Deployment replicas=3 containers=1"
+      timestamp: "2026-02-16T10:31:00Z"
+    - type: action_completed
+      data: "Action ScaleDeployment executed successfully"
+      timestamp: "2026-02-16T10:31:05Z"
+    - type: action_failed
+      data: "Action AdjustResources failed: invalid memory_limit format"
+      timestamp: "2026-02-16T10:31:10Z"
+    - type: rollback
+      data: "Rolled back production/api-gateway: replicas: 5 → 3; container app: memory_limit=1Gi"
+      timestamp: "2026-02-16T10:31:11Z"
+```
+
+<Warning>
+O rollback automático restaura o estado **anterior à remediação**, não resolve o problema original. Após o rollback, o IssueReconciler avalia se há tentativas restantes e dispara **re-análise com contexto de falha** — a IA recebe o que falhou e sugere uma estratégia diferente.
+</Warning>
+
+**Fluxo completo em caso de falha:**
+
+```mermaid
+flowchart TD
+    A[Ação Executada] -->|Falha| B[Rollback Automático]
+    A -->|Sucesso| C[Verificação de Saúde 90s]
+    C -->|Healthy| D[Completed ✓]
+    C -->|Timeout Unhealthy| B
+    B --> E{Rollback OK?}
+    E -->|Sim| F[Estado: RolledBack]
+    E -->|Não| G[Estado: Failed]
+    F --> H{Tentativas restantes?}
+    G --> H
+    H -->|Sim| I[Re-análise com failure context]
+    H -->|Não| J[Escalação para humano]
+    I --> K[IA sugere estratégia diferente]
+    K --> A
+```
+
+**Campos de status adicionados ao RemediationPlan:**
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `preflightSnapshot` | ResourceSnapshot | Estado completo do recurso antes de qualquer ação |
+| `actionCheckpoints` | []ActionCheckpoint | Checkpoint antes de cada ação com resultado (success/fail) |
+| `rollbackPerformed` | bool | Se o rollback automático foi executado |
+| `rollbackResult` | string | Descrição do que foi revertido (replicas, images, resources) |
+| `postFailureHealthy` | *bool | Se o recurso está healthy após rollback |
+
+---
+
 #### Tipos de Ação (19 tipos)
 
 **Workload:**
