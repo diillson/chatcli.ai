@@ -15,7 +15,7 @@ The ChatCLI AIOps platform manages incidents through a well-defined state machin
 | `Analyzing` | AI is performing root cause analysis | No |
 | `Remediating` | A remediation plan is executing | No |
 | `Resolved` | Incident successfully resolved | Yes |
-| `Escalated` | All automatic retries exhausted — **requires human intervention** | Yes |
+| `Escalated` | All automatic retries exhausted — **requires human intervention** (auto-resolves if resource recovers) | Semi-terminal |
 | `Failed` | Single attempt failed with no retry configured | Yes |
 
 ## State Machine Flow
@@ -25,9 +25,12 @@ Detected → Analyzing → Remediating → Resolved
                 ↓              ↓
            Escalated      Failed/RolledBack
            (after max         ↓
-            retries)     Re-analyze (up to 3x)
+            retries)     Re-analyze (up to 5x)
                               ↓
                          Escalated
+                              ↓
+                    Auto-resolve if resource
+                    recovers (configurable)
 ```
 
 ### Detection Phase (`Detected`)
@@ -38,7 +41,7 @@ When the watcher bridge detects anomalies, the correlation engine groups them in
 2. **Risk score calculation** — aggregated from all correlated anomalies
 3. **Severity determination** — Critical (risk > 80), High (> 60), Medium (> 40), Low (otherwise)
 4. **Incident ID generation** — format: `INC-YYYYMMDD-NNN`
-5. **Max remediation attempts** set to 3 (default)
+5. **Max remediation attempts** set to 5 (default, configurable via Instance `aiops.maxRemediationAttempts`)
 
 ### Analysis Phase (`Analyzing`)
 
@@ -65,7 +68,7 @@ The remediation controller executes the plan:
 
 When remediation fails:
 
-- **Attempt < MaxAttempts (3)**: The system re-analyzes with the failure context injected, potentially selecting a different runbook or strategy
+- **Attempt &lt; MaxAttempts (5)**: The system re-analyzes with the failure context injected, potentially selecting a different runbook or strategy
 - **All attempts exhausted**: Transitions to `Escalated`
 
 ### Escalated State — What Operators Must Do
@@ -106,6 +109,45 @@ When an incident reaches `Escalated`, the system has exhausted all automatic opt
    kubectl patch issue INC-20260319-001 -n production --type=merge \
      -p '{"status":{"state":"Resolved","resolution":"Manual fix applied"}}'
    ```
+
+## Auto-Resolve for Escalated Issues
+
+When an incident reaches `Escalated`, the system continues monitoring the resource every 30 seconds. If the resource recovers (all replicas healthy), the issue is **automatically resolved** with the message:
+
+> "Auto-resolved: resource recovered while awaiting human intervention"
+
+This handles cases where:
+- An operator fixes the issue manually (kubectl rollout undo, etc.) without using the API
+- The resource self-heals (e.g., transient network issue resolves)
+- A CI/CD pipeline deploys a fix while the incident is still open
+
+Auto-resolve can be disabled via the Instance CRD: `spec.aiops.enableAutoResolve: false`
+
+## Configurable AIOps Parameters
+
+All timing and retry parameters are configurable via the Instance CRD `aiops` section:
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-prod
+spec:
+  provider: OPENAI
+  model: gpt-5.2
+  aiops:
+    maxRemediationAttempts: 5    # default: 5, range: 1-10
+    resolutionCooldownMinutes: 10 # default: 10, range: 0-120
+    dedupTTLMinutes: 60           # default: 60, range: 5-1440
+    enableAutoResolve: true       # default: true
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `maxRemediationAttempts` | 5 | How many times the AI can retry before escalating |
+| `resolutionCooldownMinutes` | 10 | After resolving, how long to suppress new anomalies for the same resource |
+| `dedupTTLMinutes` | 60 | How long the bridge dedup cache retains alert hashes |
+| `enableAutoResolve` | true | Auto-resolve Escalated issues when the resource recovers |
 
 ## Remediation Plan States
 
