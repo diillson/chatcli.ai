@@ -1,0 +1,213 @@
+---
+title: "Incident Lifecycle"
+description: "Complete guide to how incidents flow through detection, analysis, remediation, escalation, and resolution — including what to do when the system requires human intervention"
+---
+
+## Overview
+
+The ChatCLI AIOps platform manages incidents through a well-defined state machine with **6 states** for incidents and **6 states** for remediation plans. Understanding this lifecycle is essential for operators who need to intervene when automatic remediation fails.
+
+## Incident States
+
+| State | Description | Terminal? |
+|-------|-------------|-----------|
+| `Detected` | Anomaly correlated into an incident, awaiting analysis | No |
+| `Analyzing` | AI is performing root cause analysis | No |
+| `Remediating` | A remediation plan is executing | No |
+| `Resolved` | Incident successfully resolved | Yes |
+| `Escalated` | All automatic retries exhausted — **requires human intervention** | Yes |
+| `Failed` | Single attempt failed with no retry configured | Yes |
+
+## State Machine Flow
+
+```
+Detected → Analyzing → Remediating → Resolved
+                ↓              ↓
+           Escalated      Failed/RolledBack
+           (after max         ↓
+            retries)     Re-analyze (up to 3x)
+                              ↓
+                         Escalated
+```
+
+### Detection Phase (`Detected`)
+
+When the watcher bridge detects anomalies, the correlation engine groups them into incidents:
+
+1. **Signal scoring** — each signal type has a weight (OOMKill=40, ErrorRate=30, PodRestart=25, etc.)
+2. **Risk score calculation** — aggregated from all correlated anomalies
+3. **Severity determination** — Critical (risk > 80), High (> 60), Medium (> 40), Low (otherwise)
+4. **Incident ID generation** — format: `INC-YYYYMMDD-NNN`
+5. **Max remediation attempts** set to 3 (default)
+
+### Analysis Phase (`Analyzing`)
+
+The system creates an AIInsight CR for AI-powered analysis:
+
+1. **Runbook matching** (tiered):
+   - **Tier 1**: Exact match on SignalType + Severity + ResourceKind (preferred)
+   - **Tier 2**: Fallback match on Severity + ResourceKind
+2. **If runbook found** → creates RemediationPlan from runbook steps
+3. **If no runbook** → enters **Agentic Mode** (AI-driven step-by-step remediation)
+4. Transitions to `Remediating`
+
+### Remediation Phase (`Remediating`)
+
+The remediation controller executes the plan:
+
+1. **Pre-flight snapshot** captured for rollback capability
+2. **Actions executed sequentially** with per-action checkpoints
+3. **Post-action health verification** (polls for up to 90 seconds)
+4. **On success** → `Resolved` + PostMortem generated
+5. **On failure** → automatic rollback attempted → re-analyze with failure context
+
+### Retry Mechanism
+
+When remediation fails:
+
+- **Attempt < MaxAttempts (3)**: The system re-analyzes with the failure context injected, potentially selecting a different runbook or strategy
+- **All attempts exhausted**: Transitions to `Escalated`
+
+### Escalated State — What Operators Must Do
+
+When an incident reaches `Escalated`, the system has exhausted all automatic options. Here's what happens and what you need to do:
+
+**What the system does automatically:**
+1. Triggers the EscalationPolicy matching the incident severity
+2. Sends notifications to L1 on-call (Slack, PagerDuty, etc.)
+3. If no acknowledgment within the configured timeout, escalates to L2, then L3
+4. Generates audit events for compliance
+
+**What operators must do:**
+1. **Acknowledge** the incident (stops escalation progression):
+   ```bash
+   curl -X POST https://operator:8090/api/v1/incidents/INC-20260319-001/acknowledge \
+     -H "X-API-Key: $API_KEY" \
+     -d '{"acknowledgedBy": "your-email@company.com"}'
+   ```
+
+2. **Investigate and fix** the issue manually
+
+3. **Resolve** the incident via one of three methods:
+
+   **Method 1: REST API** (recommended for automation/scripts)
+   ```bash
+   curl -X POST https://operator:8090/api/v1/incidents/INC-20260319-001/resolve \
+     -H "X-API-Key: $API_KEY" \
+     -d '{"resolution": "Fixed memory leak in payment-service v2.4.1, deployed hotfix manually"}'
+   ```
+
+   **Method 2: Web Dashboard**
+
+   Navigate to the incident detail page and click the **"Resolve"** button. Enter the resolution description in the dialog.
+
+   **Method 3: Kubernetes Direct** (advanced)
+   ```bash
+   kubectl patch issue INC-20260319-001 -n production --type=merge \
+     -p '{"status":{"state":"Resolved","resolution":"Manual fix applied"}}'
+   ```
+
+## Remediation Plan States
+
+Each incident may have multiple remediation plans (one per attempt):
+
+| State | Description |
+|-------|-------------|
+| `Pending` | Safety validation in progress |
+| `Executing` | Actions being executed sequentially |
+| `Verifying` | Post-action health check (up to 90s) |
+| `Completed` | All actions succeeded and health verified |
+| `Failed` | Action failed, no rollback possible |
+| `RolledBack` | Action failed, successfully rolled back to pre-flight state |
+
+## Agentic Remediation Mode
+
+When no runbook matches, the system uses AI-driven agentic remediation:
+
+1. **AI proposes an action** via the AgenticStep RPC
+2. **Action is executed** and the result is observed
+3. **AI analyzes the observation** and proposes the next action
+4. **Loop continues** until resolved or convergence detected
+
+**Safety guardrails:**
+- **Max steps**: 10 (configurable via `AgenticMaxSteps`)
+- **Max time**: 10 minutes per agentic plan
+- **Convergence detection**:
+  - Last 3 observations identical → force stop
+  - Alternating A→B→A→B pattern → force stop
+  - 5 consecutive failed actions → force stop
+
+## Decision Engine Confidence Thresholds
+
+The decision engine determines whether remediation can proceed automatically:
+
+| Severity | Auto-Approve Threshold | Action |
+|----------|----------------------|--------|
+| Low | Confidence >= 0.95 | Auto-execute |
+| Medium | Confidence >= 0.85 | Auto-execute + notify |
+| High | Confidence >= 0.80 | Requires approval |
+| Critical | Always | Manual approval required |
+
+**Adjustments**: Historical success rate, pattern match, time of day, and active issue count all modify the base confidence score.
+
+**Circuit breaker**: If 3+ remediations failed in the last hour, auto-remediation is blocked entirely.
+
+## Rollback Engine
+
+The rollback engine provides safety nets at two levels:
+
+1. **Pre-flight snapshot** — captured before ANY actions. Restores the entire resource state.
+2. **Per-action checkpoints** — captured before EACH action. Allows partial rollback.
+
+**Automatic rollback triggers:**
+- Action execution fails
+- Health verification times out (90 seconds)
+
+**Supported rollback targets:**
+- Deployment: replicas, container images, resource limits
+- StatefulSet: replicas, images, resources, partition
+- DaemonSet: images, resources, max unavailable
+- Job/CronJob: suspend, deadline, backoff limit, parallelism
+- Node: uncordon (restore schedulable)
+
+## Remediation Action Types
+
+The platform supports **46+ remediation action types** across resource kinds:
+
+### Deployment (18 actions)
+`ScaleDeployment`, `RollbackDeployment`, `RestartDeployment`, `PatchConfig`, `AdjustResources`, `DeletePod`, `HelmRollback`, `ArgoSyncApp`, `AdjustHPA`, `RestartStatefulSetPod`, `CordonNode`, `DrainNode`, `ResizePVC`, `RotateSecret`, `ExecDiagnostic`, `UpdateIngress`, `PatchNetworkPolicy`, `ApplyManifest`
+
+### StatefulSet (9 actions)
+`ScaleStatefulSet`, `RestartStatefulSet`, `RollbackStatefulSet`, `AdjustStatefulSetResources`, `DeleteStatefulSetPod`, `ForceDeleteStatefulSetPod`, `UpdateStatefulSetStrategy`, `RecreateStatefulSetPVC`, `PartitionStatefulSetUpdate`
+
+### DaemonSet (7 actions)
+`RestartDaemonSet`, `RollbackDaemonSet`, `AdjustDaemonSetResources`, `DeleteDaemonSetPod`, `UpdateDaemonSetStrategy`, `PauseDaemonSetRollout`, `CordonAndDeleteDaemonSetPod`
+
+### Job (9 actions)
+`RetryJob`, `AdjustJobResources`, `DeleteFailedJob`, `SuspendJob`, `ResumeJob`, `AdjustJobParallelism`, `AdjustJobDeadline`, `AdjustJobBackoffLimit`, `ForceDeleteJobPods`
+
+### CronJob (10 actions)
+`SuspendCronJob`, `ResumeCronJob`, `TriggerCronJob`, `AdjustCronJobResources`, `AdjustCronJobSchedule`, `AdjustCronJobDeadline`, `AdjustCronJobHistory`, `AdjustCronJobConcurrency`, `DeleteCronJobActiveJobs`, `ReplaceCronJobTemplate`
+
+## PostMortem Generation
+
+When an incident is resolved (automatically or manually), a PostMortem CR is auto-generated containing:
+
+- **Timeline** — chronological events from detection to resolution
+- **Root cause analysis** — AI-generated with confidence score
+- **Actions executed** — complete remediation history
+- **Impact assessment** — affected pods, services, SLOs
+- **Lessons learned** — AI recommendations for prevention
+- **Git correlation** — recent deployments that may have caused the issue
+- **Cascade analysis** — related incidents across services
+
+PostMortems can be reviewed and closed via the [Review PostMortem](/en/reference/api/review-postmortem) and [Close PostMortem](/en/reference/api/close-postmortem) API endpoints.
+
+## SLA Integration
+
+Each incident severity can have an SLA configuration:
+
+- **Response time** — max time from detection to first analysis
+- **Resolution time** — max time from detection to resolution
+- **Business hours** — optionally pause SLA clock outside business hours
+- **Escalation policy** — automatically triggered on SLA breach
