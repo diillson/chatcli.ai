@@ -45,14 +45,19 @@ Quando o watcher bridge detecta anomalias, o correlation engine as agrupa em inc
 
 ### Fase de Analise (`Analyzing`)
 
-O sistema cria um AIInsight CR para analise via IA:
+O sistema cria um AIInsight CR para analise via IA. Durante a deteccao, TODOS os runbooks candidatos sao injetados no contexto da IA para validacao.
 
-1. **Correspondencia de Runbook** (em camadas):
-   - **Camada 1**: Correspondencia exata por SignalType + Severity + ResourceKind (preferida)
+1. **Descoberta de runbooks candidatos** (em camadas):
+   - **Camada 1**: Todos os runbooks com SignalType + Severity + ResourceKind
    - **Camada 2**: Fallback por Severity + ResourceKind
-2. **Se runbook encontrado** → cria RemediationPlan a partir dos passos do runbook
-3. **Se sem runbook** → entra no **Modo Agentico** (remediacao passo-a-passo dirigida por IA)
-4. Transiciona para `Remediating`
+   - Multiplos runbooks podem existir por trigger (causas raiz diferentes geram runbooks diferentes)
+2. **IA valida candidatos**: O LLM recebe todos os runbooks candidatos e avalia cada um contra a analise de causa raiz atual:
+   - **`RUNBOOK_APPROVED: &lt;nome&gt;`** → usa aquele runbook especifico (caminho rapido)
+   - **`RUNBOOK_REJECTED`** → ignora todos os candidatos, usa sugestoes da IA ou modo agentico
+   - **Nenhum dos dois** → usa primeiro candidato como default (compatibilidade)
+3. **Se nao ha candidatos** e a IA tem acoes sugeridas → gera um novo runbook
+4. **Se nao ha candidatos e nem acoes da IA** → entra no **Modo Agentico** (IA passo-a-passo)
+5. Transiciona para `Remediating`
 
 ### Fase de Remediacao (`Remediating`)
 
@@ -230,6 +235,55 @@ A plataforma suporta **46+ tipos de acao de remediacao** entre tipos de recurso:
 
 ### CronJob (10 acoes)
 `SuspendCronJob`, `ResumeCronJob`, `TriggerCronJob`, `AdjustCronJobResources`, `AdjustCronJobSchedule`, `AdjustCronJobDeadline`, `AdjustCronJobHistory`, `AdjustCronJobConcurrency`, `DeleteCronJobActiveJobs`, `ReplaceCronJobTemplate`
+
+## Sistema de Aprendizado de Runbooks
+
+A plataforma constroi uma **biblioteca de estrategias aprendidas** ao longo do tempo. Cada remediacao bem-sucedida gera um runbook reutilizavel que pode ser aplicado a incidentes futuros com a mesma causa raiz.
+
+### Como os Runbooks Sao Nomeados
+
+Nomes de runbooks incluem um hash da analise de causa raiz da IA, garantindo que causas diferentes produzam runbooks diferentes:
+
+```
+auto-{sinal}-{severidade}-{tipo}-{hash}
+
+Exemplos:
+  auto-oom-kill-critical-deployment-a3f2b1  (causa: tail /dev/zero)
+  auto-oom-kill-critical-deployment-c7d4e9  (causa: memory limit muito baixo)
+  auto-pod-not-ready-low-deployment-e8b3d2  (causa: imagem invalida)
+```
+
+### Selecao Multi-Runbook
+
+Quando multiplos runbooks correspondem ao mesmo trigger (sinal + severidade + tipo), a IA recebe TODOS os candidatos e seleciona o mais apropriado:
+
+```
+Novo incidente OOMKill em Deployment
+       ↓
+3 runbooks candidatos encontrados (causas raiz diferentes)
+       ↓
+Todos os 3 injetados no contexto da IA com seus steps e descricoes
+       ↓
+IA analisa a causa raiz atual e responde:
+  "RUNBOOK_APPROVED: auto-oom-kill-critical-deployment-c7d4e9"
+  (porque este incidente e causado por memory limits baixos, correspondendo ao runbook)
+       ↓
+Runbook selecionado executado → resolucao rapida sem loop agentico
+```
+
+Se **nenhum** dos candidatos corresponde a causa raiz atual, a IA responde com `RUNBOOK_REJECTED`, gera uma nova estrategia do zero, e um **novo runbook e criado** com hash unico — expandindo a biblioteca para incidentes futuros.
+
+### Ciclo de Vida do Runbook
+
+| Estagio | O que Acontece |
+|---------|---------------|
+| **Criado** | Auto-gerado apos remediacao bem-sucedida pela IA |
+| **Encontrado** | Descoberto por criterios de trigger (sinal + severidade + tipo) |
+| **Validado** | IA avalia se o runbook se aplica a causa raiz atual |
+| **Executado** | Steps executados sequencialmente com capacidade de rollback |
+| **Biblioteca cresce** | Cada nova causa raiz adiciona um novo runbook a biblioteca |
+
+Com o tempo, a plataforma se torna mais rapida e precisa — falhas comuns sao resolvidas via runbooks (segundos) em vez de analise completa da IA (minutos).
 
 ## Geracao de PostMortem
 
