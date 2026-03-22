@@ -150,7 +150,7 @@ graph TD
         INSIGHT -->|AIInsightReconciler<br/>gRPC| AI_RPC
         AI_RPC -->|analysis + actions| INSIGHT
         ISS -->|creates| PLAN[RemediationPlan CR]
-        PLAN -->|RemediationReconciler<br/>executes| ACTIONS[19 action types:<br/>Scale / Restart / Rollback / Patch<br/>HelmRollback / ArgoSync / AdjustHPA<br/>CordonNode / DrainNode / ResizePVC...]
+        PLAN -->|RemediationReconciler<br/>executes| ACTIONS[54 action types:<br/>Scale / Restart / Rollback / Patch<br/>HelmRollback / ArgoSync / AdjustHPA<br/>CordonNode / DrainNode / ResizePVC<br/>StatefulSet / DaemonSet / Job / CronJob...]
         PLAN -->|agentic mode<br/>gRPC loop| AG_RPC
         AG_RPC -->|next action| PLAN
         ACTIONS -->|success| RESOLVED[Issue Resolved]
@@ -175,7 +175,7 @@ graph TD
 | **2. Correlation** | AnomalyReconciler + CorrelationEngine | Groups anomalies by resource + time window. Calculates risk score and severity. Creates/updates Issue CRs with `signalType`. |
 | **3. Analysis** | AIInsightReconciler + 6 enrichers | Collects K8s context (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, HPAs), **advanced log analysis** (stack traces Java/Go/Python/Node.js, 24+ error patterns), **Prometheus metrics** (CPU/mem/latency trends), **GitOps** (Helm/ArgoCD/Flux status), **source code** (commit↔incident correlation), **cascade analysis** (cross-service). |
 | **4. Remediation** | IssueReconciler | Runbook-first: **(a)** Manual Runbook (tiered matching), **(b)** generates auto Runbook from AI, or **(c)** agentic remediation (AI acts step-by-step). |
-| **5. Execution** | RemediationReconciler | **19 action types**: workload (Scale, Restart, Rollback, AdjustResources, DeletePod, RestartStatefulSetPod), GitOps (HelmRollback, ArgoSyncApp), autoscaling (AdjustHPA), infra (CordonNode, DrainNode), storage (ResizePVC), security (RotateSecret), networking (UpdateIngress, PatchNetworkPolicy), advanced (ApplyManifest, ExecDiagnostic). **Blast radius prediction** before execution. |
+| **5. Execution** | RemediationReconciler | **54 action types**: workload (Scale, Restart, Rollback, AdjustResources, DeletePod, RestartStatefulSetPod), GitOps (HelmRollback, ArgoSyncApp), autoscaling (AdjustHPA), infra (CordonNode, DrainNode), storage (ResizePVC), security (RotateSecret), networking (UpdateIngress, PatchNetworkPolicy), advanced (ApplyManifest, ExecDiagnostic), statefulset (ScaleStatefulSet, RestartStatefulSet, RollbackStatefulSet, AdjustStatefulSetResources, DeleteStatefulSetPod, ForceDeleteStatefulSetPod, UpdateStatefulSetStrategy, RecreateStatefulSetPVC, PartitionStatefulSetUpdate), daemonset (RestartDaemonSet, RollbackDaemonSet, AdjustDaemonSetResources, DeleteDaemonSetPod, UpdateDaemonSetStrategy, PauseDaemonSetRollout, CordonAndDeleteDaemonSetPod), job (RetryJob, AdjustJobResources, DeleteFailedJob, SuspendJob, ResumeJob, AdjustJobParallelism, AdjustJobDeadline, AdjustJobBackoffLimit, ForceDeleteJobPods), cronjob (SuspendCronJob, ResumeCronJob, TriggerCronJob, AdjustCronJobResources, AdjustCronJobSchedule, AdjustCronJobDeadline, AdjustCronJobHistory, AdjustCronJobConcurrency, DeleteCronJobActiveJobs, ReplaceCronJobTemplate). **Blast radius prediction** before execution. |
 | **6. Resolution** | IssueReconciler | Success -> Resolved (invalidates dedup). Failure -> re-analysis with failure context (different strategy) -> up to maxAttempts -> Escalated. |
 | **7. PostMortem** | IssueReconciler | **All remediations** (not just agentic) generate PostMortem CR with timeline, root cause, lessons, **metrics**, **git correlation**, **cascade chain**, **trending** (recurring incidents), **dev feedback**. Agentic remediation also generates reusable Runbook. |
 
@@ -293,15 +293,24 @@ spec:
     maxLogLines: 100
     maxContextChars: 32000
     targets:
-      - deployment: api-gateway
+      - name: api-gateway
         namespace: production
         metricsPort: 9090
         metricsFilter: ["http_requests_*", "http_request_duration_*"]
-      - deployment: auth-service
+      - name: auth-service
         namespace: production
         metricsPort: 9090
-      - deployment: worker
+      - name: worker
         namespace: batch
+      - name: postgres                  # Monitor a StatefulSet
+        kind: StatefulSet
+        namespace: production
+      - name: fluentd-agent             # Monitor a DaemonSet
+        kind: DaemonSet
+        namespace: logging
+      - name: etl-pipeline              # Monitor a CronJob
+        kind: CronJob
+        namespace: data
 
   resources:
     requests:
@@ -372,7 +381,7 @@ The primary provider (`spec.provider`) is always tried first. Providers in `fall
 | Field | Type | Required | Default | Description |
 |-------|------|:--------:|---------|-------------|
 | `enabled` | bool | No | `false` | Enables the watcher |
-| `targets` | []WatchTargetSpec | No | | List of deployments (multi-target) |
+| `targets` | []WatchTargetSpec | No | | List of resources to monitor (multi-target) |
 | `deployment` | string | No | | Single deployment (legacy) |
 | `namespace` | string | No | | Deployment namespace (legacy) |
 | `interval` | string | No | `"30s"` | Collection interval |
@@ -384,11 +393,32 @@ The primary provider (`spec.provider`) is always tried first. Providers in `fall
 
 | Field | Type | Required | Default | Description |
 |-------|------|:--------:|---------|-------------|
-| `deployment` | string | **Yes** | | Deployment name |
-| `namespace` | string | **Yes** | | Deployment namespace |
+| `name` | string | **Yes**&ast; | | Resource name to monitor (e.g., `postgres`, `fluentd`) |
+| `deployment` | string | No | | Deprecated alias for `name` — kept for backward compatibility |
+| `kind` | string | No | `Deployment` | Resource kind: `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob` |
+| `namespace` | string | **Yes** | | Resource namespace |
 | `metricsPort` | int32 | No | `0` | Prometheus port (0 = disabled) |
 | `metricsPath` | string | No | `/metrics` | Prometheus endpoint path |
 | `metricsFilter` | []string | No | | Glob filters for metrics |
+
+<Tip>
+Use `name` + `kind` to monitor any Kubernetes workload type. When `kind` is omitted, it defaults to `Deployment`. The legacy `deployment` field still works as alias for `name`. Examples:
+```yaml
+targets:
+  - name: api-gateway             # Deployment (default kind)
+    namespace: production
+  - name: postgres                # StatefulSet (database)
+    kind: StatefulSet
+    namespace: production
+  - name: fluentd                 # DaemonSet (logging agent)
+    kind: DaemonSet
+    namespace: logging
+  - name: etl-pipeline            # CronJob (scheduled batch)
+    kind: CronJob
+    namespace: data
+```
+The AIOps pipeline will automatically use resource-specific remediation actions (e.g., `ScaleStatefulSet`, `RestartDaemonSet`, `SuspendCronJob`) based on the detected resource kind.
+</Tip>
 
 ### Resources Created by Instance
 
@@ -608,7 +638,7 @@ status:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Human-readable action name |
-| `action` | string | Action type (19 action types available -- see [Action Types](#action-types-19-types)) |
+| `action` | string | Action type (54 action types available -- see [Action Types](#action-types-54-types)) |
 | `description` | string | Explanation of why this action is needed |
 | `params` | map[string]string | Action parameters (e.g., `replicas: "4"`) |
 
@@ -764,7 +794,7 @@ flowchart TD
 
 ---
 
-#### Action Types (19 types)
+#### Action Types (54 types)
 
 **Workload:**
 
@@ -824,6 +854,61 @@ flowchart TD
 | `ApplyManifest` | Applies JSON manifest from a ConfigMap | `configmap`, `key` |
 | `ExecDiagnostic` | Executes whitelisted diagnostic command in pod | `command` (e.g., `df -h`, `ps aux`) |
 | `Custom` | Custom action (blocked by safety checks) | -- |
+
+**StatefulSet:**
+
+| Type | Description | Parameters |
+|------|-------------|------------|
+| `ScaleStatefulSet` | Ordered replica scaling | `replicas` |
+| `RestartStatefulSet` | Rolling restart via annotation | -- |
+| `RollbackStatefulSet` | Rollback via ControllerRevision | `toRevision` |
+| `AdjustStatefulSetResources` | Adjusts CPU/memory | `container`, `memory_limit`, `cpu_limit` |
+| `DeleteStatefulSetPod` | Deletes specific or unhealthiest pod | `pod` (optional) |
+| `ForceDeleteStatefulSetPod` | Force-delete stuck pod (grace=0) | `pod` (REQUIRED) |
+| `UpdateStatefulSetStrategy` | Changes updateStrategy | `type`, `maxUnavailable` |
+| `RecreateStatefulSetPVC` | Deletes stuck PVC | `pvc`, `confirm=true` |
+| `PartitionStatefulSetUpdate` | Canary partition | `partition` |
+
+**DaemonSet:**
+
+| Type | Description | Parameters |
+|------|-------------|------------|
+| `RestartDaemonSet` | Rolling restart across all nodes | -- |
+| `RollbackDaemonSet` | Rollback via ControllerRevision | `toRevision` |
+| `AdjustDaemonSetResources` | Adjusts CPU/memory | `container`, `memory_limit`, `cpu_limit` |
+| `DeleteDaemonSetPod` | Deletes pod (optionally on specific node) | `pod`, `node` (optional) |
+| `UpdateDaemonSetStrategy` | Changes update strategy | `type`, `maxUnavailable`, `maxSurge` |
+| `PauseDaemonSetRollout` | Pauses rollout (maxUnavailable=0) | -- |
+| `CordonAndDeleteDaemonSetPod` | Cordons node + deletes pod | `node` (REQUIRED) |
+
+**Job:**
+
+| Type | Description | Parameters |
+|------|-------------|------------|
+| `RetryJob` | Deletes failed Job + recreates | -- |
+| `AdjustJobResources` | Adjusts CPU/memory on template | `container`, `memory_limit`, `cpu_limit` |
+| `DeleteFailedJob` | Cleans up failed Job | -- |
+| `SuspendJob` | Pauses Job (suspend=true) | -- |
+| `ResumeJob` | Resumes Job (suspend=false) | -- |
+| `AdjustJobParallelism` | Changes parallelism | `parallelism` |
+| `AdjustJobDeadline` | Changes deadline | `activeDeadlineSeconds` |
+| `AdjustJobBackoffLimit` | Changes backoff limit | `backoffLimit` |
+| `ForceDeleteJobPods` | Force-deletes all Job pods | -- |
+
+**CronJob:**
+
+| Type | Description | Parameters |
+|------|-------------|------------|
+| `SuspendCronJob` | Pauses scheduling | -- |
+| `ResumeCronJob` | Resumes scheduling | -- |
+| `TriggerCronJob` | Creates Job immediately | -- |
+| `AdjustCronJobResources` | Adjusts CPU/memory on jobTemplate | `container`, `memory_limit`, `cpu_limit` |
+| `AdjustCronJobSchedule` | Changes schedule | `schedule` |
+| `AdjustCronJobDeadline` | Changes deadline | `startingDeadlineSeconds` |
+| `AdjustCronJobHistory` | Changes history limits | `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` |
+| `AdjustCronJobConcurrency` | Changes concurrency policy | `concurrencyPolicy` |
+| `DeleteCronJobActiveJobs` | Kills running Jobs | -- |
+| `ReplaceCronJobTemplate` | Replaces template from ConfigMap | `configmap`, `key` |
 
 #### RemediationPlan Examples with New Actions
 
@@ -1685,7 +1770,7 @@ cd operator
 # Build
 go build ./...
 
-# Tests (110 functions, 146 with subtests)
+# Tests (130 functions, 185 with subtests)
 go test ./... -v
 
 # Docker (must be built from the repository root)

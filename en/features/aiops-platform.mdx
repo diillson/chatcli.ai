@@ -92,7 +92,7 @@ sequenceDiagram
     RR->>K8s: Watch RemediationPlan CRs
 
     alt Standard mode (Runbook)
-        RR->>K8s: Executes actions (19 types: Scale/Restart/Rollback/HelmRollback/ArgoSync/AdjustHPA/...)
+        RR->>K8s: Executes actions (54 types: Deployment/StatefulSet/DaemonSet/Job/CronJob + GitOps/Infra/Storage/Security/Network)
     else Agentic mode
         loop Each step (max 10, timeout 10min)
             RR->>Server: AgenticStep(context + history)
@@ -448,34 +448,91 @@ Impact prediction before action execution:
 
 Executes the actions defined in a RemediationPlan.
 
-**Supported Actions (19 types):**
+**Supported Actions (54 types across 9 categories):**
+
+**Deployment / Generic (19 actions):**
 
 | Category | Type | What It Does | Key Parameters |
 |----------|------|-------------|----------------|
-| Workload | `ScaleDeployment` | Adjusts replicas | `replicas` |
-| Workload | `RestartDeployment` | Rollout restart | -- |
-| Workload | `RollbackDeployment` | Rollback to previous/healthy/specific revision | `toRevision` |
-| Workload | `PatchConfig` | Updates ConfigMap | `configmap`, `key=value` |
-| Workload | `AdjustResources` | Adjusts CPU/memory | `memory_limit`, `cpu_limit`, etc. |
-| Workload | `DeletePod` | Removes the sickest pod | `pod` (auto-selects) |
-| Workload | `RestartStatefulSetPod` | Restart StatefulSet pod | `pod` (or rolling restart) |
+| Workload | `ScaleDeployment` | Adjusts Deployment replicas | `replicas` |
+| Workload | `RestartDeployment` | Rollout restart via annotation | -- |
+| Workload | `RollbackDeployment` | Rollback to previous/healthy/specific revision (via ReplicaSet) | `toRevision` |
+| Workload | `PatchConfig` | Updates ConfigMap data | `configmap`, `key=value` |
+| Workload | `AdjustResources` | Adjusts CPU/memory on Deployment containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| Workload | `DeletePod` | Removes the sickest pod (auto-selects) | `pod` (optional) |
+| Workload | `RestartStatefulSetPod` | Restart specific StatefulSet pod or rolling restart | `pod` (optional) |
 | GitOps | `HelmRollback` | Rollback Helm release | `revision` |
 | GitOps | `ArgoSyncApp` | Trigger ArgoCD sync | `revision` |
-| Autoscaling | `AdjustHPA` | Modifies HPA min/max/target | `minReplicas`, `maxReplicas` |
+| Autoscaling | `AdjustHPA` | Modifies HPA min/max/target | `minReplicas`, `maxReplicas`, `targetCPUUtilization` |
 | Infra | `CordonNode` | Marks node unschedulable | `node` |
-| Infra | `DrainNode` | Evicts pods from node | `node` |
-| Storage | `ResizePVC` | Expands PVC | `pvc`, `size` |
-| Security | `RotateSecret` | Updates Secret | `secret`, `key=value` |
-| Networking | `UpdateIngress` | Modifies Ingress | `ingress`, `backendService` |
-| Networking | `PatchNetworkPolicy` | Opens port in NetworkPolicy | `networkPolicy`, `allowPort` |
-| Advanced | `ApplyManifest` | Applies manifest from ConfigMap | `configmap`, `key` |
-| Advanced | `ExecDiagnostic` | Whitelisted diagnostic command | `command` |
+| Infra | `DrainNode` | Cordons and evicts pods from node | `node` |
+| Storage | `ResizePVC` | Expands PVC (no shrinking) | `pvc`, `size` |
+| Security | `RotateSecret` | Updates Secret values or copies from source | `secret`, `sourceSecret` or `key=value` |
+| Networking | `UpdateIngress` | Modifies Ingress backend/annotations | `ingress`, `backendService`, `backendPort` |
+| Networking | `PatchNetworkPolicy` | Adds ports to NetworkPolicy ingress rules | `networkPolicy`, `allowPort`, `protocol` |
+| Advanced | `ApplyManifest` | Applies JSON manifest from ConfigMap | `configmap`, `key` |
+| Advanced | `ExecDiagnostic` | Runs whitelisted diagnostic command in pod | `command`, `pod`, `container` |
 | -- | `Custom` | **Blocked** -- requires manual approval | -- |
 
-<Warning>
-**Safety Checks (pre-execution):** Scale to 0 replicas is blocked. AdjustResources limit cannot be less than request. DeletePod refuses if only 1 pod exists. Custom actions are blocked. Blast radius prediction checks PDB violations, resource quotas, and affected services before execution.
+**StatefulSet (9 actions):**
 
-**Automatic Rollback (post-failure):** Before any action, a structured `ResourceSnapshot` captures the complete resource state (replicas, images, CPU/memory, HPA). If an action fails or the health verification expires (90s), the `RollbackEngine` automatically restores the resource to the pre-remediation state. The plan transitions to `RolledBack` and `PostFailureHealthy` confirms whether the resource is healthy. Works for Deployments, StatefulSets, DaemonSets, Nodes, and HPAs.
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `ScaleStatefulSet` | Ordered replica scaling | `replicas` |
+| `RestartStatefulSet` | Rolling restart via annotation (ordered) | -- |
+| `RollbackStatefulSet` | Rollback via ControllerRevision (not ReplicaSet) | `toRevision` (previous\|N) |
+| `AdjustStatefulSetResources` | Adjusts CPU/memory on StatefulSet containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `DeleteStatefulSetPod` | Deletes specific or unhealthiest pod (preserves PVC identity) | `pod` (optional) |
+| `ForceDeleteStatefulSetPod` | Force-delete stuck Terminating pod (grace=0) | `pod` (REQUIRED) |
+| `UpdateStatefulSetStrategy` | Changes updateStrategy type | `type` (RollingUpdate\|OnDelete), `maxUnavailable` |
+| `RecreateStatefulSetPVC` | Deletes stuck PVC for recreation | `pvc`, `confirm=true` (REQUIRED) |
+| `PartitionStatefulSetUpdate` | Sets partition for canary rollout | `partition` |
+
+**DaemonSet (7 actions):**
+
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `RestartDaemonSet` | Rolling restart of all DaemonSet pods across nodes | -- |
+| `RollbackDaemonSet` | Rollback via ControllerRevision | `toRevision` (previous\|N) |
+| `AdjustDaemonSetResources` | Adjusts CPU/memory on DaemonSet containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `DeleteDaemonSetPod` | Deletes pod (optionally on specific node) | `pod` or `node` (optional) |
+| `UpdateDaemonSetStrategy` | Changes update strategy | `type`, `maxUnavailable`, `maxSurge` |
+| `PauseDaemonSetRollout` | Pauses rollout (sets maxUnavailable=0) | -- |
+| `CordonAndDeleteDaemonSetPod` | Cordons node + deletes DaemonSet pod on it | `node` (REQUIRED) |
+
+**Job (9 actions):**
+
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `RetryJob` | Deletes failed Job + recreates from spec | -- |
+| `AdjustJobResources` | Adjusts CPU/memory on Job template | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `DeleteFailedJob` | Cleans up a failed Job and its pods | -- |
+| `SuspendJob` | Pauses a running Job (suspend=true) | -- |
+| `ResumeJob` | Resumes a suspended Job (suspend=false) | -- |
+| `AdjustJobParallelism` | Changes Job parallelism | `parallelism` |
+| `AdjustJobDeadline` | Changes activeDeadlineSeconds | `activeDeadlineSeconds` |
+| `AdjustJobBackoffLimit` | Changes backoffLimit | `backoffLimit` |
+| `ForceDeleteJobPods` | Force-deletes all pods of a Job (grace=0) | -- |
+
+**CronJob (10 actions):**
+
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `SuspendCronJob` | Pauses CronJob scheduling (suspend=true) | -- |
+| `ResumeCronJob` | Resumes CronJob scheduling (suspend=false) | -- |
+| `TriggerCronJob` | Creates a Job from CronJob template immediately | -- |
+| `AdjustCronJobResources` | Adjusts CPU/memory on jobTemplate containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `AdjustCronJobSchedule` | Changes cron schedule expression | `schedule` |
+| `AdjustCronJobDeadline` | Changes startingDeadlineSeconds | `startingDeadlineSeconds` |
+| `AdjustCronJobHistory` | Changes success/failure history limits | `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` |
+| `AdjustCronJobConcurrency` | Changes concurrencyPolicy | `concurrencyPolicy` (Allow\|Forbid\|Replace) |
+| `DeleteCronJobActiveJobs` | Kills all currently running Jobs | -- |
+| `ReplaceCronJobTemplate` | Replaces jobTemplate from ConfigMap JSON | `configmap`, `key` |
+
+<Warning>
+**Safety Checks (pre-execution):** Scale to 0 replicas blocked (Deployment and StatefulSet). AdjustResources limit cannot be less than request (all resource types). DeletePod/DeleteStatefulSetPod refuses if only 1 pod exists. ForceDeleteStatefulSetPod requires explicit pod name. RecreateStatefulSetPVC requires `confirm=true`. Custom actions are blocked. Blast radius prediction checks PDB violations, resource quotas, and affected services before execution — now generalized for all workload types via `getPodTemplateLabels`.
+
+**Automatic Rollback (post-failure):** Before any action, a structured `ResourceSnapshot` captures the complete resource state. For Deployments: replicas, images, CPU/memory, HPA. For StatefulSets: replicas, containers, updateStrategy, partition. For DaemonSets: containers, updateStrategy, maxUnavailable. For Jobs: suspend, parallelism, backoffLimit, activeDeadlineSeconds, containers. For CronJobs: suspend, schedule, concurrencyPolicy, history limits, containers. If an action fails or health verification expires (90s), the `RollbackEngine` automatically restores the resource to the pre-remediation state. Works for Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Nodes, and HPAs.
 </Warning>
 
 **Execution Flow (Standard):**
@@ -683,20 +740,20 @@ The operator exposes Prometheus metrics for observability:
 
 ## Tests
 
-The operator has 110 tests (146 with subtests) covering all components:
+The operator has 130 tests (185 with subtests) covering all components:
 
 | Component | Tests | Coverage |
 |-----------|-------|---------|
 | InstanceReconciler | 15 | CRUD, watcher, persistence, replicas, RBAC, deletion, deepcopy |
 | AnomalyReconciler | 4 | Creation, correlation, attachment to existing Issue |
 | IssueReconciler | 12 | State machine, AI fallback, retry, agentic plan, PostMortem generation |
-| RemediationReconciler | 16 | All action types, safety checks, agentic loop (first step, resolved, max steps, timeout, action failed, observation) |
+| RemediationReconciler | 38 | All 54 action types (Deployment + StatefulSet + DaemonSet + Job + CronJob), safety constraints, agentic loop, rollback, verification |
 | AIInsightReconciler | 12 | Connectivity, mock RPC, analysis parsing, withAuth, TLS/token |
 | PostMortemReconciler | 2 | State initialization, terminal state |
 | WatcherBridge | 22 | Alert mapping, SHA256 dedup, hash, pruning, Anomaly creation, buildConnectionOpts (TLS, token, both) |
 | CorrelationEngine | 4 | Risk scoring, severity, incident ID, related anomalies |
 | Pipeline (E2E) | 3 | Complete flow: Anomaly->Issue->Insight->Plan->Resolved, escalation, correlation |
-| MapActionType | 6 | All string->enum mappings |
+| MapActionType | 6+17 | All 54 string->enum mappings including StatefulSet, DaemonSet, Job, CronJob actions |
 
 ### Run Tests
 
