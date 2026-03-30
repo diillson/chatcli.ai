@@ -1,0 +1,219 @@
+---
+title: "MCP Channels"
+sidebarTitle: "MCP Channels"
+description: "Receba push messages de servidores MCP para notificacoes reativas de CI, alerts e eventos externos"
+icon: "tower-broadcast"
+---
+
+O **MCP Channels** e o sistema de notificacoes push do ChatCLI que permite receber mensagens em tempo real de servidores MCP via SSE (Server-Sent Events). Com channels, o agent pode reagir a eventos externos como falhas de CI, alertas de monitoramento e notificacoes de deploy sem precisar fazer polling.
+
+<Info>
+MCP Channels funciona apenas com servidores MCP que suportam o transporte SSE e implementam push notifications. Servidores stdio nao suportam channels.
+</Info>
+
+---
+
+## Conceito
+
+Diferente das tool calls tradicionais (request-response), channels permitem que servidores MCP **enviem mensagens proativamente** para o ChatCLI:
+
+```text
+MCP Server (SSE)
+      |
+      | push notification
+      v
+ChatCLI MCP Manager
+      |
+      v
+Channel Buffer (circular, 100 msgs)
+      |
+      v
+Auto-inject (last 5) in system prompt
+      |
+      v
+Agent reage ao evento
+```
+
+---
+
+## Como Funciona
+
+<Steps>
+  <Step title="Conexao SSE">
+    O ChatCLI mantem uma conexao SSE persistente com cada servidor MCP que suporta channels. A conexao e estabelecida automaticamente ao iniciar.
+  </Step>
+  <Step title="Recepcao de mensagens">
+    Mensagens push sao recebidas via SSE e armazenadas em um buffer circular por channel. Cada channel armazena ate 100 mensagens.
+  </Step>
+  <Step title="Auto-injecao no prompt">
+    As ultimas 5 mensagens de cada channel ativo sao automaticamente injetadas no system prompt do proximo turno. Isso permite que o agent "veja" os eventos mais recentes.
+  </Step>
+  <Step title="Reacao do agent">
+    O agent pode reagir aos eventos injetados, tomando acoes como investigar falhas, ler logs ou notificar o usuario.
+  </Step>
+</Steps>
+
+---
+
+## Buffer Circular
+
+Cada channel mantem um buffer circular de **100 mensagens**. Quando o buffer esta cheio, mensagens mais antigas sao descartadas automaticamente:
+
+```text
+Channel: ci-pipeline
+  [97] 14:30:01 Build #456 started (branch: feature/auth)
+  [98] 14:32:15 Tests passed: 142/142
+  [99] 14:32:45 Build #456 succeeded
+  [100] 14:35:00 Deploy to staging started
+  ──── buffer full, oldest messages discarded ────
+```
+
+<Tip>
+O tamanho do buffer (100) e suficiente para a maioria dos casos. Mensagens importantes devem ser processadas pelo agent em tempo real, nao armazenadas indefinidamente.
+</Tip>
+
+---
+
+## Auto-Injecao no System Prompt
+
+As ultimas 5 mensagens de cada channel ativo sao injetadas automaticamente no system prompt:
+
+```text
+## MCP Channel Notifications
+
+### ci-pipeline (last 5):
+- [14:32:45] Build #456 succeeded
+- [14:35:00] Deploy to staging started
+- [14:35:30] Staging deploy completed
+- [14:36:00] Smoke tests: 3/3 passed
+- [14:40:00] Build #457 started (branch: main)
+
+### alerts (last 5):
+- [14:33:00] WARNING: CPU usage above 80% on prod-api-2
+- [14:38:00] RESOLVED: CPU usage normalized on prod-api-2
+```
+
+<Warning>
+A auto-injecao consome tokens do system prompt. Se voce tem muitos channels ativos, considere usar `/channel inject` seletivamente em vez da auto-injecao.
+</Warning>
+
+---
+
+## Comandos
+
+| Comando | Descricao |
+|:--------|:----------|
+| `/channel list` | Lista todos os channels disponiveis e seu status (mensagens no buffer, ultima mensagem) |
+| `/channel inject` | Injeta manualmente as mensagens mais recentes de todos os channels no proximo turno |
+| `/channel <nome>` | Mostra as mensagens do channel especificado |
+
+### Listando Channels
+
+```bash
+/channel list
+```
+
+```text
+MCP Channels:
+  ci-pipeline    12 messages  last: 14:40:00  (auto-inject: on)
+  alerts          3 messages  last: 14:38:00  (auto-inject: on)
+  deployments     0 messages  last: never     (auto-inject: off)
+```
+
+### Visualizando um Channel
+
+```bash
+/channel ci-pipeline
+```
+
+```text
+Channel: ci-pipeline (12 messages)
+
+  [14:30:01] Build #456 started (branch: feature/auth)
+  [14:31:00] Linting passed
+  [14:31:30] Unit tests: 142/142 passed
+  [14:32:00] Integration tests: 38/38 passed
+  [14:32:15] Tests passed: 142/142
+  [14:32:45] Build #456 succeeded
+  [14:33:00] Docker image pushed: registry.io/app:456
+  [14:35:00] Deploy to staging started
+  [14:35:30] Staging deploy completed
+  [14:36:00] Smoke tests: 3/3 passed
+  [14:38:00] Build #457 started (branch: main)
+  [14:40:00] Build #457: tests running...
+```
+
+### Injecao Manual
+
+```bash
+/channel inject
+```
+
+```text
+Injected 10 channel messages into next turn context.
+  ci-pipeline: 5 messages
+  alerts: 5 messages
+```
+
+---
+
+## Configuracao de Servidores com Channels
+
+Servidores MCP que suportam channels devem ser configurados com transporte SSE:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "ci-monitor",
+      "transport": "sse",
+      "url": "http://mcp-ci:8080/sse",
+      "enabled": true,
+      "channels": ["ci-pipeline", "deployments"]
+    },
+    {
+      "name": "alertmanager",
+      "transport": "sse",
+      "url": "http://mcp-alerts:8080/sse",
+      "enabled": true,
+      "channels": ["alerts"]
+    }
+  ]
+}
+```
+
+<Info>
+O campo `channels` e opcional. Se omitido, o ChatCLI aceita todos os channels que o servidor enviar. Se especificado, apenas os channels listados sao subscritos.
+</Info>
+
+---
+
+## Casos de Uso
+
+<CardGroup cols={2}>
+  <Card title="CI/CD Pipeline" icon="gears">
+    Receba notificacoes de build, testes e deploy em tempo real. O agent pode investigar falhas automaticamente.
+  </Card>
+  <Card title="Alertas de Monitoramento" icon="triangle-exclamation">
+    Receba alertas de Prometheus, Grafana ou Datadog e deixe o agent analisar metricas e logs.
+  </Card>
+  <Card title="Eventos de Deploy" icon="rocket">
+    Acompanhe deploys em staging e producao com notificacoes de status em tempo real.
+  </Card>
+  <Card title="Webhooks Externos" icon="webhook">
+    Converta webhooks de GitHub, Jira ou Slack em notificacoes MCP para o agent.
+  </Card>
+</CardGroup>
+
+---
+
+## Proximos Passos
+
+<CardGroup cols={2}>
+  <Card title="MCP Integration" icon="link" href="/features/mcp-integration">
+    Configure servidores MCP com suporte a channels.
+  </Card>
+  <Card title="Sistema de Hooks" icon="webhook" href="/features/hooks-system">
+    Combine channels com hooks para automacoes reativas.
+  </Card>
+</CardGroup>
