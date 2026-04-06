@@ -1,104 +1,332 @@
 ---
-title: "Security and Hardening"
+title: "Enterprise Security"
 sidebarTitle: "Security"
-description: "Complete overview of ChatCLI security measures: injection protection, authentication, hardened infrastructure, and best practices for production."
-icon: "lock"
+description: "Defense-in-depth security architecture: JWT + RBAC authentication, AES-256-GCM encryption, SSRF prevention, rate limiting, Ed25519 plugin signing, command allowlist, structured audit logging, and more."
+icon: "shield-halved"
 ---
 
-ChatCLI was designed with **defense-in-depth** security. This page documents all implemented protection measures, how to configure them, and best practices for production environments.
+ChatCLI is built with a **defense-in-depth** security architecture. This page documents every protection layer, how to configure them, and best practices for production environments.
 
 ---
 
-## Protection Summary
+## Security Overview
+
+The table below summarizes all active protections across every layer of the stack.
 
 | Layer | Protection | Status |
-|--------|----------|--------|
-| **Authentication** | Constant-time token comparison (crypto/subtle) | Active |
-| **Shell** | POSIX quoting to prevent shell argument injection | Active |
+|-------|------------|--------|
+| **Authentication** | JWT tokens with RS256/HS256 + RBAC role enforcement | Active |
+| **Authentication** | Legacy bearer token with constant-time comparison (`crypto/subtle`) | Active |
+| **Authentication** | OAuth 2.0 + PKCE for Anthropic, OpenAI, GitHub Copilot | Active |
+| **Authorization** | Role-based access control (viewer / operator / admin) | Active |
+| **Encryption** | AES-256-GCM encryption for stored credentials | Active |
+| **Encryption** | Session data encrypted at rest with per-profile keys | Active |
+| **Transport** | TLS 1.3 support for gRPC and REST endpoints | Active |
+| **Transport** | mTLS support with client certificate verification | Active |
+| **Keychain** | OS keychain integration (macOS Keychain, Linux secret-service, Windows Credential Manager) | Active |
+| **Shell** | POSIX quoting to prevent shell injection in arguments | Active |
 | **Editors** | EDITOR validation against allowlist of known editors | Active |
-| **Commands** | 50+ regex patterns for dangerous command detection | Active |
+| **Agent Commands** | 150+ command allowlist (strict mode) or 50+ denylist patterns (permissive mode) | Active |
+| **Agent Paths** | Read path blocking outside workspace directory | Active |
+| **Agent Shell** | Shell config sourcing disabled by default | Active |
+| **Agent Output** | Output sanitizer strips ANSI escape sequences and truncates large output | Active |
 | **Policies** | Word-boundary matching to prevent permission escalation | Active |
+| **Plugins** | Ed25519 signature verification for plugin binaries | Active |
+| **Plugins** | Quarantine period for newly installed unsigned plugins | Active |
+| **Plugins** | Per-plugin permission manifest (network, filesystem, exec) | Active |
+| **gRPC** | SSRF prevention with private IP blocking on outbound requests | Active |
+| **gRPC** | Rate limiting (token bucket) per client IP | Active |
+| **gRPC** | Maximum message size limits (send/receive) | Active |
+| **gRPC** | Maximum concurrent stream limits | Active |
+| **gRPC** | Input validation on all RPC fields | Active |
 | **gRPC** | Reflection disabled by default (hides service schema) | Active |
-| **Binaries** | stty resolution via exec.LookPath (prevents PATH injection) | Active |
-| **Containers** | read-only filesystem, no-new-privileges, drop ALL capabilities | Active |
-| **Kubernetes** | Namespace-scoped RBAC by default, restrictive SecurityContext | Active |
-| **Network** | Optional TLS with warning when disabled | Active |
-| **Critical errors** | All `io.ReadAll`, `json.Marshal` errors handled in critical paths | Active |
-| **Proto** | Meta field preserved in proto conversion (SessionData round-trip) | Active |
+| **Audit** | Structured JSON audit logging for all sensitive operations | Active |
+| **Binaries** | `stty` resolved via `exec.LookPath` (prevents PATH injection) | Active |
+| **Containers** | Read-only filesystem, no-new-privileges, drop ALL capabilities | Active |
+| **Kubernetes** | Fail-closed authentication for operator webhooks | Active |
+| **Kubernetes** | Resource type allowlist for operator actions | Active |
+| **Kubernetes** | Log scrubbing of secrets and tokens | Active |
+| **Kubernetes** | CORS policy with configurable allowed origins | Active |
+| **Kubernetes** | RBAC namespace-scoped by default, restrictive SecurityContext | Active |
+| **Kubernetes** | NetworkPolicy for pod-level network segmentation | Active |
+| **Network** | TLS optional with warning when disabled | Active |
+| **Environment** | Env variable redaction in logs and error messages | Active |
+| **History** | Disable history recording for sensitive sessions | Active |
+| **Session** | Configurable session TTL with automatic expiration | Active |
+| **CI/CD** | govulncheck, gosec, Dependabot, Cosign image signing | Active |
+| **Errors** | All critical-path errors (`io.ReadAll`, `json.Marshal`) handled | Active |
+| **Proto** | Meta field preserved in proto conversion (round-trip SessionData) | Active |
 
 ---
 
-## gRPC Server Authentication
+## Authentication and Authorization
 
-### Bearer Token with Constant-Time Comparison
+### JWT Authentication (Recommended)
 
-The gRPC server uses Bearer token authentication in the `authorization` header of each request. Token comparison uses `crypto/subtle.ConstantTimeCompare`, which **prevents timing attacks** -- an attacker cannot infer correct characters by measuring response time.
+The gRPC and REST servers support JWT-based authentication with configurable issuer, audience, and secret. JWTs carry role claims that map to RBAC policies.
+
+<Tabs>
+  <Tab title="HS256 (Symmetric)">
+    ```bash
+    export CHATCLI_JWT_SECRET="your-256-bit-secret-key-here"
+    export CHATCLI_JWT_ISSUER="chatcli-server"
+    export CHATCLI_JWT_AUDIENCE="chatcli-api"
+    chatcli server
+    ```
+  </Tab>
+  <Tab title="Via Helm">
+    ```yaml
+    # values.yaml
+    server:
+      jwt:
+        secret: "your-256-bit-secret-key-here"
+        issuer: "chatcli-server"
+        audience: "chatcli-api"
+    ```
+  </Tab>
+</Tabs>
+
+### RBAC Roles
+
+Three built-in roles control access to API endpoints and operations:
+
+| Role | Permissions | Typical Use |
+|------|-------------|-------------|
+| `viewer` | Read-only access to incidents, SLOs, analytics, audit logs | Dashboards, monitoring |
+| `operator` | Viewer + acknowledge/resolve incidents, approve remediations, manage runbooks | On-call engineers |
+| `admin` | Full access including configuration, user management, destructive operations | Platform admins |
+
+<Info>The `/Health` endpoint is always accessible without authentication to support load balancer and orchestrator health checks.</Info>
+
+### Legacy Bearer Token
+
+For simpler deployments, the server supports static bearer token authentication with constant-time comparison (`crypto/subtle.ConstantTimeCompare`), preventing timing attacks.
 
 <Tabs>
   <Tab title="Via flag">
     ```bash
-    chatcli server --token meu-token-secreto
+    chatcli server --token my-secret-token
     ```
   </Tab>
   <Tab title="Via environment variable">
     ```bash
-    export CHATCLI_SERVER_TOKEN=meu-token-secreto
+    export CHATCLI_SERVER_TOKEN=my-secret-token
     chatcli server
     ```
   </Tab>
 </Tabs>
 
-<Info>The `/Health` endpoint is always accessible without authentication to allow health checks from load balancers and orchestrators.</Info>
+### OAuth 2.0 + PKCE
 
-### TLS (Optional)
+ChatCLI supports OAuth 2.0 with PKCE for the following providers:
 
-TLS is **fully optional**. In a local development environment, you can run without TLS without issues. For production, we strongly recommend enabling TLS:
+| Provider | Flow | Token Storage |
+|----------|------|---------------|
+| Anthropic | Authorization Code + PKCE | AES-256-GCM encrypted file |
+| OpenAI | Authorization Code + PKCE | AES-256-GCM encrypted file |
+| GitHub Copilot | Device Code Flow | AES-256-GCM encrypted file |
 
-<Tabs>
-  <Tab title="Production (with TLS)">
-    ```bash
-    chatcli server --tls-cert cert.pem --tls-key key.pem --token meu-token
-    ```
-  </Tab>
-  <Tab title="Development (without TLS)">
-    ```bash
-    chatcli server
-    ```
+```bash
+# Interactive OAuth login
+/auth login anthropic
+/auth login openai
+/auth login github-copilot
+```
 
-    <Note>When the client connects without TLS, a warning log is emitted as a reminder about production usage. Functional behavior is unchanged.</Note>
-  </Tab>
-</Tabs>
+<Tip>OAuth tokens are automatically refreshed before expiration. The refresh flow uses a plain HTTP client (no logging transport) with the appropriate User-Agent header to avoid Cloudflare issues.</Tip>
 
 ---
 
-## Shell Injection Protection
+## Encryption and Data Protection
 
-### ShellQuote -- Secure POSIX Quoting
+### AES-256-GCM Credential Encryption
 
-All code paths where dynamic values are interpolated into shell commands use the `utils.ShellQuote()` function, which applies POSIX quoting with single quotes:
+All OAuth credentials are encrypted at rest using **AES-256-GCM** in `~/.chatcli/auth-profiles.json`. The encryption key is automatically generated and stored with strict permissions.
 
-```go
-// Entrada: it's a "test" $(whoami)
-// Saída:   'it'\''s a "test" $(whoami)'
+| File | Permission | Content |
+|------|------------|---------|
+| `~/.chatcli/auth-profiles.json` | `0600` | AES-256-GCM encrypted OAuth credentials |
+| `~/.chatcli/.auth-key` | `0600` | AES-256-GCM encryption key |
+| `~/.chatcli/coder_policy.json` | `0600` | Coder policy rules |
+
+### Session Encryption
+
+Session data can be encrypted at rest when a custom encryption key is provided:
+
+```bash
+export CHATCLI_ENCRYPTION_KEY="your-32-byte-hex-key"
 ```
 
-This protects against:
-- **Quote injection**: `'; rm -rf /; echo '`
-- **Command substitution**: `$(malicious)` or `` `malicious` ``
-- **Variable expansion**: `$HOME`, `${PATH}`
-- **Pipe/redirection**: `| cat /etc/passwd`, `> /etc/crontab`
+### TLS 1.3 Transport Security
 
-#### Protected Points
+<Tabs>
+  <Tab title="Server TLS">
+    ```bash
+    chatcli server --tls-cert cert.pem --tls-key key.pem
+    ```
+  </Tab>
+  <Tab title="Mutual TLS (mTLS)">
+    ```bash
+    export CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
+    export CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
+    chatcli connect server:50051 --tls --ca-cert ca.pem
+    ```
+  </Tab>
+  <Tab title="Development (no TLS)">
+    ```bash
+    chatcli server  # Warning logged when client connects without TLS
+    ```
 
-| File | Context |
-|---------|----------|
-| `cli/agent_mode.go` | Dry-run echo of commands (simulation) |
-| `cli/cli.go` | Sourcing shell configuration file (`~/.bashrc`, etc.) |
-| `cli/agent/command_executor.go` | Sourcing shell configuration file (interactive execution) |
+    <Note>When the client connects without TLS, a warning is emitted to remind about production use. Functional behavior is unchanged.</Note>
+  </Tab>
+</Tabs>
 
-### Binary Resolution via LookPath
+### Environment Variable Redaction
 
-The `stty` binary (used to restore the terminal) is resolved **once** at startup via `exec.LookPath("stty")`, returning the absolute path. This prevents an attacker from placing a malicious `stty` in the PATH.
+Sensitive environment variables are automatically redacted in logs and error messages. You can control the redaction behavior:
+
+```bash
+# Redaction mode: "full" (default), "partial" (show first/last 4 chars), "none"
+export CHATCLI_ENV_REDACT_MODE=full
+
+# Custom redaction patterns (regex, semicolon-separated)
+export CHATCLI_REDACT_PATTERNS="INTERNAL_SECRET_.*;MY_TOKEN_.*"
+```
+
+### OS Keychain Integration
+
+ChatCLI can store encryption keys in the OS keychain instead of the filesystem:
+
+```bash
+# Options: "auto" (default), "file", "keychain"
+export CHATCLI_KEYCHAIN_BACKEND=keychain
+```
+
+| Backend | macOS | Linux | Windows |
+|---------|-------|-------|---------|
+| `keychain` | Keychain.app | secret-service (GNOME Keyring) | Credential Manager |
+| `file` | `~/.chatcli/.auth-key` | `~/.chatcli/.auth-key` | `%APPDATA%\chatcli\.auth-key` |
+| `auto` | Keychain if available, else file | secret-service if available, else file | Credential Manager if available, else file |
+
+---
+
+## Agent Mode Security
+
+### Command Allowlist (Strict Mode)
+
+In **strict mode**, only commands from the allowlist can be executed. The default allowlist includes 150+ safe commands organized by category:
+
+<AccordionGroup>
+  <Accordion title="File Operations (30+ commands)">
+    ```text
+    ls, cat, head, tail, wc, find, grep, rg, ag, awk, sed, sort,
+    uniq, cut, tr, tee, diff, cmp, file, stat, readlink, realpath,
+    basename, dirname, touch, mkdir, cp, mv, ln, chmod, chown
+    ```
+  </Accordion>
+  <Accordion title="Development Tools (40+ commands)">
+    ```text
+    git, go, make, cargo, rustc, npm, npx, yarn, pnpm, bun, node,
+    python, python3, pip, pip3, poetry, ruby, gem, bundle, java,
+    javac, mvn, gradle, dotnet, php, composer, swift, kotlinc,
+    cmake, gcc, g++, clang, zig, deno, tsc, eslint, prettier
+    ```
+  </Accordion>
+  <Accordion title="System Utilities (30+ commands)">
+    ```text
+    echo, printf, date, cal, whoami, id, hostname, uname, env,
+    printenv, which, type, command, test, true, false, sleep, time,
+    timeout, seq, yes, tput, stty, clear, reset, tee, xargs, watch
+    ```
+  </Accordion>
+  <Accordion title="Network and Cloud (30+ commands)">
+    ```text
+    curl, wget, ssh, scp, rsync, ping, dig, nslookup, host,
+    kubectl, helm, docker, docker-compose, podman, terraform,
+    aws, gcloud, az, eksctl, kustomize, istioctl, argocd, flux
+    ```
+  </Accordion>
+  <Accordion title="Text Processing (20+ commands)">
+    ```text
+    jq, yq, xmllint, csvtool, column, fold, fmt, expand, unexpand,
+    paste, join, comm, look, strings, hexdump, xxd, base64, md5sum,
+    sha256sum, openssl
+    ```
+  </Accordion>
+</AccordionGroup>
+
+```bash
+# Enable strict mode (allowlist-only)
+export CHATCLI_AGENT_SECURITY_MODE=strict
+
+# Or use permissive mode (denylist-based, default)
+export CHATCLI_AGENT_SECURITY_MODE=permissive
+```
+
+### Custom Allowlist
+
+Extend the allowlist with your own commands:
+
+```bash
+# Add custom commands (semicolon-separated)
+export CHATCLI_AGENT_ALLOWLIST="mycli;internal-tool;company-deploy"
+```
+
+### Denylist Patterns (Permissive Mode)
+
+In **permissive mode**, 50+ regex patterns detect and block dangerous commands:
+
+| Category | Examples |
+|----------|----------|
+| **Data destruction** | `rm -rf /`, `dd if=`, `mkfs`, `drop database` |
+| **Remote execution** | `curl \| bash`, `wget \| sh`, `base64 \| bash` |
+| **Code injection** | `python -c`, `perl -e`, `ruby -e`, `node -e`, `php -r`, `eval` |
+| **Command substitution** | `$(curl ...)`, `` `wget ...` `` |
+| **Process substitution** | `<(cmd)`, `>(cmd)` |
+| **Privilege escalation** | `sudo`, `chmod 777 /`, `chown -R /` |
+| **Network manipulation** | `nc -l`, `iptables -F`, `/dev/tcp/` |
+| **Kernel** | `insmod`, `modprobe`, `rmmod`, `sysctl -w` |
+| **Evasion** | `${IFS;cmd}`, `VAR=x; bash`, `export PATH=` |
+
+```bash
+# Add custom denylist patterns
+export CHATCLI_AGENT_DENYLIST="terraform destroy;kubectl delete namespace"
+
+# Allow sudo (use with caution)
+export CHATCLI_AGENT_ALLOW_SUDO=true
+```
+
+### Read Path Blocking
+
+In strict workspace mode, the agent can only read files within the current workspace directory:
+
+```bash
+# Enable strict workspace confinement
+export CHATCLI_AGENT_WORKSPACE_STRICT=true
+
+# Add extra allowed read paths (semicolon-separated)
+export CHATCLI_AGENT_EXTRA_READ_PATHS="/etc/hosts;/usr/local/share/config"
+```
+
+### Shell Configuration Sourcing
+
+By default, shell configuration files (`~/.bashrc`, `~/.zshrc`) are **not** sourced during agent command execution to prevent malicious aliases and functions:
+
+```bash
+# Enable shell config sourcing (only if you trust your shell config)
+export CHATCLI_AGENT_SOURCE_SHELL_CONFIG=true
+```
+
+### Output Sanitizer
+
+Agent command output is sanitized before being sent to the LLM:
+- ANSI escape sequences are stripped
+- Output is truncated to prevent context overflow
+
+```bash
+# Maximum command output size (bytes)
+export CHATCLI_MAX_COMMAND_OUTPUT=65536
+```
 
 ### EDITOR Validation
 
@@ -111,41 +339,439 @@ ed, pico, joe, ne, kate, gedit, kwrite, notepad++, atom
 
 <Warning>If `EDITOR` contains an unknown value (e.g., `EDITOR="/tmp/exploit.sh"`), the operation is refused with an error. The validated editor is then resolved via `exec.LookPath` to obtain the absolute path.</Warning>
 
+### Kubeconfig Access Control
+
+Control whether agent commands can access kubeconfig:
+
+```bash
+# Allow kubeconfig access in agent mode (default: false)
+export CHATCLI_AGENT_ALLOW_KUBECONFIG=true
+```
+
+### Shell Injection Protection
+
+All code paths where dynamic values are interpolated into shell commands use the `utils.ShellQuote()` function, which applies POSIX quoting with single quotes:
+
+```go
+// Input:  it's a "test" $(whoami)
+// Output: 'it'\''s a "test" $(whoami)'
+```
+
+This protects against:
+- **Quote injection**: `'; rm -rf /; echo '`
+- **Command substitution**: `$(malicious)` or `` `malicious` ``
+- **Variable expansion**: `$HOME`, `${PATH}`
+- **Pipe/redirection**: `| cat /etc/passwd`, `> /etc/crontab`
+
+### Binary Resolution via LookPath
+
+The `stty` binary (used to restore the terminal) is resolved **once** at startup via `exec.LookPath("stty")`, returning the absolute path. This prevents an attacker from placing a malicious `stty` in the PATH.
+
 ---
 
-## Command Validation
+## Plugin Security
 
-### 50+ Detection Patterns
+### Ed25519 Signature Verification
 
-The `CommandValidator` analyzes each command suggested by the AI before execution, checking against more than 50 regex patterns that cover:
+ChatCLI plugins are verified using **Ed25519 digital signatures**. Each plugin binary must be signed with the developer's private key, and the corresponding public key must be registered.
 
-| Category | Examples |
-|-----------|----------|
-| **Data destruction** | `rm -rf /`, `dd if=`, `mkfs`, `drop database` |
-| **Remote execution** | `curl \| bash`, `wget \| sh`, `base64 \| bash` |
-| **Code injection** | `python -c`, `perl -e`, `ruby -e`, `node -e`, `php -r`, `eval` |
-| **Command substitution** | `$(curl ...)`, `` `wget ...` `` |
-| **Process substitution** | `<(cmd)`, `>(cmd)` |
-| **Privilege escalation** | `sudo`, `chmod 777 /`, `chown -R / ` |
-| **Network manipulation** | `nc -l`, `iptables -F`, `/dev/tcp/` |
-| **Kernel** | `insmod`, `modprobe`, `rmmod`, `sysctl -w` |
-| **Evasion** | `${IFS;cmd}`, `VAR=x; bash`, `export PATH=` |
+<Steps>
+  <Step title="Generate a signing key pair">
+    ```bash
+    chatcli plugin keygen --output ~/.chatcli/plugin-keys/
+    # Creates: plugin-signing.key (private) and plugin-signing.pub (public)
+    ```
+  </Step>
+  <Step title="Sign your plugin">
+    ```bash
+    chatcli plugin sign \
+      --binary ./my-plugin \
+      --key ~/.chatcli/plugin-keys/plugin-signing.key \
+      --output ./my-plugin.sig
+    ```
+  </Step>
+  <Step title="Distribute with signature">
+    ```text
+    my-plugin          # Plugin binary
+    my-plugin.sig      # Ed25519 signature
+    my-plugin.pub      # Public key (or register in trusted keys)
+    ```
+  </Step>
+  <Step title="Verify on install">
+    ChatCLI automatically verifies the signature when installing a plugin.
+    If verification fails, the plugin is rejected.
+  </Step>
+</Steps>
 
-### Custom Denylist
+### Quarantine for Unsigned Plugins
 
-Add your own patterns via environment variable:
+Unsigned plugins enter a quarantine period before they can execute:
 
 ```bash
-# Bloquear terraform destroy e kubectl delete namespace
-export CHATCLI_AGENT_DENYLIST="terraform destroy;kubectl delete namespace"
+# Allow unsigned plugins (NOT recommended for production)
+export CHATCLI_ALLOW_UNSIGNED_PLUGINS=true
 ```
 
-### sudo Control
+<Warning>In production, always require plugin signatures. Unsigned plugins may contain malicious code that executes with the same permissions as ChatCLI.</Warning>
+
+### Plugin Permission Manifest
+
+Each plugin declares its required permissions in a manifest:
+
+```json
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "permissions": {
+    "network": false,
+    "filesystem": {
+      "read": ["/workspace"],
+      "write": ["/workspace/.output"]
+    },
+    "exec": ["git", "go"]
+  }
+}
+```
+
+| Permission | Description | Default |
+|------------|-------------|---------|
+| `network` | Allow outbound network access | `false` |
+| `filesystem.read` | Allowed read paths | Workspace only |
+| `filesystem.write` | Allowed write paths | Workspace only |
+| `exec` | Allowed executables | None |
+
+---
+
+## gRPC Server Security
+
+### SSRF Prevention
+
+The server blocks outbound requests to private IP ranges, preventing Server-Side Request Forgery attacks:
+
+- `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918)
+- `127.0.0.0/8` (loopback)
+- `169.254.0.0/16` (link-local, including cloud metadata endpoints)
+- `::1/128`, `fc00::/7` (IPv6 private)
 
 ```bash
-# Permitir sudo (use com cautela)
-export CHATCLI_AGENT_ALLOW_SUDO=true
+# Allow HTTP providers (disable SSRF check for trusted internal networks)
+export CHATCLI_ALLOW_HTTP_PROVIDERS=true
 ```
+
+### Rate Limiting
+
+Token-bucket rate limiting protects against abuse and DoS:
+
+```bash
+# Requests per second (sustained rate)
+export CHATCLI_RATE_LIMIT_RPS=10
+
+# Burst capacity (peak requests)
+export CHATCLI_RATE_LIMIT_BURST=20
+```
+
+### Message Size Limits
+
+Prevent memory exhaustion from oversized messages:
+
+```bash
+# Maximum receive message size (bytes, default: 4MB)
+export CHATCLI_MAX_RECV_MSG_SIZE=4194304
+
+# Maximum send message size (bytes, default: 4MB)
+export CHATCLI_MAX_SEND_MSG_SIZE=4194304
+
+# Maximum concurrent streams per connection
+export CHATCLI_MAX_CONCURRENT_STREAMS=100
+```
+
+### Input Validation
+
+All RPC fields are validated before processing:
+- String length limits on all text fields
+- Enum value validation for severity, status, etc.
+- Namespace and resource name format validation (Kubernetes naming rules)
+- Timestamp range validation
+
+### Audit Logging
+
+All sensitive operations are recorded in structured JSON audit logs:
+
+```bash
+# Path for audit log file
+export CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.json
+```
+
+Example audit log entry:
+
+```json
+{
+  "timestamp": "2026-04-06T10:30:00Z",
+  "action": "incident.resolve",
+  "actor": "user:admin@example.com",
+  "role": "admin",
+  "resource": "incident/INC-2024-0042",
+  "result": "success",
+  "ip": "10.0.1.50",
+  "details": {
+    "resolution": "Scaled deployment to 5 replicas"
+  }
+}
+```
+
+### Bind Address
+
+Control which network interface the server listens on:
+
+```bash
+# Listen on all interfaces (default)
+export CHATCLI_BIND_ADDRESS=0.0.0.0
+
+# Listen only on localhost (more secure for local dev)
+export CHATCLI_BIND_ADDRESS=127.0.0.1
+```
+
+### Interceptor Chain
+
+All requests pass through a chain of gRPC interceptors:
+
+<Steps>
+  <Step title="Recovery">
+    Captures panics and returns a gRPC error instead of crashing the server.
+  </Step>
+  <Step title="Rate Limiting">
+    Token-bucket rate limiter per client IP.
+  </Step>
+  <Step title="Logging">
+    Records method, duration, and status of each request.
+  </Step>
+  <Step title="Auth">
+    Validates JWT or bearer token (when configured).
+  </Step>
+  <Step title="RBAC">
+    Checks role permissions for the requested operation.
+  </Step>
+</Steps>
+
+### gRPC Reflection (Disabled by Default)
+
+gRPC reflection exposes the full service schema, allowing tools like `grpcurl` and `grpcui` to discover and call all RPCs. In production, this can facilitate reconnaissance by attackers.
+
+<Warning>By default, reflection is disabled. Enable only for local debugging.</Warning>
+
+```bash
+export CHATCLI_GRPC_REFLECTION=true
+```
+
+---
+
+## Kubernetes Operator Security
+
+### Fail-Closed Authentication
+
+The operator webhook uses **fail-closed** authentication: if the authentication service is unavailable, all requests are denied. This prevents unauthorized access during outages.
+
+### Resource Type Allowlist
+
+The operator can only manage resources from a configurable allowlist:
+
+```bash
+# Comma-separated allowed resource types
+export CHATCLI_ALLOWED_RESOURCE_TYPES="deployments,statefulsets,daemonsets,services,configmaps"
+```
+
+Attempts to manage resources not in the allowlist are rejected and logged.
+
+### Log Scrubbing
+
+Secrets, tokens, and sensitive data are automatically scrubbed from operator logs:
+
+```bash
+# Custom scrub patterns (regex, semicolon-separated)
+export CHATCLI_LOG_SCRUB_PATTERNS="Bearer [A-Za-z0-9._-]+;password=[^&\\s]+"
+```
+
+### CORS Policy
+
+The REST API enforces a configurable CORS policy:
+
+```yaml
+# Helm values.yaml
+server:
+  cors:
+    allowedOrigins:
+      - "https://dashboard.example.com"
+    allowedMethods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+    allowCredentials: true
+```
+
+### RBAC and NetworkPolicy
+
+<Tabs>
+  <Tab title="Namespace-Scoped RBAC (Default)">
+    ```yaml
+    # values.yaml
+    rbac:
+      create: true
+      clusterWide: false   # Role (namespace-scoped)
+    ```
+  </Tab>
+  <Tab title="Cluster-Wide RBAC">
+    ```bash
+    helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
+      --set rbac.clusterWide=true \
+      --set watcher.enabled=true
+    ```
+  </Tab>
+</Tabs>
+
+The Helm chart includes a NetworkPolicy that restricts pod communication:
+
+```yaml
+# Automatically applied when networkPolicy.enabled=true
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chatcli-network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: chatcli
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: chatcli-client
+      ports:
+        - port: 50051  # gRPC
+        - port: 8090   # REST API
+        - port: 9090   # Metrics
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 443    # LLM API calls
+        - port: 6443   # Kubernetes API
+```
+
+### Pod SecurityContext
+
+The Helm chart defines a restrictive SecurityContext by default:
+
+```yaml
+# values.yaml
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault       # Kernel syscall filter
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+```
+
+<Info>When `securityContext.readOnlyRootFilesystem` is `true`, the chart automatically mounts an `emptyDir` volume at `/tmp` (limited to 100Mi) so the application can write temporary files.</Info>
+
+### Operator Dev Mode
+
+For local development, the operator can run in dev mode with relaxed security:
+
+```bash
+# Enable dev mode (disables TLS requirement and strict auth)
+export CHATCLI_OPERATOR_DEV_MODE=true
+```
+
+<Warning>Never enable `CHATCLI_OPERATOR_DEV_MODE` in production. It disables critical security checks.</Warning>
+
+### Operator TLS
+
+```bash
+# AIOps REST API TLS
+export CHATCLI_AIOPS_TLS_CERT=/path/to/cert.pem
+export CHATCLI_AIOPS_TLS_KEY=/path/to/key.pem
+
+# gRPC TLS with CA for mTLS
+export CHATCLI_GRPC_TLS_CERT=/path/to/cert.pem
+export CHATCLI_GRPC_TLS_KEY=/path/to/key.pem
+export CHATCLI_GRPC_TLS_CA=/path/to/ca.pem
+```
+
+---
+
+## Container Security (Docker)
+
+The `docker-compose.yml` includes the following hardening measures:
+
+```yaml
+services:
+  chatcli-server:
+    read_only: true             # Read-only filesystem
+    tmpfs:
+      - /tmp:size=100M          # In-memory temporary directory
+    security_opt:
+      - no-new-privileges:true  # Prevents privilege escalation
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"           # CPU limit
+          memory: 1G            # Memory limit
+```
+
+| Measure | Protection |
+|---------|------------|
+| `read_only: true` | Prevents malware from writing files to the container filesystem |
+| `tmpfs` | Provides an in-memory `/tmp` directory with limited size |
+| `no-new-privileges` | Prevents child processes from gaining more privileges than the parent |
+| Resource limits | Prevents excessive CPU/memory consumption (DoS) |
+
+---
+
+## CI/CD Security
+
+ChatCLI's CI/CD pipeline includes multiple security checks:
+
+<Steps>
+  <Step title="govulncheck">
+    Scans Go dependencies for known vulnerabilities using the Go vulnerability database.
+
+    ```bash
+    govulncheck ./...
+    ```
+  </Step>
+  <Step title="gosec">
+    Static analysis security scanner for Go code that detects common vulnerabilities.
+
+    ```bash
+    gosec ./...
+    ```
+  </Step>
+  <Step title="Dependabot">
+    Automated dependency updates with security alerts for vulnerable packages. Configured via `.github/dependabot.yml`.
+  </Step>
+  <Step title="Cosign Image Signing">
+    Container images are signed using [Sigstore Cosign](https://github.com/sigstore/cosign) for supply chain verification.
+
+    ```bash
+    # Verify a ChatCLI image
+    cosign verify ghcr.io/diillson/chatcli:latest \
+      --certificate-identity-regexp=".*" \
+      --certificate-oidc-issuer-regexp=".*"
+    ```
+  </Step>
+</Steps>
 
 ---
 
@@ -156,7 +782,7 @@ export CHATCLI_AGENT_ALLOW_SUDO=true
 The policy system uses **word boundary matching** to prevent permission escalation by prefix. Example:
 
 | Rule | Command | Result |
-|-------|---------|-----------|
+|------|---------|--------|
 | `@coder read` = allow | `@coder read file.txt` | **Allowed** |
 | `@coder read` = allow | `@coder readlink /tmp` | **Blocked** (ask) |
 | `@coder read --file /etc` = deny | `@coder read --file /etc/passwd` | **Blocked** (deny) |
@@ -182,181 +808,128 @@ Read commands are allowed by default:
 }
 ```
 
-For more details on the governance system, see the [Coder Mode documentation](/features/coder-security).
+For more details on the governance system, see the [Coder Mode documentation](/en/features/coder-security).
 
 ---
 
-## gRPC Server Security
+## Security Environment Variables Reference
 
-### gRPC Reflection (Disabled by Default)
+Complete reference of all security-related environment variables:
 
-gRPC reflection exposes the complete service schema, allowing tools like `grpcurl` and `grpcui` to discover and call all RPCs. In production, this can facilitate reconnaissance by attackers.
-
-<Warning>By default, reflection is disabled. Enable only for local debugging.</Warning>
-
-```bash
-# Via variável de ambiente
-export CHATCLI_GRPC_REFLECTION=true
-chatcli server
-```
+### Server Security
 
 | Variable | Description | Default |
-|----------|-----------|--------|
-| `CHATCLI_GRPC_REFLECTION` | Enables gRPC reflection (`true`/`false`) | `false` |
+|----------|-------------|---------|
+| `CHATCLI_JWT_SECRET` | JWT signing secret (HS256) or path to RSA key (RS256) | `""` |
+| `CHATCLI_JWT_ISSUER` | Expected JWT issuer claim | `""` |
+| `CHATCLI_JWT_AUDIENCE` | Expected JWT audience claim | `""` |
+| `CHATCLI_RATE_LIMIT_RPS` | Rate limit: sustained requests per second | `10` |
+| `CHATCLI_RATE_LIMIT_BURST` | Rate limit: burst capacity | `20` |
+| `CHATCLI_MAX_RECV_MSG_SIZE` | Maximum gRPC receive message size (bytes) | `4194304` |
+| `CHATCLI_MAX_SEND_MSG_SIZE` | Maximum gRPC send message size (bytes) | `4194304` |
+| `CHATCLI_MAX_CONCURRENT_STREAMS` | Maximum concurrent gRPC streams per connection | `100` |
+| `CHATCLI_BIND_ADDRESS` | Network interface to bind to | `0.0.0.0` |
+| `CHATCLI_AUDIT_LOG_PATH` | Path for structured audit log file | `""` |
+| `CHATCLI_LOG_FILE` | Application log file path | `~/.chatcli/app.log` |
+| `CHATCLI_LOG_MAX_SIZE_MB` | Max log file size before rotation (MB) | `100` |
+| `CHATCLI_LOG_MAX_BACKUPS` | Number of rotated log files to keep | `3` |
+| `CHATCLI_LOG_MAX_AGE_DAYS` | Maximum age of rotated log files (days) | `30` |
+| `CHATCLI_DEBUG` | Enable debug mode with verbose logging | `false` |
+| `CHATCLI_ALLOW_HTTP_PROVIDERS` | Allow HTTP (non-TLS) connections to LLM providers | `false` |
+| `CHATCLI_GRPC_REFLECTION` | Enable gRPC reflection (use only in dev) | `false` |
+| `CHATCLI_SERVER_TOKEN` | Legacy bearer token for gRPC authentication | `""` |
+| `CHATCLI_SERVER_TLS_CERT` | Server TLS certificate path | `""` |
+| `CHATCLI_SERVER_TLS_KEY` | Server TLS key path | `""` |
 
-### Security Interceptors
+### Agent Security
 
-All requests pass through a chain of interceptors:
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CHATCLI_AGENT_SECURITY_MODE` | Security mode: `strict` (allowlist) or `permissive` (denylist) | `permissive` |
+| `CHATCLI_AGENT_ALLOWLIST` | Extra allowed commands in strict mode (semicolon-separated) | `""` |
+| `CHATCLI_AGENT_DENYLIST` | Extra denied patterns in permissive mode (semicolon-separated regex) | `""` |
+| `CHATCLI_AGENT_WORKSPACE_STRICT` | Restrict file access to workspace directory only | `false` |
+| `CHATCLI_AGENT_ALLOW_KUBECONFIG` | Allow agent commands to access kubeconfig | `false` |
+| `CHATCLI_AGENT_EXTRA_READ_PATHS` | Additional allowed read paths (semicolon-separated) | `""` |
+| `CHATCLI_AGENT_SOURCE_SHELL_CONFIG` | Source shell config (`~/.bashrc`, etc.) in agent commands | `false` |
+| `CHATCLI_AGENT_ALLOW_SUDO` | Allow `sudo` without automatic blocking | `false` |
+| `CHATCLI_AGENT_CMD_TIMEOUT` | Timeout per executed command | `10m` |
+| `CHATCLI_MAX_COMMAND_OUTPUT` | Maximum command output size (bytes) | `65536` |
 
-<Steps>
-  <Step title="Recovery">
-    Catches panics and returns a gRPC error instead of crashing the server.
-  </Step>
-  <Step title="Logging">
-    Records method, duration, and status of each request.
-  </Step>
-  <Step title="Auth">
-    Validates Bearer token (when configured).
-  </Step>
-</Steps>
+### Plugin and Auth Security
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CHATCLI_ALLOW_UNSIGNED_PLUGINS` | Allow unsigned plugins to execute | `false` |
+| `CHATCLI_ALLOW_INSECURE` | Allow insecure (non-TLS) connections | `false` |
+| `CHATCLI_TLS_CLIENT_CERT` | Client TLS certificate for mTLS | `""` |
+| `CHATCLI_TLS_CLIENT_KEY` | Client TLS key for mTLS | `""` |
+| `CHATCLI_ENCRYPTION_KEY` | Custom encryption key for session data | Auto-generated |
+| `CHATCLI_KEYCHAIN_BACKEND` | Keychain backend: `auto`, `file`, `keychain` | `auto` |
+| `CHATCLI_DISABLE_HISTORY` | Disable conversation history recording | `false` |
+| `CHATCLI_SESSION_TTL` | Session time-to-live before expiration | `24h` |
+| `CHATCLI_ENV_REDACT_MODE` | Env redaction: `full`, `partial`, `none` | `full` |
+| `CHATCLI_REDACT_PATTERNS` | Custom redaction patterns (semicolon-separated regex) | `""` |
+
+### Operator Security
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CHATCLI_OPERATOR_DEV_MODE` | Enable operator dev mode (relaxed security) | `false` |
+| `CHATCLI_AIOPS_TLS_CERT` | AIOps REST API TLS certificate | `""` |
+| `CHATCLI_AIOPS_TLS_KEY` | AIOps REST API TLS key | `""` |
+| `CHATCLI_GRPC_TLS_CERT` | gRPC TLS certificate | `""` |
+| `CHATCLI_GRPC_TLS_KEY` | gRPC TLS key | `""` |
+| `CHATCLI_GRPC_TLS_CA` | gRPC CA certificate for mTLS verification | `""` |
+| `CHATCLI_ALLOWED_RESOURCE_TYPES` | Allowed Kubernetes resource types (comma-separated) | `deployments,statefulsets,daemonsets` |
+| `CHATCLI_LOG_SCRUB_PATTERNS` | Patterns to scrub from logs (semicolon-separated regex) | Built-in patterns |
 
 ---
 
 ## Version Check
 
-ChatCLI automatically checks whether a newer version is available on GitHub. To disable (e.g., air-gapped environments or CI/CD):
+ChatCLI automatically checks for newer versions on GitHub. To disable (e.g., air-gapped environments or CI/CD):
 
 ```bash
 export CHATCLI_DISABLE_VERSION_CHECK=true
 ```
 
-| Variable | Description | Default |
-|----------|-----------|--------|
-| `CHATCLI_DISABLE_VERSION_CHECK` | Disables automatic version check (`true`/`false`) | `false` |
-
 ---
 
-## Container Security (Docker)
-
-The project's `docker-compose.yml` includes the following hardening measures:
-
-```yaml
-services:
-  chatcli-server:
-    read_only: true           # Filesystem somente-leitura
-    tmpfs:
-      - /tmp:size=100M        # Diretório temporário em memória
-    security_opt:
-      - no-new-privileges:true  # Impede escalação de privilégios
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"         # Limite de CPU
-          memory: 1G          # Limite de memória
-```
-
-### What Each Measure Does
-
-| Measure | Protection |
-|--------|----------|
-| `read_only: true` | Prevents malware from writing files to the container filesystem |
-| `tmpfs` | Provides an in-memory `/tmp` directory with limited size |
-| `no-new-privileges` | Prevents child processes from gaining more privileges than the parent |
-| Resource limits | Prevents excessive CPU/memory consumption (DoS) |
-
----
-
-## Kubernetes Security (Helm)
-
-### Pod SecurityContext
-
-The Helm chart defines a restrictive SecurityContext by default:
-
-```yaml
-# values.yaml
-podSecurityContext:
-  runAsNonRoot: true          # Obriga execução como usuário não-root
-  runAsUser: 1000
-  runAsGroup: 1000
-  fsGroup: 1000
-  seccompProfile:
-    type: RuntimeDefault       # Filtro de syscalls do kernel
-
-securityContext:
-  allowPrivilegeEscalation: false  # Sem escalação de privilégios
-  readOnlyRootFilesystem: true     # Filesystem somente-leitura
-  capabilities:
-    drop:
-      - ALL                        # Remove TODAS as capabilities Linux
-```
-
-### Namespace-Scoped RBAC (Default)
-
-By default, the chart creates **Role** and **RoleBinding** (namespace-scoped) instead of ClusterRole. This ensures ChatCLI only has access to the namespace where it is deployed.
-
-```yaml
-# values.yaml
-rbac:
-  create: true
-  clusterWide: false   # false = Role (namespace-scoped, padrão)
-                       # true  = ClusterRole (cluster-wide)
-```
-
-To monitor deployments across **multiple namespaces**, enable `clusterWide`:
-
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --set rbac.clusterWide=true \
-  --set watcher.enabled=true
-```
-
-### Automatic tmpfs
-
-<Info>When `securityContext.readOnlyRootFilesystem` is `true`, the chart automatically mounts an `emptyDir` volume at `/tmp` (limited to 100Mi) so the application can write temporary files.</Info>
-
----
-
-## Security Environment Variables
-
-Summary of all security-related variables:
-
-| Variable | Description | Default |
-|----------|-----------|--------|
-| `CHATCLI_SERVER_TOKEN` | gRPC server authentication token | `""` (no auth) |
-| `CHATCLI_SERVER_TLS_CERT` | Server TLS certificate | `""` |
-| `CHATCLI_SERVER_TLS_KEY` | Server TLS key | `""` |
-| `CHATCLI_GRPC_REFLECTION` | Enables gRPC reflection | `false` |
-| `CHATCLI_DISABLE_VERSION_CHECK` | Disables version check | `false` |
-| `CHATCLI_AGENT_ALLOW_SUDO` | Allows sudo in agent mode | `false` |
-| `CHATCLI_AGENT_DENYLIST` | Additional regex patterns to block (`;` separated) | `""` |
-| `CHATCLI_AGENT_CMD_TIMEOUT` | Execution timeout per command | `10m` |
-
----
-
-## Credential Encryption
-
-OAuth credentials are stored with **AES-256-GCM encryption** in `~/.chatcli/auth-profiles.json`. The encryption key is automatically generated and saved in `~/.chatcli/.auth-key` with permission `0600` (owner-only read).
-
-| File | Permission | Content |
-|---------|-----------|----------|
-| `~/.chatcli/auth-profiles.json` | `0600` | Encrypted OAuth credentials |
-| `~/.chatcli/.auth-key` | `0600` | AES-256-GCM key |
-| `~/.chatcli/coder_policy.json` | `0600` | Coder policy rules |
-
----
-
-## Best Practices for Production
+## Production Best Practices
 
 <Steps>
-  <Step title="Always use an authentication token">
+  <Step title="Use JWT authentication with RBAC">
     ```bash
-    export CHATCLI_SERVER_TOKEN=$(openssl rand -hex 32)
-    chatcli server --token $CHATCLI_SERVER_TOKEN
+    export CHATCLI_JWT_SECRET=$(openssl rand -hex 32)
+    export CHATCLI_JWT_ISSUER="chatcli-production"
+    export CHATCLI_JWT_AUDIENCE="chatcli-api"
+    chatcli server
     ```
   </Step>
   <Step title="Enable TLS in production">
     ```bash
     chatcli server --tls-cert cert.pem --tls-key key.pem
+    ```
+  </Step>
+  <Step title="Use strict agent security mode">
+    ```bash
+    export CHATCLI_AGENT_SECURITY_MODE=strict
+    export CHATCLI_AGENT_WORKSPACE_STRICT=true
+    ```
+  </Step>
+  <Step title="Require plugin signatures">
+    Keep `CHATCLI_ALLOW_UNSIGNED_PLUGINS` as `false` (default). Only install plugins with valid Ed25519 signatures.
+  </Step>
+  <Step title="Configure rate limiting">
+    ```bash
+    export CHATCLI_RATE_LIMIT_RPS=10
+    export CHATCLI_RATE_LIMIT_BURST=20
+    ```
+  </Step>
+  <Step title="Enable audit logging">
+    ```bash
+    export CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.json
     ```
   </Step>
   <Step title="Keep gRPC reflection disabled">
@@ -365,13 +938,8 @@ OAuth credentials are stored with **AES-256-GCM encryption** in `~/.chatcli/auth
   <Step title="Use namespace-scoped RBAC">
     Keep `rbac.clusterWide: false` (default) unless you need to monitor multiple namespaces.
   </Step>
-  <Step title="Review Coder policies regularly">
-    ```bash
-    cat ~/.chatcli/coder_policy.json
-    ```
-  </Step>
-  <Step title="Configure resource limits">
-    Always set CPU and memory limits to avoid excessive consumption:
+  <Step title="Set resource limits">
+    Always define CPU and memory limits to prevent excessive consumption:
 
     ```yaml
     resources:
@@ -383,8 +951,18 @@ OAuth credentials are stored with **AES-256-GCM encryption** in `~/.chatcli/auth
         cpu: "500m"
     ```
   </Step>
-  <Step title="Keep ChatCLI up to date">
-    Version checking is enabled by default. If you disabled it with `CHATCLI_DISABLE_VERSION_CHECK`, check periodically:
+  <Step title="Enable environment variable redaction">
+    ```bash
+    export CHATCLI_ENV_REDACT_MODE=full
+    ```
+  </Step>
+  <Step title="Use OS keychain for key storage">
+    ```bash
+    export CHATCLI_KEYCHAIN_BACKEND=keychain
+    ```
+  </Step>
+  <Step title="Keep ChatCLI updated">
+    The version check is enabled by default. If you disabled it with `CHATCLI_DISABLE_VERSION_CHECK`, check periodically:
 
     ```bash
     chatcli --version
@@ -397,17 +975,23 @@ OAuth credentials are stored with **AES-256-GCM encryption** in `~/.chatcli/auth
 ## Next Steps
 
 <CardGroup cols={2}>
-  <Card title="Coder Mode Governance" icon="shield-halved" href="/features/coder-security">
+  <Card title="Coder Mode Governance" icon="shield-halved" href="/en/features/coder-security">
     Policy rules to control what the Coder can execute.
   </Card>
-  <Card title="Configure the server" icon="server" href="/features/server-mode">
-    gRPC server deployment and configuration.
+  <Card title="Configure the Server" icon="server" href="/en/features/server-mode">
+    Deploy and configure the gRPC server.
   </Card>
-  <Card title="Deploy with Docker and Helm" icon="docker" href="/getting-started/docker-deployment">
+  <Card title="Deploy with Docker and Helm" icon="docker" href="/en/getting-started/docker-deployment">
     Complete containerized deployment guide.
   </Card>
-  <Card title="Configuration reference" icon="gear" href="/reference/configuration">
-    All available environment variables.
+  <Card title="Environment Variables" icon="sliders" href="/en/reference/environment-variables">
+    Complete environment variables reference.
+  </Card>
+  <Card title="K8s Operator" icon="dharmachakra" href="/en/features/k8s-operator">
+    AIOps autonomous remediation platform.
+  </Card>
+  <Card title="Plugin System" icon="puzzle-piece" href="/en/features/plugin-system">
+    Extend ChatCLI with custom plugins.
   </Card>
 </CardGroup>
 

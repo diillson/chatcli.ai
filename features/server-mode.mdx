@@ -118,12 +118,17 @@ Para desabilitar, use `--metrics-port 0`.
 
 | Env Var | Descrição | Padrão |
 |---------|-----------|--------|
-| `CHATCLI_GRPC_REFLECTION` | Habilita gRPC reflection para debugging. **Mantenha desabilitado em produção.** Configurável via Helm com `server.grpcReflection`. | `false` |
+| `CHATCLI_GRPC_REFLECTION` | Habilita gRPC reflection para debugging. Requer **AMBOS** a flag `--grpc-reflection` **E** esta variável como `true`. **Mantenha desabilitado em produção.** Configurável via Helm com `server.grpcReflection`. | `false` |
 | `CHATCLI_DISABLE_VERSION_CHECK` | Desabilita verificação automática de versão no startup. | `false` |
+| `CHATCLI_BIND_ADDRESS` | Endereço de bind do servidor. Alterado de `0.0.0.0` para `127.0.0.1` por segurança. | `127.0.0.1` |
 
 <Warning>
-O gRPC reflection está **desabilitado por padrão** para não expor o schema do serviço em produção. Habilite apenas para debugging local. Veja a [documentação de segurança](/features/security) para todas as medidas de hardening.
+O gRPC reflection agora requer **duas condições**: a flag `--grpc-reflection` **E** a variável `CHATCLI_GRPC_REFLECTION=true`. Isso evita habilitação acidental em produção. Veja a [documentação de segurança](/features/security) para todas as medidas de hardening.
 </Warning>
+
+<Note>
+O endereço de bind padrão foi alterado de `0.0.0.0` para `127.0.0.1`. Para expor o servidor na rede, defina `CHATCLI_BIND_ADDRESS=0.0.0.0` explicitamente.
+</Note>
 
 ### Flags do K8s Watcher (opcionais)
 
@@ -171,8 +176,46 @@ Use `--watch-config` para monitorar **múltiplos deployments** simultaneamente c
     chatcli connect servidor:50051 --token meu-token-secreto
     ```
   </Tab>
+  <Tab title="JWT com RBAC">
+    Para controle de acesso baseado em roles, configure autenticação JWT:
+
+    ```bash
+    export CHATCLI_JWT_SECRET="minha-chave-secreta-256-bits"
+    export CHATCLI_JWT_ISSUER="chatcli-server"
+    export CHATCLI_JWT_AUDIENCE="chatcli-api"
+    chatcli server
+    ```
+
+    O servidor valida tokens JWT e extrai a role do claim `role`. Três roles estão disponíveis:
+
+    | Role | Permissões |
+    |------|------------|
+    | `admin` | Acesso total: gerenciar sessões, executar plugins, configurar servidor |
+    | `user` | Executar plugins, gerenciar suas próprias sessões, enviar prompts |
+    | `readonly` | Apenas visualizar: listar sessões, consultar status do servidor |
+
+    **Exemplo: gerando um JWT para um usuário:**
+
+    ```go
+    import "github.com/golang-jwt/jwt/v5"
+
+    claims := jwt.MapClaims{
+        "sub":  "usuario@empresa.com",
+        "role": "user",
+        "iss":  "chatcli-server",
+        "aud":  "chatcli-api",
+        "exp":  time.Now().Add(24 * time.Hour).Unix(),
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    signed, _ := token.SignedString([]byte(os.Getenv("CHATCLI_JWT_SECRET")))
+    ```
+
+    <Warning>
+    O rate limiting de autenticação bloqueia IPs após **5 falhas por minuto**. Isso protege contra ataques de força bruta em tokens e JWTs.
+    </Warning>
+  </Tab>
   <Tab title="TLS (HTTPS)">
-    Para conexões encriptadas, forneça certificado e chave TLS:
+    Para conexões encriptadas, forneça certificado e chave TLS. O servidor exige **TLS 1.3** como versão mínima:
 
     ```bash
     chatcli server --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
@@ -182,6 +225,14 @@ Use `--watch-config` para monitorar **múltiplos deployments** simultaneamente c
 
     ```bash
     chatcli connect servidor:50051 --tls --ca-cert /path/to/ca.pem
+    ```
+
+    **mTLS (Mutual TLS):** Para autenticação mútua, configure também o certificado do cliente:
+
+    ```bash
+    export CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
+    export CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
+    chatcli server --tls-cert cert.pem --tls-key key.pem
     ```
   </Tab>
 </Tabs>
@@ -425,6 +476,101 @@ K8s watcher active: 5 targets (interval: 30s)
 
 
 
+## Rate Limiting
+
+O servidor implementa rate limiting por cliente usando token bucket para proteger contra abuso:
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_RATE_LIMIT_RPS` | Requisições por segundo por cliente | `10` |
+| `CHATCLI_RATE_LIMIT_BURST` | Burst máximo permitido | `30` |
+
+Quando o limite é atingido, o servidor retorna o código gRPC `ResourceExhausted` com um header `Retry-After` indicando quantos segundos o cliente deve aguardar.
+
+```bash
+export CHATCLI_RATE_LIMIT_RPS=20
+export CHATCLI_RATE_LIMIT_BURST=50
+chatcli server
+```
+
+<Tip>
+Em ambientes com múltiplos clientes legítimos, aumente o burst para acomodar picos de uso. O RPS controla a taxa sustentada.
+</Tip>
+
+
+
+## Prevenção de SSRF
+
+O servidor valida todas as URLs configuradas em `provider_config` antes de utilizá-las, bloqueando:
+
+- **IPs privados**: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+- **Metadados de cloud**: `169.254.169.254` (AWS, GCP, Azure)
+- **Link-local**: `169.254.0.0/16`, `fe80::/10`
+- **Loopback**: `127.0.0.0/8`, `::1`
+
+<Warning>
+Isso impede que provedores LLM maliciosos ou configurações incorretas acessem recursos internos da rede. A validação ocorre antes de qualquer requisição HTTP ser enviada.
+</Warning>
+
+
+
+## Limites de Tamanho de Mensagem
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_MAX_RECV_MSG_SIZE` | Tamanho máximo de mensagem recebida | `50MB` |
+| `CHATCLI_MAX_SEND_MSG_SIZE` | Tamanho máximo de mensagem enviada | `50MB` |
+| `CHATCLI_MAX_CONCURRENT_STREAMS` | Streams simultâneas por conexão | `100` |
+
+Esses limites protegem contra ataques de esgotamento de recursos e garantem estabilidade do servidor sob carga.
+
+
+
+## Audit Logging
+
+O servidor pode gerar logs de auditoria em formato JSON-lines para rastreabilidade completa:
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_AUDIT_LOG_PATH` | Caminho do arquivo de audit log (vazio = desabilitado) | `""` |
+
+Cada requisição recebe um **Request ID** único para correlação. Os eventos registrados incluem:
+
+- Autenticação (sucesso/falha)
+- Execução de prompts e plugins
+- Operações de sessão (save/load/delete)
+- Alterações de configuração
+
+```bash
+export CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.jsonl
+chatcli server
+```
+
+<Info>
+O formato JSON-lines facilita integração com ferramentas como `jq`, Elasticsearch, Loki e Splunk. Cada linha é um objeto JSON independente com timestamp, request ID, ação e resultado.
+</Info>
+
+
+
+## Rotação de Logs
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_LOG_FILE` | Caminho do arquivo de log principal | `""` (stdout) |
+| `CHATCLI_LOG_MAX_SIZE_MB` | Tamanho máximo antes de rotacionar | `100` |
+| `CHATCLI_LOG_MAX_BACKUPS` | Número de backups antigos a manter | `5` |
+| `CHATCLI_LOG_MAX_AGE_DAYS` | Dias máximos de retenção | `30` |
+| `CHATCLI_LOG_COMPRESS` | Comprimir backups com gzip | `true` |
+
+```bash
+export CHATCLI_LOG_FILE=/var/log/chatcli/server.log
+export CHATCLI_LOG_MAX_SIZE_MB=50
+export CHATCLI_LOG_MAX_BACKUPS=10
+chatcli server
+```
+
+
+
 ## Variáveis de Ambiente
 
 Todas as variáveis de ambiente usadas pelo ChatCLI local também funcionam no servidor:
@@ -435,10 +581,32 @@ CHATCLI_SERVER_PORT=50051
 CHATCLI_SERVER_TOKEN=meu-token
 CHATCLI_SERVER_TLS_CERT=/path/to/cert.pem
 CHATCLI_SERVER_TLS_KEY=/path/to/key.pem
+CHATCLI_BIND_ADDRESS=127.0.0.1
 
 # Segurança
 CHATCLI_GRPC_REFLECTION=false
 CHATCLI_DISABLE_VERSION_CHECK=false
+CHATCLI_JWT_SECRET=minha-chave-secreta
+CHATCLI_JWT_ISSUER=chatcli-server
+CHATCLI_JWT_AUDIENCE=chatcli-api
+
+# Rate Limiting
+CHATCLI_RATE_LIMIT_RPS=10
+CHATCLI_RATE_LIMIT_BURST=30
+
+# Limites de Mensagem
+CHATCLI_MAX_RECV_MSG_SIZE=52428800
+CHATCLI_MAX_SEND_MSG_SIZE=52428800
+CHATCLI_MAX_CONCURRENT_STREAMS=100
+
+# mTLS
+CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
+CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
+
+# Auditoria e Logs
+CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.jsonl
+CHATCLI_LOG_FILE=/var/log/chatcli/server.log
+CHATCLI_LOG_MAX_SIZE_MB=100
 
 # LLM
 LLM_PROVIDER=CLAUDEAI

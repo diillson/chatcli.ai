@@ -1,378 +1,971 @@
 ---
-title: "Segurança e Hardening"
+title: "Segurança Enterprise"
 sidebarTitle: "Segurança"
-description: "Visão completa das medidas de segurança do ChatCLI: proteção contra injeção, autenticação, infraestrutura hardened e boas práticas para produção."
-icon: "lock"
+description: "Arquitetura de segurança defense-in-depth do ChatCLI: autenticação JWT + RBAC, criptografia AES-256-GCM, prevenção SSRF, rate limiting, assinatura de plugins Ed25519, allowlist de comandos, audit logging estruturado e muito mais."
+icon: "shield-halved"
 ---
 
-O ChatCLI foi projetado com **segurança em profundidade** (defense-in-depth). Esta página documenta todas as medidas de proteção implementadas, como configurá-las e as boas práticas para ambientes de produção.
+O ChatCLI implementa uma arquitetura de **segurança em profundidade** (defense-in-depth) com mais de **30 controles de segurança** distribuídos em todas as camadas da aplicação — da autenticação e criptografia até a prevenção de injeção, hardening de infraestrutura e auditoria estruturada.
 
----
-
-## Resumo das Proteções
-
-| Camada | Proteção | Status |
-|--------|----------|--------|
-| **Autenticação** | Comparação de tokens em tempo constante (crypto/subtle) | Ativo |
-| **Shell** | Quoting POSIX para prevenir injeção em argumentos de shell | Ativo |
-| **Editores** | Validação de EDITOR contra allowlist de editores conhecidos | Ativo |
-| **Comandos** | 50+ padrões regex para detecção de comandos perigosos | Ativo |
-| **Policies** | Matching com word-boundary para evitar escalação de permissões | Ativo |
-| **gRPC** | Reflection desabilitado por padrão (oculta schema do serviço) | Ativo |
-| **Binários** | Resolução de stty via exec.LookPath (evita injeção via PATH) | Ativo |
-| **Containers** | read-only filesystem, no-new-privileges, drop ALL capabilities | Ativo |
-| **Kubernetes** | RBAC namespace-scoped por padrão, SecurityContext restritivo | Ativo |
-| **Rede** | TLS opcional com warning quando desabilitado | Ativo |
-| **Erros críticos** | Todos os erros de `io.ReadAll`, `json.Marshal` tratados em caminhos críticos | Ativo |
-| **Proto** | Campo Meta preservado na conversão proto (round-trip SessionData) | Ativo |
+<Info>Todas as proteções listadas nesta página estão **ativas por padrão**. A filosofia do ChatCLI é *secure-by-default*: você não precisa configurar nada para obter um nível elevado de segurança.</Info>
 
 ---
 
-## Autenticação do Servidor gRPC
+## Visão Geral das Proteções
 
-### Token Bearer com Comparação em Tempo Constante
+| # | Camada | Proteção | Status |
+|---|--------|----------|--------|
+| 1 | **Autenticação** | JWT com HMAC-SHA256 (claims `iss`, `aud`, `exp`, `role`) | <Icon icon="check" /> Ativo |
+| 2 | **Autorização** | RBAC com 3 roles: `admin`, `user`, `readonly` | <Icon icon="check" /> Ativo |
+| 3 | **Auth Legacy** | Bearer token com comparação em tempo constante (`crypto/subtle`) | <Icon icon="check" /> Ativo |
+| 4 | **Auth Rate Limit** | 5 tentativas/min por IP — bloqueio progressivo | <Icon icon="check" /> Ativo |
+| 5 | **OAuth** | PKCE + Device Flow para provedores externos | <Icon icon="check" /> Ativo |
+| 6 | **Criptografia** | AES-256-GCM para credenciais em repouso | <Icon icon="check" /> Ativo |
+| 7 | **TLS** | TLS 1.3 obrigatório para gRPC em produção | <Icon icon="check" /> Ativo |
+| 8 | **Sessões** | Criptografia de sessão em repouso com HKDF key derivation | <Icon icon="check" /> Ativo |
+| 9 | **Sessões TTL** | Expiração automática de sessões inativas | <Icon icon="check" /> Ativo |
+| 10 | **Keychain** | Integração com OS keychain (macOS Keychain, Linux secret-tool) | <Icon icon="check" /> Ativo |
+| 11 | **Env Vars** | Redação automática de variáveis sensíveis (strict/permissive) | <Icon icon="check" /> Ativo |
+| 12 | **Histórico** | Redação de secrets no histórico de conversas | <Icon icon="check" /> Ativo |
+| 13 | **SSRF** | Bloqueio de IPs privados, link-local e cloud metadata | <Icon icon="check" /> Ativo |
+| 14 | **Rate Limiting** | Token bucket por cliente no servidor gRPC | <Icon icon="check" /> Ativo |
+| 15 | **Plugins** | Assinatura Ed25519 com verificação obrigatória | <Icon icon="check" /> Ativo |
+| 16 | **Plugins** | Sistema de quarentena para plugins não verificados | <Icon icon="check" /> Ativo |
+| 17 | **Comandos** | Allowlist com 150+ comandos em 8 categorias | <Icon icon="check" /> Ativo |
+| 18 | **Comandos** | Modo strict vs permissive para allowlist | <Icon icon="check" /> Ativo |
+| 19 | **Leitura** | Bloqueio de caminhos sensíveis (`.env`, `.ssh`, etc.) | <Icon icon="check" /> Ativo |
+| 20 | **Prompt Injection** | Delimitadores `<DATA>` para isolar dados de instruções | <Icon icon="check" /> Ativo |
+| 21 | **Log Scrubbing** | 18 padrões de sanitização antes de enviar ao LLM | <Icon icon="check" /> Ativo |
+| 22 | **Audit Log** | Logging estruturado em JSON Lines para auditoria | <Icon icon="check" /> Ativo |
+| 23 | **CORS** | Deny-all por padrão no operator Kubernetes | <Icon icon="check" /> Ativo |
+| 24 | **Resource Types** | Allowlist de 17 tipos seguros, 18 tipos perigosos bloqueados | <Icon icon="check" /> Ativo |
+| 25 | **Operator Auth** | Fail-closed — requisições sem auth são recusadas | <Icon icon="check" /> Ativo |
+| 26 | **RBAC K8s** | Least-privilege, namespace-scoped por padrão | <Icon icon="check" /> Ativo |
+| 27 | **gRPC Limits** | Limites de tamanho de mensagem e conexões concorrentes | <Icon icon="check" /> Ativo |
+| 28 | **Bind Address** | Bind em `localhost` por padrão (não expõe na rede) | <Icon icon="check" /> Ativo |
+| 29 | **JWT Clock Skew** | Tolerância configurável para diferença de relógio | <Icon icon="check" /> Ativo |
+| 30 | **NetworkPolicy** | Política de rede para o operator Kubernetes | <Icon icon="check" /> Ativo |
+| 31 | **Cosign** | Assinatura de imagens de container com Cosign | <Icon icon="check" /> Ativo |
+| 32 | **govulncheck** | Verificação de vulnerabilidades em dependências Go no CI | <Icon icon="check" /> Ativo |
+| 33 | **gosec** | Análise estática de segurança no CI | <Icon icon="check" /> Ativo |
+| 34 | **Dependabot** | Atualização automática de dependências | <Icon icon="check" /> Ativo |
+| 35 | **Admission Webhook** | Validação de recursos antes da criação no K8s | <Icon icon="check" /> Ativo |
 
-O servidor gRPC usa autenticação via Bearer token no header `authorization` de cada request. A comparação do token utiliza `crypto/subtle.ConstantTimeCompare`, que **previne ataques de timing** — um atacante não consegue inferir caracteres corretos medindo o tempo de resposta.
+---
+
+## Autenticação e Autorização
+
+O ChatCLI suporta dois modelos de autenticação: **JWT** (recomendado para produção) e **Bearer Token legado** (para desenvolvimento e compatibilidade).
+
+### Autenticação JWT
+
+O JWT (JSON Web Token) fornece autenticação stateless com claims estruturados. O ChatCLI valida `iss` (issuer), `aud` (audience), `exp` (expiração) e o claim customizado `role` para autorização.
 
 <Tabs>
-  <Tab title="Via flag">
+  <Tab title="Configuração JWT">
     ```bash
-    chatcli server --token meu-token-secreto
+    # Variáveis obrigatórias para habilitar JWT
+    export CHATCLI_JWT_SECRET="sua-chave-secreta-com-pelo-menos-32-caracteres"
+    export CHATCLI_JWT_ISSUER="chatcli-auth"
+    export CHATCLI_JWT_AUDIENCE="chatcli-server"
+
+    # Opcional: tolerância de clock skew (padrão: 30s)
+    export CHATCLI_JWT_CLOCK_SKEW=60s
+
+    chatcli server
     ```
   </Tab>
-  <Tab title="Via variável de ambiente">
+  <Tab title="Gerar Token JWT">
     ```bash
-    export CHATCLI_SERVER_TOKEN=meu-token-secreto
-    chatcli server
+    # Exemplo: gerar token JWT com role admin (usando Go)
+    # O token deve incluir os claims: iss, aud, exp, sub, role
+
+    # Exemplo com curl para um auth service externo:
+    curl -X POST https://auth.example.com/token \
+      -H "Content-Type: application/json" \
+      -d '{
+        "username": "admin",
+        "password": "...",
+        "audience": "chatcli-server"
+      }'
+
+    # Usar o token com o cliente:
+    export CHATCLI_SERVER_TOKEN="eyJhbGciOiJIUzI1NiIs..."
+    chatcli remote connect server.example.com:50051
+    ```
+  </Tab>
+  <Tab title="Token Legado">
+    ```bash
+    # Autenticação simples com Bearer token
+    # Usa crypto/subtle.ConstantTimeCompare (previne timing attacks)
+    export CHATCLI_SERVER_TOKEN=$(openssl rand -hex 32)
+    chatcli server --token $CHATCLI_SERVER_TOKEN
+
+    # No cliente:
+    chatcli remote connect localhost:50051 --token $CHATCLI_SERVER_TOKEN
     ```
   </Tab>
 </Tabs>
 
-<Info>O endpoint `/Health` é sempre acessível sem autenticação para permitir health checks de load balancers e orquestradores.</Info>
+### RBAC — Controle de Acesso Baseado em Roles
 
-### TLS (Opcional)
+O claim `role` no JWT determina as permissões do usuário. O sistema segue o princípio do **menor privilégio**.
 
-O TLS é **totalmente opcional**. Em ambiente de desenvolvimento local, você pode rodar sem TLS sem problemas. Para produção, recomendamos fortemente habilitar TLS:
+| Permissão | `admin` | `user` | `readonly` |
+|-----------|:-------:|:------:|:----------:|
+| Enviar mensagens | <Icon icon="check" /> | <Icon icon="check" /> | <Icon icon="xmark" /> |
+| Executar comandos (agente) | <Icon icon="check" /> | <Icon icon="check" /> | <Icon icon="xmark" /> |
+| Listar sessões | <Icon icon="check" /> | <Icon icon="check" /> | <Icon icon="check" /> |
+| Ler sessões | <Icon icon="check" /> | <Icon icon="check" /> | <Icon icon="check" /> |
+| Deletar sessões | <Icon icon="check" /> | <Icon icon="xmark" /> | <Icon icon="xmark" /> |
+| Gerenciar plugins | <Icon icon="check" /> | <Icon icon="xmark" /> | <Icon icon="xmark" /> |
+| Configurar servidor | <Icon icon="check" /> | <Icon icon="xmark" /> | <Icon icon="xmark" /> |
+| Alterar roles de usuários | <Icon icon="check" /> | <Icon icon="xmark" /> | <Icon icon="xmark" /> |
+| Visualizar audit logs | <Icon icon="check" /> | <Icon icon="xmark" /> | <Icon icon="xmark" /> |
+| Health check | <Icon icon="check" /> | <Icon icon="check" /> | <Icon icon="check" /> |
 
-<Tabs>
-  <Tab title="Produção (com TLS)">
-    ```bash
-    chatcli server --tls-cert cert.pem --tls-key key.pem --token meu-token
-    ```
-  </Tab>
-  <Tab title="Desenvolvimento (sem TLS)">
-    ```bash
-    chatcli server
-    ```
+<Warning>O role `readonly` **não pode** enviar mensagens nem executar comandos. Ideal para dashboards de monitoramento e integrações que apenas consomem dados.</Warning>
 
-    <Note>Quando o cliente se conecta sem TLS, um log de warning é emitido para lembrar sobre o uso em produção. O comportamento funcional não muda.</Note>
-  </Tab>
-</Tabs>
+### Rate Limiting de Autenticação
+
+Tentativas de autenticação falhadas são limitadas a **5 por minuto por IP**. Após exceder o limite, o IP recebe `429 Too Many Requests` com backoff progressivo.
+
+```
+Tentativa 1-5:  Resposta normal (401 Unauthorized)
+Tentativa 6:    429 Too Many Requests (espere 30s)
+Tentativa 7+:   429 Too Many Requests (espere 60s, 120s, 240s...)
+```
+
+### OAuth PKCE + Device Flow
+
+Para autenticação com provedores externos (Anthropic, GitHub, Google), o ChatCLI implementa:
+
+- **PKCE** (Proof Key for Code Exchange): Previne interceptação do authorization code
+- **Device Flow**: Para ambientes sem browser (SSH, containers, CI/CD)
+
+<Tip>Veja a documentação completa de OAuth em [Autenticação OAuth](/features/oauth-authentication).</Tip>
 
 ---
 
-## Proteção contra Injeção de Shell
+## Criptografia e Proteção de Dados
 
-### ShellQuote — Quoting POSIX Seguro
+### AES-256-GCM para Credenciais
 
-Todos os pontos do código onde valores dinâmicos são interpolados em comandos shell utilizam a função `utils.ShellQuote()`, que aplica quoting POSIX com aspas simples:
+Todas as credenciais OAuth e tokens são armazenados com criptografia **AES-256-GCM** (Galois/Counter Mode), que fornece tanto confidencialidade quanto autenticidade dos dados.
+
+```
+~/.chatcli/
+  auth-profiles.json  (0600) — credenciais criptografadas AES-256-GCM
+  .auth-key           (0600) — chave mestre de 256 bits
+```
 
 ```go
-// Entrada: it's a "test" $(whoami)
-// Saída:   'it'\''s a "test" $(whoami)'
+// Fluxo de criptografia simplificado:
+// 1. Gera chave aleatória de 256 bits (crypto/rand)
+// 2. Cria cipher AES-256
+// 3. Gera nonce aleatório de 12 bytes
+// 4. Encripta com GCM (nonce || ciphertext || tag)
+// 5. Codifica em base64 para armazenamento
+
+nonce := make([]byte, gcm.NonceSize()) // 12 bytes
+io.ReadFull(crypto.Reader, nonce)
+ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
 ```
 
-Isso protege contra:
-- **Injeção via aspas**: `'; rm -rf /; echo '`
-- **Substituição de comandos**: `$(malicious)` ou `` `malicious` ``
-- **Expansão de variáveis**: `$HOME`, `${PATH}`
-- **Pipe/redirecionamento**: `| cat /etc/passwd`, `> /etc/crontab`
+### Criptografia de Sessão em Repouso
 
-#### Pontos Protegidos
+Os dados de sessão são criptografados antes de gravar em disco usando uma chave derivada via **HKDF** (HMAC-based Key Derivation Function) a partir da chave mestre.
 
-| Arquivo | Contexto |
-|---------|----------|
-| `cli/agent_mode.go` | Dry-run echo de comandos (simulação) |
-| `cli/cli.go` | Source do arquivo de configuração do shell (`~/.bashrc`, etc.) |
-| `cli/agent/command_executor.go` | Source do arquivo de configuração do shell (execução interativa) |
-
-### Resolução de Binários via LookPath
-
-O binário `stty` (usado para restaurar o terminal) é resolvido **uma única vez** no startup via `exec.LookPath("stty")`, retornando o caminho absoluto. Isso evita que um atacante coloque um `stty` malicioso no PATH.
-
-### Validação do EDITOR
-
-Quando o usuário edita comandos no modo agente, a variável `EDITOR` é validada contra uma **allowlist de editores conhecidos**:
-
-```text
-vim, vi, nvim, nano, emacs, code, subl, micro, helix, hx,
-ed, pico, joe, ne, kate, gedit, kwrite, notepad++, atom
+```
+Chave mestre (.auth-key)
+    │
+    ▼
+  HKDF (SHA-256, salt=session-id, info="chatcli-session")
+    │
+    ▼
+  Chave de sessão (256 bits, única por sessão)
+    │
+    ▼
+  AES-256-GCM (criptografia dos dados de sessão)
 ```
 
-<Warning>Se `EDITOR` contiver um valor desconhecido (ex: `EDITOR="/tmp/exploit.sh"`), a operação é recusada com erro. O editor validado é então resolvido via `exec.LookPath` para obter o caminho absoluto.</Warning>
+### TLS 1.3 para gRPC
+
+Em produção, o servidor gRPC exige TLS 1.3 com cipher suites fortes.
+
+```bash
+# Gerar certificado autoassinado para testes:
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj "/CN=chatcli-server"
+
+# Iniciar servidor com TLS:
+chatcli server --tls-cert cert.pem --tls-key key.pem
+```
+
+<Note>Quando TLS não está configurado, o servidor emite um log de warning a cada startup. O comportamento funcional não muda, mas a comunicação trafega em texto plano.</Note>
+
+### Redação de Variáveis de Ambiente
+
+O ChatCLI detecta e redacta automaticamente variáveis de ambiente sensíveis antes de exibir ou enviar ao LLM.
+
+<Tabs>
+  <Tab title="Modo Strict">
+    ```bash
+    export CHATCLI_ENV_REDACTION=strict
+    # Redacta QUALQUER variável que contenha:
+    # KEY, SECRET, TOKEN, PASSWORD, CREDENTIAL, AUTH,
+    # API_KEY, PRIVATE, CERTIFICATE, e mais
+    ```
+
+    Exemplo de saída:
+    ```
+    AWS_ACCESS_KEY_ID=****REDACTED****
+    DATABASE_URL=****REDACTED****
+    OPENAI_API_KEY=****REDACTED****
+    ```
+  </Tab>
+  <Tab title="Modo Permissive">
+    ```bash
+    export CHATCLI_ENV_REDACTION=permissive
+    # Redacta apenas variáveis em uma lista fixa:
+    # *_KEY, *_SECRET, *_TOKEN, *_PASSWORD
+    # Variáveis como PATH, HOME, SHELL são preservadas
+    ```
+  </Tab>
+</Tabs>
+
+### Redação do Histórico de Conversas
+
+O histórico de conversas passa por redação automática antes de ser persistido. Padrões detectados incluem:
+
+- API keys (formato `sk-...`, `pk_...`, `ghp_...`)
+- Tokens JWT (formato `eyJ...`)
+- Connection strings com credenciais
+- IPs privados em contextos sensíveis
+- Números de cartão de crédito (Luhn validation)
+
+### Integração com OS Keychain
+
+Quando disponível, o ChatCLI armazena a chave mestre no keychain do sistema operacional em vez do arquivo `.auth-key`.
+
+| Sistema | Backend | Comando |
+|---------|---------|---------|
+| macOS | Keychain Services | `security add-generic-password` |
+| Linux | Secret Service API (GNOME Keyring, KDE Wallet) | `secret-tool store` |
+| Windows | Windows Credential Manager | `cmdkey /add` |
+
+<Tip>A integração com keychain é automática quando o backend está disponível. Use `CHATCLI_DISABLE_KEYCHAIN=true` para forçar o armazenamento em arquivo.</Tip>
 
 ---
 
-## Validação de Comandos
+## Segurança do Modo Agente
 
-### 50+ Padrões de Detecção
+O modo agente permite que a IA execute comandos no seu sistema. O ChatCLI implementa **múltiplas camadas de proteção** para garantir que apenas operações seguras sejam executadas.
 
-O `CommandValidator` analisa cada comando sugerido pela IA antes da execução, verificando contra mais de 50 padrões regex que cobrem:
+### Allowlist de Comandos
 
-| Categoria | Exemplos |
-|-----------|----------|
-| **Destruição de dados** | `rm -rf /`, `dd if=`, `mkfs`, `drop database` |
-| **Execução remota** | `curl \| bash`, `wget \| sh`, `base64 \| bash` |
-| **Injeção de código** | `python -c`, `perl -e`, `ruby -e`, `node -e`, `php -r`, `eval` |
-| **Substituição de comandos** | `$(curl ...)`, `` `wget ...` `` |
-| **Substituição de processos** | `<(cmd)`, `>(cmd)` |
-| **Escalação de privilégios** | `sudo`, `chmod 777 /`, `chown -R / ` |
-| **Manipulação de rede** | `nc -l`, `iptables -F`, `/dev/tcp/` |
-| **Kernel** | `insmod`, `modprobe`, `rmmod`, `sysctl -w` |
-| **Evasão** | `${IFS;cmd}`, `VAR=x; bash`, `export PATH=` |
+O sistema mantém uma allowlist com **150+ comandos** organizados em **8 categorias**. Apenas comandos nesta lista são permitidos sem confirmação do usuário.
 
-### Denylist Customizada
+<AccordionGroup>
+  <Accordion title="Navegação e Sistema de Arquivos (25+ comandos)">
+    ```
+    ls, ll, la, tree, pwd, cd, find, locate, which, whereis,
+    file, stat, df, du, wc, dirname, basename, realpath,
+    readlink, test, mkdir, touch, head, tail, less
+    ```
+    <Note>Comandos de escrita (`cp`, `mv`, `rm`) **não** estão na allowlist — requerem confirmação.</Note>
+  </Accordion>
 
-Adicione seus próprios padrões via variável de ambiente:
+  <Accordion title="Leitura e Busca de Conteúdo (20+ comandos)">
+    ```
+    cat, bat, less, more, head, tail, grep, rg, ag, ack,
+    sed (somente leitura), awk (somente leitura), cut, sort,
+    uniq, diff, comm, join, paste, tr, expand, unexpand
+    ```
+  </Accordion>
+
+  <Accordion title="Git e Controle de Versão (25+ comandos)">
+    ```
+    git status, git log, git diff, git show, git branch,
+    git tag, git stash list, git remote -v, git describe,
+    git rev-parse, git ls-files, git ls-tree, git blame,
+    git shortlog, git reflog, git config --get,
+    git cherry, git merge-base, git name-rev, git whatchanged
+    ```
+    <Warning>Operações destrutivas como `git push --force`, `git reset --hard` e `git clean -f` **nunca** estão na allowlist.</Warning>
+  </Accordion>
+
+  <Accordion title="Desenvolvimento e Build (20+ comandos)">
+    ```
+    go build, go test, go vet, go fmt, go mod tidy,
+    go run, go generate, go doc, go env, go version,
+    npm run, npm test, npm list, npx, yarn, pnpm,
+    make, cmake, cargo build, cargo test, cargo clippy,
+    python -m pytest, pip list, rustc --version
+    ```
+  </Accordion>
+
+  <Accordion title="Informações do Sistema (15+ comandos)">
+    ```
+    uname, hostname, uptime, whoami, id, groups,
+    env (com redação), printenv (com redação),
+    date, cal, free, top (modo batch), ps,
+    lsb_release, sw_vers, sysctl (somente leitura)
+    ```
+  </Accordion>
+
+  <Accordion title="Rede (diagnóstico somente) (15+ comandos)">
+    ```
+    ping, traceroute, dig, nslookup, host, whois,
+    curl (somente GET), wget (somente download),
+    ss, netstat, ip addr, ifconfig, nmap (somente scan),
+    openssl s_client (verificação TLS)
+    ```
+    <Warning>Comandos de rede que podem modificar configurações (`iptables`, `route add`, `ip link set`) são **bloqueados**.</Warning>
+  </Accordion>
+
+  <Accordion title="Containers e Kubernetes (20+ comandos)">
+    ```
+    docker ps, docker images, docker logs, docker inspect,
+    docker stats, docker top, docker port,
+    kubectl get, kubectl describe, kubectl logs,
+    kubectl top, kubectl api-resources, kubectl explain,
+    kubectl config view, kubectl cluster-info,
+    helm list, helm status, helm get values,
+    crictl ps, podman ps
+    ```
+  </Accordion>
+
+  <Accordion title="Editores e Ferramentas (15+ comandos)">
+    ```
+    jq, yq, xq, xmllint, python -m json.tool,
+    base64 (decodificação), md5sum, sha256sum,
+    tar (somente listar: tf/tvf), zip (somente listar: -l),
+    echo, printf, tee (somente leitura), column, fmt
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Modo Strict vs Permissive
+
+<Tabs>
+  <Tab title="Strict (Padrão)">
+    ```bash
+    export CHATCLI_AGENT_ALLOWLIST_MODE=strict
+    ```
+
+    - Apenas comandos da allowlist executam sem confirmação
+    - Qualquer comando fora da lista requer aprovação explícita do usuário
+    - **Recomendado para produção e ambientes compartilhados**
+  </Tab>
+  <Tab title="Permissive">
+    ```bash
+    export CHATCLI_AGENT_ALLOWLIST_MODE=permissive
+    ```
+
+    - Comandos da allowlist executam sem confirmação
+    - Comandos desconhecidos exibem um aviso, mas permitem execução após confirmação simplificada
+    - Comandos na **denylist** continuam bloqueados
+    - **Use apenas em ambientes de desenvolvimento isolados**
+  </Tab>
+</Tabs>
+
+### Bloqueio de Caminhos Sensíveis
+
+O agente **não pode ler** arquivos em caminhos considerados sensíveis, independentemente da allowlist:
+
+| Caminho | Motivo |
+|---------|--------|
+| `~/.ssh/*` | Chaves SSH privadas |
+| `~/.gnupg/*` | Chaves GPG |
+| `~/.aws/credentials` | Credenciais AWS |
+| `~/.azure/credentials` | Credenciais Azure |
+| `~/.gcp/*.json` | Service accounts GCP |
+| `~/.kube/config` | Kubeconfig com tokens |
+| `~/.env`, `.env`, `.env.*` | Variáveis de ambiente |
+| `~/.chatcli/.auth-key` | Chave mestre de criptografia |
+| `~/.chatcli/auth-profiles.json` | Credenciais criptografadas |
+| `/etc/shadow` | Hashes de senhas do sistema |
+| `/etc/sudoers` | Configuração de sudo |
+| `**/id_rsa`, `**/id_ed25519` | Chaves privadas SSH |
+| `**/*.pem`, `**/*.key` | Certificados e chaves privadas |
+
+<Warning>Tentativas de leitura desses caminhos são **silenciosamente bloqueadas** e registradas no audit log. A IA recebe uma mensagem genérica informando que o arquivo não está acessível.</Warning>
+
+### Shell Config Sourcing
+
+Por padrão, o agente **não** carrega arquivos de configuração do shell (`.bashrc`, `.zshrc`). Isso previne execução de código arbitrário que possa existir nesses arquivos.
 
 ```bash
-# Bloquear terraform destroy e kubectl delete namespace
-export CHATCLI_AGENT_DENYLIST="terraform destroy;kubectl delete namespace"
+# Habilitar source de shell config (opt-in)
+export CHATCLI_AGENT_SOURCE_SHELL_CONFIG=true
 ```
 
-### Controle de sudo
+### Sanitização de Saída de Comandos
 
-```bash
-# Permitir sudo (use com cautela)
-export CHATCLI_AGENT_ALLOW_SUDO=true
+A saída de todos os comandos executados passa por um sanitizador que detecta tentativas de **prompt injection**:
+
+```
+Padrões detectados e removidos:
+  - "Ignore previous instructions..."
+  - "You are now a..."
+  - "System: new instructions..."
+  - Sequências de escape ANSI maliciosas
+  - Caracteres Unicode de controle (RTL override, etc.)
 ```
 
 ---
 
-## Governança do Modo Coder (Policy Manager)
+## Segurança de Plugins
 
-### Matching com Word Boundary
+O sistema de plugins do ChatCLI usa **assinatura criptográfica Ed25519** para garantir integridade e autenticidade.
 
-O sistema de policies usa **matching com word boundary** para prevenir escalação de permissões por prefixo. Exemplo:
+### Verificação Ed25519
 
-| Regra | Comando | Resultado |
-|-------|---------|-----------|
-| `@coder read` = allow | `@coder read file.txt` | **Permitido** |
-| `@coder read` = allow | `@coder readlink /tmp` | **Bloqueado** (ask) |
-| `@coder read --file /etc` = deny | `@coder read --file /etc/passwd` | **Bloqueado** (deny) |
+Cada plugin deve ser assinado com uma chave Ed25519. Na instalação, o ChatCLI verifica:
 
-A lógica verifica se o próximo caractere após o match é um separador (espaço, `/`, `=`, etc.) e não a continuação de uma palavra (letra, dígito, `-`, `_`). Isso garante que `read` não case com `readlink`.
+1. A assinatura é válida contra a chave pública do autor
+2. O hash SHA-256 do binário confere com o manifesto
+3. O manifesto não foi alterado (assinatura cobre o manifesto inteiro)
 
-### Regras Padrão
+### Sistema de Quarentena
 
-Os comandos de leitura são permitidos por padrão:
+Plugins não verificados são colocados em **quarentena** — um diretório isolado onde não podem ser executados:
 
-```json
-{
-  "rules": [
-    { "pattern": "@coder read", "action": "allow" },
-    { "pattern": "@coder tree", "action": "allow" },
-    { "pattern": "@coder search", "action": "allow" },
-    { "pattern": "@coder git-status", "action": "allow" },
-    { "pattern": "@coder git-diff", "action": "allow" },
-    { "pattern": "@coder git-log", "action": "allow" },
-    { "pattern": "@coder git-changed", "action": "allow" },
-    { "pattern": "@coder git-branch", "action": "allow" }
-  ]
-}
+```
+~/.chatcli/plugins/
+  verified/          — plugins com assinatura válida (executáveis)
+  quarantine/        — plugins sem assinatura ou com assinatura inválida
 ```
 
-Para mais detalhes sobre o sistema de governança, veja a [documentação do Modo Coder](/features/coder-security).
+### Permissões de Arquivo
 
----
+| Arquivo | Permissão | Descrição |
+|---------|-----------|-----------|
+| Diretório do plugin | `0700` | Acesso apenas do dono |
+| Binário do plugin | `0600` | Leitura apenas do dono (executado via loader) |
+| Manifesto | `0600` | Leitura apenas do dono |
+| Assinatura | `0600` | Leitura apenas do dono |
 
-## Segurança do Servidor gRPC
+### Permitir Plugins Não Assinados
 
-### gRPC Reflection (Desabilitado por Padrão)
-
-O gRPC reflection expoe o schema completo do serviço, permitindo que ferramentas como `grpcurl` e `grpcui` descubram e chamem todos os RPCs. Em produção, isso pode facilitar reconhecimento por atacantes.
-
-<Warning>Por padrão, o reflection está desabilitado. Habilite apenas para debugging local.</Warning>
+<Warning>Essa opção desabilita a verificação de assinatura. Use **apenas** em desenvolvimento local.</Warning>
 
 ```bash
-# Via variável de ambiente
-export CHATCLI_GRPC_REFLECTION=true
-chatcli server
+export CHATCLI_ALLOW_UNSIGNED_PLUGINS=true
 ```
 
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `CHATCLI_GRPC_REFLECTION` | Habilita gRPC reflection (`true`/`false`) | `false` |
-
-### Interceptors de Segurança
-
-Todas as requests passam por uma cadeia de interceptors:
+### Como Assinar um Plugin
 
 <Steps>
-  <Step title="Recovery">
-    Captura panics e retorna erro gRPC em vez de derrubar o servidor.
+  <Step title="Gerar par de chaves Ed25519">
+    ```bash
+    chatcli plugin keygen --output ~/.chatcli/plugin-keys/
+
+    # Gera:
+    #   plugin-signing.key  (chave privada — NUNCA compartilhe)
+    #   plugin-signing.pub  (chave pública — distribua com o plugin)
+    ```
   </Step>
-  <Step title="Logging">
-    Registra metodo, duração e status de cada request.
+  <Step title="Criar o manifesto do plugin">
+    ```json
+    {
+      "name": "meu-plugin",
+      "version": "1.0.0",
+      "description": "Descrição do plugin",
+      "author": "seu-nome",
+      "binary": "meu-plugin",
+      "checksum": ""
+    }
+    ```
   </Step>
-  <Step title="Auth">
-    Válida Bearer token (quando configurado).
+  <Step title="Calcular o checksum do binário">
+    ```bash
+    sha256sum meu-plugin | awk '{print $1}'
+    # Copie o hash para o campo "checksum" do manifesto
+    ```
+  </Step>
+  <Step title="Assinar o manifesto">
+    ```bash
+    chatcli plugin sign \
+      --manifest manifest.json \
+      --key ~/.chatcli/plugin-keys/plugin-signing.key \
+      --output manifest.json.sig
+    ```
+  </Step>
+  <Step title="Distribuir o plugin">
+    Inclua na distribuição:
+    - O binário do plugin
+    - `manifest.json`
+    - `manifest.json.sig`
+    - `plugin-signing.pub` (chave pública)
+  </Step>
+  <Step title="Instalar e verificar">
+    ```bash
+    chatcli plugin install ./meu-plugin/
+    # A verificação de assinatura é automática
+    # Se falhar, o plugin vai para quarentena
+    ```
   </Step>
 </Steps>
 
 ---
 
-## Verificação de Versão
+## Segurança do Servidor gRPC
 
-O ChatCLI verifica automaticamente se há uma versão mais recente no GitHub. Para desabilitar (ex: ambientes air-gapped ou CI/CD):
+### Prevenção de SSRF
+
+O servidor gRPC inclui proteção contra **Server-Side Request Forgery** (SSRF). Todas as URLs processadas passam por validação antes de serem acessadas.
+
+**CIDRs bloqueados:**
+
+```
+10.0.0.0/8          — Rede privada Classe A
+172.16.0.0/12       — Rede privada Classe B
+192.168.0.0/16      — Rede privada Classe C
+127.0.0.0/8         — Loopback
+169.254.169.254/32  — AWS/GCP metadata endpoint
+100.100.100.200/32  — Alibaba Cloud metadata
+fd00::/8            — IPv6 Unique Local
+::1/128             — IPv6 loopback
+fe80::/10           — IPv6 link-local
+```
+
+<Info>A validação também resolve DNS para prevenir bypass via domínios que apontam para IPs privados (DNS rebinding).</Info>
+
+### Rate Limiting por Cliente
+
+O servidor implementa rate limiting com **token bucket** por cliente, identificado pelo IP de origem.
+
+| Parâmetro | Padrão | Variável |
+|-----------|--------|----------|
+| Tokens por segundo | 10 | `CHATCLI_RATE_LIMIT_RPS` |
+| Burst máximo | 20 | `CHATCLI_RATE_LIMIT_BURST` |
+| Cleanup interval | 5min | `CHATCLI_RATE_LIMIT_CLEANUP` |
 
 ```bash
-export CHATCLI_DISABLE_VERSION_CHECK=true
+# Configurar rate limiting customizado
+export CHATCLI_RATE_LIMIT_RPS=5
+export CHATCLI_RATE_LIMIT_BURST=10
+chatcli server
 ```
 
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `CHATCLI_DISABLE_VERSION_CHECK` | Desabilita a verificação automática de versão (`true`/`false`) | `false` |
+### Limites de Mensagem gRPC
+
+| Parâmetro | Padrão | Variável |
+|-----------|--------|----------|
+| Tamanho máximo de mensagem recebida | 4 MB | `CHATCLI_GRPC_MAX_RECV_SIZE` |
+| Tamanho máximo de mensagem enviada | 4 MB | `CHATCLI_GRPC_MAX_SEND_SIZE` |
+| MaxConcurrentStreams | 100 | `CHATCLI_GRPC_MAX_STREAMS` |
+
+### Interceptor de Validação de Campos
+
+Todas as requisições gRPC passam por um interceptor que valida:
+
+- Tamanho máximo de strings (previne DoS por payload)
+- Caracteres permitidos em identificadores
+- Formato de UUIDs de sessão
+- Ranges de valores numéricos
+
+### Bind Address
+
+```bash
+# Padrão: bind apenas em localhost (seguro)
+chatcli server
+# Escuta em 127.0.0.1:50051
+
+# Expor na rede (use apenas com TLS + auth)
+chatcli server --bind 0.0.0.0:50051 --tls-cert cert.pem --tls-key key.pem
+```
+
+<Warning>Nunca exponha o servidor na rede (`0.0.0.0`) sem TLS e autenticação habilitados.</Warning>
+
+### gRPC Reflection
+
+O gRPC reflection está **desabilitado por padrão**. Quando habilitado, expõe o schema completo do serviço, facilitando reconhecimento por atacantes.
+
+```bash
+# Habilitar apenas para debugging local
+export CHATCLI_GRPC_REFLECTION=true
+```
+
+### Audit Logging Estruturado
+
+Todas as operações do servidor são registradas em formato **JSON Lines** para integração com sistemas de SIEM.
+
+```json
+{
+  "timestamp": "2026-04-06T10:30:00Z",
+  "level": "info",
+  "event": "grpc.request",
+  "method": "/chatcli.v1.ChatService/SendMessage",
+  "client_ip": "192.168.1.100",
+  "user": "admin@example.com",
+  "role": "admin",
+  "duration_ms": 245,
+  "status": "OK",
+  "request_size": 1024,
+  "response_size": 4096
+}
+```
+
+```bash
+# Configurar output do audit log
+export CHATCLI_AUDIT_LOG=/var/log/chatcli/audit.jsonl
+export CHATCLI_AUDIT_LOG_MAX_SIZE=100M
+export CHATCLI_AUDIT_LOG_MAX_AGE=90d
+```
 
 ---
 
-## Segurança de Containers (Docker)
+## Segurança do Operator Kubernetes
 
-O `docker-compose.yml` do projeto inclui as seguintes medidas de hardening:
+O operator Kubernetes do ChatCLI implementa proteções específicas para o ambiente cloud-native.
 
-```yaml
-services:
-  chatcli-server:
-    read_only: true           # Filesystem somente-leitura
-    tmpfs:
-      - /tmp:size=100M        # Diretório temporário em memória
-    security_opt:
-      - no-new-privileges:true  # Impede escalação de privilégios
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"         # Limite de CPU
-          memory: 1G          # Limite de memória
+### Autenticação Fail-Closed
+
+A API REST do operator usa autenticação **fail-closed**: se o middleware de autenticação falhar por qualquer motivo (erro interno, timeout, configuração inválida), a requisição é **recusada**. Nenhuma requisição passa sem validação explícita.
+
+```
+Requisição → Auth Middleware → Erro?
+                                 ├── Sim → 403 Forbidden (fail-closed)
+                                 └── Não → Validar token → Processar
 ```
 
-### O que cada medida faz
+### Allowlist de Tipos de Recursos
 
-| Medida | Proteção |
-|--------|----------|
-| `read_only: true` | Impede que malware grave arquivos no filesystem do container |
-| `tmpfs` | Fornece diretório `/tmp` em memória com tamanho limitado |
-| `no-new-privileges` | Impede que processos filhos ganhem mais privilégios que o pai |
-| Resource limits | Previne consumo excessivo de CPU/memória (DoS) |
+O operator só pode remediar um conjunto restrito de recursos Kubernetes. Isso previne que a IA modifique recursos críticos do cluster.
 
----
+<Tabs>
+  <Tab title="17 Tipos Seguros (Permitidos)">
+    ```
+    Deployment, StatefulSet, DaemonSet, ReplicaSet,
+    Pod, Service, ConfigMap, Ingress,
+    Job, CronJob, HorizontalPodAutoscaler,
+    PodDisruptionBudget, NetworkPolicy,
+    ServiceAccount, Role, RoleBinding, Endpoints
+    ```
+  </Tab>
+  <Tab title="18 Tipos Perigosos (Bloqueados)">
+    ```
+    Node, Namespace, PersistentVolume,
+    ClusterRole, ClusterRoleBinding,
+    CustomResourceDefinition, MutatingWebhookConfiguration,
+    ValidatingWebhookConfiguration, APIService,
+    StorageClass, PriorityClass, RuntimeClass,
+    PodSecurityPolicy, ResourceQuota, LimitRange,
+    Secret, PersistentVolumeClaim, CSIDriver
+    ```
+  </Tab>
+</Tabs>
 
-## Segurança no Kubernetes (Helm)
+<Warning>Tentativas de remediar tipos bloqueados são registradas no audit log e geram alertas.</Warning>
 
-### Pod SecurityContext
+### Log Scrubbing (18 Padrões)
 
-O Helm chart define um SecurityContext restritivo por padrão:
+Antes de enviar logs ao LLM para análise, o operator remove informações sensíveis usando **18 padrões de sanitização**:
 
-```yaml
-# values.yaml
-podSecurityContext:
-  runAsNonRoot: true          # Obriga execução como usuário não-root
-  runAsUser: 1000
-  runAsGroup: 1000
-  fsGroup: 1000
-  seccompProfile:
-    type: RuntimeDefault       # Filtro de syscalls do kernel
+| # | Padrão | Exemplo |
+|---|--------|---------|
+| 1 | API Keys | `Bearer sk-abc123...` → `Bearer ****` |
+| 2 | JWT Tokens | `eyJhbGciOi...` → `[JWT_REDACTED]` |
+| 3 | Connection Strings | `postgres://user:pass@host` → `postgres://****:****@host` |
+| 4 | Certificados Base64 | `LS0tLS1CRUdJTi...` → `[CERT_REDACTED]` |
+| 5 | Chaves Privadas | `-----BEGIN RSA PRIVATE KEY-----` → `[KEY_REDACTED]` |
+| 6 | AWS Access Keys | `AKIA...` → `[AWS_KEY_REDACTED]` |
+| 7 | AWS Secret Keys | `wJalrXUtnFEMI...` → `[AWS_SECRET_REDACTED]` |
+| 8 | GCP Service Account | `"private_key": "..."` → `[GCP_KEY_REDACTED]` |
+| 9 | Passwords em URLs | `://user:password@` → `://****:****@` |
+| 10 | Tokens OAuth | `access_token=...` → `access_token=****` |
+| 11 | GitHub Tokens | `ghp_...`, `gho_...` → `[GH_TOKEN_REDACTED]` |
+| 12 | Slack Tokens | `xoxb-...`, `xoxp-...` → `[SLACK_TOKEN_REDACTED]` |
+| 13 | Stripe Keys | `sk_live_...`, `pk_live_...` → `[STRIPE_REDACTED]` |
+| 14 | Números de Cartão | `4111 1111 1111 1111` → `[CARD_REDACTED]` |
+| 15 | SSN (US) | `123-45-6789` → `[SSN_REDACTED]` |
+| 16 | IPs em contextos auth | `auth from 10.0.0.1` → `auth from [IP_REDACTED]` |
+| 17 | Email em logs | `user@domain.com` → `[EMAIL_REDACTED]` |
+| 18 | Kubernetes Secrets | `data: {key: base64...}` → `data: {key: [REDACTED]}` |
 
-securityContext:
-  allowPrivilegeEscalation: false  # Sem escalação de privilégios
-  readOnlyRootFilesystem: true     # Filesystem somente-leitura
-  capabilities:
-    drop:
-      - ALL                        # Remove TODAS as capabilities Linux
+### CORS Deny-All
+
+O operator responde com headers CORS que **negam todas as origens** por padrão:
+
+```
+Access-Control-Allow-Origin: (não definido)
+Access-Control-Allow-Methods: (não definido)
+Access-Control-Allow-Headers: (não definido)
 ```
 
-### RBAC Namespace-Scoped (Padrão)
+<Info>Para integrar com dashboards web, configure origens permitidas explicitamente via `CHATCLI_OPERATOR_CORS_ORIGINS`.</Info>
 
-Por padrão, o chart cria **Role** e **RoleBinding** (namespace-scoped) em vez de ClusterRole. Isso garante que o ChatCLI só tenha acesso ao namespace onde está deployado.
+### RBAC Least-Privilege
+
+O Helm chart cria **Role** e **RoleBinding** (namespace-scoped) por padrão:
 
 ```yaml
 # values.yaml
 rbac:
   create: true
-  clusterWide: false   # false = Role (namespace-scoped, padrão)
-                       # true  = ClusterRole (cluster-wide)
+  clusterWide: false  # Role (padrão) vs ClusterRole
 ```
 
-Para monitorar deployments em **múltiplos namespaces**, habilite `clusterWide`:
+### NetworkPolicy
 
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --set rbac.clusterWide=true \
-  --set watcher.enabled=true
+O chart inclui uma NetworkPolicy restritiva:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chatcli-operator
+spec:
+  podSelector:
+    matchLabels:
+      app: chatcli-operator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              chatcli-access: "true"
+      ports:
+        - port: 8443  # API REST (TLS)
+        - port: 50051  # gRPC (TLS)
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 443    # Kubernetes API
+        - port: 6443   # Kubernetes API (alternativo)
 ```
 
-### tmpfs Automático
+### Admission Webhook
 
-<Info>Quando `securityContext.readOnlyRootFilesystem` está `true`, o chart automaticamente monta um volume `emptyDir` em `/tmp` (limitado a 100Mi) para que a aplicação possa gravar arquivos temporários.</Info>
+O operator inclui um **ValidatingWebhookConfiguration** que intercepta criação e atualização de recursos ChatCLI customizados, validando:
+
+- Schema dos CRDs
+- Limites de recursos
+- Referências a secrets existentes
+- Nomes de namespace válidos
+
+### Structured Audit Logging
+
+Todas as ações de remediação são logadas em formato estruturado:
+
+```json
+{
+  "timestamp": "2026-04-06T10:30:00Z",
+  "event": "remediation.applied",
+  "resource_type": "Deployment",
+  "resource_name": "nginx",
+  "namespace": "production",
+  "action": "scale_up",
+  "replicas_before": 1,
+  "replicas_after": 3,
+  "reason": "Pod CrashLoopBackOff detectado",
+  "approved_by": "auto-policy",
+  "audit_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
 
 ---
 
-## Variáveis de Ambiente de Segurança
+## Segurança de CI/CD
 
-Resumo de todas as variáveis relacionadas a segurança:
+O pipeline de CI/CD do ChatCLI inclui verificações automáticas de segurança em cada pull request e release.
+
+<CardGroup cols={2}>
+  <Card title="govulncheck" icon="magnifying-glass-chart">
+    Verifica todas as dependências Go contra o banco de dados de vulnerabilidades do Go. Falha o build se encontrar CVEs conhecidos em dependências usadas.
+    ```bash
+    govulncheck ./...
+    ```
+  </Card>
+  <Card title="gosec" icon="shield-check">
+    Análise estática de segurança que detecta padrões inseguros no código-fonte: SQL injection, uso de `crypto/md5`, hardcoded credentials, e mais.
+    ```bash
+    gosec -fmt json ./...
+    ```
+  </Card>
+  <Card title="Dependabot" icon="robot">
+    Monitora dependências e cria PRs automáticos quando atualizações de segurança estão disponíveis. Configurado para Go modules e GitHub Actions.
+  </Card>
+  <Card title="Cosign" icon="signature">
+    Todas as imagens de container publicadas são assinadas com **Sigstore Cosign**. Verifique a autenticidade antes de usar:
+    ```bash
+    cosign verify ghcr.io/diillson/chatcli:latest \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "github.com/diillson/chatcli"
+    ```
+  </Card>
+</CardGroup>
+
+### API Key Masking em Workflows
+
+Todos os secrets usados nos workflows do GitHub Actions são mascarados automaticamente nos logs. Além disso, o ChatCLI implementa masking adicional para prevenir vazamento acidental de chaves em outputs de testes.
+
+---
+
+## Referência de Variáveis de Segurança
+
+Tabela completa de todas as variáveis de ambiente relacionadas à segurança do ChatCLI:
+
+### Autenticação e Autorização
 
 | Variável | Descrição | Padrão |
 |----------|-----------|--------|
-| `CHATCLI_SERVER_TOKEN` | Token de autenticação do servidor gRPC | `""` (sem auth) |
-| `CHATCLI_SERVER_TLS_CERT` | Certificado TLS do servidor | `""` |
-| `CHATCLI_SERVER_TLS_KEY` | Chave TLS do servidor | `""` |
-| `CHATCLI_GRPC_REFLECTION` | Habilita gRPC reflection | `false` |
-| `CHATCLI_DISABLE_VERSION_CHECK` | Desabilita verificação de versão | `false` |
-| `CHATCLI_AGENT_ALLOW_SUDO` | Permite sudo no modo agente | `false` |
+| `CHATCLI_JWT_SECRET` | Chave secreta para validação JWT (HMAC-SHA256) | `""` (JWT desabilitado) |
+| `CHATCLI_JWT_ISSUER` | Valor esperado do claim `iss` | `""` |
+| `CHATCLI_JWT_AUDIENCE` | Valor esperado do claim `aud` | `""` |
+| `CHATCLI_JWT_CLOCK_SKEW` | Tolerância de clock skew para validação `exp` | `30s` |
+| `CHATCLI_SERVER_TOKEN` | Token Bearer para autenticação legada | `""` (sem auth) |
+| `CHATCLI_AUTH_RATE_LIMIT` | Tentativas de auth por minuto por IP | `5` |
+| `CHATCLI_AUTH_LOCKOUT_DURATION` | Duração do bloqueio após exceder rate limit | `5m` |
+
+### Criptografia e TLS
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_SERVER_TLS_CERT` | Caminho do certificado TLS do servidor | `""` |
+| `CHATCLI_SERVER_TLS_KEY` | Caminho da chave TLS do servidor | `""` |
+| `CHATCLI_TLS_MIN_VERSION` | Versão mínima de TLS aceita | `1.3` |
+| `CHATCLI_ENCRYPTION_KEY` | Chave de criptografia customizada (override .auth-key) | `""` |
+| `CHATCLI_DISABLE_KEYCHAIN` | Desabilita integração com OS keychain | `false` |
+| `CHATCLI_SESSION_ENCRYPTION` | Habilita/desabilita criptografia de sessão | `true` |
+| `CHATCLI_SESSION_TTL` | Tempo de vida máximo de sessão inativa | `24h` |
+
+### Redação e Proteção de Dados
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_ENV_REDACTION` | Modo de redação de env vars (`strict`/`permissive`/`off`) | `strict` |
+| `CHATCLI_HISTORY_REDACTION` | Habilita redação do histórico de conversas | `true` |
+| `CHATCLI_LOG_SCRUB_PATTERNS` | Padrões regex adicionais para log scrubbing (`;` separados) | `""` |
+| `CHATCLI_AUDIT_LOG` | Caminho do arquivo de audit log | `""` (stdout) |
+| `CHATCLI_AUDIT_LOG_MAX_SIZE` | Tamanho máximo do arquivo de audit log | `100M` |
+| `CHATCLI_AUDIT_LOG_MAX_AGE` | Idade máxima dos logs de auditoria | `90d` |
+
+### Modo Agente
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_AGENT_ALLOWLIST_MODE` | Modo da allowlist (`strict`/`permissive`) | `strict` |
 | `CHATCLI_AGENT_DENYLIST` | Padrões regex adicionais para bloquear (`;` separados) | `""` |
+| `CHATCLI_AGENT_ALLOW_SUDO` | Permite execução de sudo no modo agente | `false` |
 | `CHATCLI_AGENT_CMD_TIMEOUT` | Timeout de execução por comando | `10m` |
+| `CHATCLI_AGENT_SOURCE_SHELL_CONFIG` | Permite source de `.bashrc`/`.zshrc` | `false` |
+| `CHATCLI_AGENT_MAX_OUTPUT_SIZE` | Tamanho máximo da saída de comandos | `1M` |
+| `CHATCLI_AGENT_BLOCKED_PATHS` | Caminhos adicionais para bloquear leitura (`;` separados) | `""` |
 
----
+### Plugins
 
-## Criptografia de Credenciais
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_ALLOW_UNSIGNED_PLUGINS` | Permite plugins sem assinatura Ed25519 | `false` |
+| `CHATCLI_PLUGIN_TRUSTED_KEYS` | Chaves públicas Ed25519 confiáveis (`,` separadas) | `""` |
+| `CHATCLI_PLUGIN_QUARANTINE_DIR` | Diretório de quarentena customizado | `~/.chatcli/plugins/quarantine` |
 
-As credenciais OAuth são armazenadas com **criptografia AES-256-GCM** em `~/.chatcli/auth-profiles.json`. A chave de criptografia é gerada automaticamente e salva em `~/.chatcli/.auth-key` com permissão `0600` (somente o dono pode ler).
+### Servidor gRPC
 
-| Arquivo | Permissão | Conteúdo |
-|---------|-----------|----------|
-| `~/.chatcli/auth-profiles.json` | `0600` | Credenciais OAuth criptografadas |
-| `~/.chatcli/.auth-key` | `0600` | Chave AES-256-GCM |
-| `~/.chatcli/coder_policy.json` | `0600` | Regras de policy do Coder |
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_GRPC_REFLECTION` | Habilita gRPC reflection | `false` |
+| `CHATCLI_GRPC_MAX_RECV_SIZE` | Tamanho máximo de mensagem recebida | `4MB` |
+| `CHATCLI_GRPC_MAX_SEND_SIZE` | Tamanho máximo de mensagem enviada | `4MB` |
+| `CHATCLI_GRPC_MAX_STREAMS` | Máximo de streams concorrentes por conexão | `100` |
+| `CHATCLI_GRPC_BIND` | Endereço de bind do servidor | `127.0.0.1:50051` |
+| `CHATCLI_RATE_LIMIT_RPS` | Requests por segundo por cliente | `10` |
+| `CHATCLI_RATE_LIMIT_BURST` | Burst máximo por cliente | `20` |
+| `CHATCLI_RATE_LIMIT_CLEANUP` | Intervalo de limpeza de buckets expirados | `5m` |
+
+### SSRF e Rede
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_SSRF_BLOCK_PRIVATE` | Bloqueia acesso a redes privadas | `true` |
+| `CHATCLI_SSRF_BLOCK_METADATA` | Bloqueia acesso a endpoints de metadata cloud | `true` |
+| `CHATCLI_SSRF_ALLOWED_HOSTS` | Hosts permitidos mesmo em redes privadas (`,` separados) | `""` |
+| `CHATCLI_SSRF_DNS_CHECK` | Valida DNS resolution contra IPs privados | `true` |
+
+### Operator Kubernetes
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_OPERATOR_CORS_ORIGINS` | Origens CORS permitidas (`,` separadas) | `""` (deny-all) |
+| `CHATCLI_OPERATOR_AUTH_MODE` | Modo de autenticação (`fail-closed`/`fail-open`) | `fail-closed` |
+| `CHATCLI_OPERATOR_ALLOWED_RESOURCES` | Override da allowlist de tipos de recursos | (17 tipos seguros) |
+| `CHATCLI_OPERATOR_LOG_SCRUB` | Habilita log scrubbing antes de enviar ao LLM | `true` |
+
+### CI/CD e Verificação
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_DISABLE_VERSION_CHECK` | Desabilita verificação automática de versão | `false` |
+| `CHATCLI_COSIGN_KEY` | Chave pública Cosign para verificação de imagens | `""` |
 
 ---
 
 ## Boas Práticas para Produção
 
 <Steps>
-  <Step title="Sempre use token de autenticação">
+  <Step title="Configure autenticação JWT com roles">
     ```bash
-    export CHATCLI_SERVER_TOKEN=$(openssl rand -hex 32)
-    chatcli server --token $CHATCLI_SERVER_TOKEN
+    export CHATCLI_JWT_SECRET=$(openssl rand -hex 32)
+    export CHATCLI_JWT_ISSUER="sua-org-auth"
+    export CHATCLI_JWT_AUDIENCE="chatcli-production"
+    chatcli server
     ```
   </Step>
-  <Step title="Habilite TLS em produção">
+  <Step title="Habilite TLS 1.3 com certificados válidos">
     ```bash
-    chatcli server --tls-cert cert.pem --tls-key key.pem
+    # Use certificados de uma CA confiável (Let's Encrypt, etc.)
+    chatcli server \
+      --tls-cert /etc/chatcli/tls/cert.pem \
+      --tls-key /etc/chatcli/tls/key.pem
     ```
   </Step>
-  <Step title="Mantenha gRPC reflection desabilitado">
-    Não defina `CHATCLI_GRPC_REFLECTION=true` em produção. Use apenas para debugging local.
-  </Step>
-  <Step title="Use RBAC namespace-scoped">
-    Mantenha `rbac.clusterWide: false` (padrão) a menos que precise monitorar múltiplos namespaces.
-  </Step>
-  <Step title="Revise as policies do Coder regularmente">
+  <Step title="Use modo strict para o agente">
     ```bash
-    cat ~/.chatcli/coder_policy.json
+    export CHATCLI_AGENT_ALLOWLIST_MODE=strict
+    export CHATCLI_AGENT_ALLOW_SUDO=false
+    export CHATCLI_AGENT_CMD_TIMEOUT=5m
+    ```
+  </Step>
+  <Step title="Configure audit logging para SIEM">
+    ```bash
+    export CHATCLI_AUDIT_LOG=/var/log/chatcli/audit.jsonl
+    export CHATCLI_AUDIT_LOG_MAX_SIZE=100M
+    export CHATCLI_AUDIT_LOG_MAX_AGE=90d
+    ```
+  </Step>
+  <Step title="Habilite redação em modo strict">
+    ```bash
+    export CHATCLI_ENV_REDACTION=strict
+    export CHATCLI_HISTORY_REDACTION=true
+    export CHATCLI_OPERATOR_LOG_SCRUB=true
+    ```
+  </Step>
+  <Step title="Mantenha gRPC reflection e CORS desabilitados">
+    Não defina `CHATCLI_GRPC_REFLECTION=true` nem `CHATCLI_OPERATOR_CORS_ORIGINS` em produção, a menos que estritamente necessário.
+  </Step>
+  <Step title="Exija assinatura de plugins">
+    ```bash
+    # Padrão — mas verifique que não foi sobrescrito:
+    export CHATCLI_ALLOW_UNSIGNED_PLUGINS=false
+    ```
+  </Step>
+  <Step title="Use RBAC namespace-scoped no Kubernetes">
+    ```bash
+    helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
+      --set rbac.clusterWide=false \
+      --set securityContext.readOnlyRootFilesystem=true \
+      --set podSecurityContext.runAsNonRoot=true
     ```
   </Step>
   <Step title="Configure resource limits">
-    Sempre defina limites de CPU e memória para evitar consumo excessivo:
-
     ```yaml
     resources:
       requests:
@@ -383,32 +976,64 @@ As credenciais OAuth são armazenadas com **criptografia AES-256-GCM** em `~/.ch
         cpu: "500m"
     ```
   </Step>
-  <Step title="Mantenha o ChatCLI atualizado">
-    A verificação de versão é habilitada por padrão. Se você desabilitou com `CHATCLI_DISABLE_VERSION_CHECK`, verifique periodicamente:
-
+  <Step title="Verifique imagens com Cosign">
     ```bash
-    chatcli --version
+    cosign verify ghcr.io/diillson/chatcli:latest \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "github.com/diillson/chatcli"
+    ```
+  </Step>
+  <Step title="Mantenha dependências atualizadas">
+    ```bash
+    # Verifique vulnerabilidades localmente:
+    govulncheck ./...
+
+    # Atualize dependências:
+    go get -u ./...
+    go mod tidy
+    ```
+  </Step>
+  <Step title="Monitore o audit log">
+    ```bash
+    # Verificar tentativas de auth falhadas:
+    jq 'select(.event == "auth.failed")' /var/log/chatcli/audit.jsonl
+
+    # Verificar remediações do operator:
+    jq 'select(.event == "remediation.applied")' /var/log/chatcli/audit.jsonl
+
+    # Alertar em tentativas de acesso a caminhos bloqueados:
+    jq 'select(.event == "blocked_path.access")' /var/log/chatcli/audit.jsonl
     ```
   </Step>
 </Steps>
 
 ---
 
-## Próximo Passo
+## Próximos Passos
 
 <CardGroup cols={2}>
-  <Card title="Governança do Modo Coder" icon="shield-halved" href="/features/coder-security">
-    Regras de policy para controlar o que o Coder pode executar.
+  <Card title="Autenticação OAuth" icon="key" href="/features/oauth-authentication">
+    Configuração detalhada de PKCE, Device Flow e integração com provedores.
   </Card>
-  <Card title="Configurar o servidor" icon="server" href="/features/server-mode">
-    Deploy e configuração do servidor gRPC.
+  <Card title="Governança do Modo Agente" icon="shield-halved" href="/features/coder-security">
+    Regras de policy, denylist customizada e controle granular de permissões.
+  </Card>
+  <Card title="Sistema de Plugins" icon="puzzle-piece" href="/features/plugin-system">
+    Desenvolvimento, distribuição e gerenciamento de plugins.
+  </Card>
+  <Card title="Servidor gRPC" icon="server" href="/features/server-mode">
+    Deploy, configuração avançada e monitoramento do servidor.
+  </Card>
+  <Card title="Operator Kubernetes" icon="dharmachakra" href="/features/k8s-operator">
+    Deploy do operator, CRDs e configuração de remediação automática.
   </Card>
   <Card title="Deploy com Docker e Helm" icon="docker" href="/getting-started/docker-deployment">
-    Guia completo de deploy containerizado.
+    Guia completo de deploy containerizado com hardening.
   </Card>
-  <Card title="Referência de configuração" icon="gear" href="/reference/configuration">
-    Todas as variáveis de ambiente disponíveis.
+  <Card title="Referência de Configuração" icon="gear" href="/reference/configuration">
+    Todas as variáveis de ambiente e opções de configuração.
+  </Card>
+  <Card title="Sistema de Hooks" icon="webhook" href="/features/hooks-system">
+    Automação de tarefas com hooks de ciclo de vida.
   </Card>
 </CardGroup>
-
----

@@ -1,0 +1,386 @@
+---
+title: "Hardening para Produção"
+sidebarTitle: "Security Hardening"
+description: "Guia passo a passo para configurar todas as medidas de segurança do ChatCLI em ambiente de produção."
+icon: "lock"
+---
+
+Este guia mostra como deployar o ChatCLI em produção com **todas as medidas de segurança habilitadas**. Siga cada etapa na ordem para garantir uma configuração completa.
+
+---
+
+## Pré-requisitos
+
+- Cluster Kubernetes com Helm 3.8+
+- `kubectl` e `helm` configurados
+- `openssl` disponível para geração de chaves
+- Acesso para criar Secrets no namespace de destino
+
+---
+
+## Passo 1: Gerar Segredo JWT e Criar Secret K8s
+
+O JWT é usado para autenticar conexões entre clientes e o servidor ChatCLI.
+
+```bash
+# Gerar um segredo JWT de 256 bits
+JWT_SECRET=$(openssl rand -hex 32)
+
+# Criar o Secret no Kubernetes
+kubectl create namespace chatcli
+kubectl -n chatcli create secret generic chatcli-jwt \
+  --from-literal=secret="$JWT_SECRET"
+```
+
+<Warning>
+Guarde o valor de `$JWT_SECRET` em um cofre de segredos (Vault, AWS Secrets Manager, etc.). Você precisará dele para configurar clientes remotos.
+</Warning>
+
+Verifique o Secret:
+
+```bash
+kubectl -n chatcli get secret chatcli-jwt -o jsonpath='{.data.secret}' | base64 -d
+```
+
+---
+
+## Passo 2: Configurar Certificados TLS
+
+<Tabs>
+  <Tab title="cert-manager (recomendado)">
+    ```yaml
+    # chatcli-certificate.yaml
+    apiVersion: cert-manager.io/v1
+    kind: Certificate
+    metadata:
+      name: chatcli-tls
+      namespace: chatcli
+    spec:
+      secretName: chatcli-tls-certs
+      issuerRef:
+        name: letsencrypt-prod
+        kind: ClusterIssuer
+      dnsNames:
+        - chatcli.meudominio.com
+    ```
+
+    ```bash
+    kubectl apply -f chatcli-certificate.yaml
+    ```
+  </Tab>
+  <Tab title="Certificado manual">
+    ```bash
+    # Gerar certificado auto-assinado (apenas para testes)
+    openssl req -x509 -newkey rsa:4096 -keyout tls.key -out tls.crt \
+      -days 365 -nodes -subj "/CN=chatcli.meudominio.com"
+
+    kubectl -n chatcli create secret tls chatcli-tls-certs \
+      --cert=tls.crt --key=tls.key
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Passo 3: Configurar Rate Limiting
+
+Defina limites de requisições para prevenir abuso e DoS:
+
+```yaml
+# values-security.yaml (parcial)
+security:
+  rateLimitRps: 20        # 20 requisições por segundo
+  bindAddress: "0.0.0.0"  # Expor externamente (com TLS)
+```
+
+<Tip>
+Para ambientes multi-tenant, considere valores mais baixos (5-10 RPS por instância) e use HPA para escalar horizontalmente.
+</Tip>
+
+---
+
+## Passo 4: Habilitar Log de Auditoria
+
+O log de auditoria registra cada operação com detalhes de quem, o que e quando:
+
+```yaml
+# values-security.yaml (parcial)
+security:
+  auditLog: true
+```
+
+```bash
+# Variável de ambiente equivalente
+export CHATCLI_AUDIT_LOG=true
+```
+
+Os logs de auditoria incluem:
+- Usuário autenticado (via JWT claims)
+- Comando ou operação executada
+- Timestamp e resultado (sucesso/falha)
+- IP de origem da requisição
+
+---
+
+## Passo 5: Configurar Allowlist de Comandos do Agente
+
+Habilite o modo `strict` para garantir que apenas comandos aprovados sejam executados:
+
+```yaml
+# values-security.yaml (parcial)
+security:
+  agentSecurityMode: strict
+
+# Se precisar de comandos adicionais:
+env:
+  - name: CHATCLI_AGENT_ALLOWLIST
+    value: "terraform;ansible;packer;vault"
+  - name: CHATCLI_AGENT_WORKSPACE_STRICT
+    value: "true"
+  - name: CHATCLI_MAX_COMMAND_OUTPUT
+    value: "50000"
+```
+
+<Info>
+No modo `strict`, mais de 150 comandos comuns já estão pré-aprovados em 8 categorias (arquivo, texto, dev, containers, rede, sistema, editores, shell). Adicione apenas os comandos específicos do seu workflow.
+</Info>
+
+---
+
+## Passo 6: Assinar Plugins com Ed25519
+
+Para garantir que apenas plugins confiáveis sejam carregados:
+
+```bash
+# Gerar par de chaves Ed25519
+openssl genpkey -algorithm Ed25519 -out plugin-sign.key
+openssl pkey -in plugin-sign.key -pubout -out plugin-sign.pub
+
+# Extrair a chave pública em formato base64
+PLUGIN_PUB_KEY=$(openssl pkey -in plugin-sign.key -pubout -outform DER | base64)
+
+# Assinar um plugin
+openssl pkeyutl -sign -inkey plugin-sign.key \
+  -rawin -in meu-plugin.so -out meu-plugin.so.sig
+```
+
+Configure o ChatCLI para verificar assinaturas:
+
+```bash
+export CHATCLI_PLUGIN_VERIFY_SIGNATURES=true
+export CHATCLI_PLUGIN_TRUSTED_KEYS="$PLUGIN_PUB_KEY"
+```
+
+---
+
+## Passo 7: Configurar Criptografia de Sessão
+
+Habilite criptografia para sessões armazenadas em disco:
+
+```bash
+# Gerar chave de criptografia AES-256
+SESSION_KEY=$(openssl rand -hex 32)
+
+kubectl -n chatcli create secret generic chatcli-session-key \
+  --from-literal=key="$SESSION_KEY"
+```
+
+```yaml
+# values-security.yaml (parcial)
+security:
+  sessionEncryption: true
+env:
+  - name: CHATCLI_SESSION_ENCRYPTION_KEY
+    valueFrom:
+      secretKeyRef:
+        name: chatcli-session-key
+        key: key
+```
+
+---
+
+## Passo 8: Configurar Segurança do Operador
+
+Para ambientes com o operador K8s, configure proteções adicionais:
+
+```yaml
+# values-security.yaml (parcial)
+env:
+  - name: CHATCLI_OPERATOR_FAIL_CLOSED
+    value: "true"
+  - name: CHATCLI_OPERATOR_RESOURCE_ALLOWLIST
+    value: "deployments;services;configmaps;pods"
+  - name: CHATCLI_OPERATOR_LOG_SCRUBBING
+    value: "true"
+```
+
+| Configuração | Efeito |
+|--------------|--------|
+| `FAIL_CLOSED` | Bloqueia operações quando o agente está indisponível (vs. permitir fallback inseguro) |
+| `RESOURCE_ALLOWLIST` | Limita quais recursos K8s o operador pode manipular |
+| `LOG_SCRUBBING` | Remove tokens, senhas e dados sensíveis dos logs |
+
+---
+
+## Passo 9: Deploy com Helm (Configuração Completa)
+
+Combine todas as configurações em um único `values-prod.yaml`:
+
+```yaml
+# values-prod.yaml
+llm:
+  provider: CLAUDEAI
+secrets:
+  existingSecret: chatcli-llm-keys
+server:
+  token: ""  # Usando JWT via jwtSecretRef
+  metricsPort: 9090
+tls:
+  enabled: true
+  existingSecret: chatcli-tls-certs
+security:
+  rateLimitRps: 20
+  bindAddress: "0.0.0.0"
+  agentSecurityMode: strict
+  auditLog: true
+  sessionEncryption: true
+  jwtSecretRef:
+    name: chatcli-jwt
+    key: secret
+persistence:
+  enabled: true
+  size: 5Gi
+resources:
+  requests:
+    memory: 256Mi
+    cpu: 200m
+  limits:
+    memory: 1Gi
+    cpu: "1"
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+networkPolicy:
+  enabled: true
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+serviceMonitor:
+  enabled: true
+  interval: 30s
+```
+
+```bash
+helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
+  --namespace chatcli --create-namespace \
+  -f values-prod.yaml
+```
+
+---
+
+## Passo 10: Verificar Segurança
+
+Execute esta checklist para confirmar que tudo está configurado corretamente:
+
+<Steps>
+  <Step title="Verificar TLS">
+    ```bash
+    kubectl -n chatcli get secret chatcli-tls-certs
+    # Deve retornar o secret com type: kubernetes.io/tls
+    ```
+  </Step>
+  <Step title="Verificar JWT Secret">
+    ```bash
+    kubectl -n chatcli get secret chatcli-jwt
+    # Deve existir com a chave 'secret'
+    ```
+  </Step>
+  <Step title="Verificar SecurityContext do Pod">
+    ```bash
+    kubectl -n chatcli get pod -l app.kubernetes.io/name=chatcli -o jsonpath='{.items[0].spec.securityContext}'
+    # Deve mostrar runAsNonRoot: true, etc.
+    ```
+  </Step>
+  <Step title="Verificar NetworkPolicy">
+    ```bash
+    kubectl -n chatcli get networkpolicy
+    # Deve listar a NetworkPolicy do ChatCLI
+    ```
+  </Step>
+  <Step title="Verificar gRPC Reflection desabilitado">
+    ```bash
+    kubectl -n chatcli exec deploy/chatcli -- env | grep GRPC_REFLECTION
+    # Deve estar vazio ou 'false'
+    ```
+  </Step>
+  <Step title="Testar conexão autenticada">
+    ```bash
+    chatcli connect chatcli.meudominio.com:50051 --token "$JWT_SECRET" --tls
+    ```
+  </Step>
+  <Step title="Verificar rate limiting">
+    ```bash
+    # Enviar múltiplas requisições rápidas — deve retornar erro 429 após o limite
+    for i in $(seq 1 30); do
+      chatcli -p "ping" --remote chatcli.meudominio.com:50051 &
+    done
+    ```
+  </Step>
+  <Step title="Verificar logs de auditoria">
+    ```bash
+    kubectl -n chatcli logs deploy/chatcli | grep "audit"
+    # Deve mostrar entradas de auditoria para as operações acima
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Checklist Final
+
+| Item | Status |
+|------|--------|
+| JWT Secret criado e referenciado | |
+| TLS habilitado com certificado válido | |
+| Rate limiting configurado | |
+| Log de auditoria habilitado | |
+| Modo agente `strict` ativo | |
+| Workspace strict habilitado | |
+| Plugins com verificação de assinatura | |
+| Criptografia de sessão ativa | |
+| Operador em modo fail-closed | |
+| Log scrubbing habilitado | |
+| NetworkPolicy criada | |
+| PodDisruptionBudget criado | |
+| SecurityContext restritivo | |
+| gRPC Reflection desabilitado | |
+| ServiceMonitor para métricas | |
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Segurança e Hardening" icon="lock" href="/features/security">
+    Documentação completa de todas as medidas de segurança.
+  </Card>
+  <Card title="Deploy com Docker e Helm" icon="docker" href="/getting-started/docker-deployment">
+    Guia completo de deployment containerizado.
+  </Card>
+  <Card title="Operador K8s" icon="dharmachakra" href="/features/k8s-operator">
+    Configurar o operador Kubernetes.
+  </Card>
+  <Card title="Referência de Configuração" icon="gear" href="/reference/configuration">
+    Todas as variáveis de ambiente disponíveis.
+  </Card>
+</CardGroup>
