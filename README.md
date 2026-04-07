@@ -20,6 +20,9 @@
   <a href="https://github.com/diillson/chatcli"><img src="https://img.shields.io/github/go-mod/go-version/diillson/chatcli?style=flat-square&amp;color=00ADD8&amp;logo=go&amp;logoColor=white" alt="Go Version" /></a>
   <a href="https://github.com/diillson/chatcli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/diillson/chatcli?style=flat-square&amp;color=7C3AED" alt="License" /></a>
   <a href="https://github.com/diillson/chatcli/actions"><img src="https://img.shields.io/github/actions/workflow/status/diillson/chatcli/3-publish-release.yml?style=flat-square&amp;label=CI&amp;logo=githubactions&amp;logoColor=white" alt="CI Status" /></a>
+  <a href="https://github.com/diillson/chatcli/actions/workflows/security-scan.yml"><img src="https://img.shields.io/github/actions/workflow/status/diillson/chatcli/security-scan.yml?style=flat-square&amp;label=security%20scan&amp;logo=githubactions&amp;logoColor=white&amp;color=2DD4BF" alt="Security Scan" /></a>
+  <img src="https://img.shields.io/badge/Trivy-image%20scanning-00C9A7?style=flat-square&amp;logo=aquasecurity&amp;logoColor=white" alt="Trivy" />
+  <img src="https://img.shields.io/badge/Sigstore-cosign%20signed-4B32C3?style=flat-square&amp;logo=sigstore&amp;logoColor=white" alt="Cosign Signed" />
 </p>
 
 ---
