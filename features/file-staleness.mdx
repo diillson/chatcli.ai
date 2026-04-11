@@ -1,0 +1,148 @@
+---
+title: "Deteccao de Staleness de Arquivos"
+sidebarTitle: "File Staleness"
+description: "Rastreamento de mtime e SHA-256 para detectar modificacoes externas entre read e write"
+icon: "eye"
+---
+
+O ChatCLI implementa um sistema de **deteccao de staleness de arquivos** que rastreia o estado dos arquivos entre operacoes de leitura e escrita. Quando um arquivo e modificado externamente (pelo usuario, IDE, ou outro processo) apos o agente te-lo lido, o sistema emite um aviso antes de sobrescrever -- prevenindo a perda silenciosa de alteracoes externas.
+
+---
+
+## Como Funciona
+
+O tracker registra o estado de cada arquivo apos leitura e verifica antes de escrita:
+
+<Steps>
+  <Step title="Leitura (RecordRead)">
+    Apos cada operacao `read` bem-sucedida, o tracker registra:
+    - **mtime**: timestamp de modificacao do arquivo
+    - **SHA-256**: hash criptografico do conteudo completo
+    - **Size**: tamanho em bytes
+    - **ReadAt**: timestamp de quando a leitura ocorreu
+  </Step>
+  <Step title="Verificacao (CheckStaleness)">
+    Antes de cada operacao `write` ou `patch`, o tracker verifica se o arquivo mudou.
+  </Step>
+  <Step title="Aviso ou Prosseguimento">
+    Se o arquivo mudou, um aviso e injetado no resultado da ferramenta para que o modelo decida como proceder. Se nao mudou, a escrita prossegue normalmente.
+  </Step>
+</Steps>
+
+---
+
+## Verificacao em 2 Etapas
+
+A verificacao usa uma estrategia otimizada de **fast path** seguida de **full hash**:
+
+<Tabs>
+  <Tab title="Etapa 1: mtime + size (rapida)">
+    Primeiro, o tracker compara o `mtime` e `size` atuais com os registrados. Se ambos sao identicos, o arquivo **nao esta stale** (retorno imediato, sem I/O adicional).
+
+    ```text
+    mtime inalterado + size inalterado → nao stale (fast path)
+    ```
+
+    <Tip>
+    Essa otimizacao evita leitura e hash do arquivo na maioria dos casos, mantendo o overhead proximo de zero.
+    </Tip>
+  </Tab>
+  <Tab title="Etapa 2: SHA-256 (completa)">
+    Se o `mtime` ou `size` mudou, o tracker le o arquivo completo e calcula o SHA-256 para comparacao definitiva.
+
+    ```text
+    mtime mudou + hash identico → nao stale (ex: touch sem edicao)
+    mtime mudou + hash diferente → STALE (modificacao real)
+    ```
+
+    <Note>
+    Isso cobre o caso de `touch` em arquivo sem edicao (mtime muda mas conteudo e igual) e o caso raro de modificacao que mantem o mesmo tamanho.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## Mensagem de Aviso
+
+Quando um arquivo stale e detectado, o sistema gera um aviso formatado:
+
+```text
+WARNING: File "/path/to/file.go" has been modified externally since you last read it.
+Reason: file modified externally (mtime: 2026-04-10T10:30:00Z → 2026-04-10T10:35:22Z,
+  size: 2048 → 2156)
+You should re-read the file before making changes to avoid overwriting external edits.
+If you proceed anyway, external changes will be lost.
+```
+
+O aviso instrui o modelo a:
+1. **Re-ler** o arquivo antes de fazer alteracoes
+2. Entender que continuar **sobrescrevera** as alteracoes externas
+
+---
+
+## Cenarios Cobertos
+
+| Cenario | Resultado | Descricao |
+|:--------|:----------|:----------|
+| Arquivo nao modificado | Nao stale | mtime e size identicos |
+| `touch` sem edicao | Nao stale | mtime muda mas SHA-256 identico |
+| Edicao real por usuario/IDE | **Stale** | mtime e hash diferentes |
+| Arquivo deletado | **Stale** | Arquivo nao existe mais |
+| Arquivo nunca lido | Nao stale | Sem registro para comparar |
+| Erro ao verificar | Nao stale | Assume nao-stale para nao bloquear |
+
+---
+
+## Normalizacao de Aspas
+
+O ChatCLI tambem normaliza aspas Unicode em arquivos de codigo para prevenir erros de compilacao causados por aspas tipograficas geradas por LLMs:
+
+| Caracter | Descricao | Substituicao |
+|:---------|:----------|:-------------|
+| `'` `'` | Aspas simples curvas | `'` |
+| `"` `"` | Aspas duplas curvas | `"` |
+| `'` | Primo | `'` |
+| `"` | Duplo primo | `"` |
+| `<<` `>>` | Aspas angulares | `<<` `>>` |
+
+A normalizacao e aplicada automaticamente em **60+ tipos de arquivo de codigo** (`.go`, `.py`, `.js`, `.ts`, `.java`, `.rs`, `.sh`, `.sql`, `.json`, `.yaml`, etc.) e em nomes de arquivo especiais (`Makefile`, `Dockerfile`, `.gitignore`, etc.).
+
+<Info>
+Arquivos de documentacao (`.md`, `.txt`, `.rst`) **nao** sao normalizados para preservar a tipografia intencional.
+</Info>
+
+---
+
+## Ciclo de Vida do Tracking
+
+```text
+1. @coder read main.go     → RecordRead(main.go): registra mtime + SHA-256
+2. (usuario edita main.go no IDE)
+3. @coder write main.go    → CheckStaleness(main.go): detecta mudanca
+                            → WARNING injetado no resultado
+                            → Modelo decide: re-ler ou prosseguir
+4. @coder read main.go     → RecordRead(main.go): atualiza registro
+5. @coder write main.go    → CheckStaleness(main.go): nao stale
+                            → Escrita normal
+6. (apos write bem-sucedido) → Clear(main.go): remove registro
+```
+
+---
+
+## Proximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Plugin @coder" icon="hammer" href="/features/coder-plugin">
+    Referencia completa das operacoes de read/write/patch.
+  </Card>
+  <Card title="Permissoes" icon="shield-halved" href="/features/enhanced-permissions">
+    Sistema de permissoes que protege operacoes de escrita.
+  </Card>
+  <Card title="Recuperacao de JSON" icon="screwdriver-wrench" href="/features/json-recovery">
+    Como argumentos de ferramenta sao corrigidos antes da execucao.
+  </Card>
+  <Card title="Seguranca do Coder" icon="lock" href="/features/coder-security">
+    Validacao de caminhos e protecoes de seguranca.
+  </Card>
+</CardGroup>

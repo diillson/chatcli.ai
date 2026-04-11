@@ -1,0 +1,202 @@
+---
+title: "Recuperacao de JSON"
+sidebarTitle: "Recuperacao de JSON"
+description: "Sistema de recuperacao automatica para JSON malformado gerado por LLMs em chamadas de ferramenta"
+icon: "screwdriver-wrench"
+---
+
+O ChatCLI implementa um **sistema de recuperacao de JSON** que corrige automaticamente argumentos malformados gerados por LLMs durante chamadas de ferramenta. Isso aumenta drasticamente a taxa de sucesso de tool calls, especialmente com modelos menores ou via XML parsing.
+
+---
+
+## Por que JSON Malformado?
+
+LLMs frequentemente geram JSON invalido em seus argumentos de tool call. Isso acontece porque modelos de linguagem trabalham com tokens, nao com validacao de sintaxe:
+
+| Problema | Exemplo | Frequencia |
+|:---------|:--------|:-----------|
+| Aspas simples em vez de duplas | `{'cmd': 'read'}` | Muito comum |
+| Chaves sem aspas | `{cmd: "read", file: "main.go"}` | Comum |
+| Virgulas finais | `{"cmd":"read","file":"main.go",}` | Comum |
+| Valor puro sem objeto | `main.go` em vez de `{"file":"main.go"}` | Frequente |
+| Mix de estilos | `{cmd: 'read', "file": main.go}` | Ocasional |
+| Texto CLI em vez de JSON | `read --file main.go` | Frequente |
+| Literais de objeto JS | `{cmd: read, file: main.go}` | Ocasional |
+
+<Warning>
+Sem recuperacao de JSON, esses erros causam falhas de parsing que interrompem o loop do agente. Em modelos menores, ate 30% das tool calls podem ter JSON invalido.
+</Warning>
+
+---
+
+## As 7 Estrategias de Recuperacao
+
+O sistema `NormalizeToolArgs` aplica ate 7 estrategias em sequencia, parando na primeira que produz JSON valido:
+
+<AccordionGroup>
+  <Accordion title="1. Parse JSON Padrao" icon="check">
+    Tenta parsing direto com `json.Unmarshal`. Se o JSON ja e valido, retorna imediatamente sem modificacoes.
+
+    ```
+    {"cmd":"read","args":{"file":"main.go"}}  =>  valido, retorna direto
+    ```
+  </Accordion>
+
+  <Accordion title="2. Aspas Simples para Duplas" icon="quote-right">
+    Converte aspas simples para duplas com tratamento correto de escaping. Preserva aspas simples dentro de strings e escapa aspas duplas internas.
+
+    ```
+    Entrada: {'cmd':'read','file':'main.go'}
+    Saida:   {"cmd":"read","file":"main.go"}
+    ```
+
+    <Tip>
+    O conversor usa um parser stateful que rastreia contexto (dentro/fora de string) para evitar substituicoes incorretas.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="3. Chaves sem Aspas" icon="key">
+    Adiciona aspas duplas a chaves que nao estao entre aspas. Usa regex para detectar o padrao `{key:` ou `, key:`.
+
+    ```
+    Entrada: {cmd: "read", file: "main.go"}
+    Saida:   {"cmd": "read", "file": "main.go"}
+    ```
+  </Accordion>
+
+  <Accordion title="4. Combinado: Aspas + Chaves" icon="layer-group">
+    Aplica a correcao de aspas simples primeiro e depois a correcao de chaves sem aspas. Resolve casos onde ambos os problemas coexistem.
+
+    ```
+    Entrada: {cmd: 'read', file: 'main.go'}
+    Saida:   {"cmd": "read", "file": "main.go"}
+    ```
+  </Accordion>
+
+  <Accordion title="5. Virgulas Finais" icon="comma">
+    Remove virgulas antes de `}` ou `]` que tornam o JSON invalido.
+
+    ```
+    Entrada: {"cmd":"read","file":"main.go",}
+    Saida:   {"cmd":"read","file":"main.go"}
+    ```
+  </Accordion>
+
+  <Accordion title="6. Plain String Wrapping" icon="box">
+    Quando o modelo envia apenas um valor puro em vez de um objeto JSON, o sistema o envolve no campo correto baseado no nome da ferramenta.
+
+    ```
+    Tool: read_file    Entrada: main.go     => {"file":"main.go"}
+    Tool: run_command  Entrada: ls -la      => {"cmd":"ls -la"}
+    Tool: search_files Entrada: TODO        => {"term":"TODO"}
+    ```
+
+    O mapeamento cobre 30+ ferramentas e aliases, incluindo funcoes nativas (`read_file`, `write_file`) e subcomandos do coder (`read`, `exec`, `search`).
+  </Accordion>
+
+  <Accordion title="7. Fix Agressivo de Literais de Objeto" icon="hammer">
+    Para literais de objeto sem nenhum tipo de aspas, o sistema faz parse manual de pares `chave: valor` e reconstroi JSON valido.
+
+    ```
+    Entrada: {cmd: read, file: main.go, append: true}
+    Saida:   {"cmd":"read","file":"main.go","append":true}
+    ```
+
+    Valores sao interpretados inteligentemente:
+    - `true`/`false` → booleans
+    - Numeros → numeros JSON
+    - `null`/`none` → null
+    - Strings entre aspas → strings (aspas removidas)
+    - Tudo mais → string
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Mapeamento Tool → Campo
+
+O plain string wrapping usa um mapeamento extenso de nomes de ferramenta para o campo primario de entrada:
+
+<Tabs>
+  <Tab title="Ferramentas Nativas">
+    | Ferramenta | Campo | Exemplo |
+    |:-----------|:------|:--------|
+    | `read_file` | `file` | `main.go` → `{"file":"main.go"}` |
+    | `write_file` | `file` | `output.txt` → `{"file":"output.txt"}` |
+    | `list_directory` | `dir` | `./src` → `{"dir":"./src"}` |
+    | `search_files` | `term` | `TODO` → `{"term":"TODO"}` |
+    | `run_command` | `cmd` | `go build` → `{"cmd":"go build"}` |
+    | `run_tests` | `dir` | `./pkg` → `{"dir":"./pkg"}` |
+  </Tab>
+  <Tab title="Subcomandos Coder">
+    | Subcomando | Campo | Exemplo |
+    |:-----------|:------|:--------|
+    | `read` | `file` | `config.yaml` → `{"file":"config.yaml"}` |
+    | `write` | `file` | `data.json` → `{"file":"data.json"}` |
+    | `exec` | `cmd` | `make test` → `{"cmd":"make test"}` |
+    | `search` | `term` | `func main` → `{"term":"func main"}` |
+    | `tree` | `dir` | `./internal` → `{"dir":"./internal"}` |
+  </Tab>
+  <Tab title="Aliases Genericos">
+    | Alias | Campo |
+    |:------|:------|
+    | `bash` / `shell` | `command` |
+    | `Bash` | `command` |
+    | `Read` / `Write` | `file_path` |
+    | `Glob` / `Grep` | `pattern` |
+    | `Edit` | `file_path` |
+  </Tab>
+</Tabs>
+
+<Note>
+O wrapping so e aplicado quando o valor **nao** se parece com argumentos CLI (sem `--flags`) e **nao** comeca com `{` ou `[`. Isso evita conflitos com o parser de argumentos CLI existente.
+</Note>
+
+---
+
+## Normalizacao de Aspas Unicode
+
+Alem do JSON recovery, o ChatCLI normaliza aspas curvas (Unicode) para aspas retas (ASCII) automaticamente. LLMs frequentemente geram aspas tipograficas que causam erros de compilacao:
+
+| Caracter | Unicode | Substituicao |
+|:---------|:--------|:-------------|
+| `'` `'` | U+2018, U+2019 | `'` (aspas simples reta) |
+| `"` `"` | U+201C, U+201D | `"` (aspas dupla reta) |
+| `'` | U+2032 (primo) | `'` |
+| `"` | U+2033 (duplo primo) | `"` |
+| `<<` `>>` | U+00AB, U+00BB | `<<` `>>` |
+
+A normalizacao e aplicada automaticamente em **arquivos de codigo** (60+ extensoes reconhecidas) e **sempre** em argumentos de tool call.
+
+---
+
+## Configuracao
+
+O sistema de recuperacao funciona automaticamente sem configuracao. Todas as estrategias sao aplicadas em ordem ate que uma produza JSON valido.
+
+| Variavel | Descricao | Default |
+|:---------|:----------|:--------|
+| _(nenhuma)_ | O JSON recovery nao possui variaveis de ambiente dedicadas | Ativo sempre |
+
+<Info>
+As estrategias de recuperacao sao **nao-destrutivas**: se nenhuma produzir JSON valido, o texto original e passado adiante para que o parser CLI tente interpretar como argumentos posicionais.
+</Info>
+
+---
+
+## Proximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Plugin @coder" icon="hammer" href="/features/coder-plugin">
+    Referencia completa das ferramentas que usam JSON recovery.
+  </Card>
+  <Card title="Tool Use Nativo" icon="wrench" href="/features/native-tool-use">
+    Com tool use nativo, o JSON vem validado pela API — menos necessidade de recovery.
+  </Card>
+  <Card title="Gerenciamento de Resultados" icon="database" href="/features/tool-result-management">
+    Como resultados de ferramentas sao gerenciados apos execucao.
+  </Card>
+  <Card title="Modo Coder" icon="code" href="/core-concepts/coder-mode">
+    O fluxo completo de engenharia com tool calls.
+  </Card>
+</CardGroup>

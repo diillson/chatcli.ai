@@ -1,0 +1,186 @@
+---
+title: "Tool Result Management"
+sidebarTitle: "Tool Results"
+description: "Pairing, budgeting, progressive microcompaction, and disk persistence for tool results"
+icon: "database"
+---
+
+ChatCLI implements a comprehensive **tool result management** system that ensures integrity, controls context size, and progressively compacts old results. This is essential for long agent sessions where dozens of tool calls can saturate the context window.
+
+---
+
+## Tool Result Pairing
+
+Every `tool_use` (a tool call made by the model) must have a corresponding `tool_result` in the conversation history. When this pairing breaks -- due to interruption, timeout, or silent error -- the API rejects the history.
+
+The `EnsureToolResultPairing` system automatically validates and repairs:
+
+| Problem | Repair Action |
+|:--------|:-------------|
+| `tool_use` without `tool_result` (orphan) | Injects synthetic error result |
+| `tool_result` without `tool_use` (orphan) | Removes from history |
+| Duplicate `tool_use` IDs | Keeps only the first occurrence |
+
+### Synthetic Results
+
+When a tool_use has no corresponding result, ChatCLI injects:
+
+```text
+[Tool result missing -- the tool execution was interrupted or failed silently.
+Do NOT retry this tool call. Analyze what went wrong and try a different approach.]
+```
+
+<Warning>
+The message instructs the model to **not repeat** the failed tool call, preventing infinite retry loops.
+</Warning>
+
+### 3-Phase Validation
+
+<Steps>
+  <Step title="ID Collection">
+    Traverses the entire history collecting `tool_use` IDs (from assistant messages) and `tool_result` IDs (from tool messages).
+  </Step>
+  <Step title="Misalignment Detection">
+    Compares the two sets of IDs. Tool uses without a result are "missing". Tool results without a use are "orphans". Duplicate IDs are flagged for deduplication.
+  </Step>
+  <Step title="History Reconstruction">
+    Rebuilds the history: removes orphans, deduplicates tool_use IDs, and injects synthetic results after assistant messages with unmatched tool_uses.
+  </Step>
+</Steps>
+
+---
+
+## Result Budget Enforcement
+
+Tool results such as large file reads or command output can quickly consume the context window. The budget system limits the aggregate size at two levels:
+
+| Level | Limit | Environment Variable | Default |
+|:------|:------|:--------------------|:--------|
+| **Per result** | Maximum size of a single result | `CHATCLI_TOOL_RESULT_MAX_CHARS` | 20,000 chars |
+| **Per turn** | Aggregate size of all results in the turn | `CHATCLI_TOOL_RESULT_BUDGET_CHARS` | 200,000 chars |
+
+### How Enforcement Works
+
+The budget is applied in two passes:
+
+<Tabs>
+  <Tab title="Pass 1: Per Result">
+    Each individual result is checked against `DefaultPerResultMaxChars` (20KB). If it exceeds the limit, the full content is saved to disk and replaced with a preview:
+
+    ```text
+    [first 4,000 chars of the result]
+
+    ... [85,432 chars omitted -- full output saved to /tmp/chatcli-tool-results/budget_tc_1_0.txt]
+
+    [last 1,000 chars of the result]
+    ```
+  </Tab>
+  <Tab title="Pass 2: Per Turn">
+    If the total of all results in the turn exceeds `DefaultTurnBudgetChars` (200KB), the largest results are progressively truncated (from largest to smallest) until the turn fits within the budget.
+  </Tab>
+</Tabs>
+
+### Disk Persistence
+
+Truncated results are saved as temporary files in `/tmp/chatcli-tool-results/`:
+
+```text
+/tmp/chatcli-tool-results/
+  budget_tc_1_0_1.txt    # Full result from tool call 1
+  budget_tc_2_3_2.txt    # Full result from tool call 2
+```
+
+<Tip>
+Files are automatically cleaned up with `CleanupBudgetFiles()` at the end of the session. The model can reference the file path in the preview if it needs the full result.
+</Tip>
+
+### Preview: Head + Tail
+
+The preview retains the beginning and end of the result to maximize usefulness:
+
+| Component | Size |
+|:----------|:-----|
+| Head (beginning) | 4,000 chars (cuts at the last line break) |
+| Reference | File path on disk |
+| Tail (end) | 1,000 chars (cuts at the first line break) |
+
+---
+
+## Progressive Microcompaction
+
+Microcompaction progressively reduces the size of old tool results as the conversation advances, without losing critical information:
+
+| Result Age | Action | Details |
+|:-----------|:-------|:--------|
+| Current and previous turn | No change | Results preserved in full |
+| 2+ turns ago | Truncated | Head (2,000 chars) + tail (500 chars) |
+| 4+ turns ago | Summarized | One-line description: `[Old tool result cleared -- 450 lines, 28K chars, Go source]` |
+
+### Content Type Detection
+
+The summary automatically identifies the content type for context:
+
+| Content | Detected Type |
+|:--------|:-------------|
+| Starts with `{` or `[` | JSON |
+| Contains `package ` | Go source |
+| Contains `def ` | Python source |
+| Contains `function ` | JavaScript source |
+| Starts with `diff ` or `---` | diff |
+| Starts with `commit ` | git log |
+| Other | text |
+
+### Microcompaction Configuration
+
+| Variable | Description | Default |
+|:---------|:-----------|:--------|
+| `CHATCLI_MICROCOMPACT_TRUNCATE_TURNS` | Turns before truncating | 2 |
+| `CHATCLI_MICROCOMPACT_SUMMARIZE_TURNS` | Turns before summarizing | 4 |
+
+<Info>
+Only results larger than 3,000 chars are compacted. Small results are always preserved. Results from write and execution tools are preserved as they contain critical error information.
+</Info>
+
+---
+
+## Complete Flow
+
+Tool result management is applied in this order during the agent loop:
+
+```text
+1. Tool executes and returns result
+2. EnsureToolResultPairing -> fixes misalignments
+3. EnforceToolResultBudget -> truncates large results
+4. ApplyMicrocompact -> compacts old results
+5. Clean history sent to the API
+```
+
+---
+
+## Complete Configuration
+
+| Environment Variable | Description | Default |
+|:--------------------|:-----------|:--------|
+| `CHATCLI_TOOL_RESULT_BUDGET_CHARS` | Aggregate budget per turn | 200,000 |
+| `CHATCLI_TOOL_RESULT_MAX_CHARS` | Maximum size per result | 20,000 |
+| `CHATCLI_MICROCOMPACT_TRUNCATE_TURNS` | Turns before truncation starts | 2 |
+| `CHATCLI_MICROCOMPACT_SUMMARIZE_TURNS` | Turns before summarization starts | 4 |
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Context Recovery" icon="life-ring" href="/en/features/context-recovery">
+    What happens when even with budgeting the context overflows.
+  </Card>
+  <Card title="JSON Recovery" icon="screwdriver-wrench" href="/en/features/json-recovery">
+    How malformed arguments are fixed before execution.
+  </Card>
+  <Card title="Cost Tracking" icon="money-bill-trend-up" href="/en/features/cost-tracking">
+    Monitor token consumption including tool results.
+  </Card>
+  <Card title="Agent Mode" icon="robot" href="/en/core-concepts/agent-mode">
+    The ReAct loop that generates and processes tool calls.
+  </Card>
+</CardGroup>

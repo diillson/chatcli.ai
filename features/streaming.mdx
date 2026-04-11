@@ -1,0 +1,167 @@
+---
+title: "Streaming em Tempo Real"
+sidebarTitle: "Streaming"
+description: "Respostas em tempo real com streaming character-by-character e watchdog de idle timeout"
+icon: "bolt"
+---
+
+O ChatCLI suporta **streaming em tempo real** de respostas de LLM, exibindo o texto character-by-character conforme ele e gerado pela API. Isso melhora significativamente a experiencia do usuario, eliminando a espera por respostas completas.
+
+---
+
+## Interface StreamingClient
+
+O streaming e implementado como uma interface opcional que provedores podem adotar:
+
+```go
+type StreamingClient interface {
+    LLMClient
+
+    SendPromptStream(ctx context.Context, prompt string,
+        history []models.Message, maxTokens int) (<-chan StreamChunk, error)
+
+    SupportsStreaming() bool
+}
+```
+
+A deteccao e automatica via type assertion — provedores que implementam `StreamingClient` recebem streaming automaticamente:
+
+```go
+if sc, ok := client.AsStreamingClient(c); ok {
+    chunks, err := sc.SendPromptStream(ctx, prompt, history, maxTokens)
+    // processa chunks em tempo real
+}
+```
+
+<Info>
+Provedores que nao implementam `StreamingClient` continuam funcionando normalmente. O ChatCLI faz fallback para `SendPrompt` (resposta completa) automaticamente.
+</Info>
+
+---
+
+## StreamChunk
+
+Cada chunk do streaming carrega:
+
+| Campo | Tipo | Descricao |
+|:------|:-----|:----------|
+| `Text` | string | Texto incremental neste chunk (pode ser vazio) |
+| `Done` | bool | `true` no chunk final |
+| `Usage` | *UsageInfo | Dados de uso de tokens (apenas no chunk final) |
+| `StopReason` | string | Razao da parada: `end_turn`, `max_tokens`, `tool_use` |
+| `Error` | error | Erro durante streaming (termina o stream) |
+
+### Contrato de Streaming
+
+- O canal retorna zero ou mais chunks de texto
+- O chunk final tem `Done=true` e pode incluir `Usage` e `StopReason`
+- Se ocorrer erro, um chunk com `Error` e enviado e o canal fecha
+- O canal fecha apos o chunk final ou erro
+- O caller pode cancelar via contexto
+
+---
+
+## Provedores com Suporte
+
+| Provedor | Streaming | Observacoes |
+|:---------|:----------|:------------|
+| **Anthropic (API Key)** | Sim | Streaming nativo via Messages API |
+| **Anthropic (OAuth)** | Sim | Streaming via token OAuth |
+| **OpenAI** | Sim | Streaming via Chat Completions |
+| **ZAI (Zhipu AI)** | Sim | Streaming compativel com OpenAI |
+| **MiniMax** | Sim | Streaming compativel com OpenAI |
+| **OpenRouter** | Sim | Streaming via API OpenAI-compatible |
+| Google (Gemini) | Nao | Fallback para resposta completa |
+| xAI (Grok) | Nao | Fallback para resposta completa |
+| GitHub Models | Nao | Fallback para resposta completa |
+| Ollama | Nao | Fallback para resposta completa |
+
+---
+
+## Stream Watchdog
+
+O **Stream Watchdog** monitora o stream para detectar stalls (interupcoes sem dados) e prevenir que o ChatCLI fique travado esperando indefinidamente:
+
+<Tabs>
+  <Tab title="Timeouts">
+    | Timer | Duracao | Acao |
+    |:------|:--------|:-----|
+    | **Warning** | 45 segundos | Loga aviso de stall no log |
+    | **Idle Timeout** | 90 segundos | Aborta stream e retorna conteudo parcial |
+
+    Ambos os timers sao resetados a cada chunk recebido. Se o provedor parar de enviar dados por 90 segundos, o watchdog interrompe o stream e retorna o texto ja acumulado.
+  </Tab>
+  <Tab title="Resultado">
+    O watchdog retorna um `WatchdogResult`:
+
+    | Campo | Descricao |
+    |:------|:----------|
+    | `Text` | Texto acumulado ate o momento |
+    | `Usage` | Dados de uso (se stream completou) |
+    | `StopReason` | Razao da parada |
+    | `WasStalled` | `true` se o watchdog disparou por timeout |
+    | `StallCount` | Numero de stalls detectados durante o stream |
+  </Tab>
+</Tabs>
+
+### Configuracao do Watchdog
+
+| Variavel de Ambiente | Descricao | Default |
+|:--------------------|:----------|:--------|
+| `CHATCLI_STREAM_IDLE_TIMEOUT_SECONDS` | Timeout de idle em segundos | 90 |
+
+<Tip>
+Em redes lentas ou com provedores que tem alta latencia entre chunks, aumente o timeout para evitar interrupcoes prematuras. O padrao de 90 segundos e suficiente para a maioria dos cenarios.
+</Tip>
+
+---
+
+## Fallback para Nao-Streaming
+
+Quando o streaming nao esta disponivel (provedor nao suporta ou erro na conexao), o ChatCLI faz fallback automatico:
+
+```text
+1. Tenta SendPromptStream()  → streaming em tempo real
+2. Se nao suportado → fallback para SendPrompt()
+3. Resposta completa exibida de uma vez
+```
+
+A funcao `DrainStream` permite converter um stream em resposta completa quando necessario:
+
+```go
+text, usage, stopReason, err := client.DrainStream(chunks)
+```
+
+---
+
+## Integracao com TUI
+
+No modo interativo (Bubble Tea), o streaming integra-se diretamente com o renderizador:
+
+- Cada chunk e emitido como evento via `TUIEmitter`
+- O modelo Bubble Tea atualiza a view incrementalmente
+- Markdown e renderizado progressivamente via Glamour
+- A barra de status mostra o estado do streaming em tempo real
+
+<Note>
+No modo one-shot (`-p`), o streaming e desabilitado e `DrainStream` e usado para coletar a resposta completa antes de imprimir.
+</Note>
+
+---
+
+## Proximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Recuperacao de Contexto" icon="life-ring" href="/features/context-recovery">
+    O que acontece quando max_tokens e atingido durante streaming.
+  </Card>
+  <Card title="Provider Fallback" icon="arrow-right-arrow-left" href="/features/provider-fallback">
+    Chain de fallback entre provedores com e sem streaming.
+  </Card>
+  <Card title="Tool Use Nativo" icon="wrench" href="/features/native-tool-use">
+    Streaming com tool calls nativas.
+  </Card>
+  <Card title="UI de Progresso" icon="spinner" href="/features/agent-progress-ui">
+    Indicadores visuais durante streaming do agente.
+  </Card>
+</CardGroup>

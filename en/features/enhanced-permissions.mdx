@@ -1,0 +1,251 @@
+---
+title: "Enhanced Permissions System"
+sidebarTitle: "Permissions"
+description: "Multi-source policy resolution, denial tracking, safety immunity, and read-only command allowlist"
+icon: "shield-halved"
+---
+
+ChatCLI implements an **enhanced permissions system** that controls which operations the agent can execute automatically, which require approval, and which are always blocked. The system combines policies from multiple sources, tracks user denials, and maintains safety defaults that are immune to bypass.
+
+---
+
+## Multi-Source Policy Resolution
+
+Permission policies are loaded and merged from multiple sources, with defined priority:
+
+| Priority | Source | File | Scope |
+|:---------|:-------|:-----|:------|
+| 1 (highest) | **CLI flags** | Command-line arguments | Current session |
+| 2 | **Project** | `.chatcli/coder_policy.json` | Current workspace |
+| 3 | **User** | `~/.chatcli/coder_policy.json` | User-wide |
+| 4 (lowest) | **Defaults** | Rules embedded in the binary | All |
+
+<Info>
+Higher-priority sources **override** lower-priority ones. If a project rule says `allow` for `@coder exec`, but the user rule says `deny`, the project rule takes precedence.
+</Info>
+
+### Policy File Format
+
+```json
+{
+  "rules": [
+    {
+      "pattern": "@coder exec *",
+      "action": "ask"
+    },
+    {
+      "pattern": "@coder read *",
+      "action": "allow"
+    },
+    {
+      "pattern": "@coder write *.go",
+      "action": "allow"
+    },
+    {
+      "pattern": "@coder exec rm *",
+      "action": "deny"
+    }
+  ],
+  "merge": true
+}
+```
+
+### Available Actions
+
+| Action | Behavior |
+|:-------|:---------|
+| `allow` | Automatic execution without asking |
+| `deny` | Automatic blocking without asking |
+| `ask` | Prompts for interactive user approval |
+
+---
+
+## Denial Tracking
+
+The **Denial Tracker** monitors when the user denies permission to prevent infinite prompts:
+
+<Tabs>
+  <Tab title="Per-Tool Blocking">
+    When the user denies the same tool **3 consecutive times**, it is auto-blocked for the rest of the session.
+
+    ```text
+    [1] @coder exec "npm install" -> user denies
+    [2] @coder exec "npm install" -> user denies
+    [3] @coder exec "npm install" -> user denies
+    -> @coder exec auto-blocked for this session
+    ```
+
+    <Note>
+    The consecutive counter is reset when the user **approves** an execution of the tool.
+    </Note>
+  </Tab>
+  <Tab title="Session Escalation">
+    When the total number of denials across **all tools** reaches 20, the session enters escalated mode: **all** tools require explicit approval, even those that had `allow`.
+
+    ```text
+    Total denials: 20+
+    -> Session escalated: all tools require approval
+    ```
+  </Tab>
+</Tabs>
+
+### Denial Tracker Configuration
+
+| Environment Variable | Description | Default |
+|:--------------------|:-----------|:--------|
+| `CHATCLI_MAX_CONSECUTIVE_DENIALS` | Consecutive denials before blocking the tool | 3 |
+| `CHATCLI_MAX_TOTAL_DENIALS` | Total denials before escalating the session | 20 |
+
+---
+
+## Safety Immunity (Safety Bypass)
+
+There are **40+ operation patterns** that **ALWAYS** require user approval, regardless of any `allow` rule in the policy. These patterns protect against catastrophic errors:
+
+<AccordionGroup>
+  <Accordion title="Destructive Filesystem Operations" icon="trash">
+    - `rm -rf` / `rm -fr` and variants
+    - `mkfs` (format filesystem)
+    - `dd` writing to devices (`of=/dev/`)
+    - `shred` (secure deletion)
+  </Accordion>
+
+  <Accordion title="System Directories" icon="folder-closed">
+    - Writing to `/etc/`, `/boot/`, `/sys/`, `/proc/`
+    - Output redirection to `/etc/`
+  </Accordion>
+
+  <Accordion title="Privilege Escalation" icon="user-shield">
+    - `sudo` any command
+    - `su -` (user switch)
+    - `chmod 777` (world-writable)
+    - `chmod +s` (setuid/setgid)
+    - `chown root`
+  </Accordion>
+
+  <Accordion title="Kernel/System Manipulation" icon="microchip">
+    - `insmod`, `rmmod`, `modprobe` (kernel modules)
+    - `sysctl -w` (sysctl write)
+    - `iptables -F` (firewall flush)
+    - `systemctl stop/disable/mask`
+  </Accordion>
+
+  <Accordion title="Network Exfiltration" icon="network-wired">
+    - `/dev/tcp/` (bash reverse shell)
+    - `nc -l` / `ncat -l` (netcat in listen mode)
+  </Accordion>
+
+  <Accordion title="Credential Access" icon="key">
+    - `.ssh/` (SSH keys)
+    - `.gnupg/` (GPG keys)
+    - `.aws/credentials`
+    - `.kube/config`
+  </Accordion>
+
+  <Accordion title="Database Destruction" icon="database">
+    - `DROP DATABASE/TABLE/SCHEMA`
+    - `TRUNCATE TABLE`
+    - `DELETE FROM ... WHERE 1=1`
+  </Accordion>
+
+  <Accordion title="Git Force and Processes" icon="code-branch">
+    - `git push --force` / `git push -f`
+    - `git reset --hard`
+    - `git clean -f`
+    - `kill -9`, `killall`, `pkill -9`
+    - `shutdown`, `reboot`, `poweroff`, `halt`
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+These patterns are **immune to bypass**: even if `@coder exec *` is configured as `allow`, commands matching these patterns **always** prompt for confirmation.
+</Warning>
+
+---
+
+## Read-Only Command Allowlist
+
+ChatCLI maintains an **allowlist of 90+ commands** that are automatically approved because they are read-only:
+
+<Tabs>
+  <Tab title="Filesystem">
+    `ls`, `ll`, `cat`, `head`, `tail`, `less`, `more`, `wc`, `file`, `stat`, `du`, `df`, `find` (without `-delete/-exec`), `tree`, `realpath`, `readlink`, `basename`, `dirname`, `md5sum`, `sha256sum`
+  </Tab>
+  <Tab title="Text Processing">
+    `grep`, `egrep`, `fgrep`, `rg`, `ag`, `awk`, `sed` (without `-i`), `sort` (without `-o`), `uniq`, `cut`, `tr`, `diff`, `comm`, `jq`, `yq`, `xmllint`
+  </Tab>
+  <Tab title="Git (Read-Only)">
+    `git status`, `git diff`, `git log`, `git show`, `git branch`, `git tag`, `git remote`, `git stash list`, `git rev-parse`, `git describe`, `git ls-files`, `git ls-tree`, `git cat-file`, `git blame`, `git shortlog`, `git reflog`
+  </Tab>
+  <Tab title="Dev Tools">
+    `go version/env/list/doc/vet`, `node -v`, `python --version`, `rustc --version`, `java -version`
+  </Tab>
+  <Tab title="System and Containers">
+    `uname`, `hostname`, `whoami`, `id`, `date`, `uptime`, `env`, `printenv`, `which`, `whereis`, `echo`, `printf`, `pwd`
+
+    **Docker**: `ps`, `images`, `inspect`, `logs`, `info`, `version`, `stats`, `top`
+
+    **kubectl**: `get`, `describe`, `logs`, `top`, `version`, `config`, `cluster-info`, `api-resources`
+  </Tab>
+  <Tab title="Package Managers">
+    `npm ls/list/outdated/info`, `yarn list/info`, `pip list/show/freeze`, `cargo tree/metadata`
+  </Tab>
+</Tabs>
+
+### Additional Protections
+
+Even for allowlisted commands, certain flags and patterns are **not** auto-approved:
+
+| Command | Unsafe Flags |
+|:--------|:------------|
+| `tail` | `-f` (follow = long-running) |
+| `find` | `-delete`, `-exec`, `-execdir` |
+| `sed` | `-i`, `--in-place` |
+| `sort` | `-o` (writes to file) |
+| `git config` | `--global`, `--system` |
+
+Additionally, commands with **pipes to dangerous targets** (`| rm`, `| sudo`, `| xargs`, `| sh`) or **output redirection** (`>`, `>>`) are never auto-approved.
+
+---
+
+## Decision Flow
+
+```text
+Tool call received
+  |
+  +- 1. Safety Bypass Check
+  |   +- Matches immune pattern? -> ALWAYS ASK (ignores everything below)
+  |
+  +- 2. Denial Tracker Check
+  |   +- Session escalated? -> ASK
+  |   +- Tool blocked? -> DENY
+  |
+  +- 3. Policy Resolution (CLI > Project > User > Default)
+  |   +- allow -> next check
+  |   +- deny -> DENY
+  |   +- ask -> ASK
+  |
+  +- 4. Read-Only Allowlist
+  |   +- Command in allowlist without dangerous flags? -> ALLOW
+  |
+  +- 5. Default -> ASK
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Coder Security" icon="shield-halved" href="/en/features/coder-security">
+    Details on coder mode security.
+  </Card>
+  <Card title="Hooks System" icon="webhook" href="/en/features/hooks-system">
+    PreToolUse hooks for additional guardrails.
+  </Card>
+  <Card title="Security" icon="lock" href="/en/features/security">
+    General ChatCLI security model.
+  </Card>
+  <Card title="Plugin @coder" icon="hammer" href="/en/features/coder-plugin">
+    Reference for the tools protected by the permissions system.
+  </Card>
+</CardGroup>
