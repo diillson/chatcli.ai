@@ -1,21 +1,21 @@
 ---
 title: "Multi-Agent Orchestration"
 sidebarTitle: "Multi-Agent"
-description: "Multi-agent system with embedded specialist agents plus custom agents that work in parallel, each with their own skills and accelerator scripts, automatically orchestrated by the LLM."
+description: "Multi-agent system with 12 embedded specialist agents plus custom agents working in parallel, each with their own skills, accelerator scripts, and individual model/effort preferences, automatically orchestrated by the LLM."
 icon: "users"
 ---
 
-The **Multi-Agent mode** transforms `/coder` and `/agent` into an orchestration system where the LLM dispatches **specialist agents in parallel** to solve complex tasks faster and more efficiently.
+The **Multi-Agent mode** transforms `/coder` and `/agent` into an orchestration system where the LLM dispatches **specialist agents in parallel** to solve complex tasks faster, cheaper, and more accurately. Each agent has its own expertise, its own skills, and — since the recent update — its own preferred model and effort level.
 
 ## Activation
 
-The multi-agent mode is **enabled by default**. To disable it, set:
+Multi-agent mode is **enabled by default**. To disable it:
 
 ```bash
 CHATCLI_AGENT_PARALLEL_MODE=false
 ```
 
-<Info>When disabled, `/coder` and `/agent` work exactly as before -- with no impact.</Info>
+<Info>When disabled, `/coder` and `/agent` work exactly like before — zero impact.</Info>
 
 ---
 
@@ -23,24 +23,25 @@ CHATCLI_AGENT_PARALLEL_MODE=false
 
 ```text
 User Query
-    |
-    v
+    │
+    ▼
 AgentMode (existing ReAct loop)
-    |
-    v  (LLM responds with <agent_call> or <tool_call> tags)
-Dispatcher (fan-out via semaphore)
-    |
-    |-- FileAgent        |-- CoderAgent       |-- ShellAgent
-    |-- GitAgent         |-- SearchAgent      |-- PlannerAgent
-    |-- ReviewerAgent    |-- TesterAgent      |-- RefactorAgent
-    |-- DiagnosticsAgent |-- FormatterAgent   |-- DepsAgent
-    +-- CustomAgent(s)   (devops, security-auditor, etc.)
-    |
-    v
-Results Aggregator -> Feedback to the orchestrator LLM
+    │
+    ▼  (LLM responds with <agent_call> or <tool_call> tags)
+Dispatcher (fan-out via semaphore + per-agent Model/Effort routing)
+    │
+    ├── FileAgent         ├── CoderAgent       ├── ShellAgent
+    ├── GitAgent          ├── SearchAgent      ├── PlannerAgent
+    ├── ReviewerAgent     ├── TesterAgent      ├── RefactorAgent
+    ├── DiagnosticsAgent  ├── FormatterAgent   ├── DepsAgent
+    └── CustomAgent(s)    (devops, security-auditor, etc.)
+           │
+           │  (each worker: Model Router → target client + effort hint on ctx)
+           ▼
+Results Aggregator → Feedback to the orchestrator LLM
 ```
 
-The orchestrator LLM receives an **agent catalog** in the system prompt and learns to route tasks using `<agent_call>` tags:
+The orchestrator LLM receives an **agent catalog** in its system prompt and learns to route tasks via `<agent_call>` tags:
 
 ```xml
 <agent_call agent="file" task="Read all .go files in pkg/coder/engine/" />
@@ -54,261 +55,422 @@ The orchestrator LLM receives an **agent catalog** in the system prompt and lear
 
 ## Two Execution Modes
 
-The orchestrator has two execution mechanisms, choosing the most appropriate one by context:
+The orchestrator has two execution mechanisms, choosing the best for each context:
 
 | Mode | Syntax | When to Use |
 |------|--------|-------------|
 | **agent_call** | `<agent_call agent="..." task="..." />` | New work phases, parallel tasks, exploratory reading, multi-file refactoring |
-| **tool_call** | `<tool_call name="@coder" args="..." />` | Quick fixes, error diagnosis, point patches, post-agent validation. **IMPORTANT**: multiple independent tool_calls must be emitted in a SINGLE response |
+| **tool_call** | `<tool_call name="@coder" args="..." />` | Quick fixes, error diagnosis, pinpoint patches, post-agent validation. **IMPORTANT**: multiple independent tool_calls should be emitted in a SINGLE response |
 
 ### Decision Guide
 
 | Situation | Mode |
 |-----------|------|
-| Read multiple files + search references | `agent_call` (file + search in parallel) |
-| Fix a compilation error | `tool_call` (direct patch) |
-| Write a new module + tests | `agent_call` (coder + shell) |
-| Verify an agent's result | `tool_call` (quick read/exec) |
-| Fix after agent failure | `tool_call` (precise diagnosis) |
-| Resume after applied fix | `agent_call` (next phase) |
+| Read multiple files + find references | `agent_call` (file + search in parallel) |
+| Fix a compile error | `tool_call` (direct patch) |
+| Write new module + tests | `agent_call` (coder + shell) |
+| Check an agent's result | `tool_call` (quick read/exec) |
+| Fix after an agent failure | `tool_call` (precise diagnosis) |
+| Resume after fix applied | `agent_call` (next phase) |
 
 ---
 
-## Embedded Specialist Agents
+## Built-in Specialist Agents
+
+The 12 built-in agents implement the `WorkerAgent` interface and embed `BuiltinAgentMeta`, which declares the default `model` and `effort` and reads env var overrides (`CHATCLI_AGENT_<NAME>_MODEL` / `CHATCLI_AGENT_<NAME>_EFFORT`).
+
+### Per-Agent Effort Strategy
+
+Each built-in has an effort level calibrated for the type of work it does. This saves tokens on mechanical tasks and guarantees quality on tasks that require deep reasoning.
+
+| Agent | Default Effort | Rationale |
+|-------|:--------------:|-----------|
+| **File** | `low` | Batch reads, no reasoning needed |
+| **Coder** | `medium` | Safe diffs benefit from some thinking |
+| **Shell** | `low` | Mechanical command execution |
+| **Git** | `low` | Git operations are deterministic |
+| **Search** | `low` | Mechanical grep/tree/read |
+| **Planner** | `high` | Decomposition is where value lives (pure reasoning) |
+| **Reviewer** | `high` | Finding subtle bugs requires deep reasoning |
+| **Tester** | `medium` | Generates boilerplate + some semantics |
+| **Refactor** | `high` | Rename/extract needs a reference model |
+| **Diagnostics** | `high` | Root-cause analysis is pure reasoning |
+| **Formatter** | `low` | Tool-driven, mechanical |
+| **Deps** | `low` | Tool output interpretation |
+
+**Default model:** all built-ins leave `model` empty — they respect the user's `/switch` choice by default. This ensures the user controls costs and isn't surprised by a built-in silently swapping models.
+
+### Environment Variable Override
+
+To force a different model or effort level on a built-in agent without recompiling, set the env vars:
+
+```bash
+# Force Planner to use Opus at max effort
+export CHATCLI_AGENT_PLANNER_MODEL="claude-opus-4-6"
+export CHATCLI_AGENT_PLANNER_EFFORT="max"
+
+# Force Formatter to use Haiku to cheapen formatting
+export CHATCLI_AGENT_FORMATTER_MODEL="claude-haiku-4-5"
+
+# Run Reviewer on gpt-5 (cross-provider)
+export CHATCLI_AGENT_REVIEWER_MODEL="gpt-5"
+export CHATCLI_AGENT_REVIEWER_EFFORT="high"
+```
+
+The env var name uses the agent name in **uppercase** (`FILE`, `CODER`, `SHELL`, `GIT`, `SEARCH`, `PLANNER`, `REVIEWER`, `TESTER`, `REFACTOR`, `DIAGNOSTICS`, `FORMATTER`, `DEPS`).
+
+<Tip>
+If the target model's provider is not configured (e.g., `CHATCLI_AGENT_REVIEWER_MODEL=gpt-5` but no `OPENAI_API_KEY`), the dispatcher gracefully falls back to the user's active provider/model and logs a clear warning. No turn breaks due to missing API keys.
+</Tip>
+
+### The 12 Agents and Their Skills
 
 <AccordionGroup>
-  <Accordion title="FileAgent (Reading and Analysis)" icon="file">
+  <Accordion title="FileAgent (Read and Analysis)" icon="file">
     **Access:** Read-only (`read`, `tree`, `search`)
+    **Default effort:** `low`
 
     **Skills:**
-    - `batch-read` -- *Accelerator script:* reads N files in parallel goroutines without calling the LLM
-    - `find-pattern` -- Searches for patterns in files
-    - `analyze-structure` -- Analyzes code structure
-    - `map-deps` -- Maps dependencies between modules
+    - `batch-read` — *Accelerator script:* reads N files in parallel goroutines without calling the LLM
+    - `find-pattern` — Search patterns in files
+    - `analyze-structure` — Analyze code structure
+    - `map-deps` — Map dependencies between modules
   </Accordion>
 
-  <Accordion title="CoderAgent (Writing and Modification)" icon="code">
+  <Accordion title="CoderAgent (Write and Modify)" icon="code">
     **Access:** Read/Write (`write`, `patch`, `read`, `tree`)
+    **Default effort:** `medium`
 
     **Skills:**
-    - `write-file` -- Creating new files
-    - `patch-file` -- Precise modification of existing code
-    - `create-module` -- Boilerplate generation
-    - `refactor` -- Safe renaming and refactoring
+    - `write-file` — Create new files
+    - `patch-file` — Precise modification of existing code
+    - `create-module` — Boilerplate generation
+    - `refactor` — Safe rename and refactor
   </Accordion>
 
   <Accordion title="ShellAgent (Execution and Tests)" icon="terminal">
     **Access:** Execution (`exec`, `test`)
+    **Default effort:** `low`
 
     **Skills:**
-    - `run-tests` -- *Accelerator script:* runs `go test ./... -json` and parses results
-    - `build-check` -- *Accelerator script:* runs `go build ./... && go vet ./...`
-    - `lint-fix` -- Automatic lint correction
+    - `run-tests` — *Accelerator script:* runs `go test ./... -json` and parses results
+    - `build-check` — *Accelerator script:* runs `go build ./... && go vet ./...`
+    - `lint-fix` — Automatic lint correction
   </Accordion>
 
   <Accordion title="GitAgent (Version Control)" icon="code-branch">
     **Access:** Git ops (`git-status`, `git-diff`, `git-log`, `git-changed`, `git-branch`, `exec`)
+    **Default effort:** `low`
 
     **Skills:**
-    - `smart-commit` -- *Accelerator script:* collects status + diff for intelligent commit
-    - `review-changes` -- *Accelerator script:* analyzes changes with changed + diff + log
-    - `create-branch` -- Branch creation
+    - `smart-commit` — *Accelerator script:* collects status + diff for smart commit
+    - `review-changes` — *Accelerator script:* analyzes changes via changed + diff + log
+    - `create-branch` — Branch creation
   </Accordion>
 
   <Accordion title="SearchAgent (Codebase Search)" icon="magnifying-glass">
     **Access:** Read-only (`search`, `tree`, `read`)
+    **Default effort:** `low`
 
     **Skills:**
-    - `find-usages` -- Finds symbol usages
-    - `find-definition` -- Finds definitions
-    - `find-dead-code` -- Detects dead code
-    - `map-project` -- *Accelerator script:* maps project in parallel (tree + interfaces + structs + funcs)
+    - `find-usages` — Find symbol usages
+    - `find-definition` — Find definitions
+    - `find-dead-code` — Detect dead code
+    - `map-project` — *Accelerator script:* maps project in parallel (tree + interfaces + structs + funcs)
   </Accordion>
 
   <Accordion title="PlannerAgent (Pure Reasoning)" icon="brain">
-    **Access:** None (no tools -- pure LLM reasoning)
+    **Access:** None (no tools — pure LLM reasoning)
+    **Default effort:** `high`
 
     **Skills:**
-    - `analyze-task` -- Complexity and risk analysis
-    - `create-plan` -- Execution plan creation
-    - `decompose` -- Complex task decomposition
+    - `analyze-task` — Complexity and risk analysis
+    - `create-plan` — Execution plan creation
+    - `decompose` — Decompose complex tasks
+
+    <Info>Planner is the agent that benefits most from extended thinking — it has no tools, so all value comes from decomposition quality.</Info>
   </Accordion>
 
   <Accordion title="ReviewerAgent (Code Review and Quality)" icon="eye">
     **Access:** Read-only (`read`, `search`, `tree`)
+    **Default effort:** `high`
 
     **Skills:**
-    - `review-file` -- Analyzes files for bugs, code smells, SOLID violations, and security issues
-    - `diff-review` -- *Accelerator script:* reviews staged changes via git-diff and git-changed
-    - `scan-lint` -- *Accelerator script:* runs `go vet` and `staticcheck` and categorizes issues
+    - `review-file` — Analyzes a file for bugs, code smells, SOLID violations, and security issues
+    - `diff-review` — *Accelerator script:* reviews staged changes via git-diff and git-changed
+    - `scan-lint` — *Accelerator script:* runs `go vet` and `staticcheck` and categorizes issues
   </Accordion>
 
   <Accordion title="TesterAgent (Tests and Coverage)" icon="vial">
-    **Access:** Read/Write/Execute (`read`, `write`, `patch`, `exec`, `test`, `search`, `tree`)
+    **Access:** Read/Write/Execution (`read`, `write`, `patch`, `exec`, `test`, `search`, `tree`)
+    **Default effort:** `medium`
 
     **Skills:**
-    - `generate-tests` -- Comprehensive test generation for functions and packages (LLM-driven)
-    - `run-coverage` -- *Accelerator script:* runs `go test -coverprofile` and parses coverage per function
-    - `find-untested` -- *Accelerator script:* finds exported functions without corresponding tests
-    - `generate-table-test` -- Idiomatic Go table-driven test generation
+    - `generate-tests` — Generates comprehensive tests for functions and packages (LLM-driven)
+    - `run-coverage` — *Accelerator script:* runs `go test -coverprofile` and parses per-function coverage
+    - `find-untested` — *Accelerator script:* finds exported functions without corresponding tests
+    - `generate-table-test` — Generates idiomatic Go table-driven tests
   </Accordion>
 
   <Accordion title="RefactorAgent (Structural Transformations)" icon="arrows-rotate">
     **Access:** Read/Write (`read`, `write`, `patch`, `search`, `tree`)
+    **Default effort:** `high`
 
     **Skills:**
-    - `rename-symbol` -- *Accelerator script:* renames symbol across all `.go` files, ignoring strings and comments
-    - `extract-interface` -- Extracts interface from a concrete type's methods
-    - `move-function` -- Moves function between packages adjusting imports
-    - `inline-variable` -- Replaces variable with its value at all usage points
+    - `rename-symbol` — *Accelerator script:* renames symbol across all `.go` files, ignoring strings and comments
+    - `extract-interface` — Extracts an interface from a concrete type's methods
+    - `move-function` — Moves a function between packages adjusting imports
+    - `inline-variable` — Replaces a variable with its value at all use sites
   </Accordion>
 
   <Accordion title="DiagnosticsAgent (Troubleshooting and Investigation)" icon="stethoscope">
-    **Access:** Read/Execute (`read`, `search`, `tree`, `exec`)
+    **Access:** Read/Execution (`read`, `search`, `tree`, `exec`)
+    **Default effort:** `high`
 
     **Skills:**
-    - `analyze-error` -- Parses error messages and stack traces mapping to code locations
-    - `check-deps` -- *Accelerator script:* runs `go mod tidy`, `go mod verify` and checks dependency health
-    - `bisect-bug` -- Guides investigation to find the commit that introduced a bug
-    - `profile-bottleneck` -- Runs benchmarks or pprof and analyzes performance hotspots
+    - `analyze-error` — Parses error messages and stack traces mapping to code locations
+    - `check-deps` — *Accelerator script:* runs `go mod tidy`, `go mod verify` and checks dependency health
+    - `bisect-bug` — Guides investigation to find the commit that introduced a bug
+    - `profile-bottleneck` — Runs benchmarks or pprof and analyzes performance hotspots
   </Accordion>
 
   <Accordion title="FormatterAgent (Formatting and Style)" icon="paintbrush">
-    **Access:** Write/Execute (`read`, `patch`, `exec`, `tree`)
+    **Access:** Write/Execution (`read`, `patch`, `exec`, `tree`)
+    **Default effort:** `low`
 
     **Skills:**
-    - `format-code` -- *Accelerator script:* runs `gofmt -w` (or `goimports -w`) on Go files
-    - `fix-imports` -- *Accelerator script:* runs `goimports` to organize imports
-    - `normalize-style` -- Applies consistent naming and style conventions (LLM-driven)
+    - `format-code` — *Accelerator script:* runs `gofmt -w` (or `goimports -w`) on Go files
+    - `fix-imports` — *Accelerator script:* runs `goimports` to organize imports
+    - `normalize-style` — Applies consistent naming and style conventions (LLM-driven)
   </Accordion>
 
   <Accordion title="DepsAgent (Dependency Management)" icon="box-open">
-    **Access:** Read/Execute (`read`, `exec`, `search`, `tree`)
+    **Access:** Read/Execution (`read`, `exec`, `search`, `tree`)
+    **Default effort:** `low`
 
     **Skills:**
-    - `audit-deps` -- *Accelerator script:* runs `go mod verify` and `govulncheck` for auditing
-    - `update-deps` -- *Accelerator script:* lists outdated dependencies with available updates (dry-run)
-    - `why-dep` -- *Accelerator script:* explains why a dependency exists via `go mod why` and `go mod graph`
-    - `find-outdated` -- Finds all dependencies with newer versions available
+    - `audit-deps` — *Accelerator script:* runs `go mod verify` and `govulncheck` for auditing
+    - `update-deps` — *Accelerator script:* lists outdated deps with available updates (dry-run)
+    - `why-dep` — *Accelerator script:* explains why a dep exists via `go mod why` and `go mod graph`
+    - `find-outdated` — Finds all deps with newer versions available
   </Accordion>
 </AccordionGroup>
 
 ---
 
+## Orchestrator-Visible Catalog
+
+The catalog the orchestrator LLM receives in its system prompt (via `registry.CatalogString()`) now includes each agent's LLM profile when it declares non-default preferences. This helps the LLM make informed decisions — e.g., prefer `planner` for deep decomposition and `formatter` for cheap mechanical work.
+
+Example of what the orchestrator sees:
+
+```text
+## Available Specialized Agents
+
+### planner (PlannerAgent)
+Expert in analyzing tasks and creating execution plans...
+LLM profile: effort=high
+Allowed commands:
+Skills: ...
+
+### formatter (FormatterAgent)
+Expert in code formatting and style normalization.
+LLM profile: effort=low
+Allowed commands: read, patch, exec, tree
+Skills: ...
+
+### devops-senior (DevOps Senior)
+Senior DevOps focused on CI/CD...
+LLM profile: effort=high, model=claude-opus-4-6
+Allowed commands: read, search, tree, exec, test
+Skills: ...
+```
+
+The profile line only appears when there's a hint — if `Effort()` and `Model()` return empty strings, no line is added (avoids prompt noise).
+
+---
+
 ## Custom Agents as Workers
 
-Agent personas defined in `~/.chatcli/agents/` are **automatically loaded** as workers in the orchestration system when starting `/coder` or `/agent`. The LLM can dispatch them via `<agent_call>` with the **same ReAct loop**, parallel reading, and error recovery as the embedded agents.
+Persona agents defined in `~/.chatcli/agents/` are **automatically loaded** as workers in the orchestration system when starting `/coder` or `/agent`. The LLM can dispatch them via `<agent_call>` with the **same ReAct loop**, parallel reading, and error recovery as built-in agents.
 
-### How It Works
+### Full Parity with Skills
 
-<Steps>
-  <Step title="Scanning">
-    When starting multi-agent mode, the system scans `~/.chatcli/agents/`
-  </Step>
-  <Step title="CustomAgent Creation">
-    For each agent found, creates a `CustomAgent` that implements the `WorkerAgent` interface
-  </Step>
-  <Step title="Tool Mapping">
-    The `tools` field in the YAML frontmatter defines which commands the agent can use
-  </Step>
-  <Step title="Skills Loading">
-    Associated skills are loaded and included in the worker's system prompt
-  </Step>
-  <Step title="Catalog Registration">
-    The agent appears in the orchestrator's catalog and can be dispatched
-  </Step>
-</Steps>
-
-### Tool Mapping
-
-The `tools` field in the YAML frontmatter maps Claude Code-style tools to @coder subcommands:
-
-| Tool in YAML | @coder Command(s) | Description |
-|--------------|-------------------|-------------|
-| `Read` | `read` | Read file contents |
-| `Grep` | `search` | Search for patterns in files |
-| `Glob` | `tree` | List directories |
-| `Bash` | `exec`, `test`, `git-status`, `git-diff`, `git-log`, `git-changed`, `git-branch` | Execution and git operations |
-| `Write` | `write` | Create/overwrite files |
-| `Edit` | `patch` | Precise editing (search/replace) |
-
-### Custom Agent Example
+Custom agents now have the same preference fields as skills:
 
 ```yaml
 ---
 name: "security-auditor"
-description: "Security specialist focused on OWASP Top 10"
+description: "Security expert focused on OWASP Top 10"
 tools: Read, Grep, Glob
 skills:
   - owasp-rules
   - compliance
+model: "claude-opus-4-6"       # ideal model for heavy work
+effort: "high"                 # extended thinking on
+category: "security"
+version: "1.0.0"
+author: "Security Team"
+tags: security, owasp, audit
 ---
 # Base Personality
 
-You are an expert Security Auditor. Analyze code looking for
+You are a Security Auditor specialist. Analyze code for
 OWASP Top 10 vulnerabilities, injection, XSS, and bad practices.
 ```
 
-This agent will be **read-only** (only Read/Grep/Glob) and the LLM can dispatch it as follows:
+When dispatched, the dispatcher runs through the Model Router and ensures this agent runs on `claude-opus-4-6` with `effort=high` — even if the user is on Sonnet. When the worker finishes, the user's next turn returns to the original model.
 
-```xml
-<agent_call agent="security-auditor" task="Audit the authentication module for OWASP vulnerabilities" />
-```
+### How It Works
+
+<Steps>
+  <Step title="Scan">
+    When starting multi-agent mode, the system scans `~/.chatcli/agents/` (global) and `./.agent/agents/` (project).
+  </Step>
+  <Step title="CustomAgent creation">
+    For each agent found, a `CustomAgent` is created, implementing the `WorkerAgent` interface. `Model()` and `Effort()` come directly from the frontmatter.
+  </Step>
+  <Step title="Tools mapping">
+    The `tools` field in the YAML frontmatter defines which commands the agent can use.
+  </Step>
+  <Step title="Skill loading">
+    Associated skills are loaded and included in the worker's system prompt.
+  </Step>
+  <Step title="Catalog registration">
+    The agent appears in the orchestrator's catalog (with LLM profile if declared) and can be dispatched.
+  </Step>
+  <Step title="Dispatcher applies hints">
+    On every `<agent_call>`, before the worker starts, the dispatcher consults `ResolveModelRouting` (for model) and attaches `WithEffortHint` to the ctx (for effort).
+  </Step>
+</Steps>
+
+### Tools Mapping
+
+The `tools` field in YAML frontmatter maps Claude Code-style tools to @coder subcommands:
+
+| Tool in YAML | @coder Command(s) | Description |
+|--------------|-------------------|-------------|
+| `Read` | `read` | Read file contents |
+| `Grep` | `search` | Search patterns in files |
+| `Glob` | `tree` | List directories |
+| `Bash` | `exec`, `test`, `git-status`, `git-diff`, `git-log`, `git-changed`, `git-branch` | Execution and git operations |
+| `Write` | `write` | Create/overwrite files |
+| `Edit` | `patch` | Precise edits (search/replace) |
 
 ### Protection Rules
 
-<Warning>The 12 embedded agent names (file, coder, shell, git, search, planner, reviewer, tester, refactor, diagnostics, formatter, deps) are protected and cannot be overwritten by custom agents.</Warning>
+<Warning>
+The 12 built-in agent names (file, coder, shell, git, search, planner, reviewer, tester, refactor, diagnostics, formatter, deps) are protected and cannot be overridden by custom agents.
+</Warning>
 
-- **No tools = read-only**: Agents without a `tools` field automatically receive `read`, `search`, `tree` and are marked as read-only
-- **Duplicates ignored**: If two agents have the same name, only the first one is registered
+- **No tools = read-only**: Agents without a `tools` field automatically receive `read`, `search`, `tree` and are marked as read-only.
+- **Duplicates ignored**: If two agents have the same name, only the first one is registered.
+
+---
+
+## Model Router — Smart Model Routing
+
+When an agent declares `model:`, the dispatcher uses `llm/client.ResolveModelRouting` to pick the correct client. This is the same function used by skills — guaranteeing consistent behavior in both flows.
+
+### Resolution Pipeline
+
+The resolver tries the following signals, in order:
+
+<Steps>
+  <Step title="1. Active provider's API cache">
+    If the target model appears in the current provider's model list (discovered via `/models` endpoint), use the user's provider and only swap the `model`. This covers real models the static catalog doesn't know about yet. Note: `api-cached`.
+  </Step>
+  <Step title="2. Catalog on the user's provider">
+    If `catalog.Resolve(userProvider, hint)` matches (exact, alias, or prefix), swap the model on the same provider. Note: `catalog-same-provider`.
+  </Step>
+  <Step title="3. Catalog across all known providers">
+    If the model exists in another provider's catalog and that provider is in `GetAvailableProviders()` (has an API key configured), cross-provider swap. Note: `catalog-cross-provider`.
+  </Step>
+  <Step title="4. Family heuristic">
+    `claude-*/sonnet/opus/haiku` → CLAUDEAI, `gpt-*/chatgpt-*/o1/o3/o4` → OPENAI, `gemini-*` → GOOGLEAI, `grok-*` → XAI, `glm-*` → ZAI, `minimax*` → MINIMAX, `llama*/mistral*/qwen*/deepseek*` → OLLAMA. Covers future models not yet in the catalog. Note: `family-same-provider` or `family-cross-provider`.
+  </Step>
+  <Step title="5. Optimistic">
+    Totally unknown model? Passes to the user's provider and lets the API decide. If the provider factory accepts, runs; if rejected, falls through. Note: `optimistic-user-provider`.
+  </Step>
+  <Step title="6. Graceful fallback">
+    If the target provider is unavailable (no API key) or the factory failed, use the user's client and populate `UserMessage` with readable text. Note: `fallback-unavailable` or `fallback-build-failed`.
+  </Step>
+</Steps>
+
+### Guarantees
+
+- **`cli.Client`, `cli.Provider`, `cli.Model` are never mutated**. Swaps are worker-turn scoped.
+- **OAuth is implicitly validated**: a provider only enters `GetAvailableProviders()` if `auth.ResolveAuth` returned some credential (API key, OAuth token, or GitHub token). OAuth-only users are treated identically to API-key users.
+- **Cross-provider without API key doesn't break**: graceful fallback with a visible user message.
+- **Structured logs**: each resolver decision emits a log with `note`, `from_provider`, `to_provider`, `from_model`, `to_model`.
+
+### Effort Mapping to Providers
+
+The `effort:` hint is propagated via `context.WithValue` and read by providers inside `SendPrompt`. Each provider does its own conversion:
+
+| Provider | Effort → Request Field | Supported Models |
+|----------|------------------------|------------------|
+| **Anthropic (Claude)** | `thinking.budget_tokens` | opus-4.x, sonnet-4.x, 3.7-sonnet |
+| **OpenAI Chat Completions** | `reasoning_effort` | o1, o3, o4, gpt-5, `*-reasoning` |
+| **OpenAI Responses** | `reasoning.effort` | o1, o3, o4, gpt-5, `*-reasoning` |
+
+Unsupported models get the request without the field (silently ignored). Mapping table:
+
+| Effort | Anthropic `budget_tokens` | OpenAI `effort` |
+|--------|---------------------------|-----------------|
+| `unset` | *(not sent)* | *(not sent)* |
+| `low` | *(not sent)* | `low` |
+| `medium` | `4096` | `medium` |
+| `high` | `16384` | `high` |
+| `max` | `32768` | `high` *(OpenAI has no "max")* |
 
 ---
 
 ## Skills: Scripts vs Descriptive
 
-Each agent has two types of skills:
+Each agent has two kinds of skills:
 
 <Tabs>
   <Tab title="Executable Skills (Accelerator Scripts)">
-    Pre-defined command sequences that **bypass the LLM** for mechanical and repetitive operations, executing directly on the engine:
+    Pre-defined command sequences that **bypass the LLM** for mechanical, repetitive operations, executing directly on the engine:
 
     ```text
-    batch-read   -> Reads N files in parallel goroutines (no LLM call)
-    run-tests    -> go test ./... -json | automatic parsing
-    build-check  -> go build ./... && go vet ./...
-    smart-commit -> git status + git diff --cached -> summary
-    map-project  -> tree + search interfaces/structs in parallel
+    batch-read   → Reads N files in parallel goroutines (no LLM call)
+    run-tests    → go test ./... -json | automatic parse
+    build-check  → go build ./... && go vet ./...
+    smart-commit → git status + git diff --cached → summary
+    map-project  → tree + search interfaces/structs in parallel
     ```
   </Tab>
   <Tab title="Descriptive Skills">
-    Inform the agent about its capabilities -- the agent resolves them via its **mini ReAct loop** with LLM calls:
+    Inform the agent about its capabilities — the agent resolves via its **mini ReAct loop** with LLM calls:
 
     ```text
-    refactor       -> Safe renaming with reference checking
-    find-dead-code -> Unused code analysis
-    create-plan    -> Structured execution plan
+    refactor       → Safe rename with reference verification
+    find-dead-code → Unused-code analysis
+    create-plan    → Structured execution plan
     ```
   </Tab>
 </Tabs>
 
-### Skills V2 (Packages)
+### V2 Skills (Packages)
 
-Skills V2 are directories containing:
-- `SKILL.md` -- Main content with frontmatter
-- Subskills (`.md`) -- Additional knowledge documents
-- `scripts/` -- Executable scripts automatically registered in the worker
+V2 Skills are directories containing:
+- `SKILL.md` — Main content with frontmatter
+- Subskills (`.md`) — Additional knowledge documents
+- `scripts/` — Executable scripts automatically registered on the worker
 
 ```text
 skills/
-+-- clean-code/
-    |-- SKILL.md            # Main content
-    |-- naming-rules.md     # Subskill: naming rules
-    |-- formatting.md       # Subskill: formatting rules
-    +-- scripts/
-        +-- lint_check.py   # Executable script (registered as skill)
+└── clean-code/
+    ├── SKILL.md            # Main content
+    ├── naming-rules.md     # Subskill: naming rules
+    ├── formatting.md       # Subskill: formatting rules
+    └── scripts/
+        └── lint_check.py   # Executable script (registered as skill)
 ```
 
-The worker can read subskills with the `read` command and execute scripts with `exec` during its autonomous operation.
+The worker can `read` subskills and `exec` scripts during its autonomous operation.
 
 ---
 
@@ -318,32 +480,32 @@ When an `agent_call` **fails**, the orchestrator follows an intelligent recovery
 
 <Steps>
   <Step title="Diagnosis via tool_call">
-    Uses direct `tool_call` to read relevant files and understand the error (already has the context)
+    Uses direct `tool_call` to read relevant files and understand the error (it already has the context).
   </Step>
   <Step title="Fix via tool_call">
-    Patches, file corrections, and retries are faster and safer via `tool_call`
+    Patches, file corrections, and retries are faster and safer via `tool_call`.
   </Step>
   <Step title="Resume via agent_call">
-    After the fix is applied and verified, resumes using `agent_call` for the next phase
+    After the fix is applied and verified, resume via `agent_call` for the next phase.
   </Step>
 </Steps>
 
 <Note>Key rule: Error recovery = `tool_call` (fast, precise). New work phases = `agent_call` (parallel, scalable).</Note>
 
 ```text
-agent_call -> FAILURE
-    |
-    v
-tool_call: read (diagnose the error)
-    |
-    v
+agent_call → FAIL
+    │
+    ▼
+tool_call: read (diagnose error)
+    │
+    ▼
 tool_call: patch (apply fix)
-    |
-    v
+    │
+    ▼
 tool_call: exec (verify fix)
-    |
-    v
-agent_call -> NEXT PHASE (success)
+    │
+    ▼
+agent_call → NEXT PHASE (success)
 ```
 
 ---
@@ -352,45 +514,53 @@ agent_call -> NEXT PHASE (success)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHATCLI_AGENT_PARALLEL_MODE` | `true` | Enables/disables multi-agent mode |
-| `CHATCLI_AGENT_MAX_WORKERS` | `4` | Maximum simultaneous goroutines |
-| `CHATCLI_AGENT_WORKER_MAX_TURNS` | `10` | Maximum turns per worker |
-| `CHATCLI_AGENT_WORKER_TIMEOUT` | `5m` | Timeout per worker |
+| `CHATCLI_AGENT_PARALLEL_MODE` | `true` | Enable/disable multi-agent mode |
+| `CHATCLI_AGENT_MAX_WORKERS` | `4` | Max concurrent goroutines |
+| `CHATCLI_AGENT_WORKER_MAX_TURNS` | `10` | Max turns per worker |
+| `CHATCLI_AGENT_WORKER_TIMEOUT` | `5m` | Per-worker timeout |
+| `CHATCLI_AGENT_<NAME>_MODEL` | *(varies)* | Model override for a specific built-in (e.g., `CHATCLI_AGENT_PLANNER_MODEL=claude-opus-4-6`) |
+| `CHATCLI_AGENT_<NAME>_EFFORT` | *(varies)* | Effort override for a specific built-in (e.g., `CHATCLI_AGENT_FORMATTER_EFFORT=low`) |
 
 ### `.env` Example
 
 ```bash
 # Multi-Agent (Parallel Orchestration)
-CHATCLI_AGENT_PARALLEL_MODE=true    # Disable with false if needed
+CHATCLI_AGENT_PARALLEL_MODE=true    # Set to false to disable
 CHATCLI_AGENT_MAX_WORKERS=4
 CHATCLI_AGENT_WORKER_MAX_TURNS=10
 CHATCLI_AGENT_WORKER_TIMEOUT=5m
+
+# Built-in overrides (optional)
+CHATCLI_AGENT_PLANNER_MODEL=claude-opus-4-6
+CHATCLI_AGENT_PLANNER_EFFORT=max
+CHATCLI_AGENT_FORMATTER_MODEL=claude-haiku-4-5
+CHATCLI_AGENT_REVIEWER_EFFORT=high
 ```
 
 ---
 
 ## Anti-Race Safety
 
-The system implements multiple layers of protection against race conditions:
+The system implements multiple layers of race-condition protection:
 
 <CardGroup cols={2}>
   <Card title="FileLockManager" icon="lock">
-    Per-filepath mutex (normalized absolute paths). Write operations acquire locks; reads do not block.
+    Per-filepath mutex (normalized absolute paths). Write operations acquire the lock; reads do not block.
   </Card>
   <Card title="Isolated History" icon="list">
-    Each worker maintains its own `[]models.Message`, with no sharing.
+    Each worker keeps its own `[]models.Message`, no sharing.
   </Card>
   <Card title="Independent LLM Clients" icon="server">
-    Each worker creates its own LLM client instance via factory pattern.
+    Each worker creates its own LLM client instance via factory pattern. With the Model Router, each worker can have a client from a different provider.
   </Card>
   <Card title="Stateless Engine" icon="gears">
-    Each worker instantiates its own fresh `engine.Engine`.
+    Each worker instantiates a fresh `engine.Engine`.
   </Card>
   <Card title="Context Tree" icon="sitemap">
-    The parent context can cancel all workers via `context.WithCancel`.
+    The parent context can cancel all workers via `context.WithCancel`. Effort hints are attached to this ctx.
   </Card>
   <Card title="Policy Enforcement" icon="shield">
-    Workers fully respect the `coder_policy.json` (allow/deny/ask). Actions with an "ask" policy pause the spinner and display a serialized security prompt to the user.
+    Workers fully respect `coder_policy.json` (allow/deny/ask). Policy "ask" actions pause the spinner and display a serialized security prompt to the user.
   </Card>
 </CardGroup>
 
@@ -398,59 +568,61 @@ The system implements multiple layers of protection against race conditions:
 
 ## Security Governance in Parallel Mode
 
-Parallel workers respect **all rules** from the `coder_policy.json` file (global and local). This means that actions like `write`, `patch`, `exec` go through the same policy verification as sequential mode.
+Parallel workers respect **all rules** in the `coder_policy.json` file (global and local). Actions like `write`, `patch`, `exec` go through the same policy check as sequential mode.
 
 ### Behavior by Rule Type
 
-| Rule | Behavior in Worker |
-|------|-------------------|
-| **allow** | Action executed automatically, without interruption |
+| Rule | Worker Behavior |
+|------|-----------------|
+| **allow** | Action runs automatically, no interruption |
 | **deny** | Action silently blocked; worker receives `[BLOCKED BY POLICY]` error |
-| **ask** | Worker **pauses**, spinner is suspended, and a security prompt is displayed to the user |
+| **ask** | Worker **pauses**, spinner suspends, and a security prompt is shown to the user |
 
 ### Prompt Serialization
 
-When multiple workers need approval simultaneously, prompts are **serialized via mutex** -- only one prompt is displayed at a time. After the user responds, the next worker in the queue receives its prompt. This prevents:
+When multiple workers need approval simultaneously, prompts are **serialized via mutex** — only one prompt is shown at a time. After the user's response, the next worker in the queue receives its prompt. This avoids:
 
-- Visual overlap of prompts in the terminal
-- stdin reading conflicts
+- Visual prompt overlap in the terminal
+- Stdin read conflict
 - Spinner rendering over the security prompt
 
 ### Prompt with Agent Context
 
-The security prompt in parallel mode displays **contextual information** about which agent is requesting the action:
+The security prompt in parallel mode shows **contextual information** about which agent is requesting the action:
 
 ```text
-+========================================================+
-|              SECURITY CHECK                             |
-+========================================================+
+╔════════════════════════════════════════════════════════╗
+║                  SECURITY CHECK                         ║
+╚════════════════════════════════════════════════════════╝
  Agent:  coder
- Task:   Refactor authentication module
- --------------------------------------------------------
+ Task:   Refactor auth module
+ ────────────────────────────────────────────────────────
  Action: Write file
          file: pkg/auth/handler.go
  Rule:   no rule for '@coder write'
- --------------------------------------------------------
- Choice:
+ ────────────────────────────────────────────────────────
+ Choose:
    [y] Yes, execute (once)
    [a] Always allow (@coder write)
    [n] No, skip
-   [d] Always block (@coder write)
+   [d] Always deny (@coder write)
 ```
 
 This allows the user to make informed decisions about each action, knowing exactly **which agent** is asking and **why**.
 
-### Runtime Provider/Model Respect
+### Respect for the User's Provider/Model
 
-Parallel workers always use the **active provider and model** at the time of dispatch. If the user switches providers (e.g., from Anthropic to Google AI) via `/switch`, the next agent dispatches will use the new provider correctly.
+Parallel workers use, by default, the **active provider and model** at dispatch time. If the user switches providers via `/switch`, subsequent agent dispatches will use the new provider correctly.
+
+**Exception:** agents (built-in or custom) that declare `model:` and/or `effort:` can use a different client for that specific turn, resolved by the Model Router. `cli.Client` still points to the user's choice — the swap is worker-scoped.
 
 ---
 
 ## Execution Flow (Example)
 
 <Steps>
-  <Step title="User sends the query">
-    "refactor the coder module, separate read and write"
+  <Step title="User sends query">
+    *"refactor the coder module, split read and write"*
   </Step>
   <Step title="Orchestrator LLM dispatches parallel agents">
     ```xml
@@ -458,23 +630,26 @@ Parallel workers always use the **active provider and model** at the time of dis
     <agent_call agent="search" task="Find references to handleRead and handleWrite" />
     ```
   </Step>
-  <Step title="Dispatcher creates goroutines">
-    FileAgent and SearchAgent run in parallel, each with their own LLM client and isolated mini ReAct loop (within the maxWorkers limit).
+  <Step title="Dispatcher creates goroutines with resolved clients">
+    FileAgent runs with `effort=low` (user's model), SearchAgent same. Both in parallel, each with its own LLM client and isolated mini ReAct loop (within `maxWorkers` limit).
   </Step>
   <Step title="Results aggregated">
     Feedback is sent to the orchestrator.
   </Step>
-  <Step title="Orchestrator dispatches CoderAgent">
-    For the refactoring (with FileLock on the files being written).
+  <Step title="Orchestrator dispatches PlannerAgent">
+    To decompose the refactor. Planner runs with `effort=high` (extended thinking) — even if the user is on Sonnet, the Planner thinks more deeply in this phase.
+  </Step>
+  <Step title="Dispatches CoderAgent">
+    For the refactor (with `effort=medium` and FileLock on files being written).
   </Step>
   <Step title="Dispatches ShellAgent for tests">
-    Runs tests after writing.
+    Runs tests after writing (`effort=low`, mechanical).
   </Step>
   <Step title="Error recovery (if needed)">
     If tests fail, uses `tool_call` for diagnosis and quick fix.
   </Step>
   <Step title="Final validation">
-    Orchestrator validates the final result and reports to the user.
+    Orchestrator validates the final result and reports back to the user.
   </Step>
 </Steps>
 
@@ -482,11 +657,11 @@ Parallel workers always use the **active provider and model** at the time of dis
 
 ## Parallelism Maximization
 
-ChatCLI's prompt system explicitly instructs the AI to **maximize parallelism** at all levels:
+ChatCLI's prompt system explicitly instructs the AI to **maximize parallelism** at every level:
 
-1. **tool_call**: Independent operations (read 3 files, search + read) must be emitted in a SINGLE response, not in separate turns
-2. **agent_call**: For 3+ independent tasks, prefer `agent_call` which runs in parallel goroutines
-3. **Per-turn anchor**: Every ReAct loop turn, a reminder reinforces the need for parallelism
+1. **tool_call**: Independent operations (read 3 files, search + read) should be emitted in a SINGLE response, not across turns.
+2. **agent_call**: For 3+ independent tasks, prefer `agent_call` running in parallel goroutines.
+3. **Per-turn anchor**: Every ReAct loop turn includes a reminder reinforcing the need for parallelism.
 
 Correct example (3 reads in ONE response):
 ```xml
@@ -495,7 +670,7 @@ Correct example (3 reads in ONE response):
 <tool_call name="@coder" args='{"cmd":"read","args":{"file":"handler.go"}}' />
 ```
 
-Incorrect example (3 turns for independent operations):
+Incorrect example (3 turns for independent ops):
 ```text
 Turn 1: read main.go → wait
 Turn 2: read config.go → wait
@@ -507,6 +682,9 @@ Turn 3: read handler.go → wait
 ## Compatibility
 
 - `CHATCLI_AGENT_PARALLEL_MODE=false`: **everything works exactly as before**
-- `<tool_call>` tags continue to work even with parallel mode active
-- No existing function signatures were changed
-- The `cli/agent/workers/` package is completely isolated and does not impact existing functionality
+- `<tool_call>` tags keep working even with parallel mode enabled
+- No existing function signatures were changed (only additions)
+- The `cli/agent/workers/` package is fully isolated and does not impact existing functionality
+- Old agents without `model:`/`effort:` keep working without any changes
+- Older gRPC servers that don't carry the new `AgentInfo` fields return zero values — the client treats them as "inherit"
+- Operator and CRDs do NOT need changes: agents are loaded by `persona.Loader` inside the pod, via ConfigMap mounts
