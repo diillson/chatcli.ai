@@ -187,6 +187,47 @@ kubectl -n chatcli-system create secret generic chatcli-tls \
 With `ca.crt` inside the Secret, you do **not** need to mount a CA ConfigMap or set `SSL_CERT_FILE` / `CHATCLI_GRPC_TLS_CA` on the operator deployment. That env var is a secondary path for multi-Instance setups sharing a CA and requires manual volume mounting (`extraEnv` + volume).
 </Tip>
 
+### What if the cert is issued by cert-manager or ACM?
+
+§2.5 above covers the fragile self-signed case. With cert-manager or AWS ACM the setup is simpler, but each issuer has its own gotcha:
+
+| Issuer | `ca.crt` in Secret? | Where SAN must match | `spec.server.address` points to... |
+|---|---|---|---|
+| cert-manager + Let's Encrypt / public ACME | **No** — CA already in the system trust store | Public FQDN (e.g. `chatcli.example.com`) | Public FQDN via Ingress/NLB with gRPC passthrough |
+| cert-manager + internal ClusterIssuer (CA) | **Yes** — cert-manager writes `ca.crt` into the Secret automatically | `dnsNames` in the `Certificate` CR; include in-cluster names | In-cluster Service (`<svc>.<ns>.svc.cluster.local`) |
+| AWS ACM Public | N/A — private key is not exportable | Public FQDN | Public FQDN via ALB/NLB (TLS terminates at the LB) |
+| AWS ACM Private CA | **Yes** — include the Private CA bundle as `ca.crt` | Set at issuance; include in-cluster names | In-cluster Service |
+| Self-signed (manual openssl — §2.5) | **Yes** — `ca.crt=tls.crt` (cert is its own CA) | Set via `subjectAltName` in `openssl.cnf` | In-cluster Service |
+
+**Key notes:**
+
+- **Publicly trusted cert → trust already exists.** The operator code (`grpc_client.go`) only sets `RootCAs` when a custom CA is provided; without one, Go uses the container's `ca-certificates` bundle. That's why Let's Encrypt and ACM Public "just work" on the CA side — but `spec.server.address` **must be the public FQDN**, not the in-cluster Service, or the SAN won't match.
+- **cert-manager with an internal CA is the cleanest K8s path.** The `Certificate` CR below emits everything ready for `WatcherBridge` auto-trust — no manual openssl:
+
+  ```yaml
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: chatcli-tls
+    namespace: chatcli-system
+  spec:
+    secretName: chatcli-tls          # Same Secret referenced in the Instance CR
+    issuerRef:
+      name: internal-ca              # ClusterIssuer with kind: CA
+      kind: ClusterIssuer
+    commonName: chatcli-prod.chatcli-system.svc.cluster.local
+    dnsNames:
+      - chatcli-prod.chatcli-system.svc.cluster.local
+      - chatcli-prod.chatcli-system.svc
+      - chatcli-prod
+    duration: 8760h                  # 1 year
+    renewBefore: 720h                # renew 30 days before expiry
+  ```
+
+  With `Certificate.issuerRef.kind: CA`, cert-manager automatically writes `ca.crt` into the generated Secret — `WatcherBridge` picks it up directly, no extra config.
+- **ACM Public does not fit pod-to-pod gRPC.** The private key is not exportable; only use when TLS terminates at the ALB/NLB and the operator dials the public endpoint.
+- **ACM Private CA** — export the Private CA bundle (`aws acm-pca get-certificate-authority-certificate`) and include it as `ca.crt` in the Secret. From there on, it follows the auto-trust path.
+
 ## 2.1 Link Source Code Repositories (Optional)
 
 Link your monitored applications' source code repositories for code-aware diagnostics. The AI will receive context from recent commits, code snippets from stack traces, and configuration files.
