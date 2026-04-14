@@ -126,6 +126,71 @@ helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
 ```
 </Tip>
 
+## 2.5 Criar o Secret `chatcli-tls` corretamente (SANs + CA)
+
+Este é o passo onde a maioria das instalações quebra silenciosamente. O Instance CR referencia `secretName: chatcli-tls`, mas o Secret precisa ser gerado com dois cuidados que o `openssl req -x509` padrão **não** faz.
+
+### Gerar o cert com `subjectAltName`
+
+Sem SANs cobrindo o nome DNS usado pelo operator para dialar o gRPC, o handshake falha com:
+
+```
+transport: authentication handshake failed: x509: certificate is not valid for any names, but wanted to match chatcli-prod.chatcli-system.svc.cluster.local
+```
+
+Use um `openssl.cnf` explícito:
+
+```bash
+cat > openssl.cnf <<'EOF'
+[req]
+distinguished_name = req
+x509_extensions    = v_ext
+prompt             = no
+
+[req]
+CN = chatcli-prod.chatcli-system.svc.cluster.local
+
+[v_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = chatcli-prod.chatcli-system.svc.cluster.local
+DNS.2 = chatcli-prod.chatcli-system.svc
+DNS.3 = chatcli-prod
+DNS.4 = localhost
+EOF
+
+openssl req -x509 -newkey rsa:4096 -sha256 -days 825 -nodes \
+  -keyout tls.key -out tls.crt -config openssl.cnf -extensions v_ext
+```
+
+Verifique com:
+
+```bash
+openssl x509 -in tls.crt -noout -text | grep -A1 'Subject Alternative Name'
+```
+
+### Incluir `ca.crt` no Secret
+
+Cert self-signed é seu próprio CA. Se o Secret tiver apenas `tls.crt` e `tls.key`, o operator vai conectar mas cair em:
+
+```
+transport: authentication handshake failed: x509: certificate signed by unknown authority
+```
+
+O `WatcherBridge` lê automaticamente a chave `ca.crt` do Secret referenciado pelo Instance e usa como trust root — por isso o Secret precisa ter as **três** chaves:
+
+```bash
+kubectl -n chatcli-system create secret generic chatcli-tls \
+  --from-file=tls.crt=tls.crt \
+  --from-file=tls.key=tls.key \
+  --from-file=ca.crt=tls.crt   # em self-signed, o cert é o próprio CA
+```
+
+<Tip>
+Com `ca.crt` dentro do Secret, **não é necessário** montar ConfigMap de CA nem definir `SSL_CERT_FILE` / `CHATCLI_GRPC_TLS_CA` no deployment do operator. Essa variável é um caminho alternativo para cenários multi-Instance com CA compartilhado e exige montagem manual (`extraEnv` + volume).
+</Tip>
+
 ## 2.1 Vincular Repositórios de Código (Opcional)
 
 Vincule os repositórios de código das aplicações monitoradas para diagnóstico code-aware. A IA receberá contexto de commits recentes, trechos de código de stack traces e arquivos de configuração.
@@ -494,10 +559,50 @@ O dashboard web mostra:
 
 
 
+## 11.1 Expor o Dashboard via Ingress (alternativa ao port-forward)
+
+Para expor o dashboard fora do cluster, crie um Ingress apontando para o Service do operator. Quando monta-se sob sub-path, o `rewrite-target` com grupo de captura é obrigatório — os assets estáticos do dashboard são servidos de `/` e retornariam 404 sem isso:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chatcli-dashboard
+  namespace: chatcli-system
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: chatcli.example.com
+      http:
+        paths:
+          - path: /chatcli(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: chatcli-operator
+                port:
+                  number: 8090
+```
+
+## 12. Troubleshooting comum
+
+| Erro nos logs do operator | Causa | Correção |
+|---|---|---|
+| `x509: certificate is not valid for any names` | Cert do servidor gRPC sem SAN cobrindo `spec.server.address` | Regerar cert com `openssl.cnf` + `subjectAltName` apontando para o FQDN do Service (ver §2.5) |
+| `x509: certificate signed by unknown authority` | Self-signed sem trust configurado no operator | Adicionar a chave `ca.crt` ao Secret `chatcli-tls` referenciado pelo Instance (ver §2.5) |
+| `no ready Instance found` | Instance não está `Ready` ou está em outro namespace | `kubectl describe instance chatcli-prod -n chatcli-system` — conferir status e eventos |
+| `connection refused` após TLS OK | Service sem endpoints ou porta gRPC errada | `kubectl get endpoints chatcli-prod -n chatcli-system` deve listar IPs de pod |
+
 ## Checklist de Produção
 
 - [x] Operator instalado com 17 CRDs
 - [x] Instance criada com TLS e auth
+- [x] Secret `chatcli-tls` contém **`tls.crt`, `tls.key` e `ca.crt`** (self-signed: `ca.crt=tls.crt`)
+- [x] `tls.crt` possui SANs para `<instance>.<ns>.svc.cluster.local`, `<instance>.<ns>.svc` e `<instance>`
+- [x] `spec.server.address` no Instance bate com uma das SANs do cert
+- [x] Logs do operator mostram `Connected to Instance` sem erros `x509:` até ~30s após Instance ficar `Ready`
 - [x] Watcher monitorando deployments alvo
 - [x] NotificationPolicy com Slack + PagerDuty
 - [x] EscalationPolicy L1 - L2 - L3
