@@ -1,0 +1,276 @@
+---
+title: "Custo de Tokens do System Prompt"
+sidebarTitle: "Token Budget"
+description: "Quanto custa, em tokens e em dólares, iniciar uma sessão em cada modo do ChatCLI — anatomia completa do system prompt, impacto do prompt caching e variáveis para reduzir o gasto."
+icon: "calculator"
+---
+
+Toda sessão do ChatCLI começa enviando um **system prompt** ao modelo. Esse prompt não é monolítico: é montado dinamicamente a partir de vários blocos (instruções de modo, contexto de workspace, schemas de plugins, hint do scratch dir, catálogo de agents, persona ativa) — e o tamanho final varia bastante entre os modos `chat`, `/agent` e `/coder`.
+
+Esta página mede empiricamente cada bloco no código atual, soma o custo total por modo e mostra como o **prompt caching** muda completamente a economia em sessões de mais de um turno.
+
+<Info>
+Os números abaixo refletem o estado atual da branch `main` do `chatcli`. A estimativa de tokens usa a regra padrão de **4 caracteres por token** (precisão típica de ±10% versus tiktoken real para texto e código mistos). Para reproduzir os valores, veja [Como reproduzir](#como-reproduzir).
+</Info>
+
+---
+
+## Anatomia do system prompt
+
+O ChatCLI monta o system prompt em camadas, definidas em `cli/prompts.go`, `cli/cli_llm.go` e `cli/agent_mode.go`:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│ Workspace context (CLAUDE.md, SOUL.md, USER.md, ...)    │  variável
+├─────────────────────────────────────────────────────────┤
+│ Bloco principal de modo:                                │
+│   - chat   -> ChatModeSystemHint                        │
+│   - /coder -> CoderSystemPrompt (ou CoderFormat+persona)│
+│   - /agent -> agent.system_prompt.default.base          │
+├─────────────────────────────────────────────────────────┤
+│ ai.response_language (instrução de idioma)              │
+├─────────────────────────────────────────────────────────┤
+│ getToolContextString (schemas dos plugins)              │
+├─────────────────────────────────────────────────────────┤
+│ buildSessionWorkspaceHint (CHATCLI_AGENT_TMPDIR + tips) │
+├─────────────────────────────────────────────────────────┤
+│ OrchestratorSystemPrompt (catálogo multi-agent)         │
+└─────────────────────────────────────────────────────────┘
+```
+
+O modo `chat` recebe apenas as duas primeiras camadas; `/agent` e `/coder` recebem todas elas.
+
+---
+
+## Tabela de blocos individuais
+
+Cada bloco medido isoladamente, com sua contribuição em caracteres e tokens:
+
+| Bloco | Quando entra | Chars | ~Tokens |
+|:------|:-------------|------:|--------:|
+| `ChatModeSystemHint` | só em chat | 855 | **214** |
+| `i18n("ai.response_language")` (PT) | sempre | 306 | **77** |
+| `CoderSystemPrompt` | `/coder` sem persona | 6.548 | **1.637** |
+| `CoderFormatInstructions` | `/coder` com persona ativa | 2.207 | **552** |
+| `AgentFormatInstructions` | `/agent` com persona ativa | 1.259 | **315** |
+| `agent.system_prompt.default.base` (PT) | `/agent` sem persona | 2.905 | **727** |
+| `getToolContextString` (3 plugins built-in) | `/agent` + `/coder` | 8.628 | **2.157** |
+| `buildSessionWorkspaceHint` | `/agent` + `/coder` | 1.593 | **399** |
+| `OrchestratorSystemPrompt` (12 agents default) | `/agent` + `/coder` com `CHATCLI_AGENT_PARALLEL_MODE=true` | 16.290 | **4.073** |
+| `BuildSystemPromptPrefix` (workspace context) | sempre | variável | depende do projeto |
+
+`getToolContextString` cresce conforme você adiciona plugins externos. `BuildSystemPromptPrefix` depende de quais arquivos de contexto estão presentes no projeto (`CLAUDE.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, `IDENTITY.md`, `RULES.md`).
+
+---
+
+## Custo total por modo
+
+Comparativo do **gasto inicial** em cada modo, considerando configuração padrão (sem persona, multi-agent ativo, sem workspace prefix). Os números são tokens enviados na primeira mensagem da sessão.
+
+### Modo `chat`
+
+```text
+ChatModeSystemHint           214
+ai.response_language          77
+                           -----
+TOTAL                       ~291 tokens
+```
+
+### Modo `/agent` default (sem persona, multi-agent ON)
+
+```text
+agent.system_prompt.default.base    727
+ai.response_language                 77
+getToolContextString              2.157
+buildSessionWorkspaceHint           399
+OrchestratorSystemPrompt          4.073
+                                  -----
+TOTAL                            ~7.433 tokens
+```
+
+### Modo `/coder` (sem persona, multi-agent ON)
+
+```text
+CoderSystemPrompt                 1.637
+ai.response_language                 77
+getToolContextString              2.157
+buildSessionWorkspaceHint           399
+OrchestratorSystemPrompt          4.073
+                                  -----
+TOTAL                            ~8.343 tokens
+```
+
+### Com persona ativa (`/agent` ou `/coder`)
+
+A persona substitui o prompt fixo principal:
+
+```text
+personaPrompt                     (~800 a 3.000)
++ AgentFormatInstructions           315       (em /agent)
++ CoderFormatInstructions           552       (em /coder)
+```
+
+Personas compactas geralmente **reduzem** o custo total — o `CoderSystemPrompt` (1.637) é maior que muitas personas + format instructions juntos.
+
+---
+
+## Custo em USD por modelo
+
+Conversão direta do gasto inicial usando o preço de input (por 1M tokens) de modelos populares:
+
+| Modelo | Preço input | Chat (291) | Agent (7.433) | Coder (8.343) |
+|:-------|:-----------:|-----------:|--------------:|--------------:|
+| Claude Sonnet 4.6 | $3.00/M | $0.0009 | $0.0223 | $0.0250 |
+| Claude Opus 4.6 | $15.00/M | $0.0044 | $0.1115 | $0.1251 |
+| Claude Haiku 4.5 | $1.00/M | $0.0003 | $0.0074 | $0.0083 |
+| GPT-4o | $2.50/M | $0.0007 | $0.0186 | $0.0209 |
+| GPT-4o-mini | $0.15/M | $0.00004 | $0.0011 | $0.0013 |
+
+Em projetos pequenos (~30 turnos por sessão) sem caching, isso multiplica por 30 — uma sessão `/coder` com Opus 4.6 chegaria a **$3.75 só de system prompt repetido**.
+
+---
+
+## Prompt caching muda completamente o jogo
+
+O system prompt do `/agent` e `/coder` é **estável dentro de uma sessão** — o único pedaço dinâmico é o `ScratchDir` aleatório dentro do `buildSessionWorkspaceHint` (que é fixo por sessão).
+
+O ChatCLI já marca o system prompt com `CacheControl{Type: "ephemeral"}` para o Anthropic (ver [Context Commands](/features/context-commands)), então o caching está ativo automaticamente. Diferenças de preço:
+
+| Operação | Multiplicador | Custo no Sonnet 4.6 |
+|:---------|:--------------|--------------------:|
+| Input regular | 1.0× | $3.00/M |
+| Cache write (1ª chamada) | 1.25× | $3.75/M |
+| Cache read (TTL 5min) | 0.1× | $0.30/M |
+
+### Exemplo prático — sessão `/coder` de 30 turnos
+
+| Cenário | Cálculo | Custo total |
+|:--------|:--------|------------:|
+| **Sem caching** | 30 × 8.343 × $3.00/M | **$0.751** |
+| **Com caching** (1× write + 29× read) | (1 × 8.343 × $3.75/M) + (29 × 8.343 × $0.30/M) | **$0.104** |
+
+Redução de **86%** no gasto de system prompt — e isso só conta o prompt fixo, não o histórico crescente da conversa.
+
+<Tip>
+A janela de cache é de 5 minutos (TTL ephemeral). Sessões com pausas longas entre mensagens podem perder o cache e pagar `cache_write` novamente. Para sessões de codificação intensa (múltiplos turnos por minuto), o caching captura praticamente tudo.
+</Tip>
+
+---
+
+## Onde o ChatCLI gasta mais tokens (e o que cortar)
+
+Análise de custo-benefício de cada bloco no `/coder`:
+
+| Bloco | Tokens | Avaliação |
+|:------|------:|:----------|
+| `OrchestratorSystemPrompt` | **4.073** | 🔴 **Maior gasto.** Lista os 12 agents + skills + scripts. Vale ouro se você usa `<agent_call>`. Se nunca usa multi-agent, desligar economiza ~50% do system prompt. |
+| `getToolContextString` | **2.157** | 🟡 Schemas dos 3 built-in plugins. Há sobreposição com a seção "OTHER TOOLS" do `CoderSystemPrompt` (~150 tokens redundantes). |
+| `CoderSystemPrompt` | **1.637** | 🟢 Necessário no `/coder` — define o contrato de saída XML/JSON. |
+| `agent.system_prompt.default.base` | **727** | 🟢 Necessário no `/agent` — define a persona base de admin de sistema. |
+| `buildSessionWorkspaceHint` | **399** | 🟢 Custo aceitável; resolve o problema de [truncamento de tool results](/features/tool-result-management) (poupa ordens de magnitude mais em refetches que economiza). |
+| `ai.response_language` | **77** | 🟢 Trivial. |
+| `ChatModeSystemHint` | **214** | 🟢 Trivial — só no modo chat. |
+
+---
+
+## Variáveis para reduzir o gasto
+
+| Variável | Efeito | Quando vale a pena |
+|:---------|:-------|:------------------|
+| `CHATCLI_AGENT_PARALLEL_MODE=false` | Remove `OrchestratorSystemPrompt` (~4.073 tokens) | Você usa `/coder` direto, sem despachar `<agent_call>`. Mantém todas as outras tools (read/write/patch/exec/git/test/`delegate_subagent`). |
+| `CHATCLI_AGENT_KEEP_TMPDIR=true` | Não muda token budget; mantém scratch dir após exit para depuração | Investigando comportamento do agente |
+| Desabilitar plugins não usados | Reduz `getToolContextString` proporcionalmente | Você não usa `@webfetch`/`@websearch` ou plugins custom |
+| Persona compacta em vez de prompt default | Reduz/substitui o bloco principal | Personas focadas (ex: `senior-go`) podem ser mais enxutas que o prompt genérico |
+
+### Exemplo concreto — sessão `/coder` enxuta
+
+```bash
+CHATCLI_AGENT_PARALLEL_MODE=false chatcli
+```
+
+Reduz o system prompt de **8.343 → 4.270 tokens** (-49%). Numa sessão de 30 turnos com Sonnet 4.6 e caching:
+
+- Antes: $0.104
+- Depois: $0.053
+
+---
+
+## Comparação visual
+
+<CardGroup cols={3}>
+  <Card title="Chat" icon="message">
+    **~291 tokens**
+    Apenas instruções de modo + idioma. Custo trivial.
+  </Card>
+  <Card title="Agent default" icon="robot">
+    **~7.433 tokens**
+    Inclui prompt base, plugins, scratch hint e orquestrador multi-agent.
+  </Card>
+  <Card title="Coder" icon="code">
+    **~8.343 tokens**
+    Maior dos três — `CoderSystemPrompt` é 2× maior que o prompt do `/agent`.
+  </Card>
+</CardGroup>
+
+---
+
+## Como reproduzir
+
+A medição é direta: o ChatCLI expõe os blocos como constantes Go públicas. Um pequeno programa basta:
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/diillson/chatcli/cli"
+	"github.com/diillson/chatcli/cli/agent/workers"
+	"github.com/diillson/chatcli/i18n"
+)
+
+func tokens(s string) int { return (len(s) + 3) / 4 }
+
+func main() {
+	i18n.Init()
+	reg := workers.SetupDefaultRegistry()
+
+	blocks := map[string]string{
+		"ChatModeSystemHint":      cli.ChatModeSystemHint,
+		"CoderSystemPrompt":       cli.CoderSystemPrompt,
+		"CoderFormatInstructions": cli.CoderFormatInstructions,
+		"AgentFormatInstructions": cli.AgentFormatInstructions,
+		"agent.system_prompt.default.base": i18n.T(
+			"agent.system_prompt.default.base", "darwin", "zsh", "/proj"),
+		"ai.response_language":      i18n.T("ai.response_language"),
+		"OrchestratorSystemPrompt":  workers.OrchestratorSystemPrompt(reg.CatalogString()),
+	}
+	for name, s := range blocks {
+		fmt.Printf("%-40s %6d chars  ~%5d tokens\n", name, len(s), tokens(s))
+	}
+}
+```
+
+Rode com `go run` apontando para o módulo do `chatcli` no GOPATH ou via replace directive. A regra de **4 chars/token** é a heurística padrão da indústria; para precisão exata use `tiktoken-go` para modelos OpenAI ou a contagem do próprio Anthropic SDK.
+
+<Note>
+Os números desta página foram colhidos com Go 1.22 contra a branch `main` do `chatcli` em 2026-04-14. Mudanças no `cli/prompts.go` ou no catálogo de agents alteram os totais — recalcule após bumps de versão se o gasto for crítico para você.
+</Note>
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Variáveis de Ambiente" icon="terminal" href="/reference/environment-variables">
+    Todas as flags que afetam o tamanho do system prompt.
+  </Card>
+  <Card title="Cost Tracking" icon="money-bill-trend-up" href="/features/cost-tracking">
+    Como o ChatCLI mostra o custo em tempo real durante a sessão.
+  </Card>
+  <Card title="Multi-Agent Orchestration" icon="users" href="/features/multi-agent-orchestration">
+    Decida se o `OrchestratorSystemPrompt` (4K tokens) vale para você.
+  </Card>
+  <Card title="Resultados de Tools" icon="database" href="/features/tool-result-management">
+    Onde mais o ChatCLI controla gasto de contexto.
+  </Card>
+</CardGroup>
