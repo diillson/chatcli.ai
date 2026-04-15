@@ -1,0 +1,182 @@
+---
+title: "Delegação para Subagent"
+sidebarTitle: "Subagent Delegate"
+description: "Tool delegate_subagent que executa uma sub-tarefa com janela de contexto isolada e devolve apenas o resumo final ao agente pai — ideal para análises de payloads grandes."
+icon: "diagram-project"
+---
+
+A tool `delegate_subagent` permite ao agente principal **delegar uma sub-tarefa focada para uma instância separada do loop ReAct**, com janela de contexto própria. O subagente executa, gasta seus próprios tokens e retorna **apenas o resumo final** — os tool calls intermediários e os outputs brutos ficam isolados na sub-sessão e não poluem o contexto do pai.
+
+Esse padrão é o que projetos como o Claude Code chamam de "Task" subagents, e resolve um problema clássico: análises sobre payloads grandes (Prometheus `/metrics`, logs verbosos, busca exaustiva no repo) que acabariam consumindo dezenas de milhares de tokens só com dados brutos no histórico do agente principal.
+
+---
+
+## Quando usar
+
+| Cenário | Use `delegate_subagent`? |
+|:--------|:-------------------------|
+| Resumir um endpoint `/metrics` de 50K caracteres extraindo apenas top-3 hotspots | ✅ Sim — payload bruto fica no subagente, só o resumo volta |
+| Encontrar todos os call sites de uma função no repo | ✅ Sim — varredura larga, resposta curta |
+| Analisar 200KB de logs e identificar a stack trace relevante | ✅ Sim |
+| Ler 1 arquivo conhecido e fazer um patch | ❌ Não — overhead da delegação não vale para tarefas pequenas |
+| Executar 3 ações independentes em paralelo | ❌ Use [`<agent_call>` multi-agent](/features/multi-agent-orchestration) — paraleliza melhor |
+| Tarefa que precisa do contexto acumulado da conversa | ❌ Não — subagente não vê o histórico do pai |
+
+---
+
+## Sintaxe
+
+A tool é exposta como `delegate_subagent` no native function calling e como subcomando `delegate` do `@coder` no formato XML:
+
+<Tabs>
+  <Tab title="Native (preferido)">
+    ```json
+    {
+      "name": "delegate_subagent",
+      "arguments": {
+        "description": "analisar metrics",
+        "prompt": "Faça GET em http://svc/metrics e devolva os 3 maiores consumidores de memória com números absolutos.",
+        "tools": ["read", "search", "tree"],
+        "read_only": true,
+        "max_turns": 10
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="XML (/coder mode)">
+    ```xml
+    <tool_call name="@coder" args='{"cmd":"delegate","args":{"description":"analisar metrics","prompt":"Faça GET em http://svc/metrics e devolva os 3 maiores consumidores de memória com números absolutos.","tools":["read","search","tree"],"read_only":true}}' />
+    ```
+  </Tab>
+</Tabs>
+
+### Parâmetros
+
+| Campo | Tipo | Obrigatório | Descrição |
+|:------|:-----|:------------|:----------|
+| `description` | string | Não | Rótulo curto exibido nos logs (ex: `"analisar metrics"`). |
+| `prompt` | string | **Sim** | Instruções completas para o subagente. **Seja explícito sobre o formato de saída esperado** — o subagente não tem acesso ao histórico do pai. |
+| `tools` | array de strings | Não | Allowlist de subcomandos do engine que o subagente pode usar. Default: conjunto read-only (`read`, `search`, `tree`, `git-*`). |
+| `read_only` | boolean | Não | Se `true` (default), bloqueia `write`, `patch`, `exec`. Defina `false` para conceder o conjunto completo de tools. |
+| `max_turns` | integer | Não | Limite de iterações do loop ReAct interno do subagente. Default: 15. |
+
+---
+
+## O que o pai recebe
+
+A saída devolvida ao agente principal é a string final do subagente, prefixada por um cabeçalho com metadados de telemetria:
+
+```text
+[subagent result — description="analisar metrics", tool_calls=4, elapsed=3.2s]
+
+Top 3 consumidores de memória observados em http://svc/metrics:
+
+1. go_memstats_heap_inuse_bytes = 1.42 GiB (87% do heap total)
+2. process_resident_memory_bytes = 1.65 GiB
+3. cache_entries_bytes (label="responses") = 412 MiB
+
+Tendência: heap crescente nas últimas 5 amostras (+12%/min).
+Recomendação: investigar cache "responses" (sem TTL configurado).
+```
+
+A saída é truncada pelo mesmo sistema de [orçamento de resultados](/features/tool-result-management) que aplica aos outros tools — então mesmo que o subagente seja prolixo, o impacto no contexto do pai fica limitado.
+
+---
+
+## Limites e proteções
+
+| Limite | Default | Variável de override |
+|:-------|:--------|:--------------------|
+| Profundidade máxima de delegação aninhada | 2 | `CHATCLI_AGENT_SUBAGENT_MAX_DEPTH` |
+| Iterações ReAct por subagente | 15 | `CHATCLI_AGENT_SUBAGENT_MAX_TURNS` |
+| Tamanho máximo do output devolvido ao pai | ~30 KB | `MaxWorkerOutputBytes` (constante interna) |
+
+A profundidade limitada protege contra recursão patológica (subagente que delega para subagente que delega...). A primeira chamada do agente principal é depth 0; cada `delegate_subagent` aninhado incrementa.
+
+<Warning>
+O subagente herda o **mesmo cliente LLM e modelo** do pai. Não há roteamento por modelo nessa tool — para isso, use o sistema de [skill model hints](/features/customizable-agents) ou despache para um agent customizado via [`<agent_call>`](/features/multi-agent-orchestration).
+</Warning>
+
+---
+
+## Tools allowlist
+
+Por padrão, o subagente recebe um conjunto **read-only** seguro:
+
+```
+read, search, tree, git-status, git-diff, git-log, git-changed, git-branch
+```
+
+Para conceder tools de escrita ou execução, você precisa **explicitamente** definir `read_only: false` e listar quais quer:
+
+```json
+{
+  "name": "delegate_subagent",
+  "arguments": {
+    "description": "rodar testes e devolver falhas",
+    "prompt": "Execute go test ./... e me retorne só o nome dos testes que falharam, com a primeira linha do erro de cada um.",
+    "tools": ["read", "search", "exec", "test"],
+    "read_only": false,
+    "max_turns": 8
+  }
+}
+```
+
+A combinação `read_only: true` + `tools: [...]` com algum tool de escrita resulta em bloqueio na hora da execução — `read_only` tem precedência.
+
+---
+
+## Diferenças de outras formas de delegação
+
+| Aspecto | `delegate_subagent` | [`<agent_call>`](/features/multi-agent-orchestration) | Tool call inline |
+|:--------|:---------------------|:----------------------------------------------|:-----------------|
+| **Contexto** | Janela própria, isolada do pai | Janela própria, isolada do pai | Mesmo contexto do pai |
+| **Paralelismo** | Sequencial (um por vez) | Paralelo (várias tags numa só resposta) | Paralelo via batch |
+| **Escolha de agent** | Loop ReAct genérico | Catálogo de agents especializados | N/A |
+| **Roteamento por modelo** | Não — usa o cliente do pai | Sim — `Model` hint no agent | Não |
+| **Indicado para** | Análises focadas que produzem resumo | Tarefas paralelas com tipos de expertise diferentes | Operações triviais e baratas |
+
+---
+
+## Exemplo completo — análise de métricas
+
+Cenário: o usuário pede para diagnosticar um pico de memória. Sem `delegate_subagent`, o agente faria `web_fetch` no `/metrics`, receberia 50K chars no contexto e gastaria tokens analisando o output bruto turno após turno.
+
+Com delegação:
+
+```xml
+<reasoning>
+1. Coletar metrics do serviço com cuidado — payload é grande
+2. Delegar análise para subagente isolado (poupa contexto)
+3. Apresentar diagnóstico ao usuário
+</reasoning>
+
+<tool_call name="@coder" args='{"cmd":"delegate","args":{
+  "description":"diagnosticar pico de memória",
+  "prompt":"Use @webfetch para buscar http://payments.prod.svc:9090/metrics com filter=^(go_memstats|process|cache_). Em seguida, identifique se há tendência de crescimento entre amostras consecutivas (busque também os labels com maior valor absoluto). Devolva: (1) top 3 métricas por valor absoluto, (2) qualquer suspeita de leak (heap crescendo sem GC eficiente), (3) recomendação acionável em 1 linha.",
+  "tools":["read","search","exec"],
+  "read_only":false,
+  "max_turns":12
+}}' />
+```
+
+O subagente executa o `webfetch` (já com filter aplicado), faz uma segunda passada se precisar, e devolve um resumo de ~500 chars. O agente principal entrega esse resumo ao usuário sem ter visto o payload bruto.
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Multi-Agent" icon="users" href="/features/multi-agent-orchestration">
+    Para tarefas paralelas em vez de delegação isolada.
+  </Card>
+  <Card title="Session Workspace" icon="folder-tree" href="/features/session-workspace">
+    O scratch dir compartilhado entre pai e subagente.
+  </Card>
+  <Card title="Resultados de Tools" icon="database" href="/features/tool-result-management">
+    Como o output do subagente é truncado se for grande demais.
+  </Card>
+  <Card title="Web Tools" icon="globe" href="/features/web-tools">
+    Filtros do `@webfetch` que combinam com delegação.
+  </Card>
+</CardGroup>

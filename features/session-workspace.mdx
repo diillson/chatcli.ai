@@ -1,0 +1,156 @@
+---
+title: "Workspace de Sessão (Scratch Dir)"
+sidebarTitle: "Session Workspace"
+description: "Diretório scratch isolado por sessão onde o agente pode ler e escrever livremente — para scripts temporários, artefatos intermediários e leitura sob demanda de outputs truncados."
+icon: "folder-tree"
+---
+
+A cada inicialização do ChatCLI, um **diretório scratch isolado por sessão** é criado em `$TMPDIR/chatcli-agent-<random>/` e exposto ao agente via a variável de ambiente `CHATCLI_AGENT_TMPDIR`. Esse diretório resolve duas dores recorrentes:
+
+1. O agente precisa criar um script temporário (por exemplo, um `.sh` para um patch complexo) mas o boundary do `/coder` bloqueia escritas fora do projeto, forçando-o a poluir a árvore do repositório.
+2. Quando um tool result é truncado e o ChatCLI salva o conteúdo completo em disco com a marca `[full output saved to /tmp/...]`, o agente não consegue ler esse arquivo porque o caminho está fora do workspace boundary.
+
+A partir desta versão, o workspace de sessão resolve ambas: o agente tem permissão automática de leitura **e** escrita dentro dele, e os arquivos de overflow do orçamento de resultados passam a viver lá também.
+
+---
+
+## Estrutura
+
+```text
+$TMPDIR/chatcli-agent-<random>/
+  scratch/        <- exposto via CHATCLI_AGENT_TMPDIR
+                     (agente pode escrever e ler)
+  tool-results/   <- destino do EnforceToolResultBudget e
+                     TruncateToolResult quando um output excede
+                     o limite inline
+```
+
+O sufixo `<random>` vem de `os.MkdirTemp` — único por processo. Isso evita colisão entre múltiplos `chatcli` rodando em paralelo no mesmo host.
+
+---
+
+## Como o agente sabe que existe?
+
+O system prompt do `/agent` e do `/coder` recebe automaticamente um bloco com:
+
+- Caminho **literal** do scratch dir resolvido na hora (o agente não precisa expandir variável).
+- Instrução para usar `$CHATCLI_AGENT_TMPDIR` em comandos shell quando preferir.
+- Padrão de uso para os marcadores de truncamento: quando ler `[full output saved to /tmp/chatcli-agent-XXX/tool-results/...]`, abrir o arquivo com `read_file` em vez de refazer a tool call original.
+
+```text
+SESSION WORKSPACE & LARGE OUTPUTS
+
+You have an isolated scratch directory for this session, exposed via the
+environment variable CHATCLI_AGENT_TMPDIR (current value: /tmp/chatcli-agent-Xy7K3a/scratch).
+Both read and write are ALLOWED in this directory and in its subtree.
+
+Use it whenever you need to:
+- stage a temporary shell script before exec'ing it
+- persist an intermediate artifact between tool calls
+- avoid polluting the project tree with one-off files
+```
+
+---
+
+## Cenário 1 — Criar e executar script temporário
+
+No `/coder`, o modelo tem duas vias para staging de script:
+
+### Via direta com path absoluto
+
+```xml
+<tool_call name="@coder" args='{"cmd":"write","args":{"file":"/tmp/chatcli-agent-Xy7K3a/scratch/patch.sh","content":"BASE64","encoding":"base64"}}' />
+<tool_call name="@coder" args='{"cmd":"exec","args":{"cmd":"bash /tmp/chatcli-agent-Xy7K3a/scratch/patch.sh"}}' />
+```
+
+O `validatePath` do engine reconhece o aux path registrado pela `InitSessionWorkspace` e libera a escrita.
+
+### Via shell expansion no `exec`
+
+```xml
+<tool_call name="@coder" args='{"cmd":"exec","args":{"cmd":"cat > $CHATCLI_AGENT_TMPDIR/patch.sh <<EOF\nset -e\necho rodando\nEOF\nbash $CHATCLI_AGENT_TMPDIR/patch.sh"}}' />
+```
+
+Aqui o engine não valida path porque é apenas uma string de comando — quem expande `$CHATCLI_AGENT_TMPDIR` é o shell filho, que herda a variável do processo do ChatCLI.
+
+<Warning>
+Não use `$CHATCLI_AGENT_TMPDIR` no campo `file` do `write` ou `patch`. O `validatePath` faz `filepath.Abs` mas **não** expande variáveis de ambiente — `$CHATCLI_AGENT_TMPDIR/x` vira `<cwd>/$CHATCLI_AGENT_TMPDIR/x` literal e cai no boundary check normal. Use o caminho absoluto que aparece no system prompt para essa via.
+</Warning>
+
+---
+
+## Cenário 2 — Recuperar miolo de output truncado
+
+O sistema de [orçamento de resultados](/features/tool-result-management) trunca tool results grandes (> 20K chars por padrão) e salva o conteúdo completo em `tool-results/`. O preview retornado ao modelo contém um marcador como:
+
+```text
+... [83.450 chars omitted — full output saved to /tmp/chatcli-agent-Xy7K3a/tool-results/budget_tc_3_1.txt]
+```
+
+Antes desta versão, esse marcador era um beco sem saída — o read tool bloqueava a leitura porque o caminho estava fora do workspace. Agora o scratch dir e o `tool-results/` estão na **read allowlist** do agente, então o modelo simplesmente abre o arquivo:
+
+```xml
+<tool_call name="@coder" args='{"cmd":"read","args":{"file":"/tmp/chatcli-agent-Xy7K3a/tool-results/budget_tc_3_1.txt","start":1200,"end":1500}}' />
+```
+
+E recebe exatamente o trecho que precisa, sem precisar refazer a tool call original (que iria custar tokens novamente e provavelmente truncar de novo).
+
+---
+
+## Lifecycle
+
+| Evento | Ação |
+|:-------|:-----|
+| `NewChatCLI` (startup) | `agent.InitSessionWorkspace(logger)` cria os dirs, exporta `CHATCLI_AGENT_TMPDIR`, registra os paths nos validators |
+| Cada turno do agente | Aux paths consultados pelo `validatePath` (engine) e `IsReadAllowed` (read validator) |
+| Tool result excede orçamento | `tool-results/` recebe o conteúdo completo; preview com marcador volta para o modelo |
+| `ChatCLI.cleanup()` (exit, Ctrl+D, SIGTERM) | `ws.Cleanup()` faz `os.RemoveAll` do dir raiz; env var é desexportada |
+
+---
+
+## Configuração
+
+| Variável | Descrição | Default |
+|:---------|:----------|:--------|
+| `CHATCLI_AGENT_TMPDIR` | **Apenas leitura.** Caminho absoluto do scratch dir, exportado automaticamente para subprocessos | (definido na inicialização) |
+| `CHATCLI_AGENT_KEEP_TMPDIR` | Se `true`, pula o cleanup e mantém os arquivos após o exit (para depuração) | `false` |
+
+<Tip>
+Para investigar um problema do agente após encerrar a sessão:
+
+```bash
+CHATCLI_AGENT_KEEP_TMPDIR=true chatcli
+```
+
+Ao sair, o ChatCLI loga o caminho do scratch dir e mantém todos os scripts e overflows lá para você inspecionar com `ls`, `cat`, `grep` etc.
+</Tip>
+
+---
+
+## Segurança
+
+O workspace de sessão **não** afrouxa o boundary do agente para o resto do sistema:
+
+- O scratch dir vive em `os.TempDir()` (`$TMPDIR` no macOS, `/tmp` no Linux), com permissão `0700` no diretório raiz da sessão.
+- Apenas esse diretório específico (criado por `os.MkdirTemp`) é adicionado à allowlist — **não** o `/tmp` inteiro.
+- Os validators (`engine.validatePath`, `SensitiveReadPaths.IsReadAllowed`) seguem aplicando o resto das proteções: bloqueio de paths sensíveis (`/etc/shadow`, `~/.ssh`, `~/.aws/`, `~/.gnupg`, etc.) e o boundary do projeto.
+- O webfetch com `save_to_file=true` confina escritas ao scratch dir via `filepath.Base` + verificação pós-resolve, mesmo se o modelo tentar passar um caminho absoluto.
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Resultados de Tools" icon="database" href="/features/tool-result-management">
+    Como o orçamento decide o que truncar e onde persistir.
+  </Card>
+  <Card title="Subagent Delegation" icon="diagram-project" href="/features/subagent-delegation">
+    Delegar tarefas pesadas para um subagente com contexto isolado.
+  </Card>
+  <Card title="Web Tools" icon="globe" href="/features/web-tools">
+    `save_to_file` do `@webfetch` usa o scratch dir.
+  </Card>
+  <Card title="Variáveis de Ambiente" icon="terminal" href="/reference/environment-variables">
+    Lista completa das variáveis que controlam o workspace.
+  </Card>
+</CardGroup>
