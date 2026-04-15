@@ -31,7 +31,7 @@
 
 Este repositório contém a **documentação oficial** do [ChatCLI](https://github.com/diillson/chatcli), construída com [Mintlify](https://mintlify.com) e publicada em **[chatcli.edilsonfreitas.com](https://chatcli.edilsonfreitas.com)**.
 
-O ChatCLI é uma CLI open-source escrita em Go que conecta seu terminal a 7 provedores de IA (OpenAI, Anthropic, Google, xAI, Ollama, StackSpot e GitHub Copilot) com modos agente, coder, MCP, K8s operator e muito mais.
+O ChatCLI é uma CLI open-source escrita em Go que conecta seu terminal a 13 provedores de IA (OpenAI, OpenAI Assistants, Anthropic Claude, AWS Bedrock, Google Gemini, xAI Grok, ZAI, MiniMax, StackSpot, Ollama, GitHub Copilot, GitHub Models e OpenRouter) com modos agente, coder, MCP, K8s operator e muito mais.
 
 ---
 
