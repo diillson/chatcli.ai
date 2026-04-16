@@ -35,14 +35,22 @@ Ideal for corporate environments that already manage billing, compliance, and ac
 
 ## Configuration
 
-The provider is auto-detected when ChatCLI finds **any AWS config signal**:
+The provider is auto-detected when ChatCLI finds **valid AWS credentials** (not just file existence):
 
-- Env vars `AWS_ACCESS_KEY_ID`, `AWS_PROFILE`, `AWS_REGION`, `BEDROCK_REGION`
-- File `~/.aws/credentials` or `~/.aws/config`
-- Attached IAM role (EC2, ECS, EKS, Lambda)
-- Web Identity Token (EKS IRSA) or Container Credentials (ECS)
+- **Static creds in env:** `AWS_ACCESS_KEY_ID`
+- **Profile selection:** `AWS_PROFILE` (via env var or `.env` file)
+- **`~/.aws/credentials` file** with at least one non-empty `aws_access_key_id`
+- **AWS SSO:** SSO profile in `~/.aws/config` (detects `sso_session`, `sso_start_url`, `sso_account_id`)
+- **Assume-role / credential_process:** profiles with `role_arn` or `credential_process` in `~/.aws/config`
+- **SSO token cache:** presence of files in `~/.aws/sso/cache/` (indicating a prior `aws sso login`)
+- **Web Identity Token** (EKS IRSA): `AWS_WEB_IDENTITY_TOKEN_FILE`
+- **Container Credentials** (ECS): `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` / `_FULL_URI`
 
-### Option 1: `~/.aws/credentials` (most common)
+<Warning>
+The mere existence of `~/.aws/config` with only `region` or `output` **does not activate** Bedrock. The file must contain credential configuration (SSO, assume-role, credential_process), or credentials must exist in another source.
+</Warning>
+
+### Option 1: `~/.aws/credentials` (static credentials)
 
 If you already use AWS CLI, just have a profile configured:
 
@@ -69,7 +77,52 @@ Inside ChatCLI:
 /switch BEDROCK
 ```
 
-### Option 2: Environment variables
+<Tip>
+You can also set `AWS_PROFILE` in your `.env` file instead of exporting in the shell:
+```env
+AWS_PROFILE=corp-prod
+BEDROCK_REGION=us-east-1
+LLM_PROVIDER=BEDROCK
+```
+ChatCLI reads the `.env` via godotenv and resolves the profile correctly.
+</Tip>
+
+### Option 2: AWS SSO (IAM Identity Center)
+
+If your company uses AWS SSO, configure the profile in `~/.aws/config`:
+
+```ini
+[profile my-sso]
+sso_session = my-session
+sso_account_id = 123456789012
+sso_role_name = MyRole
+region = us-east-1
+
+[sso-session my-session]
+sso_start_url = https://my-company.awsapps.com/start
+sso_region = us-east-1
+```
+
+```bash
+# Log in (opens browser)
+aws sso login --profile my-sso
+
+# Use with ChatCLI (any of these):
+export AWS_PROFILE=my-sso && chatcli
+AWS_PROFILE=my-sso chatcli
+
+# Or in .env:
+echo 'AWS_PROFILE=my-sso' >> .env
+chatcli
+```
+
+<Info>
+ChatCLI automatically detects SSO profiles in `~/.aws/config` (via `sso_session`, `sso_start_url`, `sso_account_id` keys). If the SSO token expires, the error will be clear (`SSOTokenProviderError`) — just run `aws sso login` again.
+
+**Important:** the AWS SDK **does not** know which profile is "logged in". You **must** indicate the profile via `AWS_PROFILE` (env, `.env`, or flag). If your SSO profile is named `default`, it is used automatically without `AWS_PROFILE`.
+</Info>
+
+### Option 3: Environment variables (static credentials)
 
 ```bash
 export AWS_ACCESS_KEY_ID=AKIA...
@@ -78,9 +131,17 @@ export AWS_SESSION_TOKEN=...      # if using STS
 export AWS_REGION=us-east-1
 ```
 
-### Option 3: IAM Role (EC2/ECS/EKS)
+### Option 4: IAM Role (EC2/ECS/EKS)
 
 On AWS-native environments, nothing to configure — the SDK picks up the role automatically through IMDSv2 / webidentity. Just make sure the role has the IAM permissions below.
+
+<Info>
+ChatCLI disables the IMDS probe (169.254.169.254) by default on machines that are **not** EC2/ECS/EKS, to avoid unnecessary timeouts. IMDS is automatically enabled when container/EKS env vars are detected (`AWS_CONTAINER_CREDENTIALS_*`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `ECS_CONTAINER_METADATA_URI*`).
+
+To force behavior, use:
+- `AWS_EC2_METADATA_DISABLED=true` — explicitly disable IMDS
+- `CHATCLI_BEDROCK_ENABLE_IMDS=1` — force enable IMDS (useful on EC2 without standard env vars)
+</Info>
 
 ---
 
@@ -268,11 +329,13 @@ The SDK v2 reads these natively — no ChatCLI changes needed.
 | `BEDROCK_TEMPERATURE` | Temperature used for OpenAI family models | — |
 | `BEDROCK_REGION` | AWS region (takes precedence over `AWS_REGION`) | — |
 | `AWS_REGION` | AWS region (fallback) | — |
-| `AWS_PROFILE` | Profile in `~/.aws/credentials` | — |
+| `AWS_PROFILE` | Profile in `~/.aws/credentials` or `~/.aws/config` (SSO, assume-role). Can be set in `.env`. | — |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Static credentials | — |
 | `AWS_CA_BUNDLE` | PEM bundle read natively by SDK v2 | — |
 | `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` | Override for Bedrock Runtime endpoint | — |
 | `AWS_ENDPOINT_URL_BEDROCK` | Override for Bedrock (control plane) endpoint | — |
+| `AWS_EC2_METADATA_DISABLED` | `true` explicitly disables IMDS (169.254.169.254) | — |
+| `CHATCLI_BEDROCK_ENABLE_IMDS` | `1`/`true` forces IMDS probe on non-EC2 machines | `false` |
 | `BEDROCK_MAX_TOKENS` | Output token limit | From catalog |
 | `ANTHROPIC_MAX_TOKENS` | Alternative shared with direct Anthropic provider | — |
 | `CHATCLI_BEDROCK_CA_BUNDLE` | Bedrock-specific PEM bundle (overrides `AWS_CA_BUNDLE`) | — |
@@ -353,7 +416,32 @@ If your company already runs everything on AWS with managed compliance, **BEDROC
     env | grep -E 'AWS_|BEDROCK_'
     ls -la ~/.aws/
     ```
-    If nothing returns credentials, set them up via `aws configure` or export env vars.
+    If nothing returns credentials, set them up via `aws configure`, `aws sso login`, or export env vars.
+  </Accordion>
+  <Accordion title="no EC2 IMDS role found / dial tcp 169.254.169.254:80: connect: host is down">
+    This error occurs when the AWS SDK tries to reach the **EC2 Instance Metadata Service** (IMDS) on a machine that **is not EC2** (e.g., your laptop). ChatCLI disables the IMDS probe by default on non-EC2, but if the error persists:
+
+    ```bash
+    # Solution 1: Set valid credentials
+    export AWS_PROFILE=my-profile
+    # or
+    export AWS_ACCESS_KEY_ID=AKIA...
+
+    # Solution 2: Explicitly disable IMDS
+    export AWS_EC2_METADATA_DISABLED=true
+    ```
+
+    If you **are actually on EC2** and need IMDS:
+    ```bash
+    export CHATCLI_BEDROCK_ENABLE_IMDS=1
+    ```
+  </Accordion>
+  <Accordion title="SSOTokenProviderError / expired token (SSO)">
+    Your SSO token has expired (default validity ~8h). Log in again:
+    ```bash
+    aws sso login --profile your-profile
+    ```
+    Remember to have `AWS_PROFILE` set (env, `.env`, or name your profile `default`).
   </Accordion>
   <Accordion title="x509: certificate signed by unknown authority">
     Corporate proxy doing TLS interception. Configure `CHATCLI_BEDROCK_CA_BUNDLE` with the PEM of the corp CA. For quick troubleshooting, set `CHATCLI_BEDROCK_INSECURE_SKIP_VERIFY=true` (insecure, temporary only).
