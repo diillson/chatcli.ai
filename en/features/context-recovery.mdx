@@ -1,11 +1,11 @@
 ---
 title: "Context Recovery"
 sidebarTitle: "Context Recovery"
-description: "Automatic 3-level recovery against context overflow and max output token escalation"
+description: "Automatic 3-level recovery against context overflow, corporate-proxy payload limits and max output token escalation"
 icon: "life-ring"
 ---
 
-ChatCLI implements an **automatic context recovery** system that handles two common failure types in long sessions: context window overflow ("prompt too long") and output token limits. When the API rejects a request due to excessive size, the system applies progressively more aggressive strategies to recover the session without losing the conversation.
+ChatCLI implements an **automatic context recovery** system that handles three common failure types in long sessions: model context window overflow ("prompt too long"), corporate proxy/gateway payload limits (413 / WAF 403 / silent EOF), and output token limits. When the API rejects a request for any of these reasons, the system applies progressively more aggressive strategies to recover the session without losing the conversation.
 
 ---
 
@@ -52,7 +52,7 @@ When the API returns a "context too long" error, ChatCLI applies up to 3 recover
   </Tab>
 </Tabs>
 
-### Error Detection
+### Error Detection — model overflow
 
 The system recognizes multiple forms of overflow errors:
 
@@ -64,6 +64,78 @@ The system recognizes multiple forms of overflow errors:
 | `max_tokens exceed` | Various |
 | `input too long` | Google |
 | `token limit` | Generic |
+
+---
+
+## Corporate proxy / gateway recovery
+
+Enterprise environments often sit behind a proxy or gateway that enforces **a POST body size cap** — typically 1-5 MB, completely independent of the model's context window. You can be well within Anthropic's 200K-token window (~800 KB) and still take a mysterious rejection from the proxy. Worse: many proxies don't return a clean 413 — some send a WAF 403 (Cloudflare, Akamai, mod_security), 431 (header too large), or simply drop the TCP connection mid-POST, surfacing as `EOF` / `connection reset` on the client.
+
+ChatCLI detects all three patterns and funnels them through the same recovery flow as context overflow.
+
+### Error Detection — proxy/gateway
+
+| Pattern detected | Example | Function |
+|:-----------------|:--------|:---------|
+| HTTP 413 + variants | `413 Payload Too Large`, `request entity too large`, `body too large`, `maximum request size`, `431 Request Header Fields Too Large` | `IsPayloadTooLargeError` |
+| 403 with WAF/firewall signals | 403 with `firewall`, `waf`, `security policy`, `blocked by`, `cloudflare`, `cf-ray`, `mod_security`, `akamai`, `proxy denied`, `policy violation` | `IsProxyWAFRejection` |
+| EOF / reset with large history | `unexpected eof`, `connection reset`, `broken pipe`, `stream error` **and** history > 500 KB | `IsLikelyPayloadProblem` (heuristic) |
+
+<Info>
+WAF detection is **conservative** — a 403 without firewall signals continues to be treated as an auth error (OAuth refresh + retry). Only when a 403 carries specific proxy/WAF signals is it reclassified as a recoverable payload failure. This prevents invalidating valid OAuth credentials when the real problem is on the network layer.
+</Info>
+
+<Info>
+EOF / connection-reset detection applies a **history-size threshold (500 KB)** before suspecting payload. Small requests that hit EOF keep being treated as transient network failures (normal retry). Only when the history is already suspiciously large is EOF reclassified as a probable body cap.
+</Info>
+
+### Pre-flight check
+
+Every agent turn, history is measured before the request goes out. Two paths:
+
+**With `CHATCLI_MAX_PAYLOAD` set:**
+If history crosses 85% of the cap, `BudgetRatio` is forced to `0.40` up front — aggressive preventive compaction. The user sees:
+
+```text
+ℹ pre-flight: history 4.2 MB ≈ 86% of configured cap (5.0 MB) — compacting
+```
+
+**Without a cap set:**
+If history crosses 2.5 MB, a **one-shot warning per session** fires suggesting the env var. It will not re-trigger in the same run to avoid noise.
+
+```text
+ℹ history 2.8 MB — if you are behind a proxy/gateway, export CHATCLI_MAX_PAYLOAD=5MB (adjust to the proxy limit)
+```
+
+### Reactive auto-cap after 413
+
+If a 413/WAF/EOF fires and the user hasn't configured `CHATCLI_MAX_PAYLOAD`, ChatCLI automatically assumes **4 MB** for the rest of the session — a high probability that the retry passes through the same proxy:
+
+```text
+⚠ Recoverable failure (proxy/WAF rejection (403 + security signals)) — compacting and retrying
+ℹ Assuming 4 MB payload cap — export CHATCLI_MAX_PAYLOAD (e.g. 5MB, 512KB) to adjust
+```
+
+### System notice injected in history
+
+After a payload-limit-triggered recovery, ChatCLI injects a `user` message before the retry instructing the model to prefer smaller reads going forward. This breaks the model's loop of trying to re-read the same huge file that caused the 413 in the first place:
+
+```text
+[SYSTEM NOTICE — PAYLOAD LIMIT HIT] A proxy/gateway rejected the previous
+request due to body size. History was compacted to recover. Going forward:
+(1) When reading files, prefer targeted reads with line ranges
+    (e.g. sed -n '100,200p' file, or read_file with offset+limit) instead
+    of reading entire files.
+(2) Prefer grep/ripgrep with specific patterns over full-file reads.
+(3) If you previously read a large file, its full content is persisted at
+    the path shown in the tool-result preview — re-read specific ranges
+    from that file rather than repeating the original read.
+(4) Summarize findings incrementally rather than accumulating raw tool output.
+```
+
+<Tip>
+This hint is intentionally injected **in English**. The AI follows English instructions much more faithfully even when the user is on pt-BR, and this message is never shown to the user — it only enters the history sent to the model.
+</Tip>
 
 ---
 
@@ -97,9 +169,38 @@ The message instructs the model to continue from where it left off, avoiding rep
 
 | Environment Variable | Description | Default |
 |:--------------------|:-----------|:--------|
-| `CHATCLI_MAX_RECOVERY_ATTEMPTS` | Maximum context recovery attempts | 3 |
-| `CHATCLI_MAX_TOKEN_ESCALATIONS` | Maximum max_tokens escalations | 2 |
-| `CHATCLI_EMERGENCY_KEEP_MESSAGES` | Messages kept in emergency truncation | 10 |
+| `CHATCLI_MAX_RECOVERY_ATTEMPTS` | Maximum context recovery attempts | `3` |
+| `CHATCLI_MAX_TOKEN_ESCALATIONS` | Maximum max_tokens escalations | `2` |
+| `CHATCLI_EMERGENCY_KEEP_MESSAGES` | Messages kept in emergency truncation | `10` |
+| `CHATCLI_MAX_PAYLOAD` | **Human-friendly** ceiling for POST body size (e.g. `5MB`, `512KB`, `2.5MB`, `5`=5MB). When set, the compactor respects this ceiling as an extra cap on top of the model's context window, and pre-flight forces compaction on crossing 85% of it. | _(unset — no cap)_ |
+
+### Live feedback during compaction
+
+Since this release, the terminal never "freezes" during a long compaction anymore. `HistoryCompactor` emits status at each pipeline phase via `SetStatusCallback`:
+
+```text
+│ 📦 Compacting history (23 msgs, 4.2 MB → target 2.9 MB)
+│ 🧹 Trim: stripping reasoning/dedup (no LLM)…
+│ 🧠 Summarizing old messages via LLM (may take 30-90s — ESC cancels)…
+│ ✓ Summary applied (23 → 9 msgs, 4.2 MB → 1.8 MB)
+```
+
+**Cancellation**: the summarization LLM call now derives its context from the turn — `Ctrl+C` / `ESC` propagates correctly and aborts compaction without corrupting history (returns `ctx.Err()` instead of blindly falling through to emergency truncation).
+
+### Microcompact (pre-budget)
+
+Before `NeedsCompaction` checks whether history exceeds budget, the agent loop applies `ApplyMicrocompact` — a **pure-Go, no-LLM, no-network** pass that progressively truncates/summarizes old tool results (2+ turns old → head+tail preview; 4+ turns old → one-line summary). In most cases this keeps history inside budget without triggering the (expensive) Level 2.
+
+```text
+🗜 microcompact: 3 truncated, 2 summarized, 1.7 MB freed
+```
+
+Configurable via env:
+
+| Environment Variable | Description | Default |
+|:--------------------|:-----------|:--------|
+| `CHATCLI_MICROCOMPACT_TRUNCATE_TURNS` | Age (in turns) at which tool results start getting truncated | `2` |
+| `CHATCLI_MICROCOMPACT_SUMMARIZE_TURNS` | Age (in turns) at which tool results are replaced by a one-line summary | `4` |
 
 ### Aggressive Budget Ratio
 
@@ -115,22 +216,27 @@ At level 1, the tool result budget limits are multiplied by `0.5` (50%). This me
 ## Recovery Flow
 
 ```text
-API returns "context too long" error
-  |
-  +- Attempt 1: Aggressive budget (50%) + pairing cleanup
-  |   +- Resend to API
-  |       +- Success -> continues normally
-  |       +- Failure -> next attempt
-  |
-  +- Attempt 2: Emergency truncate (system + last 10 msgs)
-  |   +- Resend to API
-  |       +- Success -> continues with reduced history
-  |       +- Failure -> next attempt
-  |
-  +- Attempt 3: Nuclear truncate (system + last 4 msgs)
-      +- Resend to API
-          +- Success -> continues with minimal history
-          +- Failure -> error reported to user
+API returns recoverable error (context overflow | 413 | WAF 403 | EOF w/ large history)
+  │
+  ├─ System notice injected into history (payload-related only) ─────┐
+  │                                                                   │
+  ├─ Attempt 1: Aggressive budget (50%) + pairing cleanup             │
+  │   └─ Resend to API                                                │
+  │       ├─ Success → continues normally                             │
+  │       └─ Failure → next attempt                                   │
+  │                                                                   │
+  ├─ Attempt 2: Emergency truncate (system + last 10 msgs)            │
+  │   └─ Resend to API                                                │
+  │       ├─ Success → continues with reduced history                 │
+  │       └─ Failure → next attempt                                   │
+  │                                                                   │
+  └─ Attempt 3: Nuclear truncate (system + last 4 msgs)               │
+      └─ Resend to API                                                │
+          ├─ Success → continues with minimal history                 │
+          └─ Failure → error reported to user                         │
+                                                                      │
+  For payload-related (413/WAF/EOF): CHATCLI_MAX_PAYLOAD auto-set ◄───┘
+                                      to 4MB if not configured
 ```
 
 <Warning>
