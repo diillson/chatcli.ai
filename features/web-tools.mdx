@@ -142,29 +142,89 @@ O agente pode então emitir um `read_file` apontando para o caminho absoluto ret
 
 ## @websearch
 
-Realiza uma busca web via DuckDuckGo e retorna os resultados com titulo, URL e snippet de cada resultado.
+Realiza uma busca web e retorna os resultados com título, URL e snippet. Suporta **dois backends keyless** por design — nada de API key externa para cadastrar: **DuckDuckGo** (scraping HTML) é o default zero-config, e **SearxNG self-hosted** é o preferido em ambiente corporativo quando você aponta para uma instância interna.
 
-### Como Funciona
+### Backends disponíveis
 
-<Steps>
-  <Step title="Query">
-    O agent envia a query de busca para a API do DuckDuckGo.
-  </Step>
-  <Step title="Parse de resultados">
-    Os resultados são parseados e formatados com titulo, URL e snippet descritivo.
-  </Step>
-  <Step title="Retorno estruturado">
-    Os resultados são retornados como texto formatado para o agent processar.
-  </Step>
-</Steps>
+| Backend | Requisito | Quando brilha | Quando dói |
+|:--------|:----------|:--------------|:-----------|
+| **DuckDuckGo** | Nenhum | Default, funciona já, zero config | DDG eventualmente serve interstitial de anti-bot (CAPTCHA) — pode retornar zero resultados |
+| **SearxNG self-hosted** | `SEARXNG_URL` apontando para a instância | Empresa fechada em rede corporativa — você controla o backend, sem saída para scraping público, agrega vários engines (Bing/Google/Qwant) pela instância | Requer subir um container interno + habilitar JSON no `settings.yml` |
 
-### Uso
+### Cadeia de fallback
 
-O LLM invoca `@websearch` quando precisa buscar informações atualizadas na web:
+A cada query, o ChatCLI monta uma cadeia ordenada de backends. Se o primeiro falha ou retorna vazio, o próximo é tentado automaticamente.
+
+**Ordem default (`CHATCLI_WEBSEARCH_PROVIDER` não setado ou `auto`):**
+
+```
+1. DuckDuckGo          ← default, sempre disponível
+2. SearxNG             ← só entra na cadeia se SEARXNG_URL estiver setado
+```
+
+**Override explícito para priorizar SearxNG:**
+
+```bash
+export CHATCLI_WEBSEARCH_PROVIDER=searxng
+export SEARXNG_URL=https://searx.internal.corp
+```
+
+Resultado: cadeia vira `searxng → duckduckgo`. DDG continua como fallback se a instância SearxNG falhar.
+
+### Variáveis de ambiente
+
+| Variável | Descrição | Default |
+|:---------|:----------|:--------|
+| `CHATCLI_WEBSEARCH_PROVIDER` | Força um backend específico no topo da cadeia: `searxng`, `duckduckgo`, ou `auto`. | `auto` |
+| `SEARXNG_URL` | URL raiz da instância SearxNG (ex.: `https://searx.internal.corp`). Quando setado, SearxNG entra na cadeia. | _(não setado)_ |
+
+### Comando `/websearch`
+
+Gerenciador interativo do backend preferido. **Autocomplete disponível** para subcomandos e nomes de provider.
+
+| Subcomando | Efeito |
+|:-----------|:-------|
+| `/websearch` ou `/websearch status` | Mostra provider atual + cadeia ativa |
+| `/websearch list` | Lista providers conhecidos e quais estão configurados |
+| `/websearch provider <searxng\|duckduckgo\|auto>` | Define provider preferido para a sessão (seta `CHATCLI_WEBSEARCH_PROVIDER` no processo) |
+| `/websearch reset` | Remove o override e volta ao modo auto |
+
+O `/websearch provider` é apenas para a sessão corrente. Para persistir, exporte a env no shell ou adicione ao `.env`.
+
+### Configurando SearxNG self-hosted
+
+A instância SearxNG precisa ter a **JSON API habilitada** — não vem ativa por default. No `settings.yml` do SearxNG:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Se você apontar o `SEARXNG_URL` para uma instância sem JSON habilitado, o ChatCLI retorna um erro acionável ao invés de uma mensagem de decode confusa:
 
 ```text
-Pesquise as melhores praticas para rate limiting em Go em 2026
+SearxNG did not return JSON (Content-Type="text/html"). Enable JSON in settings.yml: search.formats: [html, json]
 ```
+
+<Tip>
+A imagem oficial `searxng/searxng` no Docker Hub sobe em 30 segundos. Em ambiente corporativo, um único container com ingress interno já é suficiente — e resolve o problema de "DDG bloqueado pelo proxy" de uma vez.
+</Tip>
+
+### Como funciona internamente
+
+<Steps>
+  <Step title="Seleção da cadeia">
+    `SelectSearchChain()` lê `CHATCLI_WEBSEARCH_PROVIDER` e `SEARXNG_URL`, retorna uma lista ordenada de backends a tentar.
+  </Step>
+  <Step title="Tentativa sequencial">
+    Para cada backend na cadeia: chama a função de busca. Se retorna resultados, pára e formata. Se falha ou retorna zero, loga o motivo e avança para o próximo.
+  </Step>
+  <Step title="Formatação">
+    Resultados viram texto formatado com `via <provider>` no cabeçalho, numerados com título + URL + snippet.
+  </Step>
+</Steps>
 
 ### Formatos de Argumentos
 
@@ -195,19 +255,22 @@ Agent: Vou buscar informações atualizadas sobre isso.
 
 [tool_call: websearch {"query": "opentelemetry go setup tutorial"}]
 
-Resultados:
+Search results for: "opentelemetry go setup tutorial" (via DuckDuckGo)
+
 1. Getting Started with OpenTelemetry in Go
-   https://opentelemetry.io/docs/languages/go/getting-started/
+   URL: https://opentelemetry.io/docs/languages/go/getting-started/
    Official guide to instrumenting Go applications with OpenTelemetry...
 
 2. OpenTelemetry Go SDK - Complete Guide
-   https://example.com/otel-go-guide
+   URL: https://example.com/otel-go-guide
    Step-by-step tutorial covering traces, metrics and logs...
-
-3. Distributed Tracing in Go with OpenTelemetry
-   https://example.com/distributed-tracing-go
-   Learn how to implement distributed tracing across microservices...
 ```
+
+O cabeçalho `(via DuckDuckGo)` ou `(via SearxNG)` deixa claro qual backend respondeu — útil para diagnosticar por que alguma query não voltou resultado (ex.: DDG serviu CAPTCHA → fallback para SearxNG).
+
+<Info>
+**Por que keyless?** O ChatCLI é usado em ambientes corporativos onde gerenciar API keys de terceiros (Brave Search, Tavily, SerpAPI) gera atrito operacional — cadastro, rotação, approvals. SearxNG self-hosted resolve fechamento de rede sem custo recorrente; DuckDuckGo cobre o caso casual sem nenhuma config.
+</Info>
 
 ---
 
@@ -217,9 +280,9 @@ Resultados:
 |:--------|:----------|:-----------|
 | **Proposito** | Ler conteúdo de uma URL específica | Buscar na web por uma query |
 | **Input** | URL | Query de busca |
-| **Output** | Texto limpo da página | Lista de resultados (titulo + URL + snippet) |
+| **Output** | Texto limpo da página | Lista de resultados (título + URL + snippet) |
 | **Quando usar** | Você sabe a URL exata | Você precisa encontrar informações |
-| **Motor** | HTTP GET + HTML parser | DuckDuckGo API |
+| **Motor** | HTTP GET + HTML parser | DuckDuckGo (scraping HTML) + SearxNG (JSON API) |
 
 ---
 
