@@ -479,8 +479,9 @@ The AIOps pipeline will automatically use resource-specific remediation actions 
 | **ConfigMap** | `<name>` | Environment variables (provider, model, etc.) |
 | **ConfigMap** | `<name>-watch-config` | Multi-target YAML (if `targets` defined) |
 | **ServiceAccount** | `<name>` | Identity for RBAC |
-| **Role/ClusterRole** | `<name>-watcher` | K8s watcher permissions |
-| **RoleBinding/CRB** | `<name>-watcher` | SA to Role binding |
+| **Role** | `<name>-watcher` | K8s watcher permissions (single-namespace) |
+| **RoleBinding** | `<name>-watcher` | SA to Role binding (single-namespace) |
+| **ClusterRoleBinding** | `<namespace>-<name>-watcher` | SA binding to the shared ClusterRole (multi-namespace) |
 | **PVC** | `<name>-sessions` | Persistence (if enabled) |
 
 ### gRPC Load Balancing
@@ -494,9 +495,13 @@ gRPC uses persistent HTTP/2 connections that pin to a single pod via kube-proxy,
 
 ### Automatic RBAC
 
-- **Same namespace** (all targets in the same namespace as the Instance): Creates `Role` + `RoleBinding`
-- **Cross-namespace** (targets in a different namespace than the Instance, or in multiple namespaces): Creates `ClusterRole` + `ClusterRoleBinding` automatically
-- On CR deletion, cluster-scoped resources are cleaned up by the finalizer
+- **Same namespace** (all targets in the same namespace as the Instance): Creates per-Instance `Role` + `RoleBinding`
+- **Cross-namespace** (targets in a different namespace than the Instance, or in multiple namespaces): Creates only a per-Instance `ClusterRoleBinding` pointing at the shared `chatcli-watcher` ClusterRole (pre-provisioned by the Helm chart / kustomize overlay)
+- On CR deletion, the finalizer removes the `ClusterRoleBinding`; the shared ClusterRole stays (owned by the release)
+
+<Note>
+As of v1.105.1, the operator **no longer creates `ClusterRole` resources at runtime** (H5 hardening). Shared ClusterRoles — `chatcli-watcher` for the watcher and `chatcli-role-{viewer,operator,admin,superadmin}` for platform roles — are installed by the operator Helm chart. The operator's ServiceAccount carries the `bind` verb restricted to those exact names via `resourceNames`, preventing privilege escalation even if the operator is compromised.
+</Note>
 
 ### Auto-Rollout on Configuration Changes
 
@@ -927,8 +932,35 @@ flowchart TD
 | Type | Description | Parameters |
 |------|-------------|-----------|
 | `ApplyManifest` | Applies JSON manifest from a ConfigMap | `configmap`, `key` |
-| `ExecDiagnostic` | Executes whitelisted diagnostic command in pod | `command` (e.g., `df -h`, `ps aux`) |
+| `ExecDiagnostic` | Executes a command from a read-only allowlist inside a pod | `command` (exact string — see [allowlist](#execdiagnostic-allowlist)) |
 | `Custom` | Custom action (blocked by safety checks) | -- |
+
+#### ExecDiagnostic Allowlist
+
+`ExecDiagnostic` does an exact-string match against a short read-only command allowlist. Any variation (different flags, alternate host, etc.) is rejected with `command "..." not in approved diagnostic commands whitelist`.
+
+**Default approved commands (~30):**
+
+| Category | Commands |
+|----------|----------|
+| **Process / shell** | `env`, `whoami`, `id`, `uname -a`, `ps aux`, `ps -ef` |
+| **Filesystem / resources** | `df -h`, `free -m`, `free -h`, `mount`, `uptime` |
+| **Network (read-only)** | `netstat -tlnp`, `netstat -an`, `ss -tlnp`, `ss -an`, `ip addr`, `ip route`, `ifconfig` |
+| **DNS / resolver** | `cat /etc/hosts`, `cat /etc/resolv.conf`, `nslookup kubernetes.default.svc.cluster.local` |
+| **Local health probes** | `curl -s localhost{,:8080,:9090}/{health,healthz,ready,readyz,metrics,-/ready}` |
+
+Extend via the `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` env var (comma-separated, read once at startup):
+
+```yaml
+spec:
+  extraEnv:
+    - name: CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS
+      value: "dig +short kubernetes.default, iptables -L"
+```
+
+<Warning>
+Each entry is matched exactly. `nslookup <other-host>` will not work — it is rejected. If you need a specific host, add the full string to the env var.
+</Warning>
 
 **StatefulSet:**
 
@@ -1907,6 +1939,7 @@ Before sending application logs to the LLM for analysis, the Operator removes **
 - **TLS 1.3** required on all ChatCLI server connections
 - **ClusterRoles** with least privilege (read-only by default)
 - **NetworkPolicy** configurable to restrict network traffic to the Operator namespace
+- **H5 hardening — no runtime RBAC escalation**: the operator never creates or mutates `ClusterRole`/`ClusterRoleBinding` at runtime. Shared ClusterRoles (`chatcli-watcher`, `chatcli-role-*`) are pre-provisioned by the Helm chart, and the operator's SA holds the `bind` verb restricted to those exact names via `resourceNames`. A compromised operator cannot reference a more-privileged ClusterRole from a new `ClusterRoleBinding`.
 
 ### Audit
 
