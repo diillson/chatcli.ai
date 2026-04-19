@@ -515,6 +515,36 @@ O gRPC usa conexões HTTP/2 persistentes que fixam em um único pod via kube-pro
 A partir da v1.105.2, o operator **não cria mais `ClusterRole` em runtime** (hardening H5). As ClusterRoles compartilhadas — `chatcli-watcher` para o watcher e `chatcli-role-{viewer,operator,admin,superadmin}` para as platform roles — são instaladas pelo Helm chart do operator. O ServiceAccount do operator tem o verb `bind` restrito a esses nomes específicos via `resourceNames`, impedindo escalonamento de privilégio mesmo em caso de comprometimento.
 </Note>
 
+<Note>
+**Upgrade a partir de v1.105.0**: clusters com Instances multi-namespace pré-existentes tinham um `ClusterRoleBinding` apontando para uma ClusterRole por-Instance (formato antigo). Como `roleRef` é imutável no Kubernetes, um `helm upgrade` direto travava o reconcile com `cannot change roleRef`. A partir de v1.105.3, o operator detecta o `roleRef` divergente no início de `reconcileClusterRBAC`, deleta o CRB obsoleto e recria apontando para `chatcli-watcher` — migração transparente, sem intervenção manual.
+</Note>
+
+### Imagem do Servidor e Auto-Resolução
+
+A tag da imagem do servidor (`spec.image.tag`) segue três níveis de prioridade:
+
+1. **Pin explícito** em `spec.image.tag` — honrado literalmente (GitOps-friendly).
+2. **Omitido** — o operator resolve a partir do env var `CHATCLI_OPERATOR_APP_VERSION`, que o Helm chart injeta automaticamente a partir de `.Chart.AppVersion`. Efeito: `helm upgrade chatcli-operator` rola o servidor de todas as Instances que optaram por esse modo, sem patch manual.
+3. **Fallback** — `latest` quando nenhum dos dois está presente (ex.: `make deploy` sem Helm).
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-prod
+spec:
+  image:
+    repository: ghcr.io/diillson/chatcli
+    # tag omitido → herda appVersion do chart (recomendado p/ ambientes que atualizam via Helm)
+  provider: CLAUDEAI
+  model: claude-sonnet-4-6
+  replicas: 2
+```
+
+<Tip>
+Para ambientes que querem versionamento imutável, continue pinando `spec.image.tag` e gerencie o upgrade manual. Para ambientes que querem "helm upgrade = upgrade completo", omita a tag.
+</Tip>
+
 ### Auto-Rollout em Mudanças de Configuração
 
 O operator monitora mudanças em ConfigMaps e Secrets referenciados pelo Instance e dispara rolling updates automaticamente via hash annotations no PodTemplate:
@@ -949,30 +979,40 @@ flowchart TD
 
 #### ExecDiagnostic Allowlist
 
-A ação `ExecDiagnostic` faz match exato de string contra um allowlist curto de comandos read-only. Qualquer variação (flags diferentes, host alternativo, etc.) é rejeitada com `command "..." not in approved diagnostic commands whitelist`.
+A ação `ExecDiagnostic` faz match exato de string contra um allowlist de comandos read-only. Qualquer variação (flags diferentes, host alternativo, etc.) é rejeitada com `command "..." not in approved diagnostic commands whitelist`.
 
-**Comandos aprovados por padrão (~30):**
+**Comandos aprovados por padrão (~90):**
 
 | Categoria | Comandos |
 |-----------|----------|
-| **Processo / shell** | `env`, `whoami`, `id`, `uname -a`, `ps aux`, `ps -ef` |
-| **Filesystem / recursos** | `df -h`, `free -m`, `free -h`, `mount`, `uptime` |
-| **Rede (read-only)** | `netstat -tlnp`, `netstat -an`, `ss -tlnp`, `ss -an`, `ip addr`, `ip route`, `ifconfig` |
-| **DNS / resolver** | `cat /etc/hosts`, `cat /etc/resolv.conf`, `nslookup kubernetes.default.svc.cluster.local` |
-| **Health probes locais** | `curl -s localhost{,:8080,:9090}/{health,healthz,ready,readyz,metrics,-/ready}` |
+| **Processo / shell** | `env`, `whoami`, `id`, `hostname`, `pwd`, `uname -a`, `uname -r`, `ps aux`, `ps -ef`, `top -b -n1` |
+| **Filesystem / recursos** | `df -h`, `df -i`, `free -m`, `free -h`, `mount`, `uptime`, `ls -la /`, `ls -la /tmp`, `ls -la /var/log`, `du -sh /tmp`, `du -sh /var/log` |
+| **Cgroups v2** (pod moderno) | `cat /sys/fs/cgroup/memory.max`, `memory.current`, `memory.events`, `memory.stat`, `cpu.max`, `cpu.stat` |
+| **Cgroups v1** (pod legado) | `cat /sys/fs/cgroup/memory/memory.{limit_in_bytes,usage_in_bytes,oom_control,stat}`, `cat /sys/fs/cgroup/cpu/cpu.{cfs_quota_us,cfs_period_us,stat}` |
+| **/proc introspection** | `cat /proc/1/{cgroup,status,limits,cmdline,environ}`, `cat /proc/{meminfo,cpuinfo,loadavg,version}`, `cat /proc/net/{tcp,udp,sockstat}` |
+| **Rede (read-only)** | `netstat -tlnp`/`-an`/`-rn`, `ss -tlnp`/`-an`/`-s`, `ip addr`, `ip -s link`, `ip route`, `ip -6 route`, `ip neigh`, `ifconfig`, `arp -a` |
+| **DNS / resolver** | `cat /etc/{hosts,resolv.conf,nsswitch.conf}`, `nslookup/getent/dig/host kubernetes.default.svc.cluster.local`, `nslookup kube-dns.kube-system.svc.cluster.local` |
+| **Health / métricas / pprof** | `curl -s localhost{,:8080}/{health,healthz,ready,readyz,live,livez}`, `curl -s localhost:{8080,8081,9090,9091}/metrics`, `curl -s localhost:9090/-/{ready,healthy}`, `curl -s localhost:6060/debug/pprof/{,goroutine,heap}?debug=1` |
+| **Envoy / Istio sidecar** | `curl -s localhost:15000/ready`, `curl -s localhost:{15020,15021}/healthz/ready` |
+| **wget fallback (Alpine)** | `wget -qO- http://localhost{,:8080}/{health,healthz,metrics}` |
+| **Reachability TCP** | `nc -zv kubernetes.default.svc.cluster.local 443`, `nc -zv kube-dns.kube-system.svc.cluster.local 53` |
 
-Extender via env var `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` (comma-separated, sobrescreve o cache na inicialização):
+Extender via env var `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` (comma-separated, lido uma vez na inicialização):
 
 ```yaml
 spec:
   extraEnv:
     - name: CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS
-      value: "dig +short kubernetes.default, iptables -L"
+      value: "dig +short redis.default.svc.cluster.local, nc -zv redis.default.svc.cluster.local 6379"
 ```
 
 <Warning>
 Cada entrada é matching exato. `nslookup <outro-host>` não funciona — é rejeitado. Se precisar de um host específico, adicione a string completa ao env var.
 </Warning>
+
+<Tip>
+A IA recebe esse allowlist no prompt de remediação (`server/handler_analysis.go`) e é instruída a escolher o comando certo por sintoma: `memory.events` para OOM, `cpu.stat` para throttling, `getent/dig` para DNS, pprof para apps Go travadas, `nc -zv` para dependência externa.
+</Tip>
 
 **StatefulSet:**
 

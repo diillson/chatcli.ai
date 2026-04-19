@@ -503,6 +503,36 @@ gRPC uses persistent HTTP/2 connections that pin to a single pod via kube-proxy,
 As of v1.105.2, the operator **no longer creates `ClusterRole` resources at runtime** (H5 hardening). Shared ClusterRoles — `chatcli-watcher` for the watcher and `chatcli-role-{viewer,operator,admin,superadmin}` for platform roles — are installed by the operator Helm chart. The operator's ServiceAccount carries the `bind` verb restricted to those exact names via `resourceNames`, preventing privilege escalation even if the operator is compromised.
 </Note>
 
+<Note>
+**Upgrading from v1.105.0**: clusters with pre-existing multi-namespace Instances had a `ClusterRoleBinding` pointing to a per-Instance ClusterRole (legacy shape). Because `roleRef` is immutable in Kubernetes, a direct `helm upgrade` used to freeze the reconcile with `cannot change roleRef`. As of v1.105.3, the operator detects the divergent `roleRef` at the top of `reconcileClusterRBAC`, deletes the stale binding, and recreates it pointing at `chatcli-watcher` — transparent migration, no manual intervention.
+</Note>
+
+### Server Image and Auto-Resolution
+
+The server image tag (`spec.image.tag`) follows a three-step priority:
+
+1. **Explicit pin** in `spec.image.tag` — honored verbatim (GitOps-friendly).
+2. **Omitted** — the operator resolves it from the `CHATCLI_OPERATOR_APP_VERSION` env var, which the Helm chart injects automatically from `.Chart.AppVersion`. Effect: `helm upgrade chatcli-operator` rolls the server of every Instance that opted into auto-resolution, with no per-Instance patch.
+3. **Fallback** — `latest` when neither is present (e.g., `make deploy` without Helm).
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-prod
+spec:
+  image:
+    repository: ghcr.io/diillson/chatcli
+    # tag omitted → inherits chart appVersion (recommended for Helm-upgrade environments)
+  provider: CLAUDEAI
+  model: claude-sonnet-4-6
+  replicas: 2
+```
+
+<Tip>
+For environments that want immutable versioning, keep `spec.image.tag` pinned and manage upgrades manually. For environments that want "helm upgrade = full upgrade," omit the tag.
+</Tip>
+
 ### Auto-Rollout on Configuration Changes
 
 The operator monitors changes in ConfigMaps and Secrets referenced by the Instance and triggers rolling updates automatically via hash annotations on the PodTemplate:
@@ -937,17 +967,23 @@ flowchart TD
 
 #### ExecDiagnostic Allowlist
 
-`ExecDiagnostic` does an exact-string match against a short read-only command allowlist. Any variation (different flags, alternate host, etc.) is rejected with `command "..." not in approved diagnostic commands whitelist`.
+`ExecDiagnostic` does an exact-string match against a read-only command allowlist. Any variation (different flags, alternate host, etc.) is rejected with `command "..." not in approved diagnostic commands whitelist`.
 
-**Default approved commands (~30):**
+**Default approved commands (~90):**
 
 | Category | Commands |
 |----------|----------|
-| **Process / shell** | `env`, `whoami`, `id`, `uname -a`, `ps aux`, `ps -ef` |
-| **Filesystem / resources** | `df -h`, `free -m`, `free -h`, `mount`, `uptime` |
-| **Network (read-only)** | `netstat -tlnp`, `netstat -an`, `ss -tlnp`, `ss -an`, `ip addr`, `ip route`, `ifconfig` |
-| **DNS / resolver** | `cat /etc/hosts`, `cat /etc/resolv.conf`, `nslookup kubernetes.default.svc.cluster.local` |
-| **Local health probes** | `curl -s localhost{,:8080,:9090}/{health,healthz,ready,readyz,metrics,-/ready}` |
+| **Process / shell** | `env`, `whoami`, `id`, `hostname`, `pwd`, `uname -a`, `uname -r`, `ps aux`, `ps -ef`, `top -b -n1` |
+| **Filesystem / resources** | `df -h`, `df -i`, `free -m`, `free -h`, `mount`, `uptime`, `ls -la /`, `ls -la /tmp`, `ls -la /var/log`, `du -sh /tmp`, `du -sh /var/log` |
+| **Cgroups v2** (modern pod) | `cat /sys/fs/cgroup/memory.max`, `memory.current`, `memory.events`, `memory.stat`, `cpu.max`, `cpu.stat` |
+| **Cgroups v1** (legacy pod) | `cat /sys/fs/cgroup/memory/memory.{limit_in_bytes,usage_in_bytes,oom_control,stat}`, `cat /sys/fs/cgroup/cpu/cpu.{cfs_quota_us,cfs_period_us,stat}` |
+| **/proc introspection** | `cat /proc/1/{cgroup,status,limits,cmdline,environ}`, `cat /proc/{meminfo,cpuinfo,loadavg,version}`, `cat /proc/net/{tcp,udp,sockstat}` |
+| **Network (read-only)** | `netstat -tlnp`/`-an`/`-rn`, `ss -tlnp`/`-an`/`-s`, `ip addr`, `ip -s link`, `ip route`, `ip -6 route`, `ip neigh`, `ifconfig`, `arp -a` |
+| **DNS / resolver** | `cat /etc/{hosts,resolv.conf,nsswitch.conf}`, `nslookup/getent/dig/host kubernetes.default.svc.cluster.local`, `nslookup kube-dns.kube-system.svc.cluster.local` |
+| **Health / metrics / pprof** | `curl -s localhost{,:8080}/{health,healthz,ready,readyz,live,livez}`, `curl -s localhost:{8080,8081,9090,9091}/metrics`, `curl -s localhost:9090/-/{ready,healthy}`, `curl -s localhost:6060/debug/pprof/{,goroutine,heap}?debug=1` |
+| **Envoy / Istio sidecar** | `curl -s localhost:15000/ready`, `curl -s localhost:{15020,15021}/healthz/ready` |
+| **wget fallback (Alpine)** | `wget -qO- http://localhost{,:8080}/{health,healthz,metrics}` |
+| **TCP reachability** | `nc -zv kubernetes.default.svc.cluster.local 443`, `nc -zv kube-dns.kube-system.svc.cluster.local 53` |
 
 Extend via the `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` env var (comma-separated, read once at startup):
 
@@ -955,12 +991,16 @@ Extend via the `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` env var (comma-separated, r
 spec:
   extraEnv:
     - name: CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS
-      value: "dig +short kubernetes.default, iptables -L"
+      value: "dig +short redis.default.svc.cluster.local, nc -zv redis.default.svc.cluster.local 6379"
 ```
 
 <Warning>
 Each entry is matched exactly. `nslookup <other-host>` will not work — it is rejected. If you need a specific host, add the full string to the env var.
 </Warning>
+
+<Tip>
+The AI is given this allowlist in the remediation prompt (`server/handler_analysis.go`) and is instructed to pick the right command per symptom: `memory.events` for OOM, `cpu.stat` for CPU throttling, `getent/dig` for DNS, pprof for stuck Go apps, `nc -zv` for external dependency reachability.
+</Tip>
 
 **StatefulSet:**
 
