@@ -1,0 +1,270 @@
+---
+title: "#5 Self-Refine — Critique and Rewrite"
+sidebarTitle: "Self-Refine"
+description: "RefinerAgent receives the previous worker's draft, emits structured critique in <critique> and rewrite in <revised>. Multi-pass with EpsilonChars convergence so we don't iterate on already-good outputs."
+icon: "wand-magic-sparkles"
+---
+
+**Self-Refine** turns raw worker output into polished versions via a deliberate critique → rewrite cycle. The `RefinerAgent` is a pure-reasoning worker (zero tool access) that operates on text only, and can be invoked directly by the orchestrator or automatically by `RefineHook` as post-processing.
+
+<Info>Self-Refine is **opt-in**. With `CHATCLI_QUALITY_REFINE_ENABLED=false` (default), the `RefineHook` is not added to the pipeline and zero overhead is introduced.</Info>
+
+---
+
+## RefinerAgent protocol
+
+The model receives TASK + DRAFT and emits two XML-ish blocks:
+
+```text
+<critique>
+- Bullet 1: identified logical gap
+- Bullet 2: vagueness or lack of examples
+- Bullet 3: unsupported claim
+</critique>
+
+<revised>
+…rewritten version addressing each critique bullet,
+ready to ship to the user…
+</revised>
+```
+
+**System prompt rules:**
+- Output ONLY the two blocks — nothing before, nothing after.
+- If draft is already excellent, `<revised>` repeats verbatim and `<critique>` says "no material issues".
+- **Never invents new requirements** beyond the TASK.
+- Keeps the draft's format (code → code, prose → prose).
+
+<Tip>The parser is tolerant: if the model violates the protocol, `RefinerAgent.Execute` returns the full response as output — Reflexion picks up the violation as a low-quality signal.</Tip>
+
+---
+
+## RefineHook flow
+
+<Steps>
+  <Step title="Worker finishes">
+    Any agent (CoderAgent, FileAgent, ...) produces `result.Output`.
+  </Step>
+  <Step title="RefineHook.PostRun is invoked">
+    ```go
+    if result.Error != nil { return }  // errors go to Reflexion, not Refine
+    if !cfg.Refine.Enabled { return }
+    if !AppliesToAgent(agent, cfg.ExcludeAgents) { return }
+    if len(draft) < cfg.MinDraftBytes { return }  // skip short outputs
+    ```
+  </Step>
+  <Step title="Multi-pass loop">
+    For each pass up to `MaxPasses`:
+    - Dispatch `workers.AgentCall{Agent: refiner, Task: RefineDirective + "Task: ...\n\nDraft: ..."}`
+    - Receives `res.Output` with contents of `<revised>`
+    - If `convergedRefine(currentDraft, res.Output, EpsilonChars)` → break
+  </Step>
+  <Step title="Replace result.Output">
+    `result.Output = currentDraft` (only if it changed).
+  </Step>
+</Steps>
+
+---
+
+## Convergence
+
+`convergedRefine` is a cheap check that detects when two consecutive revisions are "practically identical":
+
+```go
+func convergedRefine(a, b string, epsilon int) bool {
+    if abs(len(a) - len(b)) > epsilon { return false }
+    mismatches := 0
+    for i := 0; i < min(len(a), len(b)); i++ {
+        if a[i] != b[i] {
+            mismatches++
+            if mismatches > epsilon { return false }
+        }
+    }
+    return true
+}
+```
+
+With `EpsilonChars=50` (default), the loop stops when two passes differ by less than 50 chars — clear sign of stabilization. This **avoids spending tokens** iterating on an output the model already considers ready.
+
+---
+
+## Exclude lists (anti-recursion and mechanical agents)
+
+Default `ExcludeAgents`:
+
+```go
+ExcludeAgents: []string{"formatter", "deps", "refiner", "verifier"}
+```
+
+| Agent | Reason |
+|---|---|
+| **formatter** | Mechanical output (formatted file), refine doesn't add value |
+| **deps** | Output is deterministic interpretation of `go list`, `npm ls`, etc. |
+| **refiner** | **Anti-recursion**: refining the refiner's output creates an infinite loop |
+| **verifier** | Same reason — verifier already delivers polished output |
+
+Add more via env:
+
+```bash
+export CHATCLI_QUALITY_REFINE_EXCLUDE="formatter,deps,refiner,verifier,shell,git"
+```
+
+---
+
+## `/refine` — session toggle
+
+Instead of editing env vars and restarting, use the slash:
+
+<CodeGroup>
+```bash Turn on for the session
+/refine on
+# → self-refine ON for this session
+```
+
+```bash Turn off
+/refine off
+```
+
+```bash Back to /config quality default
+/refine auto
+```
+
+```bash Just for the next turn
+/refine once
+# (today identical to "on"; flag stays on until /refine off or end of session)
+```
+
+```bash Show current state
+/refine
+# → self-refine: ON (session override active)
+```
+</CodeGroup>
+
+The session override lives in `cli.qualityOverrides.Refine` as `*bool`:
+- `nil` → defer to `/config quality`
+- `&true` → force on
+- `&false` → force off
+
+It's applied on top of env when `AgentMode.Run()` builds its `qualityConfig`.
+
+---
+
+## Environment variables
+
+| Env var | Default | What it does |
+|---|---|---|
+| `CHATCLI_QUALITY_REFINE_ENABLED` | `false` | Master switch |
+| `CHATCLI_QUALITY_REFINE_MAX_PASSES` | `1` | Hard cap on passes (recommend 1-2) |
+| `CHATCLI_QUALITY_REFINE_MIN_BYTES` | `200` | Don't refine outputs smaller than this |
+| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | Convergence threshold in chars |
+| `CHATCLI_QUALITY_REFINE_EXCLUDE` | `formatter,deps,refiner,verifier` | CSV of agents that are NOT refined |
+
+### Refiner agent override
+
+`RefinerAgent` has defaults `model=""` and `effort="medium"`. Override:
+
+```bash
+# Use Haiku for cheap refine
+export CHATCLI_AGENT_REFINER_MODEL="claude-haiku-4-5"
+export CHATCLI_AGENT_REFINER_EFFORT="low"
+
+# Or gpt-5 with high effort for max quality
+export CHATCLI_AGENT_REFINER_MODEL="gpt-5"
+export CHATCLI_AGENT_REFINER_EFFORT="high"
+```
+
+---
+
+## Example: refine on documentation response
+
+<Tabs>
+  <Tab title="Draft (CoderAgent output)">
+    ```markdown
+    # HTTP Client
+
+    The HTTP client is used for making requests. You can use it with various providers.
+
+    ## Usage
+
+    Just call the Do method with a request and you get a response back.
+    ```
+    **Quality judgment:** vague, no example, dismissive "just".
+  </Tab>
+  <Tab title="<critique>">
+    ```
+    - "used for making requests" — tautologic; remove.
+    - No code example; docs readers need a snippet.
+    - "various providers" — list which.
+    - "Just call" minimizes real complexity (error handling, context, timeouts).
+    ```
+  </Tab>
+  <Tab title="<revised>">
+    ```markdown
+    # HTTP Client
+
+    The HTTP client wraps `net/http.Client` with chatcli-specific
+    timeouts, retry policy, and provider-aware header injection. It is
+    used internally by every LLM provider (OpenAI, Anthropic, Voyage)
+    and by the MCP transport.
+
+    ## Usage
+
+    ```go
+    resp, err := httpclient.Do(ctx, req)
+    if err != nil {
+        return fmt.Errorf("request failed: %w", err)
+    }
+    defer resp.Body.Close()
+    ```
+
+    The `ctx` parameter is mandatory — requests without a cancellable
+    context will be rejected with `ErrContextRequired`.
+    ```
+    **Quality:** concrete, code-ready example, explicit `ctx` contract.
+  </Tab>
+</Tabs>
+
+---
+
+## Direct invocation by the orchestrator
+
+Beyond the automatic hook, the orchestrator can call the refiner via `<agent_call>`:
+
+```xml
+<agent_call agent="refiner" task="Polish this draft doc section: [paste draft here]" />
+```
+
+Useful when:
+- You want to refine a specific output without enabling the global hook.
+- The task **itself** is "improve this text".
+- Complex chains: coder writes → reviewer analyzes → refiner polishes the analysis before delivery.
+
+---
+
+## Cost and latency
+
+| Config | Extra LLM calls per turn | Typical latency |
+|---|---|---|
+| `MaxPasses=1` (default) | +1 | 1-3s with Haiku, 3-8s with Sonnet |
+| `MaxPasses=2` | +1 to +2 (convergence may stop at 1) | up to 2x |
+| `MaxPasses=3+` | Rarely converges → expensive | Avoid |
+
+<Warning>Refine shines in **writing** tasks: documentation, summaries, reports. Less useful in tool-heavy workflows (shell, git, file) because outputs are already mechanical.</Warning>
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="#6 CoVe" icon="check-double" href="/en/features/quality/cove">
+    Chain-of-Verification complements refine with factual checking.
+  </Card>
+  <Card title="#3 Reflexion" icon="lightbulb" href="/en/features/quality/reflexion">
+    If refine flags low-quality across multiple turns, Reflexion persists the lesson.
+  </Card>
+  <Card title="ReviewerAgent" icon="magnifying-glass-chart" href="/en/features/customizable-agents">
+    Pre-pipeline agent that does code review. Refiner is complementary: one analyzes, the other rewrites.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/en/features/quality/configuration">
+    All CHATCLI_QUALITY_REFINE_* in one place.
+  </Card>
+</CardGroup>

@@ -1,0 +1,322 @@
+---
+title: "#7 Cross-Provider Reasoning Backbone"
+sidebarTitle: "Reasoning Backbone"
+description: "Single abstraction that maps SkillEffort to thinking_budget (Anthropic) and reasoning_effort (OpenAI o-series). Auto-attach for AutoAgents, /thinking session override, transparent priority resolution."
+icon: "brain-circuit"
+---
+
+The **Reasoning Backbone** unifies how ChatCLI asks "think harder" across different providers. Anthropic exposes **extended thinking** with `thinking_budget` in tokens; OpenAI o-series exposes **reasoning effort** as the `low/medium/high` enum. The pipeline abstracts this into `SkillEffort` and auto-attaches it to `ctx` before each LLM call from reasoning-heavy agents.
+
+<Info>The cross-provider abstraction is **pre-existing** in `llm/client/skill_hints.go`. What the pipeline adds is: **auto-attach policy** (auto for listed agents), **session override** via `/thinking`, and **exposure in /config quality**.</Info>
+
+---
+
+## The existing abstraction (pre-pipeline)
+
+`llm/client/skill_hints.go`:
+
+```go
+type SkillEffort string
+
+const (
+    EffortUnset  SkillEffort = ""
+    EffortLow    SkillEffort = "low"
+    EffortMedium SkillEffort = "medium"
+    EffortHigh   SkillEffort = "high"
+    EffortMax    SkillEffort = "max"
+)
+
+// Maps to Anthropic thinking budget_tokens
+func ThinkingBudgetForEffort(e SkillEffort) int {
+    switch e {
+    case EffortMedium: return 4096
+    case EffortHigh:   return 16384
+    case EffortMax:    return 32768
+    }
+    return 0 // unset/low = no thinking
+}
+
+// Maps to OpenAI reasoning.effort
+func ReasoningEffortForOpenAI(e SkillEffort) string {
+    switch e {
+    case EffortLow:               return "low"
+    case EffortMedium:            return "medium"
+    case EffortHigh, EffortMax:   return "high"
+    }
+    return ""
+}
+```
+
+Providers read from ctx via `client.EffortFromContext(ctx)` inside their `SendPrompt`, translate to the native field, and send.
+
+---
+
+## Auto-attach: what the pipeline adds
+
+`applyAutoReasoning(ctx, cfg ReasoningConfig, agent WorkerAgent) context.Context`:
+
+```go
+// cli/agent/quality/reasoning.go
+func applyAutoReasoning(ctx, cfg, agent) context.Context {
+    if cfg.Mode == "off" { return ctx }
+    if client.EffortFromContext(ctx) != client.EffortUnset {
+        return ctx  // respects existing hint (skill frontmatter, agent.Effort)
+    }
+    if cfg.Mode != "on" && !inAutoAgents(agent.Type(), cfg.AutoAgents) {
+        return ctx  // auto: only for listed agents
+    }
+    return client.WithEffortHint(ctx, EffortForBudget(cfg.Budget))
+}
+```
+
+**EffortForBudget** translates `cfg.Budget` (tokens) to the nearest SkillEffort tier:
+
+| Budget (tokens) | Resulting tier |
+|---|---|
+| `≥ 16384` | `EffortMax` |
+| `≥ 8192` | `EffortHigh` |
+| `≥ 4096` | `EffortMedium` |
+| `< 4096` or `0` | `EffortHigh` (sane default) |
+
+<Tip>Default `CHATCLI_QUALITY_REASONING_BUDGET=8000` → `EffortHigh` (8000 thinking tokens on Claude, `reasoning.effort=high` on OpenAI).</Tip>
+
+---
+
+## Three modes
+
+<Tabs>
+  <Tab title="auto (default)">
+    ```bash
+    CHATCLI_QUALITY_REASONING_MODE=auto
+    CHATCLI_QUALITY_REASONING_AUTO_AGENTS=planner,refiner,verifier,reflexion
+    ```
+
+    Effort hint is attached **only** for agents in `AutoAgents`. Mechanical agents (formatter, shell) don't pay for pricier thinking.
+  </Tab>
+  <Tab title="on">
+    ```bash
+    CHATCLI_QUALITY_REASONING_MODE=on
+    ```
+
+    Effort hint attached for **every agent** (that doesn't already have its own hint). More expensive; use when latency is secondary to quality.
+  </Tab>
+  <Tab title="off">
+    ```bash
+    CHATCLI_QUALITY_REASONING_MODE=off
+    ```
+
+    Pipeline **never** auto-attaches. Skill frontmatter (`effort: high`) and `agent.Effort()` still work — only the automatic layer is off.
+  </Tab>
+</Tabs>
+
+---
+
+## Resolution priority
+
+For an LLM call inside a worker, the effort hint resolves in this order (later wins):
+
+<Steps>
+  <Step title="Skill frontmatter">
+    If the turn activated a skill with `effort: high`, that hint is already on ctx before the dispatcher.
+  </Step>
+  <Step title="Agent default">
+    `PlannerAgent` has embedded `effort="high"`; dispatcher attaches via `WithEffortHint`.
+  </Step>
+  <Step title="CHATCLI_QUALITY_REASONING_*">
+    `applyAutoReasoning` only attaches if (1) mode isn't `off` and (2) ctx **doesn't already have** an effort hint.
+  </Step>
+  <Step title="/thinking session override">
+    In chat (cli_llm.go) and the orchestrator turn (agent_mode.go), `cli.applyThinkingOverride(skillEffort)` wins over everything above for that turn.
+  </Step>
+</Steps>
+
+This means `/thinking off` can **force** zero thinking even if the agent has `high` default. Useful for turns where speed matters more than quality.
+
+---
+
+## `/thinking` — the slash
+
+<CodeGroup>
+```bash Turn on high for next turn
+/thinking on
+# alias for /thinking high
+```
+
+```bash Turn off for next turn
+/thinking off
+```
+
+```bash Exact tier
+/thinking low
+/thinking medium
+/thinking high
+/thinking max
+```
+
+```bash By token budget
+/thinking budget=12000
+# → maps to the closest tier (here: EffortHigh)
+```
+
+```bash Back to automatic
+/thinking auto
+# clears override; skill/agent/quality.reasoning decides
+```
+
+```bash Show current state
+/thinking
+# → thinking: auto (no override active)
+# → thinking: HIGH (override active)
+# → thinking: explicitly off (override active)
+```
+</CodeGroup>
+
+The override lives in `cli.thinkingOverride`:
+
+```go
+type thinkingOverrideState struct {
+    set    bool                 // nil vs set
+    effort client.SkillEffort   // EffortUnset when set=true means "off"
+}
+```
+
+---
+
+## Providers that support it
+
+| Provider | Native field | Notes |
+|---|---|---|
+| **Anthropic Claude** | `thinking: {type: enabled, budget_tokens: N}` | Beta header `interleaved-thinking-2025-05-14` |
+| **OpenAI o1 / o3 / o4** | `reasoning: {effort: "low\|medium\|high"}` | Via `/v1/responses` endpoint |
+| **Anthropic via Bedrock** | Same shape, but via AWS API | Supports thinking |
+| **Other providers** | Silently ignore | Fall-through without error |
+
+<Tip>`CHATCLI_QUALITY_REASONING_MODE=on` with a provider that doesn't support it is a **no-op** — ctx has the hint, provider doesn't use it, zero failures. You only pay for real capability.</Tip>
+
+---
+
+## Environment variables
+
+| Env var | Default | Values | Effect |
+|---|---|---|---|
+| `CHATCLI_QUALITY_REASONING_MODE` | `auto` | `off\|auto\|on` | Policy |
+| `CHATCLI_QUALITY_REASONING_BUDGET` | `8000` | int | Thinking tokens (Anthropic); mapped to tier on OpenAI |
+| `CHATCLI_QUALITY_REASONING_AUTO_AGENTS` | `planner,refiner,verifier,reflexion` | CSV | List for mode=auto |
+
+### Per-agent override
+
+Each agent also has its own default via `BuiltinAgentMeta`:
+
+```bash
+# Force Planner to max thinking
+export CHATCLI_AGENT_PLANNER_EFFORT=max
+
+# Lower Formatter (it's low by default, but explicit)
+export CHATCLI_AGENT_FORMATTER_EFFORT=low
+```
+
+The flow: dispatcher reads `agent.Effort()` → if non-empty, attaches via `WithEffortHint`. This **wins** over `applyAutoReasoning` (see priority step 2).
+
+---
+
+## Interaction with skill effort hints
+
+Skills can declare effort in frontmatter:
+
+```yaml
+---
+name: investigate-crashes
+description: Deep dive into crash logs and bug reproduction
+effort: high
+---
+```
+
+When the skill is activated (auto or via `/skill`), `skillEffortHint` is set and propagated. The order becomes:
+
+```
+skill.effort=high → skillEffortHint=EffortHigh → WithEffortHint(ctx, EffortHigh)
+                                                        │
+                                                        ▼
+                                       dispatcher propagates to workerCtx
+                                                        │
+                                                        ▼
+                                       applyAutoReasoning detects hint already set → skip
+                                                        │
+                                                        ▼
+                                       provider reads EffortHigh → thinking_budget=16384
+```
+
+<Info>Skills and reasoning backbone are **orthogonal and composable**. Skill says "the whole task needs high effort"; quality says "these specific agents always think"; the user can override with `/thinking`.</Info>
+
+---
+
+## Observability
+
+`/config quality` shows the state:
+
+```text
+── Reasoning backbone (#7)
+  CHATCLI_QUALITY_REASONING_MODE      : auto
+  CHATCLI_QUALITY_REASONING_BUDGET    : 8000
+  CHATCLI_QUALITY_REASONING_AUTO_AGENTS: planner, refiner, verifier, reflexion
+```
+
+In worker logs, each LLM call with active effort shows up as:
+
+```json
+{"level":"info","msg":"SendPrompt with thinking","provider":"anthropic","model":"claude-sonnet-4-6","thinking_budget":8000}
+{"level":"info","msg":"SendPrompt with reasoning","provider":"openai","model":"o4-mini","reasoning.effort":"high"}
+```
+
+---
+
+## Cost
+
+<Warning>Thinking tokens are **billed separately** on Anthropic (output-priced). An 8000-token budget adds ~$0.12/call with Sonnet. Reasoning effort on OpenAI also increases output tokens.</Warning>
+
+**Recommended budget strategy:**
+
+| Scenario | Recommendation |
+|---|---|
+| Casual chat | `CHATCLI_QUALITY_REASONING_MODE=off` |
+| Daily dev | `mode=auto`, `budget=8000` (default) |
+| Critical workflows (large refactors, debugging) | `/thinking max` on the specific turn |
+| Batch without user | `mode=on`, `budget=16384` |
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Provider seems not to use thinking">
+    1. Check `/config quality` — confirm `CHATCLI_QUALITY_REASONING_MODE != off`
+    2. Check `CHATCLI_QUALITY_REASONING_AUTO_AGENTS` includes the running agent
+    3. Check provider logs — `thinking_budget` should appear in the request body
+    4. For Anthropic via OAuth: needs beta header `interleaved-thinking-2025-05-14` (already on in `claude_client.go:46`)
+  </Accordion>
+  <Accordion title="/thinking doesn't persist across turns">
+    Correct! `/thinking on` is valid for the **next turn** — the flag stays until cleared with `/thinking auto` or `/thinking off`. Each `/thinking` **replaces** the previous one.
+  </Accordion>
+  <Accordion title="Cost exploded after enabling reasoning">
+    The default budget (8000) is calibrated for Sonnet. For Opus or GPT-5, consider lowering: `CHATCLI_QUALITY_REASONING_BUDGET=4000`. Or use `mode=off` and trigger manually with `/thinking` only when it makes a difference.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Multi-Agent Orchestration" icon="users" href="/en/features/multi-agent-orchestration">
+    How effort hints flow from the dispatcher into parallel workers.
+  </Card>
+  <Card title="Skills and Registry" icon="book-open" href="/en/features/skill-registry">
+    How skills declare `effort:` in frontmatter.
+  </Card>
+  <Card title="OpenAI Responses API" icon="openai" href="https://platform.openai.com/docs/guides/reasoning">
+    Official docs for reasoning.effort.
+  </Card>
+  <Card title="Anthropic Extended Thinking" icon="robot" href="https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking">
+    Official docs for thinking_budget.
+  </Card>
+</CardGroup>

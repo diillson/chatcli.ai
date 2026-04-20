@@ -1,0 +1,215 @@
+---
+title: "#2 Plan-and-Solve / ReWOO"
+sidebarTitle: "Plan-and-Solve"
+description: "PlannerAgent emite um plano JSON estruturado; PlanRunner executa cada passo em ordem topológica resolvendo placeholders #E1 (ReWOO). Dispara automaticamente em tarefas complexas ou manualmente via /plan."
+icon: "list-check"
+---
+
+**Plan-and-Solve** sintetiza um plano estruturado **antes** do orquestrador começar a despachar. **ReWOO** (Reasoning Without Observation) estende: o plano usa placeholders `#E1`, `#E2` que são resolvidos em runtime com os outputs dos passos anteriores. Combinados, evitam o padrão caro de "despachar um agente, esperar, pensar de novo, despachar outro".
+
+<Info>**Quando ativa:** `/plan <task>` força; `CHATCLI_QUALITY_PLAN_FIRST_MODE=always` sempre; `auto` (default) dispara quando `ComplexityScore(task) >= 6`.</Info>
+
+---
+
+## Formato do plano
+
+O `PlannerAgent`, quando recebe a marcação `PlannerStructuredOutputDirective` no início da task, emite JSON estrito:
+
+```json
+{
+  "task_summary": "Add OAuth login with Google",
+  "steps": [
+    {"id": "E1", "agent": "search", "task": "Find existing auth code in cli/auth"},
+    {"id": "E2", "agent": "planner", "task": "Design integration plan based on #E1", "deps": ["E1"]},
+    {"id": "E3", "agent": "coder",   "task": "Implement based on #E2", "deps": ["E2"]},
+    {"id": "E4", "agent": "tester",  "task": "Write tests for #E3", "deps": ["E3"]}
+  ],
+  "parallel_groups": [["E1"], ["E2"], ["E3", "E4"]]
+}
+```
+
+### Placeholders ReWOO
+
+Qualquer passo pode injetar output de passos anteriores via `#E<n>`:
+
+| Sintaxe | Efeito |
+|---|---|
+| `#E1` | Substitui pelo output trimmed completo |
+| `#E1.summary` | Primeira linha não vazia do output |
+| `#E1.head=200` | Primeiros 200 runes com `…` se truncado |
+| `#E1.last=200` | Últimos 200 runes com `…` no início |
+
+<Tip>Use `.head=N` para tarefas grandes (ex: "dado este log #E1.head=500, diagnostique") para bound o contexto que o próximo passo vê.</Tip>
+
+---
+
+## Heurística de complexidade
+
+A função `ComplexityScore(task) → int[0,10]` é calibrada para disparar Plan-First só quando paga. O score blends três sinais:
+
+| Sinal | Cap | O que conta |
+|---|---|---|
+| **Verbos de ação** | 5 | `implement, add, create, fix, refactor, write, test, deploy, build, run, update, …` — bilíngue (en + pt-BR: `implementar, adicionar, criar, corrigir, escrever, …`) |
+| **Artefatos de arquivo** | 3 | Matches em `\b[\w./-]+\.(go\|ts\|py\|md\|yaml\|…)\b` + `Dockerfile\|Makefile\|…` |
+| **Sequenciadores** | 2 | `then, after, finally, e depois, e em seguida, por fim, após, …` |
+
+### Exemplos
+
+<Tabs>
+  <Tab title="Trivial (score 1)">
+    ```text
+    read main.go
+    ```
+    `auto` **não** dispara Plan-First. Orquestrador lida direto.
+  </Tab>
+  <Tab title="Multi-action (score 6+)">
+    ```text
+    update auth.go and add tests/auth_test.go then run go test
+    ```
+    `auto` **dispara** Plan-First. 3 verbos (update, add, run) + 2 arquivos + 1 sequenciador = score 6.
+  </Tab>
+  <Tab title="PT-BR (score 6+)">
+    ```text
+    criar handler em api.go e adicionar testes em api_test.go depois rodar go test
+    ```
+    Idêntico ao anterior — bilíngue por design.
+  </Tab>
+</Tabs>
+
+---
+
+## Fluxo de execução
+
+<Steps>
+  <Step title="Usuário dispara /agent ou /coder">
+    A tarefa vai para `AgentMode.Run()`.
+  </Step>
+  <Step title="runPlanFirstIfApplicable">
+    Checa `cli.pendingPlanFirst` (one-shot) ou `quality.ShouldPlanFirst(cfg, userQuery)`.
+  </Step>
+  <Step title="Planner dispatch">
+    `agentDispatcher.Dispatch([{Agent: planner, Task: PlannerStructuredOutputDirective + userQuery}])`.
+  </Step>
+  <Step title="ParsePlan">
+    Tolerante a markdown code fences e trailing prose. Valida: IDs únicos, deps apontam para passos anteriores, placeholders `#E<n>` apontam para IDs declarados.
+  </Step>
+  <Step title="TopologicalOrder + Execute">
+    Ordem topológica estável (sort lex em ties) garante reprodutibilidade. Cada passo: resolve placeholders → dispatcher.Dispatch → armazena output.
+  </Step>
+  <Step title="Inject report">
+    Dois messages sintéticos vão para `cli.history`:
+    - **assistant**: o JSON do plano (o modelo vê o que foi tentado)
+    - **system**: `FinalReport` determinístico com task/agent/status/output por passo
+  </Step>
+  <Step title="ReAct loop continua">
+    Com o report em history, o orquestrador finaliza sem re-executar os passos já concluídos.
+  </Step>
+</Steps>
+
+---
+
+## Tolerância a falhas
+
+Um passo que falha **não aborta** a run. O comportamento é "continue downstream with substituted error":
+
+```go
+// cli/agent/quality/plan_runner.go:126
+if res.Error != nil {
+    hadErrors = true
+    outputs[id] = fmt.Sprintf("<error: %s>", res.Error.Error())
+    // continua — passos downstream verão a string "<error: …>" substituída em seus placeholders
+}
+```
+
+Isso espelha como o orquestrador já reage a erros per-agent hoje (continua, sumariza, faz o modelo decidir). O flag `HadErrors` é setado para Reflexion decidir se escala.
+
+---
+
+## `/plan` — invocação manual
+
+<CodeGroup>
+```bash Arma o flag one-shot
+/plan
+# → "plan-first armado — seu próximo /agent ou /coder rodará um plano estruturado"
+/agent refatorar auth package para usar OAuth
+# → roda Plan-First mesmo se complexity score < threshold
+```
+
+```bash Inline (arm + run)
+/plan refatorar auth package para usar OAuth
+# → entra direto em agent mode com Plan-First armado
+```
+</CodeGroup>
+
+O flag `cli.pendingPlanFirst` é **consumido** e **cleared** na primeira invocação de `/agent` ou `/coder` subsequente.
+
+---
+
+## Variáveis de ambiente
+
+| Env var | Default | Valores | Efeito |
+|---|---|---|---|
+| `CHATCLI_QUALITY_PLAN_FIRST_MODE` | `auto` | `off\|auto\|always` | Modo de disparo |
+| `CHATCLI_QUALITY_PLAN_FIRST_THRESHOLD` | `6` | 0..10 | Score mínimo para `auto` disparar |
+
+### Override por persona (CHATCLI_AGENT_PLANNER_*)
+
+O `PlannerAgent` respeita os overrides usuais de agent:
+
+```bash
+# Forçar planner a usar Opus com thinking máximo
+export CHATCLI_AGENT_PLANNER_MODEL="claude-opus-4-7"
+export CHATCLI_AGENT_PLANNER_EFFORT="max"
+```
+
+---
+
+## Observabilidade
+
+Cada run emite logs estruturados:
+
+```json
+{"level":"info","msg":"Plan-First triggered","forced":false,"mode":"auto","complexity":7}
+{"level":"info","msg":"plan step dispatching","id":"E1","agent":"search","task":"Find existing..."}
+{"level":"info","msg":"plan step dispatching","id":"E2","agent":"planner","task":"Design based on found auth code"}
+{"level":"warn","msg":"plan step failed","id":"E3","agent":"coder","error":"timeout"}
+```
+
+E imprime no terminal um one-liner amigável:
+
+```text
+  plan-first executed 4 step(s) before handing off to the orchestrator
+```
+
+---
+
+## Quando desligar
+
+<Warning>Plan-First acrescenta **+1 chamada LLM** (o planner) por turn disparado. Em ambientes com budget apertado, `off` ou `threshold=8` economizam.</Warning>
+
+```bash
+# off: nunca dispara, mesmo com /plan
+export CHATCLI_QUALITY_PLAN_FIRST_MODE=off
+
+# threshold alto: só dispara em tarefas muito complexas
+export CHATCLI_QUALITY_PLAN_FIRST_THRESHOLD=9
+```
+
+---
+
+## Leia também
+
+<CardGroup cols={2}>
+  <Card title="#3 Reflexion" icon="lightbulb" href="/features/quality/reflexion">
+    Reflexion consome `HadErrors` do plan runner para gerar lições quando passos falham.
+  </Card>
+  <Card title="Multi-Agent Orchestration" icon="users" href="/features/multi-agent-orchestration">
+    O dispatcher que Plan-Runner reutiliza é o mesmo do orquestrador padrão.
+  </Card>
+  <Card title="PlannerAgent (pré-PR)" icon="person-walking-luggage" href="/features/customizable-agents">
+    O agent existia desde antes do pipeline — esse padrão formaliza como invocá-lo de forma determinística.
+  </Card>
+  <Card title="Configuração completa" icon="sliders" href="/features/quality/configuration">
+    Todos os env vars e slashes num lugar só.
+  </Card>
+</CardGroup>

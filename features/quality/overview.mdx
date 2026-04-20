@@ -1,0 +1,199 @@
+---
+title: "Pipeline de Qualidade do Agente"
+sidebarTitle: "Visão Geral"
+description: "Suite completa dos sete padrões de agente LLM do ChatCLI: ReAct, Plan-and-Solve/ReWOO, Reflexion, RAG+HyDE, Self-Refine, Chain-of-Verification (CoVe) e backbone de reasoning — tudo plugável, observável e configurável."
+icon: "sparkles"
+---
+
+O ChatCLI implementa **sete padrões de agente LLM** trabalhando em conjunto como um pipeline de qualidade que envolve o dispatcher ReAct existente. Cada padrão tem propósito específico, pode ser ligado/desligado por sessão ou `/config`, e compõe com os demais sem regressão de performance no caminho padrão.
+
+<Info>**Premissa de design:** opt-in por padrão. Com `CHATCLI_QUALITY_*` sem configuração, o pipeline roda com zero post-hooks — `Pipeline.Run` degenera em uma chamada direta a `agent.Execute`. Você só paga pelos padrões que ativar.</Info>
+
+---
+
+## Os sete padrões
+
+<CardGroup cols={2}>
+  <Card title="#1 — ReAct" icon="rotate" href="/features/quality/react">
+    Reason → Act → Observe. O loop base que todo worker executa. Já estava presente; agora emite eventos estruturados e auto-atacha effort hints.
+  </Card>
+  <Card title="#2 — Plan-and-Solve / ReWOO" icon="list-check" href="/features/quality/plan-and-solve">
+    `PlannerAgent` emite JSON estruturado; `PlanRunner` executa passos em ordem topológica com placeholders `#E1.head=200`.
+  </Card>
+  <Card title="#3 — Reflexion" icon="lightbulb" href="/features/quality/reflexion">
+    Detecta erro, alucinação ou qualidade baixa; destila uma **Lesson** via LLM e persiste em `memory.Fact` para retrieval futuro via RAG.
+  </Card>
+  <Card title="#4 — RAG + HyDE" icon="database" href="/features/quality/rag-hyde">
+    Hypothesis-based keyword expansion (3a) + busca por cosseno em vetores (3b — Voyage/OpenAI, backend pure-Go).
+  </Card>
+  <Card title="#5 — Self-Refine" icon="wand-magic-sparkles" href="/features/quality/self-refine">
+    `RefinerAgent` crítica o rascunho e reescreve. Multi-pass com convergência por `EpsilonChars`.
+  </Card>
+  <Card title="#6 — Chain-of-Verification" icon="check-double" href="/features/quality/cove">
+    `VerifierAgent` gera perguntas de verificação independentes, responde cada uma e reescreve se houver discrepância.
+  </Card>
+  <Card title="#7 — Reasoning Backbone" icon="brain-circuit" href="/features/quality/reasoning-backbone">
+    Abstração cross-provider: `thinking_budget` na Anthropic, `reasoning_effort` na OpenAI. Auto-attach para agents críticos.
+  </Card>
+  <Card title="Configuração" icon="sliders" href="/features/quality/configuration">
+    Env vars `CHATCLI_QUALITY_*`, `/config quality`, e os cinco slash commands: `/thinking`, `/plan`, `/refine`, `/verify`, `/reflect`.
+  </Card>
+</CardGroup>
+
+---
+
+## Como os padrões se conectam
+
+```text
+                 ┌──────────────────────────────────────┐
+                 │   /agent ou /coder <tarefa>          │
+                 └──────────────────┬───────────────────┘
+                                    │
+  (#4 RAG+HyDE) ────────────────────▼───────────────
+  memory.Retriever expande hints com a hipótese gerada
+  pelo LLM (HyDE-3a) e opcionalmente busca no vector
+  store (HyDE-3b) antes de montar o system prompt.
+                                    │
+  (#2 Plan-and-Solve) ──────────────▼───────────────
+  Quando disparado (auto-score ou /plan), o planner
+  emite um plano JSON, o PlanRunner executa cada
+  passo resolvendo placeholders #E1, e o relatório
+  determinístico é injetado na history.
+                                    │
+                    ┌───────────────▼───────────────┐
+                    │   Loop ReAct (workers)        │
+                    │   (#1, sempre ativo)          │
+                    └───────────────┬───────────────┘
+                                    │
+                    ┌───────────────▼───────────────┐
+                    │   QualityPipeline (por call)  │
+                    │   - Pre:  applyAutoReasoning  │ (#7)
+                    │   - Execute worker            │
+                    │   - Post: RefineHook          │ (#5)
+                    │   - Post: VerifyHook          │ (#6)
+                    │   - Post: ReflexionHook       │ (#3)
+                    └───────────────┬───────────────┘
+                                    │
+  Lições geradas pela Reflexion são persistidas em
+  memory.Fact e ressurgem via #4 em tarefas similares
+  futuras — fechando o loop sem retreinamento.
+```
+
+<Tip>**Princípio arquitetural**: todos os padrões novos se ligam ao **dispatcher** ou ao **context builder** — o loop ReAct interno (`worker_react.go`) **não muda**. Padrões não se substituem, se compõem.</Tip>
+
+---
+
+## Tabela de disparo
+
+| Padrão | Slash | Env var | Default | Gatilho automático |
+|---|---|---|---|---|
+| **#1 ReAct** | — | — | sempre on | sempre |
+| **#2 Plan-First** | `/plan [task]` | `CHATCLI_QUALITY_PLAN_FIRST_MODE` | `auto` | complexity ≥ 6 |
+| **#3 Reflexion** | `/reflect <lição>` | `CHATCLI_QUALITY_REFLEXION_ENABLED` | `on` | erro, CoVe flagou, refine baixo |
+| **#4 HyDE** | — (transparente) | `CHATCLI_QUALITY_HYDE_ENABLED` | `off` | toda retrieval |
+| **#5 Refine** | `/refine on\|off` | `CHATCLI_QUALITY_REFINE_ENABLED` | `off` | pós-worker |
+| **#6 CoVe** | `/verify on\|off` | `CHATCLI_QUALITY_VERIFY_ENABLED` | `off` | pós-worker |
+| **#7 Reasoning** | `/thinking on\|off` | `CHATCLI_QUALITY_REASONING_MODE` | `auto` | para AutoAgents |
+
+---
+
+## Prioridade de overrides
+
+Para um dado turno, o effort hint é resolvido nesta ordem (último ganha):
+
+<Steps>
+  <Step title="Skill frontmatter">
+    `effort: high` no frontmatter da skill ativada.
+  </Step>
+  <Step title="Agent default">
+    Ex: `PlannerAgent` tem `effort="high"` embutido.
+  </Step>
+  <Step title="CHATCLI_QUALITY_REASONING_*">
+    Auto-enable para agents em `AutoAgents`.
+  </Step>
+  <Step title="/thinking session override">
+    Ganha de tudo acima para o próximo turno.
+  </Step>
+</Steps>
+
+Para hooks de Refine / Verify / Reflexion:
+
+<Steps>
+  <Step title="/config quality (env)">
+    `CHATCLI_QUALITY_REFINE_ENABLED`, etc.
+  </Step>
+  <Step title="/refine e /verify session toggles">
+    `*bool` override que mora em `cli.qualityOverrides`; sobrescreve o env para a sessão.
+  </Step>
+</Steps>
+
+Para Plan-First:
+
+<Steps>
+  <Step title="Flag one-shot /plan">
+    `cli.pendingPlanFirst = true` consumido na próxima dispatch.
+  </Step>
+  <Step title="CHATCLI_QUALITY_PLAN_FIRST_MODE + complexidade">
+    `always` ignora score; `auto` dispara quando `ComplexityScore(task) >= threshold`.
+  </Step>
+</Steps>
+
+---
+
+## Custo e latência
+
+<Info>Defaults foram calibrados para **steady-state idêntico** ao chatcli pré-pipeline. Padrões caros (Refine, Verify, HyDE) iniciam desligados; você opt-in quando o contexto justifica.</Info>
+
+| Padrão | Chamadas LLM extras por turn | Observações |
+|---|---|---|
+| ReAct | 0 (já parte do loop) | — |
+| Plan-First (auto) | +1 (planner) quando disparado | Passos reutilizam o dispatcher |
+| Reflexion | +1 (lesson gen), **em background** | Nunca bloqueia o turn |
+| HyDE 3a | +1 (hipótese), barato | Budget de 200 tokens |
+| HyDE 3b | +1 (query embed) + backfill lazy | embedding API ~$0.00002/1k tokens |
+| Self-Refine | +N (um por pass, default 1) | Convergência corta cedo |
+| CoVe | +1 (verifier) por ponto de uso | Internamente N=3 perguntas |
+| Reasoning auto | 0 calls extras; +tokens na thinking hospedada | Anthropic budget = 8k default |
+
+---
+
+## Observabilidade
+
+Todo padrão ativo aparece em `/config quality`:
+
+```text
+✨ Pipeline de Qualidade do Agente ──────────────
+  CHATCLI_QUALITY_ENABLED         : enabled
+  Hooks registrados              : pre=0, post=3
+
+  ── Self-Refine (#5)
+  CHATCLI_QUALITY_REFINE_ENABLED  : enabled
+  CHATCLI_QUALITY_REFINE_MAX_PASSES: 1
+  ...
+
+  ── RAG + HyDE (#4)
+  CHATCLI_QUALITY_HYDE_ENABLED    : enabled
+  CHATCLI_QUALITY_HYDE_USE_VECTORS: enabled
+  CHATCLI_EMBED_PROVIDER          : voyage
+  Provedor de vetores            : voyage:voyage-3
+  Entradas vetoriais             : 127
+```
+
+---
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card title="Tutorial: Plan-and-Solve" icon="graduation-cap" href="/features/quality/plan-and-solve">
+    Comece pelo padrão com maior impacto em tarefas multi-step.
+  </Card>
+  <Card title="Configurar HyDE com vetores" icon="rocket" href="/features/quality/rag-hyde#phase-3b-vector-embeddings">
+    Ative embeddings (Voyage ou OpenAI) para retrieval semântico.
+  </Card>
+  <Card title="Referência de slashes" icon="terminal" href="/features/quality/configuration#slash-commands">
+    `/thinking`, `/plan`, `/refine`, `/verify`, `/reflect`.
+  </Card>
+  <Card title="Lista completa de env vars" icon="list" href="/features/quality/configuration#env-vars">
+    Todos os `CHATCLI_QUALITY_*` e `CHATCLI_EMBED_*`.
+  </Card>
+</CardGroup>

@@ -1,0 +1,252 @@
+---
+title: "#3 Reflexion — Aprender com Falhas"
+sidebarTitle: "Reflexion"
+description: "Após erro, alucinação ou qualidade baixa, uma chamada LLM destila uma lição estruturada (situation / mistake / correction) e persiste em memory.Fact. Próximas tarefas similares a recuperam via RAG — fechando o loop sem retreinamento."
+icon: "lightbulb"
+---
+
+**Reflexion** fecha o loop de aprendizado: quando um agente falha ou produz saída de baixa qualidade, em vez de perder a experiência, o pipeline gera uma **Lesson** estruturada e persiste na memória de longo prazo. Na próxima tarefa similar, essa lição emerge naturalmente via RAG+HyDE.
+
+<Info>Reflexion é **o único post-hook ligado por default** — porque só dispara em condições excepcionais (erro, discrepância) e o lesson generator roda em **goroutine detached**, nunca bloqueando o turn do usuário.</Info>
+
+---
+
+## O que é uma Lesson
+
+Uma `Lesson` é um registro de quatro linhas:
+
+```go
+type Lesson struct {
+    Situation  string   // "Quando preciso editar arquivo Go grande..."
+    Mistake    string   // "Tentei reescrever o arquivo todo de uma vez"
+    Correction string   // "Use Edit tool com old_string/new_string específicos"
+    Tags       []string // ["go", "edit-file", "large-file", "reflexion"]
+    Trigger    string   // "error" | "hallucination" | "low_quality" | "manual"
+    CreatedAt  time.Time
+}
+```
+
+Ao persistir em `memory.Fact`, o `Content` fica:
+
+```text
+LESSON: Quando preciso editar arquivo Go grande
+MISTAKE: Tentei reescrever o arquivo todo de uma vez
+CORRECTION: Use Edit tool com old_string/new_string específicos
+TRIGGER: error
+```
+
+A categoria do Fact é `lesson` e as tags incluem `reflexion` + `trigger:<x>` + os tags específicos do domínio. Isso permite queries precisas: "me mostre todas as lições sobre edit-file" se torna uma pesquisa normal da memória.
+
+---
+
+## Quatro gatilhos
+
+<Tabs>
+  <Tab title="OnError">
+    ```go
+    if cfg.OnError && result.Error != nil {
+        return "error"
+    }
+    ```
+    O worker retornou `Error != nil`. Exemplos: timeout, tool call inválido, crash do provedor.
+    **Default: ON.**
+  </Tab>
+  <Tab title="OnHallucination">
+    ```go
+    if cfg.OnHallucination && result.MetadataFlag("verified_with_discrepancy") {
+        return "hallucination"
+    }
+    ```
+    O `VerifyHook` (#6 CoVe) flagou discrepância entre o rascunho e as respostas às perguntas de verificação.
+    **Default: ON.**
+  </Tab>
+  <Tab title="OnLowQuality">
+    ```go
+    if cfg.OnLowQuality && result.MetadataFlag("refine_low_quality") {
+        return "low_quality"
+    }
+    ```
+    O `RefineHook` (#5) deu nota baixa no rascunho original.
+    **Default: OFF** (barulhento demais por default).
+  </Tab>
+  <Tab title="Manual via /reflect">
+    ```go
+    if result.MetadataFlag(MetaForceReflexion) {
+        return "manual"
+    }
+    ```
+    Slash `/reflect <free-text>` persiste direto, sem chamada LLM.
+    **Sempre disponível.**
+  </Tab>
+</Tabs>
+
+---
+
+## Fluxo async
+
+<Steps>
+  <Step title="PostRun é chamado no pipeline">
+    `ReflexionHook.PostRun(ctx, hc, result)` inspeciona `result.Metadata` + `result.Error` para decidir o trigger.
+  </Step>
+  <Step title="Se trigger matched, spawn goroutine">
+    ```go
+    go h.runReflexion(context.Background(), req)
+    return nil  // PostRun retorna imediatamente
+    ```
+    Context **detached** deliberado: o ctx do turn vai ser cancelado quando a resposta chega no usuário, mas queremos a lição gerada mesmo assim.
+  </Step>
+  <Step title="GenerateLesson via LLM">
+    O LLM recebe o system prompt + a tarefa + o attempt + o outcome, e emite blocos XML-like (`<situation>`, `<mistake>`, `<correction>`, `<tags>`, ou `<skip>` se não há lição útil).
+  </Step>
+  <Step title="Parse + persist">
+    `parseLesson` valida que pelo menos `situation` e `correction` estão presentes. Se `<skip>nothing actionable</skip>`, **retorna nil sem persistir**.
+  </Step>
+  <Step title="memory.Facts.AddFactWithSource">
+    Persiste em `~/.chatcli/memory/memory_index.json` com categoria=`lesson` e tags incluindo o workspace atual como source.
+  </Step>
+</Steps>
+
+---
+
+## Protocolo do lesson generator
+
+O system prompt instrui o modelo a ser **geral**, não one-off:
+
+```text
+Rules:
+- A "lesson" must be GENERAL enough to apply next time a similar task
+  comes up — not one-off and not a play-by-play.
+- If there is genuinely nothing to learn (e.g. the task was trivial and
+  the failure was a transient network blip), reply with exactly:
+  <skip>nothing actionable</skip>
+- Otherwise emit ALL of the following blocks. Keep each to ONE line.
+- "tags" is a comma-separated list of 2-5 short keywords (lowercase,
+  hyphenated if needed) that future similar tasks will likely contain.
+
+OUTPUT:
+<situation>brief description of when this lesson applies</situation>
+<mistake>what went wrong this time</mistake>
+<correction>what to do differently next time</correction>
+<tags>tag1, tag2, tag3</tags>
+```
+
+<Tip>O bloco `<skip>` existe justamente para evitar pollution da memória com "lições" de falhas transientes. O modelo pode recusar gerar lição com custo zero de persistência.</Tip>
+
+---
+
+## `/reflect` — caminho manual sem LLM
+
+Quando você sabe a lição e não precisa do LLM destilando:
+
+```bash
+/reflect quando editar arquivos Go grandes use Edit, não rewrite total
+```
+
+Isso entra direto em `memory.Fact`:
+
+```text
+LESSON: quando editar arquivos Go grandes use Edit, não rewrite total
+MISTAKE: (user-supplied lesson; no automatic mistake detection)
+CORRECTION: quando editar arquivos Go grandes use Edit, não rewrite total
+TRIGGER: manual
+```
+
+Tags geradas: `["reflexion", "trigger:manual", "user-supplied"]`.
+
+<Warning>O caminho manual **não faz** chamada LLM — é barato, síncrono e ideal para capturar aprendizados durante a sessão.</Warning>
+
+---
+
+## Como a lição "volta"
+
+Uma vez persistida, a lesson é um fact normal no índice. Ela emerge via:
+
+1. **Retrieval por hints**: se a próxima task mencionar keywords em `Tags`, o scorer relevance-based a surfaceia.
+2. **HyDE amplifica**: com `CHATCLI_QUALITY_HYDE_ENABLED=true`, a hipótese gerada cobre conceitos semelhantes, aumentando chance de match.
+3. **Vector search**: com embeddings configurados, a lesson é buscada por proximidade cosseno.
+
+O system prompt do turn seguinte contém a seção `## Long-term Memory` com o texto da lesson, e o modelo tem todas as pistas para **não repetir o erro**.
+
+---
+
+## Variáveis de ambiente
+
+| Env var | Default | O que faz |
+|---|---|---|
+| `CHATCLI_QUALITY_REFLEXION_ENABLED` | `true` | Master switch |
+| `CHATCLI_QUALITY_REFLEXION_ON_ERROR` | `true` | Disparar em erro de tool |
+| `CHATCLI_QUALITY_REFLEXION_ON_HALLUCINATION` | `true` | Disparar em `verified_with_discrepancy` |
+| `CHATCLI_QUALITY_REFLEXION_ON_LOW_QUALITY` | `false` | Disparar em `refine_low_quality` |
+| `CHATCLI_QUALITY_REFLEXION_PERSIST` | `true` | Escrever em memory.Fact (false = log-only) |
+
+---
+
+## Exemplo de ciclo completo
+
+<Steps>
+  <Step title="Usuário pede task que falha">
+    `/coder refactor pkg/engine to extract Close method`
+  </Step>
+  <Step title="CoderAgent tenta rewrite total">
+    Arquivo tem 2000 linhas, provider responde com timeout.
+  </Step>
+  <Step title="PostRun detecta result.Error != nil">
+    OnError trigger matched.
+  </Step>
+  <Step title="goroutine: GenerateLesson">
+    Model emite:
+    ```
+    <situation>Refactoring large Go files (>1000 lines)</situation>
+    <mistake>Attempted full rewrite via @coder write</mistake>
+    <correction>Use @coder patch or Edit tool for surgical changes</correction>
+    <tags>go, refactor, large-file, edit-tool</tags>
+    ```
+  </Step>
+  <Step title="Persiste em memory.Fact">
+    Categoria=`lesson`, workspace=current project.
+  </Step>
+  <Step title="Próxima semana, usuário pede refactor similar">
+    `/coder refactor pkg/auth/manager.go split into smaller files`
+  </Step>
+  <Step title="RAG+HyDE traz a lesson">
+    Tags `refactor` + `large-file` matchem. Lesson aparece no system prompt.
+  </Step>
+  <Step title="Coder escolhe abordagem correta de primeira">
+    Emite múltiplos `@coder patch` ao invés de `write`. Task concluída sem timeout.
+  </Step>
+</Steps>
+
+---
+
+## Inspecionar lições armazenadas
+
+```bash
+# Todas as lições
+/memory longterm | grep -A3 "^LESSON:"
+
+# Ou diretamente no arquivo
+cat ~/.chatcli/memory/memory_index.json | jq '.[] | select(.category=="lesson")'
+
+# Ou via /config
+/config quality
+# → mostra total de hooks post registrados (reflexion aparece se Enabled=true)
+```
+
+---
+
+## Leia também
+
+<CardGroup cols={2}>
+  <Card title="#4 RAG + HyDE" icon="database" href="/features/quality/rag-hyde">
+    Como as lições são recuperadas em tarefas futuras via retrieval semântico.
+  </Card>
+  <Card title="#6 CoVe" icon="check-double" href="/features/quality/cove">
+    O verifier gera o signal `verified_with_discrepancy` que Reflexion consome.
+  </Card>
+  <Card title="Bootstrap Memory" icon="brain" href="/features/bootstrap-memory">
+    Como a memória de longo prazo foi estruturada pré-pipeline.
+  </Card>
+  <Card title="Memory Commands" icon="terminal" href="/core-concepts/context-commands">
+    `/memory load`, `/memory show`, `/memory longterm`.
+  </Card>
+</CardGroup>

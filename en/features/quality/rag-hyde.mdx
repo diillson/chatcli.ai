@@ -1,0 +1,255 @@
+---
+title: "#4 RAG + HyDE — Semantic Retrieval"
+sidebarTitle: "RAG + HyDE"
+description: "Two retrieval layers over memory.Fact: Phase 3a generates an LLM hypothesis and extracts keywords to expand the query; Phase 3b adds vector embeddings (Voyage/OpenAI) + pure-Go cosine search. Lazy backfill, JSON-persisted, zero CGO."
+icon: "database"
+---
+
+**HyDE** (Hypothetical Document Embeddings) is the classic technique of generating a **hypothetical answer** to the user's question and using that answer as an additional retrieval signal. In ChatCLI, HyDE operates in two complementary phases: **3a** expands keywords via LLM hypothesis, **3b** adds vector cosine search.
+
+<Info>HyDE is **opt-in** (`CHATCLI_QUALITY_HYDE_ENABLED=true`) to keep the steady-state with no additional cost. Phase 3a costs +1 cheap LLM call; Phase 3b requires configuring an embedding provider.</Info>
+
+---
+
+## The problem HyDE solves
+
+The pre-pipeline `memory.Fact` retrieval was **keyword-only**: the scorer matches tokens extracted from recent messages against tags and content of stored facts. Works well when vocabulary matches exactly — fails when the user uses synonyms or asks abstract questions.
+
+Gap example:
+
+<Tabs>
+  <Tab title="Without HyDE">
+    User: `how to do X in Go?`<br/>
+    Extracted keywords: `[do, go]`<br/>
+    Stored fact: `"use goroutines for concurrency in X pipelines"`<br/>
+    **Match: ❌** — "do" and "go" don't literally appear in the fact.
+  </Tab>
+  <Tab title="With HyDE 3a">
+    User: `how to do X in Go?`<br/>
+    LLM hypothesis: `"In Go you would use goroutines and channels for X, leveraging the concurrency primitives..."`<br/>
+    Expanded keywords: `[do, go, goroutines, channels, concurrency, primitives]`<br/>
+    **Match: ✅**
+  </Tab>
+  <Tab title="With HyDE 3b">
+    Hypothesis → embed (1024 dim via Voyage) → cosine search in vector store → top-3 semantically close facts.<br/>
+    **Match: ✅** — even with no shared keyword.
+  </Tab>
+</Tabs>
+
+---
+
+## Phase 3a — Hypothesis-based keyword expansion
+
+<Steps>
+  <Step title="User types query">
+    The query enters `cli_llm.go` or `agent_mode.go`.
+  </Step>
+  <Step title="HyDEAugmenter.Augment">
+    ```go
+    augmenter := memory.NewHyDEAugmenter(cfg, llmCallback, logger)
+    expanded := augmenter.Augment(ctx, query, originalHints)
+    ```
+  </Step>
+  <Step title="LLM generates short hypothesis">
+    Prompt: "Write a 2-4 sentence plausible answer that uses the technical nouns that would appear in any matching note. Bilingual if the query mixes languages."
+  </Step>
+  <Step title="ExtractKeywords from the hypothesis">
+    The same extractor already used in chat mode (en+pt stop words, min 3 chars).
+  </Step>
+  <Step title="Merge unique + lower-case">
+    Original keywords + top-N from hypothesis, cap configurable via `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS` (default 5).
+  </Step>
+  <Step title="FactIndex.Search uses the expanded set">
+    Existing keyword-based scorer operates over richer hints → much higher recall.
+  </Step>
+</Steps>
+
+<Tip>Phase 3a **works without configuring an embedding provider**. It's the recommended default if the cost of +1 light LLM call is acceptable.</Tip>
+
+---
+
+## Phase 3b — Vector embeddings
+
+Adds **cosine similarity** search over fact embeddings.
+
+### Architecture
+
+```text
+┌──────────────────┐
+│ User query       │
+└────────┬─────────┘
+         │
+         ▼
+┌─────────────────────────┐
+│ EmbeddingProvider.Embed │  (Voyage AI / OpenAI / Null)
+└────────┬────────────────┘
+         │
+         ▼  vector float32[1024] or [1536]
+┌─────────────────────────┐
+│ VectorIndex.SimilarFacts│  (pure-Go cosine)
+└────────┬────────────────┘
+         │
+         ▼  top-K fact IDs
+┌─────────────────────────┐
+│ FactIndex.GetByID       │
+│ ExtractKeywords(content)│
+└────────┬────────────────┘
+         │
+         ▼
+    Hints expanded via Phase 3a AND 3b
+```
+
+### Supported providers
+
+<Tabs>
+  <Tab title="Voyage (recommended)">
+    ```bash
+    export CHATCLI_QUALITY_HYDE_ENABLED=true
+    export CHATCLI_QUALITY_HYDE_USE_VECTORS=true
+    export CHATCLI_EMBED_PROVIDER=voyage
+    export VOYAGE_API_KEY=pa-...
+    # Optional: pick model (default voyage-3, 1024-dim)
+    export CHATCLI_EMBED_MODEL=voyage-3
+    ```
+
+    **Why Voyage:** it's the provider **recommended by Anthropic** for Claude workflows, offers high quality/$ for retrieval, and the default model (`voyage-3`, 1024-dim) is the general-purpose sweet spot.
+  </Tab>
+  <Tab title="OpenAI">
+    ```bash
+    export CHATCLI_QUALITY_HYDE_ENABLED=true
+    export CHATCLI_QUALITY_HYDE_USE_VECTORS=true
+    export CHATCLI_EMBED_PROVIDER=openai
+    export OPENAI_API_KEY=sk-...
+    # Optional: pick model and custom dimension
+    export CHATCLI_EMBED_MODEL=text-embedding-3-small
+    export CHATCLI_EMBED_DIMENSIONS=512   # can reduce to save storage
+    ```
+
+    **Models:** `text-embedding-3-small` (default, 1536-dim, $0.02/1M tokens) or `text-embedding-3-large` (3072-dim, higher quality).
+  </Tab>
+  <Tab title="Null (default)">
+    If `CHATCLI_EMBED_PROVIDER` isn't set, `NullProvider` is returned. `Embed()` returns an error — the code checks `embedding.IsNull(p)` before calling, so it gracefully falls back to keyword-only. **No surprises, no silent failures.**
+  </Tab>
+</Tabs>
+
+### Pure-Go vector store
+
+<Info>**No CGO, no SQLite-vec, no external deps.** Just `float32[]` + cosine + JSON persistence in `~/.chatcli/memory/vector_index.json`.</Info>
+
+```go
+// cli/workspace/memory/vector_store.go
+type VectorEntry struct {
+    FactID    string    `json:"fact_id"`
+    Vector    []float32 `json:"vector"`
+    Dimension int       `json:"dim"`
+    Provider  string    `json:"provider"`
+}
+```
+
+For `N < 1000 facts` (typical chatcli case), linear in-memory search completes in microseconds. No need for HNSW or IVFFlat indexing.
+
+### Dimension lock
+
+Switching provider (Voyage 1024 → OpenAI 1536) is **not automatic**: the store rejects with an explanatory error. Reason: cosine between vectors of different dimensions is mathematically invalid.
+
+```bash
+# To migrate, clear the file
+rm ~/.chatcli/memory/vector_index.json
+# Change the provider and restart — lazy backfill repopulates
+```
+
+### Lazy backfill
+
+When retrieving a fact, if it has no vector (fact predates embeddings activation), the index spawns a **detached** goroutine to embed the top-25 visible facts:
+
+```go
+// cli/workspace/memory/store.go:120
+go func(items map[string]string) { //#nosec G118 -- detached on purpose
+    if err := m.vectors.BackfillFacts(context.Background(), items); err != nil {
+        m.logger.Warn("vector backfill failed", zap.Error(err))
+    }
+}(items)
+```
+
+<Tip>Backfill is **bounded**: at most 25 facts per retrieve invocation. In a normal session, most of the index is embedded within the first dozens of interactions.</Tip>
+
+---
+
+## Full configuration
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CHATCLI_QUALITY_HYDE_ENABLED` | `false` | Master switch (phase 3a) |
+| `CHATCLI_QUALITY_HYDE_USE_VECTORS` | `false` | Enable phase 3b (requires provider) |
+| `CHATCLI_QUALITY_HYDE_PROVIDER` | — | Display-only provider name |
+| `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS` | `5` | Hypothesis keyword cap in phase 3a |
+| `CHATCLI_EMBED_PROVIDER` | — | `voyage\|openai\|null` |
+| `CHATCLI_EMBED_MODEL` | provider default | E.g. `voyage-3`, `text-embedding-3-small` |
+| `CHATCLI_EMBED_DIMENSIONS` | provider default | OpenAI only |
+
+---
+
+## `/config quality` surfaces state
+
+```text
+── RAG + HyDE (#4)
+  CHATCLI_QUALITY_HYDE_ENABLED    : enabled
+  CHATCLI_QUALITY_HYDE_USE_VECTORS: enabled
+  CHATCLI_QUALITY_HYDE_PROVIDER   : voyage
+  CHATCLI_EMBED_PROVIDER          : voyage
+  CHATCLI_EMBED_MODEL             : voyage-3
+  CHATCLI_QUALITY_HYDE_NUM_KEYWORDS: 5
+  Vector provider                : voyage:voyage-3
+  Vector entries                 : 127
+```
+
+---
+
+## Integration with Reflexion
+
+HyDE amplifies Reflexion's value: lessons persisted by #3 are retrieved with much higher recall when the next task doesn't use the exact same keywords. Workflow:
+
+<Steps>
+  <Step title="Turn 1: auth.go refactor fails (timeout)">
+    Reflexion persists lesson: `"use Edit tool for large files"`, tags `[go, refactor, edit-tool]`.
+  </Step>
+  <Step title="Turn 5 (days later): 'help me split pkg/engine'">
+    Query doesn't contain `refactor` or `edit`. Keyword-only would **miss** the lesson.
+  </Step>
+  <Step title="HyDE 3a generates hypothesis">
+    `"To split a Go package, identify logical groupings and use refactor patterns with Edit tool for surgical changes..."`<br/>
+    Extracted keywords: `[split, package, refactor, edit, patterns, …]`
+  </Step>
+  <Step title="Match!">
+    Lesson appears in system prompt. Coder picks `Edit` over `write` from the start.
+  </Step>
+</Steps>
+
+---
+
+## Caveats and tuning
+
+<Warning>**Token cost** of phase 3a: ~200 tokens per retrieval turn. In workflows with many read turns, the cost compounds. Use `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS=3` for tighter budget.</Warning>
+
+<Warning>**Privacy**: the user query is sent to the embedding provider. For sensitive workloads, consider self-hosting an embedding model (roadmap: Ollama-embedding provider).</Warning>
+
+<Info>**Graceful fallback**: if the LLM fails or the embedding provider returns an error, retrieval falls back to keyword-only silently. No turn is aborted by HyDE failure.</Info>
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="#3 Reflexion" icon="lightbulb" href="/en/features/quality/reflexion">
+    The lessons that HyDE retrieves with higher recall.
+  </Card>
+  <Card title="Bootstrap Memory" icon="brain" href="/en/features/bootstrap-memory">
+    The layer underneath: how memory.Fact is populated and maintained.
+  </Card>
+  <Card title="Persistent Context" icon="database" href="/en/features/persistent-context">
+    `/context attach` for explicit file contexts.
+  </Card>
+  <Card title="Full configuration" icon="sliders" href="/en/features/quality/configuration">
+    All envs and slashes.
+  </Card>
+</CardGroup>

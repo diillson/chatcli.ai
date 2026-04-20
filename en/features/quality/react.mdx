@@ -1,0 +1,115 @@
+---
+title: "#1 ReAct — Reason + Act"
+sidebarTitle: "ReAct"
+description: "The base loop every ChatCLI worker runs: reason about the task, act (call a tool), observe the result, repeat until done or max-turns."
+icon: "rotate"
+---
+
+**ReAct** is the oldest and most essential pattern in ChatCLI. Every invocation of `/agent` or `/coder` runs inside it: each specialized agent (FileAgent, CoderAgent, Planner, Refiner, …) executes its own `Reason → Act → Observe` loop until it solves the task or hits the turn cap.
+
+<Info>ReAct is **always on**. The other six patterns compose around it without replacing it.</Info>
+
+---
+
+## How it works
+
+<Steps>
+  <Step title="Reason">
+    The LLM receives the agent's system prompt + the task + history of observations and produces a response that may contain reasoning text, a `<tool_call>`, an `<agent_call>`, or the final answer.
+  </Step>
+  <Step title="Act">
+    If there was a tool/agent call, chatcli executes it (shell, file read, API call, sub-agent dispatch, …) and captures the output.
+  </Step>
+  <Step title="Observe">
+    The tool output goes back into history as a system message — the next LLM turn already sees the result.
+  </Step>
+  <Step title="Repeat">
+    Until the LLM emits a response without tool calls (natural end) or it hits `CHATCLI_AGENT_WORKER_MAX_TURNS` (default 30).
+  </Step>
+</Steps>
+
+---
+
+## Code architecture
+
+```text
+cli/agent/workers/worker_react.go
+    │
+    ▼  RunWorkerReAct(ctx, cfg WorkerReActConfig)
+    │
+    ▼  for turn := 0; turn < maxTurns; turn++ {
+    │     llmResponse := client.SendPrompt(ctx, prompt, history, maxTokens)
+    │     if done(llmResponse) { return }
+    │     toolCalls := parse(llmResponse)
+    │     for _, call := range toolCalls {
+    │         result := execute(call)
+    │         history = append(history, observation(result))
+    │     }
+    │  }
+```
+
+<Tip>The ReAct loop was deliberately left intact in the seven-pattern PR. Every new addition (Refine, Verify, Reflexion) plugs in **around** it via `QualityPipeline.Run`, not **inside** it.</Tip>
+
+---
+
+## Configuration
+
+| Env var | Default | What it does |
+|---|---|---|
+| `CHATCLI_AGENT_WORKER_MAX_TURNS` | 30 | Turn cap per worker |
+| `CHATCLI_AGENT_WORKER_TIMEOUT` | `10m` | Timeout per individual worker |
+| `CHATCLI_AGENT_PARALLEL_MODE` | `true` | Disable multi-agent orchestration (ReAct still runs) |
+
+<Warning>Max-turns > 50 is rarely useful. If a worker doesn't finish in 30 turns, it's usually a sign of bad prompts/tools, not lack of iteration.</Warning>
+
+---
+
+## Interaction with the rest of the pipeline
+
+Inside `Pipeline.Run`, the flow is:
+
+```go
+// cli/agent/quality/pipeline.go
+func (p *Pipeline) Run(ctx, agent, task, deps) (*AgentResult, error) {
+    // Phase 1 (#7): reasoning auto-attach BEFORE ReAct
+    ctx = applyAutoReasoning(ctx, p.cfg.Reasoning, agent)
+
+    // Pre-hooks (rarely used — HyDE lives in the context builder, not here)
+    for _, h := range p.pre { h.PreRun(ctx, hc) }
+
+    // The agent's ReAct loop runs in here
+    result, err := agent.Execute(ctx, currentTask, deps)
+
+    // Post-hooks: Refine, Verify, Reflexion
+    for _, h := range p.post { h.PostRun(ctx, hc, result) }
+
+    return result, err
+}
+```
+
+---
+
+## Observability
+
+Each loop turn emits structured events via `zap.Logger`:
+
+```json
+{"level":"info","msg":"agent turn","agent":"coder","turn":3,"tokens":1240}
+{"level":"info","msg":"tool_call","name":"@coder","args":"{\"cmd\":\"write\",...}"}
+{"level":"info","msg":"tool result","lines":87,"duration":"234ms"}
+```
+
+The dispatcher also emits `AgentEvent{Type: Started|Completed|Failed}` via channel (see `DispatchWithProgress`), consumed by the UI to render the timeline.
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Multi-Agent Orchestration" icon="users" href="/en/features/multi-agent-orchestration">
+    How the parallel fan-out dispatcher coordinates multiple ReAct workers at once.
+  </Card>
+  <Card title="#7 Reasoning Backbone" icon="brain-circuit" href="/en/features/quality/reasoning-backbone">
+    How the effort hint gets auto-attached to ctx before each turn.
+  </Card>
+</CardGroup>
