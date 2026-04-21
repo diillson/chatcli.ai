@@ -1,0 +1,237 @@
+---
+title: "Eficiência de Tokens"
+sidebarTitle: "Eficiência de Tokens"
+description: "Prompt caching, early-exit, smart routing e auto-save — como o ChatCLI evita queimar tokens no modo agente/coder."
+icon: "gauge-high"
+---
+
+O ChatCLI implementa uma série de otimizações para manter o consumo de tokens sob controle em sessões longas com os modos `/agent` e `/coder`. Esta página explica **o que roda sem você mexer em nada** e **quais interruptores estão disponíveis** quando o comportamento default não serve para o seu workflow.
+
+<Info>
+Todas as otimizações desta página funcionam em todos os provedores suportados (Anthropic direto, Bedrock, OpenAI, xAI, ZAI, MiniMax, Google AI, Ollama, Copilot, GitHub Models, OpenRouter, OpenAI Assistant, StackSpot). Providers com **prompt caching explícito** (Anthropic, Bedrock Anthropic) ou **auto-caching** (OpenAI, xAI) aproveitam ganhos adicionais.
+</Info>
+
+---
+
+## O problema real
+
+Um loop ReAct mal calibrado consegue transformar uma pergunta trivial num consumo absurdo de tokens. Sem as otimizações abaixo, uma query como *"resultado do jogo do Flamengo"* pode facilmente queimar 20k+ tokens porque:
+
+1. O system prompt inteiro é re-enviado em cada turno (sem cache).
+2. As definições de tools (15+ schemas JSON) também vão re-enviadas por turno.
+3. Nada quebra o loop quando o modelo repete a mesma tool_call sem convergir.
+4. Bodies grandes do `@webfetch` entram crus no contexto.
+
+Em agregado, cada turno pesa 4-8k tokens de **overhead puro**, multiplicado por 3-5 turnos de uma sessão normal = 12-40k tokens antes mesmo de contar a resposta útil.
+
+---
+
+## 1. Prompt Caching estruturado
+
+O system prompt do agente é composto de **quatro blocos semânticos** ordenados do mais estável para o mais volátil:
+
+| Bloco | Conteúdo | Por que separar |
+|:------|:---------|:----------------|
+| **Core** | Persona + regras de formato (Coder/Agent) + hint de idioma | Não muda entre turnos → cache longo |
+| **Tools** | Descrições de plugins + hint do workspace | Muda só quando um plugin é carregado/descarregado |
+| **Workspace** | SOUL.md / MEMORY.md / IDENTITY.md / contexto dinâmico | Varia entre sessões, estável dentro de uma |
+| **Skills + Orchestrator** | Skills auto-ativadas e catálogo do orquestrador | Mais volátil — fica no final para não invalidar o cache dos blocos anteriores |
+
+Cada bloco carrega `cache_control: ephemeral` para os providers Anthropic. Para providers com auto-caching de prefixo (OpenAI, xAI), a ordem estável dos blocos faz o cache casar naturalmente.
+
+### Cache nas tool definitions
+
+A última definição de ferramenta enviada para a Anthropic também recebe `cache_control: ephemeral`, o que transforma todo o array de tools num prefixo cacheável. Em uma sessão `/coder` com 15 ferramentas coder + 2 web tools, isso representa ~19KB que deixam de ser re-tokenizados a cada turno.
+
+### Visibilidade do cache
+
+| Provider | Campo populado em `UsageInfo` |
+|:---------|:------------------------------|
+| Anthropic / Bedrock Anthropic | `CacheReadInputTokens`, `CacheCreationInputTokens` |
+| OpenAI (auto-caching) | `CacheReadInputTokens` (via `prompt_tokens_details.cached_tokens`) |
+| Demais providers | Não reportado — mas prefixo estável ainda beneficia cache interno |
+
+Verifique o impacto real da sua sessão com `/cost` — o hit de cache aparece como linha separada.
+
+---
+
+## 2. Detector de estagnação (early-exit)
+
+Quando o modelo entra em *reflection loop* — emitindo exatamente a mesma batch de `tool_calls` turno após turno sem informação nova — o ChatCLI detecta e **quebra o loop**.
+
+### Como funciona
+
+A cada turno, o fingerprint das `tool_calls` (nome + args normalizados, order-independent, SHA-256 truncado) é computado. Três turnos consecutivos com o mesmo fingerprint → o loop é encerrado com uma mensagem clara ao usuário.
+
+### Parâmetros
+
+| Variável | Default | Descrição |
+|:---------|:--------|:----------|
+| `CHATCLI_AGENT_EARLY_EXIT` | `1` (on) | Liga/desliga o detector. `0`/`false`/`off` desativa. |
+| `CHATCLI_AGENT_EARLY_EXIT_TURNS` | `3` | Número de repetições consecutivas para acionar o break (clamp [2, 10]). |
+
+<Tip>
+Fingerprint é order-independent: `[read A, read B]` e `[read B, read A]` produzem o mesmo hash, então reordenamentos cosméticos não enganam o detector.
+</Tip>
+
+---
+
+## 3. Smart Routing chat ↔ agent
+
+Nem toda query precisa de um loop ReAct inteiro. Perguntas conversacionais ou factuais (*"o que é um mutex?"*, *"diferença entre slice e array"*) são respondidas por um único turno em chat mode.
+
+O classificador identifica queries triviais usando sinais léxicos:
+
+- Palavras-chave de pergunta (`o que`, `por que`, `how does`, `explain`, ...)
+- Ausência de sinais de task (`create`, `build`, `run`, `fix`, ...)
+- Ausência de referências ao workspace (`@file`, `@git`, paths, extensões de código)
+- Tamanho curto + ponto de interrogação
+
+### Modos
+
+| Valor de `CHATCLI_AGENT_SMART_ROUTE` | Comportamento |
+|:-------------------------------------|:--------------|
+| `off` \| `0` \| `false` \| `no` | Desliga completamente. `/agent` e `/run` sempre entram no loop. |
+| `hint` (default) \| `1` \| `on` \| `true` | Detecta e imprime uma dica no terminal, mas **respeita a intenção do usuário** e entra no loop mesmo assim. |
+| `auto` \| `redirect` \| `2` | Auto-redireciona queries triviais para chat mode. Máxima economia; pode surpreender em casos limítrofes. |
+
+<Warning>
+`/coder` **nunca** é reroteado — esse modo existe para tarefas estruturadas. Mesmo perguntas aparentemente triviais ali são tratadas como pedido de trabalho.
+</Warning>
+
+### Exemplo
+
+```bash
+$ /agent "o que é um canal em Go?"
+  ℹ Dica: essa pergunta parece conversacional — o loop /agent foi ignorado.
+    Use /chat ou digite a pergunta direto para forçar chat, ou /run para forçar o agente.
+
+# Com CHATCLI_AGENT_SMART_ROUTE=auto, a pergunta vai direto ao chat.
+# Com o default (hint), você vê a dica mas o agente roda normalmente.
+```
+
+---
+
+## 4. WebFetch com auto-save inteligente
+
+O `@webfetch` foi calibrado para nunca vomitar páginas gigantes no contexto. Veja também [WebFetch & WebSearch](/features/web-tools) para a documentação completa.
+
+| Parâmetro | Antes | Agora |
+|:----------|:------|:------|
+| `max_length` default | 50.000 chars | **20.000 chars** |
+| Auto-save quando body > 10KB sem filtro | não | **sim** — salva no scratch dir e retorna preview compacto |
+
+### Escape hatch
+
+| Variável | Descrição |
+|:---------|:----------|
+| `CHATCLI_WEBFETCH_AUTOSAVE_BYTES` | Threshold em bytes para o auto-save disparar. Default: `10000`. |
+
+O auto-save **sempre** persiste o body completo (pré-filtro) em `$CHATCLI_AGENT_TMPDIR`, e o retorno contém:
+
+```text
+[auto-saved: response was 142318 bytes — too large to inline.
+ Full body is at /tmp/chatcli-agent-.../webfetch_1712....txt.
+ Preview below; use read_file with start/end or rerun with
+ filter/from_line/to_line for specific ranges.]
+
+[primeiros ~5000 chars do texto extraído]
+...(auto-truncated — full body saved to disk)
+```
+
+O agente tipicamente emite um `read_file` apontando para esse caminho com o `start`/`end` apropriado, pagando apenas pelas linhas que importam.
+
+---
+
+## 5. System prompts enxutos
+
+Os prompts que acompanham cada modo foram condensados sem perda semântica — todas as regras originais permanecem, apenas redundância e exemplos repetidos foram removidos:
+
+| Prompt | Tamanho antes | Tamanho agora | Redução |
+|:-------|:--------------|:--------------|:--------|
+| `CoderSystemPrompt` | ~1.647 tokens | ~1.000 tokens | **~40%** |
+| `CoderFormatInstructions` | ~560 tokens | ~390 tokens | **~30%** |
+| `AgentFormatInstructions` | ~324 tokens | ~230 tokens | **~30%** |
+| `OrchestratorSystemPrompt` | ~2.111 tokens | ~1.050 tokens | **~50%** |
+
+Como esses prompts são cacheados no bloco **core**, modelos que suportam cache (Anthropic/Bedrock/OpenAI) enxergam a redução só no primeiro turno da sessão. Modelos sem cache ganham a economia em **todo turno**.
+
+---
+
+## 6. Compactação proativa de resultados de tool
+
+Resultados de ferramentas antigas (file reads, search, git-diff, etc.) são progressivamente comprimidos na história para não inflar o payload. Veja [Tool Result Management](/features/tool-result-management) para os detalhes completos.
+
+Os defaults são **conservadores** para proteger workflows multi-turnos com cross-references (refactors grandes, review sessions). Quem quiser ser mais agressivo pode ajustar:
+
+| Variável | Default | Descrição |
+|:---------|:--------|:----------|
+| `CHATCLI_MICROCOMPACT_TRUNCATE_TURNS` | `2` | Após quantos turnos os tool results antigos são truncados para head+tail preview. |
+| `CHATCLI_MICROCOMPACT_SUMMARIZE_TURNS` | `4` | Após quantos turnos os tool results são substituídos por uma linha de resumo. |
+| `CHATCLI_MICROCOMPACT_HEAD_CHARS` | `2000` | Tamanho do head mantido na truncagem. |
+| `CHATCLI_MICROCOMPACT_TAIL_CHARS` | `500` | Tamanho da cauda mantida na truncagem. |
+| `CHATCLI_MICROCOMPACT_MIN_CONTENT` | `3000` | Tamanho mínimo de tool result para virar candidato à compactação. |
+
+<Tip>
+Para sessões de chat/lookup onde rapidez e tokens baixos importam mais que recall de longo prazo, tente:
+
+```bash
+export CHATCLI_MICROCOMPACT_TRUNCATE_TURNS=1
+export CHATCLI_MICROCOMPACT_SUMMARIZE_TURNS=3
+export CHATCLI_MICROCOMPACT_HEAD_CHARS=1200
+export CHATCLI_MICROCOMPACT_TAIL_CHARS=300
+export CHATCLI_MICROCOMPACT_MIN_CONTENT=2000
+```
+</Tip>
+
+---
+
+## Como medir o impacto
+
+Rode sua sessão normalmente e olhe o `/cost` ao final:
+
+```text
+Session cost summary
+  Provider: CLAUDEAI | Model: claude-sonnet-4-6
+  ─────────────────────────────────────────────
+  Input tokens:       12_345
+  Output tokens:       3_210
+  Cache read:         87_650   ← ideal: crescendo a cada turno
+  Cache creation:      4_100
+  ─────────────────────────────────────────────
+  Total cost: $0.0234
+```
+
+Os sinais que indicam que as otimizações estão ativas e funcionando:
+
+- **`Cache read` > 0 e crescendo** por turno → caching estruturado está casando o prefixo.
+- **Poucos/nenhum FORMAT ERROR no log** → reminders estão segurando o formato nos modelos menores.
+- **Turnos com `tool_calls = 0` seguidos de conclusão rápida** → early-exit detectou convergência.
+- **Marker `[auto-saved: response was N bytes]`** em respostas de `@webfetch` → o limite inline está protegendo o contexto.
+
+---
+
+## Resumo das variáveis
+
+Todas as variáveis desta página em um só lugar:
+
+| Variável | Default | Desliga com |
+|:---------|:--------|:------------|
+| `CHATCLI_AGENT_EARLY_EXIT` | `1` (on) | `0` / `false` / `off` / `no` |
+| `CHATCLI_AGENT_EARLY_EXIT_TURNS` | `3` | — (clamp [2, 10]) |
+| `CHATCLI_AGENT_SMART_ROUTE` | `hint` | `off` / `0` / `false` / `no` |
+| `CHATCLI_WEBFETCH_AUTOSAVE_BYTES` | `10000` | setar valor muito alto |
+| `CHATCLI_MICROCOMPACT_TRUNCATE_TURNS` | `2` | valor alto (ex: `100`) |
+| `CHATCLI_MICROCOMPACT_SUMMARIZE_TURNS` | `4` | valor alto |
+| `CHATCLI_MICROCOMPACT_HEAD_CHARS` | `2000` | valor alto |
+| `CHATCLI_MICROCOMPACT_TAIL_CHARS` | `500` | valor alto |
+| `CHATCLI_MICROCOMPACT_MIN_CONTENT` | `3000` | valor muito alto |
+
+---
+
+## Próximos passos
+
+- [Native Tool Use](/features/native-tool-use) — como `cache_control:ephemeral` é propagado para Anthropic/Bedrock.
+- [Tool Result Management](/features/tool-result-management) — detalhes do pipeline de compactação.
+- [Cost Tracking](/features/cost-tracking) — como o `/cost` e o catálogo calculam o valor real de cada turno.
+- [WebFetch & WebSearch](/features/web-tools) — filtros, save_to_file e fallback entre backends.
