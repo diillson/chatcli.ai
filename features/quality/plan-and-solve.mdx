@@ -7,7 +7,7 @@ icon: "list-check"
 
 **Plan-and-Solve** sintetiza um plano estruturado **antes** do orquestrador começar a despachar. **ReWOO** (Reasoning Without Observation) estende: o plano usa placeholders `#E1`, `#E2` que são resolvidos em runtime com os outputs dos passos anteriores. Combinados, evitam o padrão caro de "despachar um agente, esperar, pensar de novo, despachar outro".
 
-<Info>**Quando ativa:** `/plan <task>` força; `CHATCLI_QUALITY_PLAN_FIRST_MODE=always` sempre; `auto` (default) dispara quando `ComplexityScore(task) >= 6`.</Info>
+<Info>**Quando ativa:** `/plan <task>` força; `CHATCLI_QUALITY_PLAN_FIRST_MODE=always` sempre; `auto` (default) dispara quando `ComplexityScore(task) >= 6`. Para revisar o plano antes de executar, use `/plan preview <task>` (dry-run).</Info>
 
 ---
 
@@ -99,10 +99,12 @@ A função `ComplexityScore(task) → int[0,10]` é calibrada para disparar Plan
   <Step title="Inject report">
     Dois messages sintéticos vão para `cli.history`:
     - **assistant**: o JSON do plano (o modelo vê o que foi tentado)
-    - **system**: `FinalReport` determinístico com task/agent/status/output por passo
+    - **user**: `FinalReport` determinístico com task/agent/status/output por passo + handoff
+
+    <Note>O segundo message é **role=user** (não `system`) desde o fix de abril/2026. Modelos como **Claude Sonnet 4.6** recusam completion quando a conversa termina em `assistant` (_"This model does not support assistant message prefill"_). O turno de usuário sintético fecha a conversa corretamente e dá ao orquestrador um ponto-âncora explícito para finalizar.</Note>
   </Step>
-  <Step title="ReAct loop continua">
-    Com o report em history, o orquestrador finaliza sem re-executar os passos já concluídos.
+  <Step title="ReAct loop continua (ou pula, se dry-run)">
+    Com o report em history, o orquestrador finaliza sem re-executar os passos já concluídos. Em modo dry-run (`/plan preview`), o loop é **pulado** via `planDryRunHandled` — nenhuma chamada ao orquestrador é feita.
   </Step>
 </Steps>
 
@@ -127,21 +129,56 @@ Isso espelha como o orquestrador já reage a erros per-agent hoje (continua, sum
 
 ## `/plan` — invocação manual
 
+O comando `/plan` aceita seis formas. Autocomplete (Tab) oferece os subcomandos.
+
 <CodeGroup>
-```bash Arma o flag one-shot
+```bash Arma o flag (sem task)
 /plan
 # → "plan-first armado — seu próximo /agent ou /coder rodará um plano estruturado"
 /agent refatorar auth package para usar OAuth
 # → roda Plan-First mesmo se complexity score < threshold
+
+# também funciona com /coder — o flag é consumido na primeira invocação subsequente
 ```
 
-```bash Inline (arm + run)
+```bash Inline agent (default)
 /plan refatorar auth package para usar OAuth
-# → entra direto em agent mode com Plan-First armado
+# → entra direto em agent mode com Plan-First armado e executa
+
+# Equivalente explícito:
+/plan agent refatorar auth package para usar OAuth
+```
+
+```bash Inline coder
+/plan coder refatorar auth package para usar OAuth
+# → entra em coder mode (CoderSystemPrompt) com Plan-First armado e executa
+# Recomendado para tarefas que modificam arquivos / rodam builds
+```
+
+```bash Dry-run / preview (não executa)
+/plan preview refatorar auth package para usar OAuth
+# → roda só o PlannerAgent, renderiza o plano estruturado, NÃO executa nenhum passo
+# Nenhuma chamada ao orquestrador é feita — ideal para revisar antes de commitar
+
+# Alias:
+/plan dry refatorar auth package para usar OAuth
 ```
 </CodeGroup>
 
-O flag `cli.pendingPlanFirst` é **consumido** e **cleared** na primeira invocação de `/agent` ou `/coder` subsequente.
+### Matriz de comportamento
+
+| Forma | Entra em | Executa passos? | Chama orquestrador? | Quando usar |
+|---|---|---|---|---|
+| `/plan` | — (arma flag) | depende do próximo `/agent` ou `/coder` | sim | Quer controle manual do modo consumidor |
+| `/plan <task>` | agent | sim | sim | Fluxo padrão, mais rápido |
+| `/plan agent <task>` | agent | sim | sim | Equivalente explícito (simetria com `coder`) |
+| `/plan coder <task>` | coder | sim | sim | Tarefas de engenharia (edições, builds, testes) |
+| `/plan preview <task>` | agent (temporário) | **não** | **não** | Revisar plano antes de rodar |
+| `/plan dry <task>` | idem `preview` | **não** | **não** | Alias |
+
+O flag `cli.pendingPlanFirst` é **consumido** e **cleared** na primeira invocação de `/agent` ou `/coder` subsequente. O flag `cli.pendingPlanDryRun` (exclusivo dos modos preview/dry) é limpo no mesmo ponto e faz `AgentMode.Run` retornar antes do ReAct loop via `planDryRunHandled`.
+
+<Tip>Fluxo recomendado para mudanças grandes: **`/plan preview <task>`** primeiro → revise o JSON → se aprovado, rode **`/plan coder <mesma task>`**.</Tip>
 
 ---
 
@@ -180,6 +217,44 @@ E imprime no terminal um one-liner amigável:
 ```text
   plan-first executed 4 step(s) before handing off to the orchestrator
 ```
+
+### Spinner durante Plan-First
+
+O spinner "planning structured steps..." aparece **somente** durante a chamada pura do `PlannerAgent` (step 1). Durante a execução do `PlanRunner` (step 2), o spinner é intencionalmente **desligado** e um print estático é emitido:
+
+```text
+  executing structured plan...
+```
+
+<Warning>Isso é crítico para segurança: passos podem disparar approvals interativos (ShellAgent `exec`, CoderAgent `write`) via policy engine. Se o spinner ficasse ativo durante a execução, seu repaint `\r\033[K` sobrescreveria o prompt de aprovação e impediria a resposta. Ctrl+C continua cancelando normalmente — o ctx cancelado propaga para dispatcher e PlanRunner entre passos.</Warning>
+
+### Modo dry-run: o que é renderizado
+
+`/plan preview <task>` renderiza:
+
+```text
+  Plano gerado (dry-run — nada será executado)
+
+  Resumo: <task_summary do JSON>
+
+  1. [E1] agent=search
+     <task resolvida>
+  2. [E2] agent=planner
+     <task>
+     deps: E1
+  3. [E3] agent=coder
+     <task>
+     deps: E2
+
+  Grupos paralelizáveis:
+     [E1]
+     [E2]
+     [E3]
+
+  Para executar este plano: /plan <mesma tarefa> (ou /plan coder <tarefa>)
+```
+
+Se o `ParsePlan` falhar (planner devolveu JSON malformado ou prose), o output bruto é impresso com um aviso — nunca é silencioso.
 
 ---
 

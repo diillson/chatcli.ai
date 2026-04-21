@@ -7,7 +7,7 @@ icon: "list-check"
 
 **Plan-and-Solve** synthesizes a structured plan **before** the orchestrator starts dispatching. **ReWOO** (Reasoning Without Observation) extends it: the plan uses `#E1`, `#E2` placeholders resolved at runtime with the outputs of previous steps. Combined, they avoid the expensive pattern of "dispatch an agent, wait, think again, dispatch another".
 
-<Info>**When it fires:** `/plan <task>` forces it; `CHATCLI_QUALITY_PLAN_FIRST_MODE=always` always; `auto` (default) triggers when `ComplexityScore(task) >= 6`.</Info>
+<Info>**When it fires:** `/plan <task>` forces it; `CHATCLI_QUALITY_PLAN_FIRST_MODE=always` always; `auto` (default) triggers when `ComplexityScore(task) >= 6`. To review the plan before executing, use `/plan preview <task>` (dry-run).</Info>
 
 ---
 
@@ -99,10 +99,12 @@ Any step can inject the output of earlier steps via `#E<n>`:
   <Step title="Inject report">
     Two synthetic messages go into `cli.history`:
     - **assistant**: the plan JSON (the model sees what was attempted)
-    - **system**: deterministic `FinalReport` with task/agent/status/output per step
+    - **user**: deterministic `FinalReport` with task/agent/status/output per step + handoff
+
+    <Note>The second message is **role=user** (not `system`) since the April 2026 fix. Models like **Claude Sonnet 4.6** refuse completion when the conversation ends on `assistant` (_"This model does not support assistant message prefill"_). The synthetic user turn closes the conversation correctly and gives the orchestrator an explicit anchor to finalize.</Note>
   </Step>
-  <Step title="ReAct loop continues">
-    With the report in history, the orchestrator finalizes without re-executing completed steps.
+  <Step title="ReAct loop continues (or is skipped, if dry-run)">
+    With the report in history, the orchestrator finalizes without re-executing completed steps. In dry-run mode (`/plan preview`), the loop is **skipped** via `planDryRunHandled` — no orchestrator call is made.
   </Step>
 </Steps>
 
@@ -127,21 +129,56 @@ This mirrors how the orchestrator already reacts to per-agent errors today (cont
 
 ## `/plan` — manual invocation
 
+`/plan` accepts six forms. Autocomplete (Tab) offers the subcommands.
+
 <CodeGroup>
-```bash Arm the one-shot flag
+```bash Arm the flag (no task)
 /plan
 # → "plan-first armed — your next /agent or /coder turn will run a structured plan"
 /agent refactor auth package to use OAuth
 # → runs Plan-First even if complexity score < threshold
+
+# Also works with /coder — the flag is consumed on the first subsequent invocation
 ```
 
-```bash Inline (arm + run)
+```bash Inline agent (default)
 /plan refactor auth package to use OAuth
-# → enters agent mode directly with Plan-First armed
+# → enters agent mode directly with Plan-First armed and executes
+
+# Explicit equivalent:
+/plan agent refactor auth package to use OAuth
+```
+
+```bash Inline coder
+/plan coder refactor auth package to use OAuth
+# → enters coder mode (CoderSystemPrompt) with Plan-First armed and executes
+# Recommended for tasks that modify files / run builds
+```
+
+```bash Dry-run / preview (no execution)
+/plan preview refactor auth package to use OAuth
+# → runs PlannerAgent only, renders the structured plan, does NOT execute any step
+# No orchestrator call is made — ideal to review before committing
+
+# Alias:
+/plan dry refactor auth package to use OAuth
 ```
 </CodeGroup>
 
-The `cli.pendingPlanFirst` flag is **consumed** and **cleared** on the first subsequent `/agent` or `/coder` invocation.
+### Behavior matrix
+
+| Form | Enters | Executes steps? | Calls orchestrator? | When to use |
+|---|---|---|---|---|
+| `/plan` | — (arms flag) | depends on next `/agent` or `/coder` | yes | Want manual control of the consumer mode |
+| `/plan <task>` | agent | yes | yes | Default flow, fastest |
+| `/plan agent <task>` | agent | yes | yes | Explicit equivalent (symmetry with `coder`) |
+| `/plan coder <task>` | coder | yes | yes | Engineering tasks (edits, builds, tests) |
+| `/plan preview <task>` | agent (temporary) | **no** | **no** | Review plan before running |
+| `/plan dry <task>` | same as `preview` | **no** | **no** | Alias |
+
+The `cli.pendingPlanFirst` flag is **consumed** and **cleared** on the first subsequent `/agent` or `/coder` invocation. The `cli.pendingPlanDryRun` flag (exclusive to preview/dry modes) is cleared at the same point and makes `AgentMode.Run` return before the ReAct loop via `planDryRunHandled`.
+
+<Tip>Recommended flow for large changes: **`/plan preview <task>`** first → review the JSON → if approved, run **`/plan coder <same task>`**.</Tip>
 
 ---
 
@@ -180,6 +217,44 @@ And prints a friendly one-liner to the terminal:
 ```text
   plan-first executed 4 step(s) before handing off to the orchestrator
 ```
+
+### Spinner during Plan-First
+
+The "planning structured steps..." spinner shows **only** during the pure `PlannerAgent` call (step 1). During `PlanRunner` execution (step 2), the spinner is intentionally **off** and a static status line is emitted:
+
+```text
+  executing structured plan...
+```
+
+<Warning>This is critical for safety: steps can trigger interactive approvals (ShellAgent `exec`, CoderAgent `write`) via the policy engine. If the spinner stayed active during execution, its `\r\033[K` repaint would overwrite the approval prompt and block the response. Ctrl+C still cancels normally — the cancelled context propagates through dispatcher and PlanRunner between steps.</Warning>
+
+### Dry-run: what gets rendered
+
+`/plan preview <task>` renders:
+
+```text
+  Generated plan (dry-run — nothing will be executed)
+
+  Summary: <task_summary from JSON>
+
+  1. [E1] agent=search
+     <resolved task>
+  2. [E2] agent=planner
+     <task>
+     deps: E1
+  3. [E3] agent=coder
+     <task>
+     deps: E2
+
+  Parallel groups:
+     [E1]
+     [E2]
+     [E3]
+
+  To execute this plan: /plan <same task> (or /plan coder <task>)
+```
+
+If `ParsePlan` fails (planner returned malformed JSON or prose), the raw output is printed with a warning — never silent.
 
 ---
 
