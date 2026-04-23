@@ -30,6 +30,12 @@ Typical output:
   CHATCLI_QUALITY_REFINE_MIN_BYTES     : 200
   CHATCLI_QUALITY_REFINE_EPSILON       : 50
   CHATCLI_QUALITY_REFINE_EXCLUDE       : formatter, deps, refiner, verifier
+  CHATCLI_QUALITY_REFINE_CONVERGENCE_ENABLED   : enabled
+  CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING : disabled
+  CHATCLI_QUALITY_REFINE_CONVERGENCE_STRICT    : disabled
+  CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_HIGH : 0.99
+  CHATCLI_QUALITY_REFINE_CONVERGENCE_JACCARD_HIGH: 0.95
+  CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING_SIM: 0.92
 
   ── Chain-of-Verification / CoVe (#6)
   CHATCLI_QUALITY_VERIFY_ENABLED       : disabled
@@ -43,6 +49,12 @@ Typical output:
   CHATCLI_QUALITY_REFLEXION_ON_HALLUCINATION: enabled
   CHATCLI_QUALITY_REFLEXION_ON_LOW_QUALITY : disabled
   CHATCLI_QUALITY_REFLEXION_PERSIST       : enabled
+  CHATCLI_QUALITY_REFLEXION_QUEUE_ENABLED : enabled
+  CHATCLI_QUALITY_REFLEXION_QUEUE_WORKERS : 2
+  CHATCLI_QUALITY_REFLEXION_QUEUE_CAPACITY: 1000
+  CHATCLI_QUALITY_REFLEXION_QUEUE_MAX_ATTEMPTS: 5
+  CHATCLI_QUALITY_REFLEXION_QUEUE_STALE_AFTER : 168h0m0s
+  Runtime state                         : queue=0 dlq=0
 
   ── Plan-and-Solve / ReWOO (#2)
   CHATCLI_QUALITY_PLAN_FIRST_MODE      : auto
@@ -135,18 +147,35 @@ Details: [#6 CoVe](/en/features/quality/cove#verify-session-toggle).
 
 ---
 
-### `/reflect` — persist a manual lesson
+### `/reflect` — durable lesson queue
 
 <CodeGroup>
-```bash
+```bash Persist manual lesson (no LLM)
 /reflect <free text of the lesson>
 # Ex: /reflect when editing large Go files use Edit, not full rewrite
 ```
+
+```bash Status
+/reflect                  # queue depth + DLQ size + subcommands
+```
+
+```bash Inspect the queue
+/reflect list             # pending + DLQ with preview
+/reflect failed           # DLQ only (with last error)
+```
+
+```bash DLQ operations
+/reflect retry <job-id>   # re-queue (resets attempts)
+/reflect purge <job-id>   # remove permanently
+/reflect drain            # force WAL replay
+```
 </CodeGroup>
 
-Writes directly to `memory.Fact` (category=`lesson`, trigger=`manual`) **without an LLM call**. Useful to capture real-time learnings.
+`/reflect <free text>` writes directly to `memory.Fact` (category=`lesson`, trigger=`manual`) **without an LLM call**. The queue subcommands (list/failed/retry/purge/drain) show and operate on automatic triggers (error, hallucination, low quality) buffered in the WAL awaiting async processing.
 
-Details: [#3 Reflexion](/en/features/quality/reflexion#reflect-manual-path-without-llm).
+<Info>`/reflect retry ` and `/reflect purge ` feature dynamic autocomplete: Tab pulls live IDs from the DLQ with task preview + last error.</Info>
+
+Full details: [#3 Reflexion → Durable Queue](/en/features/quality/reflexion#durable-queue-wal-worker-pool-dlq).
 
 ---
 
@@ -165,8 +194,23 @@ Details: [#3 Reflexion](/en/features/quality/reflexion#reflect-manual-path-witho
 | `CHATCLI_QUALITY_REFINE_ENABLED` | `false` | `true\|false` | Enable RefineHook |
 | `CHATCLI_QUALITY_REFINE_MAX_PASSES` | `1` | int ≥ 1 | Hard cap on passes |
 | `CHATCLI_QUALITY_REFINE_MIN_BYTES` | `200` | int ≥ 0 | Skip outputs smaller than N bytes |
-| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | int ≥ 0 | Convergence threshold in chars |
+| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | int ≥ 0 | Char-level fallback threshold |
 | `CHATCLI_QUALITY_REFINE_EXCLUDE` | `formatter,deps,refiner,verifier` | CSV | Agents that don't pass through refine |
+
+#### Semantic convergence cascade
+
+| Env var | Default | Values | Effect |
+|---|---|---|---|
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_ENABLED` | `true` | `true\|false` | Cascade master switch (char→Jaccard→embedding) |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING` | `false` | `true\|false` | Include embedding scorer (opt-in — costs $) |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_STRICT` | `false` | `true\|false` | Strict: refuse convergence without embedding |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_HIGH` | `0.99` | 0.0-1.0 | Char short-circuit CONVERGED |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_LOW` | `0.3` | 0.0-1.0 | Char short-circuit DIVERGED |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_JACCARD_HIGH` | `0.95` | 0.0-1.0 | Jaccard short-circuit CONVERGED |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING_SIM` | `0.92` | 0.0-1.0 | Final embedding cosine threshold |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_SIZE` | `256` | int | LRU cache size |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_TTL_MIN` | `5` | int | Cache TTL (minutes) |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_BREAKER_THRESHOLD` | `3` | int | Failures before breaker opens |
 
 ### CoVe (#6)
 
@@ -186,6 +230,23 @@ Details: [#3 Reflexion](/en/features/quality/reflexion#reflect-manual-path-witho
 | `CHATCLI_QUALITY_REFLEXION_ON_HALLUCINATION` | `true` | `true\|false` | Fire on `verified_with_discrepancy` |
 | `CHATCLI_QUALITY_REFLEXION_ON_LOW_QUALITY` | `false` | `true\|false` | Fire on `refine_low_quality` |
 | `CHATCLI_QUALITY_REFLEXION_PERSIST` | `true` | `true\|false` | Write to memory.Fact |
+
+#### Durable queue (WAL + worker pool + DLQ)
+
+| Env var | Default | Values | Effect |
+|---|---|---|---|
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_ENABLED` | `true` | `true\|false` | Enable the queue (default). `false` = legacy mode (goroutine) |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_WORKERS` | `2` | int ≥ 1 | Workers processing in parallel |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_CAPACITY` | `1000` | int | In-memory cap |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_DROP_OLDEST` | `false` | `true\|false` | `true` = drop oldest; `false` = block |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_BLOCK_TIMEOUT` | `5s` | duration | Enqueue timeout when queue is full |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_MAX_ATTEMPTS` | `5` | int ≥ 1 | Total retries |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_INITIAL_DELAY` | `1s` | duration | First retry delay |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_MAX_DELAY` | `5m` | duration | Cap on exponential backoff |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_JITTER` | `0.2` | 0.0-0.5 | Fractional jitter |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_JOB_TIMEOUT` | `2m` | duration | Per-job timeout |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_STALE_AFTER` | `168h` | duration | Old records discarded on replay |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_BASE_DIR` | — | path | Queue directory override |
 
 ### Plan-and-Solve (#2)
 

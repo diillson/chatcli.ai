@@ -84,6 +84,55 @@ ChatCLI ships **seven LLM-agent patterns** that work together as a quality pipel
 
 ---
 
+## Pipeline Architecture (engine)
+
+The QualityPipeline itself is a thread-safe machine with enterprise guarantees. Hooks are pluggable, but the scheduler below handles concurrency, failures, and shutdown:
+
+<Steps>
+  <Step title="State machine (Active → Draining → Closed)">
+    Transitions via atomic CAS. `DrainAndClose(timeout)` waits for in-flight to finish before closing — safe for graceful SIGTERM.
+  </Step>
+  <Step title="Copy-on-Write snapshots">
+    Each `AddPre`/`AddPost`/`SwapConfig` builds a new snapshot and CAS-swaps via `atomic.Pointer`. In-flight runs always see a consistent view; zero locks on the hot path.
+  </Step>
+  <Step title="Per-hook isolation">
+    Every hook runs inside a wrapper that recovers panics, enforces a timeout (default 30s), and records failures in a per-hook circuit breaker (default 5 failures → open 30s).
+  </Step>
+  <Step title="Priority-based ordering">
+    Hooks implementing `Prioritized` are ordered (lower first). Ties preserve registration order. Backward compat: hooks without Priority() default to 100.
+  </Step>
+  <Step title="Short-circuit sentinels">
+    A PreHook can return `ErrSkipExecution` (cache hit → skip `agent.Execute`) or `ErrSkipRemainingHooks` (stop the phase). The pipeline synthesizes a result so PostHooks still run.
+  </Step>
+  <Step title="Hot reload">
+    `SwapConfig(cfg)` atomically swaps config. In-flight runs keep the old config (correct — one turn under one config); new runs pick up the new one.
+  </Step>
+</Steps>
+
+### Pipeline metrics
+
+5 collections under `chatcli_quality_pipeline_*`:
+
+| Metric | Type | Labels | Notes |
+|---|---|---|---|
+| `dispatch_total` | Counter | `outcome` | ok, exec_error, pre_short_circuit, bypass_disabled, draining, closed |
+| `hook_duration_seconds` | Histogram | `hook`, `phase` | phase = pre\|post |
+| `hook_errors_total` | Counter | `hook`, `reason` | returned_error, timeout, panic, circuit_open |
+| `hook_circuit_state` | Gauge | `hook` | 0=closed, 1=open, 2=half_open |
+| `generation` | Gauge | — | Snapshot version — bumps on every registration/swap |
+
+Use `generation` to correlate dashboards with config changes:
+
+```promql
+# Pipeline change timeline
+changes(chatcli_quality_pipeline_generation[1h])
+
+# Worst-offender hooks
+sort_desc(rate(chatcli_quality_pipeline_hook_errors_total[5m])) by (hook, reason)
+```
+
+---
+
 ## Trigger matrix
 
 | Pattern | Slash | Env var | Default | Auto trigger |

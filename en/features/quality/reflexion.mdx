@@ -7,7 +7,9 @@ icon: "lightbulb"
 
 **Reflexion** closes the learning loop: when an agent fails or produces low-quality output, instead of losing the experience, the pipeline generates a structured **Lesson** and persists it to long-term memory. On the next similar task, that lesson naturally surfaces via RAG+HyDE.
 
-<Info>Reflexion is **the only post-hook on by default** — because it only fires in exceptional conditions (error, discrepancy) and the lesson generator runs in a **detached goroutine**, never blocking the user turn.</Info>
+<Info>Reflexion is **the only post-hook on by default** — because it only fires in exceptional conditions (error, discrepancy) and lesson generation never blocks the user turn.</Info>
+
+<Warning>**Durable mode (default since Apr 2026):** triggers flow through a WAL-backed queue with worker pool and dead-letter queue. Lessons survive process crashes via replay on next boot. See [Durable Queue](#durable-queue-wal-worker-pool-dlq).</Warning>
 
 ---
 
@@ -82,29 +84,175 @@ The Fact category is `lesson` and tags include `reflexion` + `trigger:<x>` + dom
 
 ---
 
-## Async flow
+## Flow — durable mode (default)
+
+With `CHATCLI_QUALITY_REFLEXION_QUEUE_ENABLED=true` (default), triggers flow through a persistent queue. The hook **never blocks the turn** and the process can crash without losing the lesson:
 
 <Steps>
-  <Step title="PostRun is called in the pipeline">
-    `ReflexionHook.PostRun(ctx, hc, result)` inspects `result.Metadata` + `result.Error` to decide the trigger.
+  <Step title="PostRun inspects the trigger">
+    `ReflexionHook.PostRun(ctx, hc, result)` looks at `result.Metadata` + `result.Error` — if no gate matches, returns in μs.
   </Step>
-  <Step title="If trigger matched, spawn goroutine">
-    ```go
-    go h.runReflexion(context.Background(), req)
-    return nil  // PostRun returns immediately
-    ```
-    **Detached** context on purpose: the turn's ctx will be cancelled when the response reaches the user, but we want the lesson generated anyway.
+  <Step title="WAL Append (synchronous, sub-ms)">
+    The hook calls `enqueuer.Enqueue(req)`. The Runner computes `JobID = sha256(task|trigger|attempt)[:16]`, writes a record to the WAL (`~/.chatcli/reflexion/wal/<id>.wal`) via **tmp → fsync → atomic rename → dir fsync**, then pushes in-memory.
   </Step>
-  <Step title="GenerateLesson via LLM">
-    The LLM receives system prompt + task + attempt + outcome, and emits XML-like blocks (`<situation>`, `<mistake>`, `<correction>`, `<tags>`, or `<skip>` if no useful lesson).
+  <Step title="Immediate return to the pipeline">
+    PostRun returns nil; the user's turn continues without waiting. Added latency is the fsync (typically < 1 ms).
   </Step>
-  <Step title="Parse + persist">
-    `parseLesson` validates that at least `situation` and `correction` are present. If `<skip>nothing actionable</skip>`, **returns nil without persisting**.
+  <Step title="Worker pool processes async">
+    One of N workers (default 2) dequeues, calls `GenerateLesson` with per-job timeout (default 2 min), and persists to `memory.Fact` unless the LLM emits `<skip>`.
   </Step>
-  <Step title="memory.Facts.AddFactWithSource">
-    Persists in `~/.chatcli/memory/memory_index.json` with category=`lesson` and tags including the current workspace as source.
+  <Step title="Outcome classification">
+    Success or Skipped → ACK (delete WAL record). Transient error (timeout, 429/503) → reschedule with exponential backoff + jitter. Permanent (parser error) → move to DLQ immediately.
+  </Step>
+  <Step title="Replay on boot">
+    Next session, `Runner.Replay()` runs async and re-queues every pending record from the WAL (discarding those older than `StaleAfter`, default 7 days).
   </Step>
 </Steps>
+
+<Tip>**Observable turn latency:** a local fsync on SSD is typically < 1 ms. Lesson generation (LLM call) happens **after** the turn responds — users never wait.</Tip>
+
+### Fallback: legacy mode (detached goroutine)
+
+If `CHATCLI_QUALITY_REFLEXION_QUEUE_ENABLED=false`, the hook reverts to the original behavior:
+
+```go
+go h.runReflexion(context.Background(), req)  // fire-and-forget
+```
+
+Zero filesystem dependency, but in-flight lessons vanish if the process is killed. Kept for backward compatibility and for users who prefer simplicity over durability.
+
+---
+
+## Durable Queue — WAL + Worker Pool + DLQ
+
+The queue is implemented in `cli/agent/quality/lessonq/` with enterprise guarantees:
+
+### WAL (Write-Ahead Log)
+
+Each pending lesson is a `.wal` file in `~/.chatcli/reflexion/wal/` — one per Job ID. Binary layout:
+
+```text
+[4B magic 'LSN1'][4B length BE][4B CRC32 payload][N bytes JSON payload][4B CRC32 trailer]
+```
+
+- **Double CRC** detects torn writes (crash mid-fsync). Corrupt records are discarded on replay + `chatcli_lessonq_wal_corruption_total` increments.
+- **Atomic rename**: write to `<id>.tmp.<pid>.<seq>` → fsync → rename → dir fsync. A reader never sees a partial record.
+- **O(1) ACK**: a single `unlink` removes the record. No background compaction.
+
+### Worker Pool
+
+```text
+Queue (min-heap by NextAttemptAt)
+      │
+      ├─► Worker 1 ─► GenerateLesson ─► persist ─► ACK
+      ├─► Worker 2 ─► GenerateLesson ─► persist ─► ACK
+      └─► Worker N ─► ...
+```
+
+Each worker:
+- Blocking Dequeue (waits until NextAttemptAt ≤ now).
+- Bounded per-job timeout (doesn't inherit turn ctx — reflexion outlives the turn by design).
+- Panic recovery: if the processor panics, goes straight to DLQ (retrying a bug loops).
+- Emits `chatcli_lessonq_processing_duration_seconds{outcome}`.
+
+### Dead Letter Queue
+
+Permanent failures or retry exhaustion go to `~/.chatcli/reflexion/dlq/` (same WAL format, read-only to the process). Operator inspects and decides:
+
+```bash
+/reflect failed              # list with last error
+/reflect retry <job-id>      # re-queue (resets Attempts=0)
+/reflect purge <job-id>      # remove permanently
+```
+
+### Retry with Jitter
+
+Transient errors (ctx timeout, provider 429/503, temp fs error) become reschedules:
+
+```text
+delay = InitialDelay × Multiplier^(attempt-1)
+delay = min(delay, MaxDelay)
+delay = delay × uniform(1-JitterFraction, 1+JitterFraction)
+```
+
+Defaults: 1s initial, 5min cap, 2.0 multiplier, ±20% jitter, 5 attempts. **Full jitter** prevents thundering herd when the provider recovers.
+
+### Idempotency
+
+`JobID` is content-addressed: `sha256(normalized(task) | trigger | attempt | outcome)[:16]`. Re-triggering the same situation while the job is in-flight is a no-op (WAL exists → Runner skips queue insert). Whitespace is normalized to avoid inflation from trivial churn.
+
+### Drain + Graceful Shutdown
+
+On exit (`cli.cleanup()`), the Runner enters `DrainAndShutdown(30s)`:
+1. Queue closes — no new dequeues.
+2. Workers finish in-flight (or get cancelled on timeout).
+3. WAL/DLQ close.
+
+Jobs still queued survive in the WAL and reprocess on next boot. **Zero data loss on SIGTERM or kill -9**.
+
+---
+
+## `/reflect` — Commands
+
+<CodeGroup>
+```bash Status
+/reflect                     # queue depth + DLQ size + subcommands hint
+```
+
+```bash Persist manual lesson (no LLM)
+/reflect when editing large Go files use Edit, not full rewrite
+# → writes directly to memory.Fact (trigger=manual)
+```
+
+```bash List pending + DLQ
+/reflect list
+# pending (N):
+#   <id>  [trigger=...  attempts=N  age=Ns]
+#     task: <truncated>
+# dead letter queue (M):
+#   <id>  [trigger=...  attempts=N]
+#     last error: <truncated>
+```
+
+```bash DLQ only (investigation focus)
+/reflect failed
+```
+
+```bash Re-queue job from DLQ (resets attempts)
+/reflect retry <job-id>
+# Tab complete pulls real IDs from the DLQ with task preview
+```
+
+```bash Permanently remove from DLQ
+/reflect purge <job-id>
+# Tab complete pulls real IDs from the DLQ
+```
+
+```bash Force WAL replay
+/reflect drain
+# Useful after importing a WAL from another machine or for manual reprocessing
+```
+</CodeGroup>
+
+<Info>All subcommands have Tab autocomplete. `/reflect retry ` and `/reflect purge ` list live DLQ IDs with task preview + last error.</Info>
+
+---
+
+## Files and layout
+
+```text
+~/.chatcli/reflexion/
+├── wal/                          # active queue (pending + in-flight)
+│   ├── a3f8...bc.wal            # one file per Job ID
+│   └── ...
+└── dlq/                          # dead letter queue (permanent failures)
+    ├── 9e2c...7a.wal
+    └── ...
+```
+
+Path configurable via `CHATCLI_QUALITY_REFLEXION_QUEUE_BASE_DIR` (default: `<workspace>/.chatcli/reflexion`).
+
+<Tip>Operators can `ls` the directory for quick triage without special tools. Each record is JSON inside the binary framing — `xxd` + the `lessonq` protocol docs help in forensics.</Tip>
 
 ---
 
@@ -171,6 +319,8 @@ The next turn's system prompt contains the `## Long-term Memory` section with th
 
 ## Environment variables
 
+### Gates (when to fire)
+
 | Env var | Default | What it does |
 |---|---|---|
 | `CHATCLI_QUALITY_REFLEXION_ENABLED` | `true` | Master switch |
@@ -178,6 +328,40 @@ The next turn's system prompt contains the `## Long-term Memory` section with th
 | `CHATCLI_QUALITY_REFLEXION_ON_HALLUCINATION` | `true` | Fire on `verified_with_discrepancy` |
 | `CHATCLI_QUALITY_REFLEXION_ON_LOW_QUALITY` | `false` | Fire on `refine_low_quality` |
 | `CHATCLI_QUALITY_REFLEXION_PERSIST` | `true` | Write to memory.Fact (false = log-only) |
+
+### Durable queue (WAL + worker pool + DLQ)
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_ENABLED` | `true` | Queue master switch. `false` falls back to legacy (detached goroutine) |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_WORKERS` | `2` | Worker pool size. Reflexion is I/O-bound on the LLM call |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_CAPACITY` | `1000` | Max in-memory depth before overflow policy kicks in |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_DROP_OLDEST` | `false` | Overflow: `true` drop oldest; `false` block with timeout |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_BLOCK_TIMEOUT` | `5s` | How long Enqueue waits when full (if `DROP_OLDEST=false`) |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_MAX_ATTEMPTS` | `5` | Total retries before moving to DLQ |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_INITIAL_DELAY` | `1s` | First retry delay |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_MAX_DELAY` | `5m` | Cap on exponential retry |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_JITTER` | `0.2` | Fractional jitter ([0, 0.5]) — AWS-style full jitter |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_JOB_TIMEOUT` | `2m` | Per-processor-call timeout (LLM + persist) |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_STALE_AFTER` | `168h` | WAL records older than this are discarded on replay (7 days) |
+| `CHATCLI_QUALITY_REFLEXION_QUEUE_BASE_DIR` | `<workspace>/.chatcli/reflexion` | Override of the root dir (WAL + DLQ) |
+
+### Prometheus metrics
+
+The queue emits 10 metrics under `chatcli_lessonq_*`:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `enqueue_total` | Counter | `outcome` | accepted, rejected_full, deduped, dropped_oldest |
+| `queue_depth` | Gauge | — | In-memory pending jobs |
+| `processing_duration_seconds` | Histogram | `outcome` | dequeue→outcome time |
+| `attempts_total` | Counter | `outcome` | success, skipped, transient, permanent |
+| `retry_total` | Counter | `attempt` | retries bucketed by attempt number |
+| `dlq_size` | Gauge | — | Jobs in DLQ |
+| `wal_segments` | Gauge | — | Active `.wal` files |
+| `wal_corruption_total` | Counter | — | Records rejected for CRC mismatch/torn write |
+| `stale_discarded_total` | Counter | — | Records dropped at replay due to age |
+| `persist_failures_total` | Counter | — | memory.Fact callback failures |
 
 ---
 
@@ -221,10 +405,40 @@ The next turn's system prompt contains the `## Long-term Memory` section with th
 ## Inspect stored lessons
 
 ```bash
-# All lessons
+# Lessons already persisted (materialized to memory.Fact)
 /memory longterm | grep -A3 "^LESSON:"
+cat ~/.chatcli/memory/memory_index.json | jq '.[] | select(.category=="lesson")'
 
-# Or directly in the file
+# Durable queue — live pending + DLQ
+/reflect list               # pending + DLQ
+/reflect failed             # DLQ only (triage)
+/config quality             # hook state + queue depth + dlq size
+```
+
+### Useful Prometheus snapshots
+
+```promql
+# General queue health
+chatcli_lessonq_queue_depth
+chatcli_lessonq_dlq_size
+sum(rate(chatcli_lessonq_attempts_total[5m])) by (outcome)
+
+# Regression detection: DLQ growing without new success
+rate(chatcli_lessonq_attempts_total{outcome="permanent"}[5m]) > 0
+
+# Alert on WAL corruption (signal of unstable fs)
+increase(chatcli_lessonq_wal_corruption_total[1h]) > 0
+
+# Processor percentile latency
+histogram_quantile(0.95,
+  rate(chatcli_lessonq_processing_duration_seconds_bucket[5m]))
+```
+
+### Legacy inspection (pre-queue)
+
+```bash
+# All lessons (same as above, shown for backward-compat)
+/memory longterm | grep -A3 "^LESSON:"
 cat ~/.chatcli/memory/memory_index.json | jq '.[] | select(.category=="lesson")'
 
 # Or via /config

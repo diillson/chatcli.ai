@@ -65,12 +65,72 @@ pronta para ir ao usuário…
 
 ---
 
-## Convergência
+## Convergência — cascade semântico
 
-`convergedRefine` é um check barato que detecta quando duas revisões consecutivas são "praticamente iguais":
+O Self-Refine usa um **cascade char → Jaccard → embedding** pra decidir quando parar. O heurístico char-level antigo (`convergedCharHeuristic`, ainda fallback) só pegava igualdade literal; o cascade pega **mesmo significado em palavras diferentes**, que é o caso real da maioria dos rewrites.
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  Pass N: revisão nova (next) vs draft atual                 │
+└───────────────┬────────────────────────────────────────────┘
+                ▼
+   1. Char scorer (μs)  ─────────── sim > 0.99?  ─► CONVERGIU (idêntico)
+                       │                     sim < 0.3?  ─► DIVERGIU (obviamente diferente)
+                       ▼ borderline
+   2. Jaccard scorer (ms) ────── sim > 0.95 + high conf? ─► CONVERGIU
+                       │
+                       ▼ ainda borderline
+   3. Embedding (ms + $) ──── sim > 0.92? ─► CONVERGIU
+                       │                  senão ─► CONTINUA REFINANDO
+                       │
+                       ▼ embedder fora
+   Fallback: Jaccard → Char (com flag DegradedFrom)
+```
+
+### Os três scorers
+
+| Scorer | Custo | Pega | Confiança |
+|---|---|---|---|
+| **Char** | μs | Igualdade literal, length delta | Alta nos extremos, baixa no meio |
+| **Jaccard** | ms | Sets de tokens normalizados (lowercase, stop-words PT/EN, sem pontuação) — captura reordenação | Cresce com tamanho do corpus |
+| **Embedding** | 100-500ms + $ | Cosine similarity via `embedding.Provider` (Voyage/OpenAI) — captura paráfrase + sinônimos | Alta, autoritativa |
+
+### Quality regression guard
+
+Além de detectar convergência, o hook compara cada nova revisão contra o **draft original**. Se a similaridade começa a **cair** entre passes (rewrite está drift-ando pra pior), reverte ao melhor draft visto e marca `refine_rolled_back=true` no metadata — sinal que Reflexion consome:
+
+```text
+pass 0: draft original                        sim_best=1.0
+pass 1: rewrite v1    sim vs original = 0.95  → melhor que original, keep
+pass 2: rewrite v2    sim vs original = 0.50  → drop > 15% → REVERT a v1
+                                                refine_rolled_back=true
+```
+
+Isso previne o modelo de iterar até uma resposta pior quando a crítica superinterpreta.
+
+### Cache LRU com TTL
+
+Embedding é caro ($). O cascade cacheia vetores por `sha256(text)` numa LRU bounded (default 256 entries, 5min TTL) — durante um loop multi-pass, a mesma string aparece em comparações consecutivas e o hit evita chamada duplicada.
+
+### Circuit breaker por scorer
+
+Se o embedder retorna 3 erros consecutivos (provider 429/503/timeout), o breaker abre por 30s — o cascade degrada graciosamente pro Jaccard com `DegradedFrom="embedding_unavailable"` no Score. Zero stall no refine.
+
+### Modo strict vs permissive
+
+| Modo | Embedder fora | Comportamento |
+|---|---|---|
+| **permissive** (default) | Degrada pra Jaccard | Marca DegradedFrom no trail, continua |
+| **strict** | Recusa convergência | Trata embedding como autoridade; sem ela, `Converged=false` |
+
+Strict é pra workloads de alta-stakes (contratos legais, código de segurança) onde false-positive convergence = ship output não-polido.
+
+### Fallback legado
+
+Quando nenhum checker é wirado (ou `CONVERGENCE_ENABLED=false`), cai no heurístico char-level original:
 
 ```go
-func convergedRefine(a, b string, epsilon int) bool {
+func convergedCharHeuristic(a, b string, epsilon int) bool {
     if abs(len(a) - len(b)) > epsilon { return false }
     mismatches := 0
     for i := 0; i < min(len(a), len(b)); i++ {
@@ -83,7 +143,7 @@ func convergedRefine(a, b string, epsilon int) bool {
 }
 ```
 
-Com `EpsilonChars=50` (default), o loop para quando duas passadas diferem por menos de 50 caracteres — sinal claro de estabilização. Isso **evita gastar tokens** iterando em um output que o modelo já considera pronto.
+Com `EpsilonChars=50` (default), para quando duas passadas diferem por menos de 50 caracteres. Barato mas cego a paráfrase — por isso o cascade é o default enterprise.
 
 ---
 
@@ -150,13 +210,32 @@ O override de sessão mora em `cli.qualityOverrides.Refine` como `*bool`:
 
 ## Variáveis de ambiente
 
+### Básicos
+
 | Env var | Default | O que faz |
 |---|---|---|
 | `CHATCLI_QUALITY_REFINE_ENABLED` | `false` | Master switch |
 | `CHATCLI_QUALITY_REFINE_MAX_PASSES` | `1` | Hard cap de passes (recomendo 1-2) |
 | `CHATCLI_QUALITY_REFINE_MIN_BYTES` | `200` | Não refina outputs menores |
-| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | Threshold de convergência em chars |
+| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | Threshold char do fallback |
 | `CHATCLI_QUALITY_REFINE_EXCLUDE` | `formatter,deps,refiner,verifier` | CSV de agents que NÃO são refinados |
+
+### Cascade semântico de convergência
+
+| Env var | Default | Efeito |
+|---|---|---|
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_ENABLED` | `true` | Master switch do cascade. `false` = fallback pro char heurístico |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING` | `false` | Inclui embedding scorer — opt-in porque custa $ |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_STRICT` | `false` | Strict mode: recusa convergência sem embedding |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_HIGH` | `0.99` | Sim ≥ X pelo char → short-circuit CONVERGIU |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_LOW` | `0.3` | Sim < X pelo char → short-circuit DIVERGIU |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_JACCARD_HIGH` | `0.95` | Sim ≥ X pelo Jaccard (com confiança ≥ 0.6) → CONVERGIU |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING_SIM` | `0.92` | Threshold final do embedding |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_SIZE` | `256` | Entries do LRU cache de embeddings |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_TTL_MIN` | `5` | TTL do cache em minutos |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_BREAKER_THRESHOLD` | `3` | Falhas consecutivas do embedder antes do breaker abrir |
+
+<Tip>Pra habilitar o embedding: `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING=1` + `CHATCLI_EMBED_PROVIDER=voyage` + `VOYAGE_API_KEY`. O cascade reutiliza o mesmo provedor do HyDE — zero infra duplicada.</Tip>
 
 ### Override do refiner agent
 

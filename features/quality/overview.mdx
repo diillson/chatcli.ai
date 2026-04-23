@@ -83,6 +83,55 @@ O ChatCLI implementa **sete padrões de agente LLM** trabalhando em conjunto com
 
 ---
 
+## Arquitetura do Pipeline (engine)
+
+O QualityPipeline em si é uma máquina thread-safe com garantias enterprise. Os hooks são plugáveis, mas o scheduler embaixo deles cuida de concorrência, falhas e shutdown:
+
+<Steps>
+  <Step title="State machine (Active → Draining → Closed)">
+    Transições via CAS atômico. `DrainAndClose(timeout)` espera in-flight terminarem antes de fechar — safe pra SIGTERM graceful.
+  </Step>
+  <Step title="Copy-on-Write snapshots">
+    Cada `AddPre`/`AddPost`/`SwapConfig` constrói um novo snapshot e faz CAS-swap via `atomic.Pointer`. Runs em vôo sempre veem um view consistente; zero lock no hot path.
+  </Step>
+  <Step title="Isolamento por hook">
+    Cada hook roda dentro de um wrapper que recupera de panic, impõe timeout (default 30s) e registra falhas num circuit breaker per-hook (default 5 falhas → open 30s).
+  </Step>
+  <Step title="Priority-based ordering">
+    Hooks implementando `Prioritized` interface são ordenados (lower first). Ties usam ordem de registro. Backward-compat: hooks sem Priority() ficam em 100.
+  </Step>
+  <Step title="Short-circuit sentinels">
+    PreHook pode retornar `ErrSkipExecution` (cache-hit → pula `agent.Execute`) ou `ErrSkipRemainingHooks` (para a phase). Pipeline sintetiza um result pra PostHooks continuarem rodando.
+  </Step>
+  <Step title="Hot reload">
+    `SwapConfig(cfg)` substitui config atomicamente. Runs em vôo mantêm o config antigo (correto — um turn sob um config só); runs novos pegam o novo.
+  </Step>
+</Steps>
+
+### Métricas do pipeline
+
+5 coleções em `chatcli_quality_pipeline_*`:
+
+| Métrica | Tipo | Labels | Observação |
+|---|---|---|---|
+| `dispatch_total` | Counter | `outcome` | ok, exec_error, pre_short_circuit, bypass_disabled, draining, closed |
+| `hook_duration_seconds` | Histogram | `hook`, `phase` | phase = pre\|post |
+| `hook_errors_total` | Counter | `hook`, `reason` | returned_error, timeout, panic, circuit_open |
+| `hook_circuit_state` | Gauge | `hook` | 0=closed, 1=open, 2=half_open |
+| `generation` | Gauge | — | Snapshot version — pula a cada registration/swap |
+
+Use `generation` pra correlacionar dashboards com config changes:
+
+```promql
+# Cronologia de mudanças de pipeline
+changes(chatcli_quality_pipeline_generation[1h])
+
+# Hooks problemáticos
+sort_desc(rate(chatcli_quality_pipeline_hook_errors_total[5m])) by (hook, reason)
+```
+
+---
+
 ## Tabela de disparo
 
 | Padrão | Slash | Env var | Default | Gatilho automático |
