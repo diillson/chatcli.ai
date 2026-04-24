@@ -403,10 +403,67 @@ In `cli/scheduler/action/`:
 slash_cmd, llm_prompt, agent_task, worker_dispatch, hook, noop, webhook, shell
 ```
 
-Each action passes through its own security door:
-- `shell` → CLIBridge.RunShell → CoderMode allowlist from `/config security`.
+Each action type passes through its own security door:
+- `shell` → **enqueue preflight + fire-time re-check against CoderMode** (see next section).
 - `webhook` → http.Client with timeout and max response size.
-- CoderMode bypass requires `CHATCLI_SCHEDULER_SHELL_ALLOW_BYPASS=true` **and** `--bypass_safety` in the spec.
+- `agent_task` → re-enters the ReAct loop, which keeps its own interactive policy.
+- `slash_cmd` → flows through the CLI's CommandHandler (subject to the normal session rules).
+
+### CoderMode preflight for shell
+
+<Warning>
+The scheduler **never prompts interactively**. In daemon mode there is no user present; under a nightly cron the user may be offline. So **every approval happens at `/schedule` time**, not at fire.
+</Warning>
+
+Every shell command embedded in a job (in `Action`, in `Wait.Condition`, or in `all_of`/`any_of` composite children) is passed to CoderMode's `PolicyManager` — the same one `/coder` and `/agent` use interactively. Three outcomes:
+
+| Classification | Scheduler behavior |
+|---|---|
+| **Allow** (allowlist match, or known read-only like `kubectl get`) | ✅ job admitted |
+| **Deny** (denylist match) | ❌ rejected at `/schedule` with `ErrShellPolicyDeny`. **Denylist beats `--i-know`** — not an override. |
+| **Ask** (outside allowlist, unknown command) | ⚠️ rejected with `ErrShellPolicyAsk` **unless** the job has `DangerousConfirmed=true` (via `--i-know`) |
+
+The preflight runs **before the WAL write**, so dangerous jobs never get persisted. At fire time, `RunShell` on the bridge **reloads the on-disk policy and re-classifies** — if the operator added a Deny rule between schedule and execution, the job fails instead of running.
+
+### `--i-know` and `i_know` (agents)
+
+When you want to schedule a command outside the allowlist without adding it permanently:
+
+```bash
+/schedule custom-probe --when +30s \
+  --do "shell: my-proprietary-tool --probe" \
+  --i-know
+```
+
+That sets `Job.DangerousConfirmed=true` and the job passes preflight even with an `Ask` classification. Denylist **still** blocks — `--i-know` does not override an explicit `deny`.
+
+Agents get the equivalent via tool call:
+
+```xml
+<tool_call name="@scheduler" args='{
+  "cmd": "schedule",
+  "args": {
+    "name": "probe",
+    "when": "+30s",
+    "do": "shell: my-proprietary-tool --probe",
+    "i_know": true
+  }
+}' />
+```
+
+The authorization here is implicit: you already authorized the agent when you ran `/agent`. To keep agents from using `i_know`, set `CHATCLI_SCHEDULER_ALLOW_AGENTS=false` or keep dangerous commands on the denylist (agents can never bypass denylist).
+
+### Full bypass (trusted automation)
+
+For internal automation in a trusted environment you can disable the policy check per-job entirely:
+
+1. Operator enables it: `CHATCLI_SCHEDULER_SHELL_ALLOW_BYPASS=true`
+2. Job carries `bypass_safety: true` in the action payload:
+   ```json
+   {"type": "shell", "payload": {"command": "...", "bypass_safety": true}}
+   ```
+
+**Avoid** this in most cases — the right path is almost always to add the command to the allowlist via `/config security` or to use `--i-know` explicitly. Bypass is for CI/CD in ephemeral containers.
 
 ### Rate limiting
 
