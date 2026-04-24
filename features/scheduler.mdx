@@ -1,0 +1,570 @@
+---
+title: "Scheduler (Chronos) — Agendamento durável"
+sidebarTitle: "Scheduler"
+description: "Sistema de agendamento com cron, wait-until, DAG e daemon mode. Agents agendam ações sozinhos; jobs sobrevivem a reinícios."
+icon: "clock"
+---
+
+O **Scheduler** (codename **Chronos**) é a camada de automação durável do ChatCLI. Ele permite:
+
+- **Agendar ações** por tempo absoluto, relativo, cron ou interval.
+- **Esperar condições** (HTTP, K8s, Docker, TCP, file, shell, LLM) e disparar ações só quando satisfeitas.
+- **Encadear jobs** em DAG com `DependsOn` / `Triggers`.
+- **Rodar em daemon** que sobrevive ao fechar da CLI — perfeito para deploys longos, `terraform apply`, migrações de banco.
+- **Dar aos agents** uma ferramenta `@scheduler` para planejar os próprios follow-ups ("aguarde o deploy e me avise").
+
+Tudo persistente via **WAL com CRC32**, **snapshots** periódicos, **circuit breakers** por evaluator/action, **rate limiter** global e por-owner, **audit log** JSONL, **métricas Prometheus** e **hooks** de lifecycle.
+
+<Info>
+Todos os três modos do ChatCLI (CLI interativa, servidor gRPC, operador K8s) podem usar o scheduler. O daemon é opcional — em uso casual o scheduler roda in-process e o WAL replaya os jobs na próxima vez que você abrir o CLI.
+</Info>
+
+---
+
+## Por que você precisa disso
+
+Antes do scheduler, ChatCLI era sempre síncrono. Você pedia algo, esperava, recebia resposta. Agora:
+
+```bash
+❯ /schedule deploy --when +0s --do "shell: terraform apply -auto-approve" --triggers verify
+❯ /schedule verify --when manual --do "/run kubectl get pods" --wait "k8s:deployment/prod/api:Available" --timeout 10m
+
+❯ exit    # pode fechar o CLI — jobs continuam se o daemon estiver rodando
+```
+
+O `terraform apply` roda, espera a deployment ficar Available, então executa o check final. Você volta horas depois e pergunta `/jobs history` para ver o que aconteceu.
+
+---
+
+## Dois modos de execução
+
+<Tabs>
+<Tab title="In-process (padrão)">
+
+**Sem setup.** Abra o chatcli normal e use `/schedule` / `/wait` / `/jobs`. O scheduler roda dentro do próprio processo.
+
+```bash
+❯ chatcli
+❯ /schedule backup --cron "0 2 * * *" --do "/run backup diário"
+```
+
+O status line no prompt mostra `[jobs: 1⏳]` enquanto há jobs ativos.
+
+<Warning>
+Se você sair do chatcli, os workers param. Os jobs pendentes ficam no WAL (`~/.chatcli/scheduler/wal/`) e serão **replayados** automaticamente na próxima vez que você abrir o CLI.
+</Warning>
+
+</Tab>
+<Tab title="Daemon (autônomo)">
+
+**Setup uma vez, roda sozinho.** Jobs continuam mesmo se você fechar o terminal.
+
+```bash
+# Sobe o daemon em background
+$ chatcli daemon start --detach
+chatcli daemon started (pid=12345, socket=/tmp/chatcli-scheduler.sock, log=~/.chatcli/scheduler/daemon.log)
+
+# Qualquer chatcli que você abrir conecta sozinho
+$ chatcli
+[scheduler: connected to daemon at /tmp/chatcli-scheduler.sock]
+
+❯ /schedule deploy ...
+❯ exit
+# Daemon continua rodando. Volte depois:
+
+$ chatcli daemon status
+chatcli daemon
+  socket   : /tmp/chatcli-scheduler.sock
+  uptime   : 3h 14m
+  jobs     : 4 active, queue=2
+  wal segs : 11
+  clients  : 0
+```
+
+**Parar o daemon:** `chatcli daemon stop` — jobs pendentes ficam no WAL e serão retomados no próximo start.
+
+</Tab>
+</Tabs>
+
+---
+
+## Comando `/schedule` — criar um job
+
+```bash
+/schedule <nome> --when <t> --do <ação> [flags]
+```
+
+### Valores de `--when`
+
+O DSL aceita múltiplos formatos:
+
+| Formato | Exemplo | Comportamento |
+|---|---|---|
+| Relative | `+5m`, `in 30s`, `after 2h` | Uma vez, após a duração |
+| Absolute | `at 2026-04-25T14:00`, `at now` | Uma vez, em tempo exato |
+| Cron 5-campos | `cron:0 2 * * *`, `0 2 * * *` | Recorrente, padrão Vixie-cron |
+| Cron shorthand | `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly` | Presets comuns |
+| Interval | `every 30s`, `every 5m`, `every 1h` | Recorrente com intervalo fixo |
+| Condition-gated | `when-ready` | Sem tempo — dispara quando `--wait` for satisfeito |
+| Manual | `manual`, `triggered` | Só dispara via `--triggers` de outro job |
+
+### Valores de `--do`
+
+Sete tipos de action:
+
+| Tipo | Sintaxe | Descrição |
+|---|---|---|
+| **Slash command** | `/run tests` / `/coder refactor X` | Executa slash command como se o user tivesse digitado |
+| **Shell** | `shell: docker compose up -d` | Comando shell sob CoderMode safety |
+| **Agent task** | `agent: deploy e verifique` | Boota ReAct agent com a tarefa |
+| **LLM prompt** | `llm: resumir o relatório semanal` | Single LLM call headless |
+| **Webhook** | `POST https://hooks.slack.com/... \| hello` | HTTP request |
+| **Hook** | `hook:PostToolUse` | Dispara hook chatcli por event name |
+| **Noop** | `noop` | Útil para pipelines só com Triggers |
+
+### Flags completas
+
+<Expandable title="Flags de /schedule">
+| Flag | Valor | Descrição |
+|---|---|---|
+| `--when` | DSL | Quando disparar (obrigatório) |
+| `--cron` | expr 5-campos | Atalho para `--when cron:<expr>` |
+| `--every` | duração | Atalho para `--when every <dur>` |
+| `--do` | DSL | Ação a executar (obrigatório) |
+| `--wait` / `--until` | DSL condição | Poll até satisfazer antes da ação |
+| `--timeout` | duração | Timeout da ação (padrão 5m) |
+| `--wait-timeout` | duração | Timeout do loop de wait (padrão 30m) |
+| `--poll` | duração | Intervalo entre polls (padrão 5s) |
+| `--max-polls` | int | Limite de polls (0=ilimitado) |
+| `--max-retries` | int | Retries em falha transiente |
+| `--depends-on` | job_id | Bloqueia até o job dependency completar |
+| `--triggers` | job_id | Dispara o job alvo quando este completar |
+| `--ttl` | duração | Quanto tempo manter o registro pós-terminal |
+| `--description` | texto | Descrição livre para `/jobs show` |
+| `--tag` | k=v | Tag para filtrar em `/jobs list` |
+| `--on-timeout` | `fail\|fire_anyway\|fallback` | Comportamento no timeout do wait |
+| `--async` | — | Não bloqueia — retorna o job ID |
+| `--i-know` | — | Confirma comando shell perigoso |
+</Expandable>
+
+### Exemplos
+
+```bash
+# Cron diário
+/schedule backup --cron "0 2 * * *" --do "/run backup --full"
+
+# Um-shot com wait
+/schedule deploy --when +0s --do "shell: terraform apply -auto-approve" \
+  --wait "k8s:deployment/prod/api:Available" --timeout 15m \
+  --triggers smoke-tests
+
+# Interval com tag
+/schedule health-check --every 30s --do "/run healthcheck prod" --tag env=prod
+
+# Manual (só dispara via triggers do pai)
+/schedule notify --when manual --do "POST https://slack.webhook | deploy done"
+```
+
+---
+
+## Comando `/wait` — bloquear até condição
+
+Açúcar sintático para "esperar que X aconteça e opcionalmente fazer Y".
+
+```bash
+/wait --until <condição> [--then <ação>] [flags]
+```
+
+### DSL de condições
+
+| Sintaxe | Evaluator interno | Exemplo |
+|---|---|---|
+| `http://host/path==200` | `http_status` | Aguarda HTTP 200 |
+| `http://host~=/ok/` | `http_status` (regex) | Aguarda regex bater no body |
+| `tcp://host:port` | `tcp_reachable` | Aguarda porta TCP aberta |
+| `k8s:<kind>/<ns>/<name>:<cond>` | `k8s_resource_ready` | `k8s:pod/prod/api:Ready` |
+| `k8s:<kind>/<name>` | `k8s_resource_ready` | Namespace default, condição `Ready` |
+| `docker:<name>:running` | `docker_running` | Container rodando |
+| `docker:<name>:healthy` | `docker_running` | Container com healthcheck OK |
+| `file:/path` | `file_exists` | Arquivo existe |
+| `file:/path>=100` | `file_exists` (min_size) | Arquivo ≥ 100 bytes |
+| `shell: <cmd>` | `shell_exit` | Shell retorna 0 |
+| `<cmd>~=/pattern/` | `regex_match` | Output do cmd casa regex |
+| `llm: <pergunta>` | `llm_check` | LLM responde YES à pergunta |
+| `and(<expr>, <expr>, ...)` | `all_of` | Todos satisfeitos |
+| `or(<expr>, <expr>, ...)` | `any_of` | Qualquer um satisfeito |
+| `not <expr>` | `negate` | Nega a expressão filha |
+
+### Exemplos
+
+```bash
+# Esperar o endpoint ficar saudável e rodar smoke test
+/wait --until http://localhost:8080/health==200 --then "/run smoke" --every 5s --timeout 10m
+
+# Async: registra e volta imediato; você vê em /jobs list
+/wait --until "k8s:pod/prod/api-*:Ready" --async --name api-ready
+
+# Composta: porta aberta E arquivo de lock removido
+/wait --until "and(tcp://db:5432, not file:/tmp/migrating)" --then "/run app restart"
+```
+
+### Timeouts
+
+- **`--on-timeout fail`** (padrão) — marca como `timed_out` e encerra.
+- **`--on-timeout fire_anyway`** — roda a ação mesmo sem a condição satisfeita.
+- **`--on-timeout fallback`** — roda o action alternativo definido em `WaitSpec.Fallback` (via JSON spec) e depois falha.
+
+---
+
+## Comando `/jobs` — gerenciar
+
+```bash
+/jobs list                    # ativos (pending, blocked, waiting, running, paused)
+/jobs list --all              # inclui terminais
+/jobs list --status running
+/jobs list --owner me
+/jobs list --tag env=prod --name backup
+
+/jobs show <id>               # detalhe completo + histórico de execuções
+/jobs tree                    # DAG ASCII (depends_on / triggers)
+/jobs logs <id>               # histórico de execuções (falhas, outputs)
+/jobs history                 # jobs terminais (alias de list --all filtrado)
+
+/jobs cancel <id> [motivo...]
+/jobs pause <id>
+/jobs resume <id>
+
+/jobs daemon                  # status do daemon ou in-process
+/jobs gc                      # força snapshot + WAL garbage collection
+```
+
+O autocomplete (pressione Tab) sugere:
+- Subcomandos (`list`, `show`, `cancel`, …)
+- IDs reais dos jobs para `show`/`cancel`/`pause`/`resume`/`logs`
+- Valores para `--status` (pending, running, waiting, …) e `--owner` (me, user, agent, worker, system, hook)
+
+---
+
+## Daemon mode
+
+### Ciclo de vida
+
+```bash
+chatcli daemon start [--detach] [--socket <path>]
+chatcli daemon stop  [--socket <path>]
+chatcli daemon status [--socket <path>]
+chatcli daemon ping  [--socket <path>]
+chatcli daemon install    # imprime template systemd/launchd
+```
+
+- **`--detach`** faz re-exec com `setsid` (Unix) / `CREATE_NEW_PROCESS_GROUP` (Windows), libera o terminal. Log vai para `<socket_dir>/daemon.log`.
+- O CLI interativo auto-detecta um daemon na socket configurada e vira **thin client** — `/schedule`, `/wait`, `/jobs` round-trip por IPC.
+- Stale sockets (processo morto) são limpos automaticamente antes de `start`.
+
+### Protocolo IPC
+
+Socket UNIX com frames de 4-byte length-prefix + JSON payload. Kinds suportados:
+- `ping`, `bye` — health/close
+- `enqueue`, `cancel`, `pause`, `resume`, `query`, `list`, `snapshot`, `stats` — operações
+- `subscribe` — server-sent events para UI
+
+**Durabilidade** é idêntica ao in-process: WAL fsync antes de admitir, snapshot periódico, replay on boot.
+
+### systemd / launchd
+
+`chatcli daemon install` imprime um template pronto para colar em `/etc/systemd/system/chatcli-scheduler.service` ou `~/Library/LaunchAgents/`.
+
+---
+
+## `@scheduler` — tool para agents
+
+Dentro do ReAct loop, o agent pode chamar `@scheduler` com 5 subcomandos. Isso permite agents plancjar pausas autônomas.
+
+```xml
+<tool_call name="@scheduler" args='{
+  "cmd": "schedule",
+  "args": {
+    "name": "wait-deploy",
+    "when": "+0s",
+    "do": "/run kubectl get pods -n prod",
+    "until": "k8s:deployment/prod/api:Available",
+    "timeout": "10m"
+  }
+}' />
+```
+
+Subcomandos:
+
+| `cmd` | Args shape | Retorna |
+|---|---|---|
+| `schedule` | `{name, when, do, wait?, timeout?, depends_on?, triggers?, ...}` | `{job_id, status, summary}` |
+| `wait` | `{until, every?, timeout?, async?, then?}` | Sync: `{outcome, job}` · Async: `{job_id, status}` |
+| `query` | `{id}` | Job completo (status, history, transitions) |
+| `list` | `{filter?: {owner, statuses, tag, name_substr, include_terminal}}` | `{jobs: [...]}` |
+| `cancel` | `{id, reason?}` | `{ok, job_id}` |
+
+<Tip>
+Owner do agent é preservado automaticamente — `filter.owner == OwnerAgent` por default no `list`, e agents só podem cancelar jobs que criaram (ou jobs de workers filhos).
+</Tip>
+
+---
+
+## Evaluators e actions — plug-in registry
+
+### Evaluators builtin
+
+Cada um implementa `ConditionEvaluator` em `cli/scheduler/condition/`:
+
+<CardGroup cols={2}>
+<Card title="shell_exit" icon="terminal">
+Executa comando, compara exit code com `expected` (default 0).
+</Card>
+<Card title="http_status" icon="globe">
+GET/POST para URL, matching exato ou por regex no body.
+</Card>
+<Card title="file_exists" icon="file">
+Presença de arquivo, tamanho mínimo, mtime estável.
+</Card>
+<Card title="k8s_resource_ready" icon="cubes">
+`kubectl get` + jsonpath; Pod, Deployment, StatefulSet, Service, etc.
+</Card>
+<Card title="docker_running" icon="docker">
+`docker inspect`; running + healthcheck.
+</Card>
+<Card title="tcp_reachable" icon="network-wired">
+Dial TCP com timeout.
+</Card>
+<Card title="regex_match" icon="code">
+Shell cmd + regex contra stdout/stderr/combined.
+</Card>
+<Card title="llm_check" icon="sparkles">
+LLM headless responde YES/NO à sua pergunta.
+</Card>
+<Card title="custom" icon="gear">
+User script — args via env `CHATCLI_SCHEDULER_SPEC`.
+</Card>
+<Card title="all_of / any_of" icon="sitemap">
+Composite com curto-circuito e negação por filho.
+</Card>
+</CardGroup>
+
+### Actions builtin
+
+Em `cli/scheduler/action/`:
+
+- **slash_cmd** — invoca `/foo args` via command handler.
+- **shell** — comando shell sob CoderMode safety (allowlist/denylist de `/config security`).
+- **agent_task** — boota ReAct loop com a tarefa.
+- **worker_dispatch** — single-agent worker invocation.
+- **llm_prompt** — LLM call headless, opção de append na history.
+- **webhook** — HTTP POST/GET/PUT com JSON body, headers, expected status.
+- **hook** — fire hook chatcli por evento.
+- **noop** — útil para pipelines só com Triggers.
+
+---
+
+## Durabilidade
+
+### WAL (Write-Ahead Log)
+
+- Um arquivo por job: `~/.chatcli/scheduler/wal/<jobid>.wal`
+- Framing: `magic[4] | length[4] | crc32[4] | payload | crc32[4]` — duplo CRC detecta torn writes.
+- Atomic write via `tmp+rename` + `dir fsync`.
+- Arquivos corrompidos viram `<jobid>.wal.corrupt` para inspeção.
+
+### Snapshot
+
+- Escrito a cada `SNAPSHOT_INTERVAL` (padrão 5min) em `snapshot.json`.
+- Atomic replace via tmp-rename.
+- Boot preferencial: snapshot → overlay com qualquer `.wal` mais novo.
+
+### Replay on boot
+
+- Jobs `Running` ou `Waiting` no momento do crash voltam a `Pending` com `Attempts` preservado.
+- Missed fires respeitam `MissPolicy`:
+  - **`fire_once`** (padrão) — coalesce de todos os ticks perdidos em um único fire.
+  - **`fire_all`** — fire por cada tick perdido (opt-in, pode saturar).
+  - **`skip`** — ignora a janela perdida, forward pra próxima.
+
+### Garbage collection
+
+- Jobs terminais ficam `TTL` em disco (padrão 24h) para `/jobs history`.
+- GC loop (`WAL_GC_INTERVAL`, padrão 1h) unlink `.wal` expirados.
+
+---
+
+## Segurança
+
+### Action allowlist
+
+`CHATCLI_SCHEDULER_ACTION_ALLOWLIST` controla quais tipos de action podem ser agendados. Default:
+
+```
+slash_cmd, llm_prompt, agent_task, worker_dispatch, hook, noop, webhook, shell
+```
+
+Cada action passa pela sua porta de segurança específica:
+- `shell` → CLIBridge.RunShell → CoderMode allowlist do `/config security`.
+- `webhook` → http.Client com timeout e max response size.
+- Bypass de CoderMode exige `CHATCLI_SCHEDULER_SHELL_ALLOW_BYPASS=true` **e** `--bypass_safety` no spec.
+
+### Rate limiting
+
+Token-bucket global + per-owner com tolerância de nanodelay:
+
+```
+CHATCLI_SCHEDULER_RATE_LIMIT_GLOBAL_RPS=5.0    # default
+CHATCLI_SCHEDULER_RATE_LIMIT_GLOBAL_BURST=20
+CHATCLI_SCHEDULER_RATE_LIMIT_OWNER_RPS=1.0
+CHATCLI_SCHEDULER_RATE_LIMIT_OWNER_BURST=10
+```
+
+Um agent em ReAct loop runaway não consegue inundar a fila — o rate limiter rejeita com `Retry-After` hint.
+
+### Circuit breakers
+
+Um breaker por evaluator type e um por action type, com `closed → open → half_open` classic:
+
+```
+CHATCLI_SCHEDULER_BREAKER_FAILURE_THRESHOLD=5
+CHATCLI_SCHEDULER_BREAKER_WINDOW=60s
+CHATCLI_SCHEDULER_BREAKER_COOLDOWN=30s
+```
+
+Se o k8s API cair, o breaker `k8s_resource_ready` abre e todos os jobs dependentes fail-fast com `ErrBreakerOpen` em vez de saturar o worker pool.
+
+### Audit log
+
+Toda mutação (create, transition, cancel, fire) escreve uma linha JSON em `~/.chatcli/scheduler/audit.log`. Rotação por lumberjack (padrão 10 MiB, 7 backups, 30 dias).
+
+### Autorização
+
+- `OwnerUser` e `OwnerSystem` podem cancelar qualquer job.
+- `OwnerAgent` só pode cancelar jobs próprios ou de workers filhos.
+- Cross-owner cancel retorna `ErrNotAuthorized` e fire hook `PreJobCancel` para auditoria.
+
+---
+
+## Observabilidade
+
+### Métricas Prometheus
+
+| Métrica | Tipo | Labels |
+|---|---|---|
+| `chatcli_scheduler_jobs_created_total` | Counter | `owner_kind`, `action_type` |
+| `chatcli_scheduler_jobs_fired_total` | Counter | `outcome`, `action_type` |
+| `chatcli_scheduler_wait_checks_total` | Counter | `condition_type`, `satisfied` |
+| `chatcli_scheduler_wait_duration_seconds` | Histogram | `condition_type` |
+| `chatcli_scheduler_action_duration_seconds` | Histogram | `action_type`, `outcome` |
+| `chatcli_scheduler_queue_depth` | Gauge | — |
+| `chatcli_scheduler_active_jobs` | Gauge | — |
+| `chatcli_scheduler_breaker_state` | Gauge | `kind`, `key` (0=closed, 1=open, 2=half_open) |
+| `chatcli_scheduler_retries_total` | Counter | `attempt` (bucketed 1/2/3/4+) |
+| `chatcli_scheduler_enqueue_errors_total` | Counter | `reason` (rate_limited, full, invalid, …) |
+| `chatcli_scheduler_wal_segments` | Gauge | — |
+| `chatcli_scheduler_audit_writes_total` | Counter | — |
+| `chatcli_scheduler_daemon_connections` | Gauge | — |
+
+### Events
+
+Scheduler publica no `cli/bus` e dispara hooks chatcli:
+
+- `job.created`, `job.scheduled`, `job.fired`
+- `job.wait_started`, `job.wait_tick`, `job.wait_satisfied`
+- `job.running`, `job.completed`, `job.failed`, `job.timed_out`, `job.cancelled`, `job.skipped`
+- `job.retry_queued`, `job.paused`, `job.resumed`, `job.dependency_resolved`
+- `breaker.opened`, `breaker.half_open`, `breaker.closed`
+- `daemon.started`, `daemon.stopped`
+
+Hooks recebem `Scheduler.<evento>` como `HookEvent.Type` — você pode amarrar um Slack webhook em `Scheduler.job.failed` via `~/.chatcli/hooks.json`.
+
+### Status line no prompt
+
+Quando há jobs ativos, o prefix do prompt ganha `[jobs: 2▶ 1⏳ 1✗]`:
+- `▶` running
+- `👁` waiting (em polling)
+- `⏳` pending
+- `⛓` blocked (aguardando deps)
+- `✗` failed
+
+---
+
+## Configuração completa
+
+Veja [Variáveis de Ambiente → Scheduler](/reference/environment-variables#scheduler) para as ~25 env vars.
+
+### `/config scheduler`
+
+```
+❯ /config scheduler
+
+⏲ Scheduler (Chronos) — Agendamento & Wait-Until
+  Núcleo
+    CHATCLI_SCHEDULER_ENABLED:        enabled
+    CHATCLI_SCHEDULER_DATA_DIR:       ~/.chatcli/scheduler
+    CHATCLI_SCHEDULER_MAX_JOBS:       256
+    CHATCLI_SCHEDULER_WORKER_COUNT:   4
+    CHATCLI_SCHEDULER_ALLOW_AGENTS:   enabled
+    CHATCLI_SCHEDULER_ACTION_ALLOWLIST: slash_cmd,shell,agent_task,...
+  Budget Padrão
+    CHATCLI_SCHEDULER_DEFAULT_ACTION_TIMEOUT:  5m
+    CHATCLI_SCHEDULER_DEFAULT_POLL_INTERVAL:   5s
+    CHATCLI_SCHEDULER_DEFAULT_WAIT_TIMEOUT:    30m
+    ...
+  Daemon
+    CHATCLI_SCHEDULER_DAEMON_SOCKET:           /tmp/chatcli-scheduler.sock
+    CHATCLI_SCHEDULER_DAEMON_AUTO_CONNECT:     enabled
+  Active jobs: 3
+  Queue depth: 2
+  WAL segments: 11
+  Daemon:      connected @ /tmp/chatcli-scheduler.sock
+```
+
+---
+
+## Arquitetura interna (resumida)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ChatCLI process                                             │
+│                                                              │
+│  /schedule  ─┐                                               │
+│  /wait      ─┼──▶ Scheduler ◀──▶ WAL + snapshot              │
+│  /jobs      ─┘      │                                        │
+│  @scheduler ────────┤                                        │
+│                     │                                        │
+│                     ├──▶ Condition evaluators (plug-in)      │
+│                     ├──▶ Action executors (plug-in)          │
+│                     ├──▶ Rate limiter (global + per-owner)   │
+│                     ├──▶ Circuit breakers (cond + action)    │
+│                     ├──▶ bus.EventBus + hook manager         │
+│                     └──▶ audit log (JSONL) + Prometheus      │
+└──────────────────────────────────────────────────────────────┘
+             │
+             ▼ (opcional)
+       UNIX socket ─▶ chatcli-daemon (mesma binary, --detach)
+```
+
+- **Schedule pump** (1 goroutine) drena a priority queue por `NextFireAt`.
+- **Worker pool** (N goroutines = `WORKER_COUNT`) executa handleJob (wait → action → finalize).
+- **Snapshot loop** (1 goroutine) freeze periódico.
+- **GC loop** (1 goroutine) reap terminais expirados.
+
+---
+
+## Próximos passos
+
+<CardGroup cols={2}>
+<Card title="Cookbook: Automatizações" icon="book" href="/cookbook/scheduler-automations">
+Exemplos práticos: deploy com wait, cron de backup, pipeline com DAG.
+</Card>
+<Card title="Referência: Comandos" icon="rectangle-list" href="/reference/command-reference#scheduler">
+Tabela completa de flags e subcomandos.
+</Card>
+<Card title="Referência: Env vars" icon="sliders" href="/reference/environment-variables#scheduler">
+Todas as 25+ variáveis do scheduler.
+</Card>
+<Card title="Hooks System" icon="webhook" href="/features/hooks-system">
+Amarrar webhooks Slack/PagerDuty nos eventos do scheduler.
+</Card>
+</CardGroup>

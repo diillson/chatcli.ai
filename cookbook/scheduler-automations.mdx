@@ -1,0 +1,280 @@
+---
+title: "Automações com Scheduler"
+sidebarTitle: "Scheduler: automações"
+description: "Receitas práticas: deploy com wait, cron de backup, pipeline DAG, agent que se auto-pausa."
+icon: "book-open"
+---
+
+Coletânea de receitas práticas do [**Scheduler (Chronos)**](/features/scheduler). Todas assumem que o daemon está rodando (`chatcli daemon start --detach`) — mas funcionam igual em modo in-process se você mantiver o chatcli aberto.
+
+---
+
+## 1. Deploy Terraform + espera K8s + valida
+
+Subir infraestrutura via `terraform apply`, esperar o deployment ficar `Available`, então imprimir o estado final. Tudo em uma linha — você pode fechar o CLI.
+
+```bash
+❯ /schedule tf-apply --when +0s \
+  --do "shell: cd infra && terraform apply -auto-approve" \
+  --triggers verify-k8s
+
+❯ /schedule verify-k8s --when manual \
+  --do "/run kubectl get pods,svc,ingress -n prod" \
+  --wait "k8s:deployment/prod/api:Available" \
+  --timeout 20m
+
+❯ /jobs tree
+└─ ▶ tf-apply (a1b2c3d4)
+   └─ ⛓ verify-k8s (e5f6g7h8)
+
+❯ exit    # pode fechar — daemon continua
+```
+
+Volta depois:
+
+```bash
+❯ /jobs history
+  completed  a1b2c3d4   tf-apply     — success (4m 12s)
+  completed  e5f6g7h8   verify-k8s   — success (3m 40s)
+
+❯ /jobs logs e5f6g7h8
+  #1 2026-04-23T20:18:04Z  success (3m40s)
+    k8s wait: deployment/prod/api Available=True (expected True)
+  #2 2026-04-23T20:21:44Z  success (300ms)
+    NAME           READY   STATUS    RESTARTS   AGE
+    api-7d9...     1/1     Running   0          3m
+    ...
+```
+
+---
+
+## 2. Docker compose + healthcheck + smoke tests
+
+```bash
+❯ /schedule boot --when +0s \
+  --do "shell: docker compose up -d" \
+  --triggers smoke
+
+❯ /schedule smoke --when manual \
+  --do "/run pytest tests/smoke -v" \
+  --wait "and(docker:api:healthy, http://localhost:8080/health==200)" \
+  --timeout 5m \
+  --on-timeout fallback
+```
+
+A condição `and(...)` só satisfaz quando o container está healthy **e** o endpoint retorna 200 — evita o caso clássico de "container up mas app ainda inicializando".
+
+---
+
+## 3. Backup noturno com cron
+
+```bash
+❯ /schedule nightly-backup --cron "0 2 * * *" \
+  --do "shell: ./scripts/backup-db.sh" \
+  --timeout 1h \
+  --max-retries 3 \
+  --ttl 168h \
+  --tag env=prod --tag category=backup
+```
+
+- Roda todo dia às 02:00 locais.
+- Timeout de 1h (restore longo tolerado).
+- Até 3 retries com exponential backoff.
+- TTL de 7 dias em `/jobs history`.
+- Filtrável por tag em `/jobs list --tag category=backup`.
+
+---
+
+## 4. Esperar condição e notificar Slack
+
+Sem agendamento — um wait que só avisa quando o banco voltar:
+
+```bash
+❯ /wait --until tcp://db.prod:5432 \
+  --then "POST https://hooks.slack.com/services/XXX | db is back" \
+  --every 10s --timeout 30m --async
+```
+
+`--async` faz o comando retornar imediatamente (você recebe o job ID). Quando a porta abrir, o webhook dispara.
+
+---
+
+## 5. Pipeline DAG — multi-estágio
+
+Deploy canário → smoke tests → rollout para o restante → notificar:
+
+```bash
+# Stages terminais em "manual" — só disparam via Triggers de cima
+❯ /schedule canary --when manual --do "shell: kubectl apply -f canary.yaml" --triggers canary-smoke
+❯ /schedule canary-smoke --when manual --do "/run pytest tests/smoke -v" \
+  --wait "k8s:deployment/prod/api-canary:Available" --timeout 10m \
+  --triggers rollout
+
+❯ /schedule rollout --when manual --do "shell: kubectl apply -f prod.yaml" --triggers notify
+❯ /schedule notify --when manual \
+  --do "POST https://hooks.slack.com/services/XXX | deploy v2.1 successful"
+
+# Dispara o topo — a cascata encadeia automaticamente
+❯ /schedule start --when +0s --do noop --triggers canary
+
+❯ /jobs tree
+└─ ✔ start (…)
+   └─ ▶ canary (…)
+      └─ ⛓ canary-smoke (…)
+         └─ ⛓ rollout (…)
+            └─ ⛓ notify (…)
+```
+
+Se qualquer estágio falhar, a cascata de falha propaga — `rollout` e `notify` ficam `StatusFailed` com `dependency failed` no message.
+
+---
+
+## 6. Agent agendando sozinho (ReAct)
+
+Você pede algo que demora; o agent decide pausar e voltar:
+
+```
+❯ /agent aplique o terraform e depois me dê o estado do cluster
+
+  [agent emite <tool_call name="@scheduler" .../>]
+  agent: agendei um job "tf-apply-check" que primeiro roda terraform apply,
+  espera o deployment ficar Available e depois coleta o kubectl get pods.
+  Vou te trazer o resultado quando terminar. Continue com outras coisas.
+
+❯ me explica o README dessa pasta
+  [agent responde sobre o README; o job continua rodando em paralelo]
+
+❯ ...10 minutos depois...
+  [no próximo turn do agent, o sistema injeta na history: "Scheduler job
+   tf-apply-check completou — output: NAME READY STATUS... (completo)"]
+```
+
+O agent usa `schedule` com `async:true` + `triggers` para encadear; na próxima conversa o resultado já está no contexto.
+
+---
+
+## 7. Job que se auto-limita (budget)
+
+Rate-limit e budget explícitos para evitar LLM cost runaway:
+
+```bash
+❯ /schedule nightly-report --cron "0 7 * * 1" \
+  --do "llm: Resumir as últimas 50 PRs mergeadas da semana" \
+  --max-retries 1 \
+  --timeout 2m
+```
+
+- Uma retry só.
+- 2 min cap na LLM call (se o modelo travar, falha rápido).
+
+Combine com `CHATCLI_SCHEDULER_RATE_LIMIT_OWNER_RPS` para cap global.
+
+---
+
+## 8. Probe periódico com circuit breaker automático
+
+```bash
+❯ /schedule api-probe --every 30s \
+  --do "/run se o /health falhar, crie issue no github" \
+  --wait "http://api.prod.com/health==200" \
+  --on-timeout fire_anyway \
+  --max-polls 3
+```
+
+Se o health fica down por 3 polls (90s), `--on-timeout fire_anyway` dispara a action mesmo — que por sua vez chama o agent para criar a issue.
+
+Após 5 falhas consecutivas em 60s, o circuit breaker do `http_status` abre por 30s — os próximos probes retornam `OutcomeBreakerOff` sem bombardear a API caída.
+
+---
+
+## 9. Cancelar em massa via tag
+
+```bash
+❯ /jobs list --tag env=staging
+  ...20 jobs de staging...
+
+# Via shell script externo:
+for id in $(chatcli daemon status ...  # parse JSON via IPC no futuro
+            | jq -r '.jobs[] | select(.tags.env=="staging") | .id'); do
+  chatcli /jobs cancel $id "staging cleanup"
+done
+```
+
+Enquanto o CLI não expuser `/jobs cancel --tag` direto, a combinação IPC + shell basta.
+
+---
+
+## 10. Auditoria e troubleshooting
+
+```bash
+# Ver o que rodou
+❯ /jobs history
+
+# Detalhe de um job (com todas as transitions + history)
+❯ /jobs show a1b2c3d4
+
+# Logs tail de execução
+❯ /jobs logs a1b2c3d4
+
+# Audit log — toda mutação em JSONL
+$ tail -f ~/.chatcli/scheduler/audit.log | jq .
+
+# Métricas Prometheus (servidor gRPC ou operador)
+$ curl localhost:8888/metrics | grep chatcli_scheduler
+```
+
+Cada entrada do audit inclui `type`, `timestamp`, `job_id`, `status`, `message` e payload completo do evento — use como base para alertas em Splunk/Datadog/Loki.
+
+---
+
+## Troubleshooting comum
+
+<AccordionGroup>
+<Accordion title="Job fica em pending e não dispara">
+Verifique:
+- `/config scheduler` mostra `enabled`?
+- `CHATCLI_SCHEDULER_ACTION_ALLOWLIST` inclui o tipo da ação?
+- Rate limiter não rejeitou (veja `chatcli_scheduler_enqueue_errors_total{reason="rate_limited"}`)?
+- Daemon está rodando? `chatcli daemon status`.
+</Accordion>
+
+<Accordion title="Wait fica polling para sempre">
+- Você setou `--timeout`? (default 30m)
+- Cheque breaker state: `/config scheduler` mostra `breakers` na seção daemon; ou métrica `chatcli_scheduler_breaker_state`.
+- Teste a condição isoladamente com `/wait --until <cond> --async` — quando dispara, confere que o evaluator está funcionando.
+</Accordion>
+
+<Accordion title="Daemon não inicia ('address already in use')">
+Socket stale de um crash anterior. O start tenta limpar automaticamente, mas pode falhar se outro processo ainda estiver travado nele:
+
+```bash
+$ chatcli daemon status        # "not running"?
+$ rm /tmp/chatcli-scheduler.sock{,.pid}
+$ chatcli daemon start --detach
+```
+</Accordion>
+
+<Accordion title="Shell action bloqueado por CoderMode">
+`CHATCLI_SCHEDULER_ACTION_ALLOWLIST` permite `shell`, mas o comando específico caiu na denylist do coder. Duas opções:
+
+1. Adicione o comando à allowlist (`/config security` → `CHATCLI_AGENT_ALLOWLIST`).
+2. Opt-in explícito do bypass:
+   ```bash
+   export CHATCLI_SCHEDULER_SHELL_ALLOW_BYPASS=true
+   # no spec JSON: {"bypass_safety": true}
+   ```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Próximos passos
+
+<CardGroup cols={2}>
+<Card title="Doc da feature" icon="clock" href="/features/scheduler">
+Arquitetura, invariantes e padrões plug-in completos.
+</Card>
+<Card title="Referência de comandos" icon="rectangle-list" href="/reference/command-reference#scheduler">
+Todas as flags e subcomandos.
+</Card>
+</CardGroup>
