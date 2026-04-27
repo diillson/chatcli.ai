@@ -54,7 +54,7 @@ Exibe o status de autenticação de todos os provedores configurados, incluindo 
   <Step title="Autorize o acesso">
     **OpenAI:** um servidor HTTP local captura o callback automaticamente (porta **1455**).
 
-    **Anthropic:** após autorizar, copie o código exibido na página e cole no terminal.
+    **Anthropic:** um servidor HTTP local em `localhost:<porta-aleatória>/callback` captura o código automaticamente. Após autorizar, o navegador é redirecionado para a página de sucesso oficial do Anthropic e o terminal completa o login. Se o servidor local não puder iniciar (porta indisponível, firewall) ou se `CHATCLI_ANTHROPIC_LEGACY_OAUTH=1` estiver definido, o ChatCLI cai automaticamente no fluxo legado de **copiar e colar** o código.
 
     **GitHub Copilot:** insira o código do dispositivo exibido no terminal na página do GitHub.
   </Step>
@@ -88,39 +88,70 @@ Remove as credenciais OAuth armazenadas para o provedor específicado.
 
 Esta seção descreve como cada fluxo OAuth funciona internamente, incluindo URLs, parâmetros e comportamento do ChatCLI.
 
-### Anthropic OAuth (PKCE + Código Manual)
+### Anthropic OAuth (PKCE + Callback Localhost, com fallback para paste)
 
-O fluxo da Anthropic usa OAuth 2.0 com PKCE (Proof Key for Code Exchange) e um mecanismo de cópia manual do código de autorização.
+O fluxo da Anthropic usa OAuth 2.0 com PKCE (Proof Key for Code Exchange) e um servidor HTTP local em `localhost:<porta-aleatória>/callback` para capturar o código de autorização — o mesmo padrão usado pelo Claude Code CLI. O fluxo legado de **copiar e colar** o código permanece disponível como fallback automático.
+
+#### Fluxo primário (callback local)
 
 <Steps>
-  <Step title="Geração do PKCE e abertura do navegador">
-    O ChatCLI gera um `code_verifier` aleatório e calcula o `code_challenge` usando SHA-256 (método `S256`). O navegador abre na URL de autorização com os parâmetros necessários.
+  <Step title="Geração do PKCE e início do servidor local">
+    O ChatCLI gera um `code_verifier` aleatório, calcula o `code_challenge` usando SHA-256 (método `S256`), e sobe um servidor HTTP em uma porta aleatória de `localhost`. Um `state` de 32 bytes (base64url, 43 caracteres) é gerado para proteção CSRF.
+  </Step>
+  <Step title="Abertura do navegador">
+    O navegador abre na URL de autorização da Anthropic com `code=true`, o PKCE challenge, o `state` e o `redirect_uri` apontando para o servidor local.
   </Step>
   <Step title="Usuário autoriza no navegador">
-    O usuário faz login no Claude e autoriza o acesso. A página do console exibe um código no formato `código#state`.
+    O usuário faz login no Claude e autoriza o acesso. O navegador é redirecionado para `http://localhost:<porta>/callback?code=...&state=...`.
   </Step>
-  <Step title="Usuário cola o código no terminal">
-    O ChatCLI solicita que o usuário cole o código exibido. A parte após o `#` é o parâmetro `state`, utilizado na troca de tokens.
+  <Step title="Validação CSRF e troca de tokens">
+    O servidor local valida o `state` recebido contra o gerado, troca o código por tokens via `platform.claude.com/v1/oauth/token` e encerra o servidor. O navegador é redirecionado para a página de sucesso oficial do Anthropic (`platform.claude.com/oauth/code/success`).
+  </Step>
+</Steps>
+
+#### Fluxo de fallback (copiar e colar)
+
+Acionado automaticamente quando o servidor local não consegue se vincular à porta (firewall, porta em uso) ou quando `CHATCLI_ANTHROPIC_LEGACY_OAUTH=1` é definido explicitamente.
+
+<Steps>
+  <Step title="Abertura do navegador no fluxo legado">
+    O ChatCLI abre a URL de autorização legada (`console.anthropic.com` como `redirect_uri`).
+  </Step>
+  <Step title="Usuário copia o código">
+    Após autorizar, a página do console exibe um código no formato `código#state`. O usuário cola o texto completo no terminal — o ChatCLI separa código e `state` automaticamente.
   </Step>
   <Step title="Troca do código por tokens">
-    O ChatCLI envia o código, o state e o code_verifier para o endpoint de tokens e recebe access_token + refresh_token.
+    O ChatCLI envia código, `state` e `code_verifier` para o endpoint de tokens e recebe access_token + refresh_token.
   </Step>
 </Steps>
 
 | Parâmetro | Valor |
 |-----------|-------|
-| Auth URL | `https://claude.ai/oauth/authorize` |
-| Token URL | `https://console.anthropic.com/v1/oauth/token` |
-| Redirect URI | `https://console.anthropic.com/oauth/code/callback` |
+| Auth URL (primário) | `https://claude.com/cai/oauth/authorize` |
+| Auth URL (fallback) | `https://claude.ai/oauth/authorize` |
+| Token URL (primário) | `https://platform.claude.com/v1/oauth/token` |
+| Token URL (fallback) | `https://console.anthropic.com/v1/oauth/token` |
+| Redirect URI (primário) | `http://localhost:<porta-aleatória>/callback` |
+| Redirect URI (fallback) | `https://console.anthropic.com/oauth/code/callback` |
+| Página de sucesso | `https://platform.claude.com/oauth/code/success?app=claude-code` |
 | Client ID | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
-| Scopes | `org:create_api_key user:profile user:inference` |
+| Scopes | `org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload` |
 | PKCE Method | `S256` (SHA-256 code challenge) |
+| Tamanho do `state` | 32 bytes (base64url, 43 caracteres) |
 
 <Warning>
-A troca de tokens usa um `http.Client` puro (sem transporte customizado) para evitar problemas de fingerprinting TLS com o Cloudflare. O header `User-Agent: claude-cli/2.1.2 (external, cli)` é obrigatório. Usar um HTTP client com `LoggingTransport` ou transporte customizado causa rejeição pela CDN da Anthropic.
+**Validações silenciosas do `claude.ai`** — o fluxo primário **só funciona** se três parâmetros estiverem corretos. Caso contrário, a página de autorização retorna apenas "Invalid request format" sem código de erro:
+
+- `code=true` deve estar presente na query string
+- `state` deve ter exatamente 32 bytes (43 caracteres base64url) — `state` de 16 bytes é silenciosamente rejeitado
+- A URL de autorização deve ser `claude.com/cai/oauth/authorize` (faz 307 para `claude.ai/oauth/authorize`, e o redirect define cookies que a SPA precisa)
 </Warning>
 
-O refresh de tokens também usa o `http.Client` puro e o mesmo `User-Agent`, pela mesma razão.
+<Warning>
+A troca e o refresh de tokens usam um `http.Client` puro (sem transporte customizado) com header `User-Agent: claude-cli/2.1.2 (external, cli)` para evitar fingerprinting TLS pelo Cloudflare. Usar um HTTP client com `LoggingTransport` causa rejeição pela CDN da Anthropic.
+</Warning>
+
+O refresh tenta primeiro `platform.claude.com` e cai automaticamente para `console.anthropic.com/v1/oauth/token` se o token tiver sido emitido pelo fluxo legado de paste.
 
 ---
 
@@ -369,6 +400,7 @@ Ao determinar qual credencial usar para um provedor, o ChatCLI segue está ordem
 | `CHATCLI_OPENAI_CLIENT_ID` | Permite sobrescrever o client ID do OAuth da OpenAI |
 | `CHATCLI_COPILOT_CLIENT_ID` | Permite sobrescrever o client ID do Device Flow do GitHub Copilot (padrão: `Ov23lifEydOk2Non90tJ`) |
 | `COPILOT_API_BASE_URL` | URL base da API do Copilot para ambientes enterprise (padrão: `https://api.githubcopilot.com`) |
+| `CHATCLI_ANTHROPIC_LEGACY_OAUTH` | Quando definido como `1`, força o fluxo legado de **copiar e colar** o código no `/auth login anthropic`, ignorando o callback local. Útil em ambientes onde o `localhost` não é acessível (containers, SSH sem port-forward, firewall restritivo). |
 
 ---
 
@@ -378,8 +410,24 @@ Ao determinar qual credencial usar para um provedor, o ChatCLI segue está ordem
   <Accordion title="Erro de autenticação ao clicar no link OAuth (OpenAI)">
     Verifique se a porta de callback não está em uso por outra aplicação. O servidor de callback da OpenAI precisa da porta **1455** para capturar o retorno.
   </Accordion>
-  <Accordion title="Código não aparece após autorizar (Anthropic)">
-    O fluxo da Anthropic redireciona para a página do console que exibe o código de autorização no formato `código#state`. Copie **o texto completo** (incluindo a parte após o `#`) e cole no terminal quando solicitado. O ChatCLI separa o código do state automaticamente.
+  <Accordion title="Anthropic: callback local não funciona ou navegador trava em localhost">
+    O fluxo primário usa um servidor HTTP local em `localhost:<porta-aleatória>/callback`. Se sua porta estiver bloqueada por firewall ou se você estiver em um ambiente sem `localhost` acessível (containers, sessões SSH sem port-forward), force o fluxo legado de paste:
+
+    ```bash
+    export CHATCLI_ANTHROPIC_LEGACY_OAUTH=1
+    /auth login anthropic
+    ```
+
+    No fluxo legado, o navegador abre na página do console que exibe o código no formato `código#state`. Copie **o texto completo** (incluindo a parte após o `#`) e cole no terminal — o ChatCLI separa código e state automaticamente.
+  </Accordion>
+  <Accordion title='Anthropic: página de autorização retorna "Invalid request format"'>
+    O `claude.ai` valida silenciosamente três parâmetros do fluxo primário e retorna apenas "Invalid request format" se algum estiver errado:
+
+    - `code=true` ausente na query string
+    - `state` com tamanho diferente de 32 bytes (43 caracteres base64url)
+    - URL de autorização diferente de `claude.com/cai/oauth/authorize`
+
+    Se você modificou o código da função `loginAnthropicLocalhost`, verifique esses três pontos antes de qualquer outra coisa.
   </Accordion>
   <Accordion title="Anthropic: erro 403 ou conexão recusada na troca de tokens">
     Isso geralmente ocorre quando um HTTP client customizado (com LoggingTransport) é usado. O ChatCLI usa um `http.Client` puro para a troca de tokens da Anthropic, evitando fingerprinting TLS pelo Cloudflare. Se você estiver desenvolvendo, certifique-se de que a função `exchangeAnthropicToken` usa um client sem transporte customizado.
