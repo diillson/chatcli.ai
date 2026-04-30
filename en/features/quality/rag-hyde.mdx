@@ -1,7 +1,7 @@
 ---
 title: "#4 RAG + HyDE — Semantic Retrieval"
 sidebarTitle: "RAG + HyDE"
-description: "Two retrieval layers over memory.Fact: Phase 3a generates an LLM hypothesis and extracts keywords to expand the query; Phase 3b adds vector embeddings (Voyage/OpenAI) + pure-Go cosine search. Lazy backfill, JSON-persisted, zero CGO."
+description: "Two retrieval layers over memory.Fact: Phase 3a generates an LLM hypothesis and extracts keywords to expand the query; Phase 3b adds vector embeddings (Voyage / OpenAI / Bedrock Titan-Cohere) + pure-Go cosine search. Lazy backfill, JSON-persisted, zero CGO."
 icon: "database"
 ---
 
@@ -127,6 +127,39 @@ Adds **cosine similarity** search over fact embeddings.
 
     **Models:** `text-embedding-3-small` (default, 1536-dim, $0.02/1M tokens) or `text-embedding-3-large` (3072-dim, higher quality). The native dimension is auto-detected from the model — only set `CHATCLI_EMBED_DIMENSIONS` if you want to **truncate** via Matryoshka (e.g. 512 to save storage).
   </Tab>
+  <Tab title="Bedrock (Titan + Cohere)">
+    ```bash
+    export CHATCLI_QUALITY_HYDE_ENABLED=true
+    export CHATCLI_QUALITY_HYDE_USE_VECTORS=true
+    export CHATCLI_EMBED_PROVIDER=bedrock
+
+    # Reuses the chat client's credentials chain — no extra API key.
+    # Set region/profile if not already in the environment.
+    export BEDROCK_REGION=us-east-1
+    export AWS_PROFILE=my-profile        # optional
+
+    # Optional: pick model
+    export CHATCLI_EMBED_MODEL=amazon.titan-embed-text-v2:0   # default
+    export CHATCLI_EMBED_DIMENSIONS=1024                      # Titan v2: 256/512/1024
+    ```
+
+    **Why Bedrock:** same AWS credentials chain as the chat — single billing, AWS compliance (CloudTrail, guardrails), VPC endpoints. Ideal for companies already running chat through Bedrock and wanting retrieval inside the same perimeter.
+
+    **Supported families:**
+
+    | Model ID | Family | Supported dims | Native batching |
+    | :--- | :--- | :--- | :--- |
+    | `amazon.titan-embed-text-v2:0` (default) | Titan v2 | 256, 512, 1024 | No — parallelized with 8-worker pool |
+    | `amazon.titan-embed-text-v1` | Titan v1 | 1536 (fixed) | No — parallelized |
+    | `cohere.embed-english-v3` | Cohere v3 (en) | 1024 (fixed) | Yes — one call per batch |
+    | `cohere.embed-multilingual-v3` | Cohere v3 (multi) | 1024 (fixed) | Yes — one call per batch |
+
+    Dispatch between Titan and Cohere is automatic by the model id prefix. `CHATCLI_EMBED_DIMENSIONS` only applies to Titan v2 (256/512/1024); invalid values are rejected in `NewBedrock` before any AWS call.
+
+    **No Converse API for embeddings:** embeddings only live in `InvokeModel`, so each family keeps its dedicated body schema — unlike chat, where Converse covers nearly everything.
+
+    See [AWS Bedrock](/en/features/bedrock) for the full credentials chain config (SSO, IAM role, corporate proxy, VPC endpoint).
+  </Tab>
   <Tab title="Null (default)">
     If `CHATCLI_EMBED_PROVIDER` isn't set, `NullProvider` is returned. `Embed()` returns an error — the code checks `embedding.IsNull(p)` before calling, so it gracefully falls back to keyword-only. **No surprises, no silent failures.**
   </Tab>
@@ -182,9 +215,11 @@ go func(items map[string]string) { //#nosec G118 -- detached on purpose
 | `CHATCLI_QUALITY_HYDE_ENABLED` | `false` | Master switch (phase 3a) |
 | `CHATCLI_QUALITY_HYDE_USE_VECTORS` | `false` | Enable phase 3b (requires provider) |
 | `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS` | `5` | Hypothesis keyword cap in phase 3a |
-| `CHATCLI_EMBED_PROVIDER` | — | `voyage\|openai\|null` — **single source of truth** for provider selection |
-| `CHATCLI_EMBED_MODEL` | provider default | E.g. `voyage-3`, `text-embedding-3-small`, `text-embedding-3-large` |
-| `CHATCLI_EMBED_DIMENSIONS` | model native | OpenAI only; set only to truncate via Matryoshka |
+| `CHATCLI_EMBED_PROVIDER` | — | `voyage` / `openai` / `bedrock` / `null` — **single source of truth** for provider selection |
+| `CHATCLI_EMBED_MODEL` | provider default | Voyage: `voyage-3`. OpenAI: `text-embedding-3-small` / `-large`. Bedrock: `amazon.titan-embed-text-v2:0` (default), `amazon.titan-embed-text-v1`, `cohere.embed-english-v3`, `cohere.embed-multilingual-v3`. |
+| `CHATCLI_EMBED_DIMENSIONS` | model native | OpenAI: truncate via Matryoshka. Bedrock Titan v2: 256 / 512 / 1024 (rejects others). Bedrock Titan v1 / Cohere v3: fixed dimension, ignored. |
+| `BEDROCK_REGION` / `AWS_REGION` | `us-east-1` | AWS region — only used when `CHATCLI_EMBED_PROVIDER=bedrock`. |
+| `AWS_PROFILE` | — | AWS profile — only used when `CHATCLI_EMBED_PROVIDER=bedrock`. |
 
 ---
 
@@ -194,10 +229,11 @@ go func(items map[string]string) { //#nosec G118 -- detached on purpose
 ── RAG + HyDE (#4)
   CHATCLI_QUALITY_HYDE_ENABLED    : enabled
   CHATCLI_QUALITY_HYDE_USE_VECTORS: enabled
-  CHATCLI_EMBED_PROVIDER          : voyage
-  CHATCLI_EMBED_MODEL             : voyage-3
+  CHATCLI_EMBED_PROVIDER          : bedrock
+  CHATCLI_EMBED_MODEL             : amazon.titan-embed-text-v2:0
+  CHATCLI_EMBED_DIMENSIONS        : 1024
   CHATCLI_QUALITY_HYDE_NUM_KEYWORDS: 5
-  Vector provider                : voyage:voyage-3
+  Vector provider                : bedrock:amazon.titan-embed-text-v2:0
   Vector entries                 : 127
 ```
 
@@ -229,7 +265,7 @@ HyDE amplifies Reflexion's value: lessons persisted by #3 are retrieved with muc
 
 <Warning>**Token cost** of phase 3a: ~200 tokens per retrieval turn. In workflows with many read turns, the cost compounds. Use `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS=3` for tighter budget.</Warning>
 
-<Warning>**Privacy**: the user query is sent to the embedding provider. For sensitive workloads, consider self-hosting an embedding model (roadmap: Ollama-embedding provider).</Warning>
+<Warning>**Privacy**: the user query is sent to the embedding provider. For sensitive workloads in corporate environments, **Bedrock is the preferred path** — it stays inside the AWS perimeter (CloudTrail, VPC endpoint, IAM). For local workloads with no network, consider self-hosting (roadmap: Ollama-embedding provider).</Warning>
 
 <Info>**Graceful fallback**: if the LLM fails or the embedding provider returns an error, retrieval falls back to keyword-only silently. No turn is aborted by HyDE failure.</Info>
 
