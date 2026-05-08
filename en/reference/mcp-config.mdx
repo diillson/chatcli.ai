@@ -19,6 +19,37 @@ The `mcp_servers.json` file defines which MCP servers ChatCLI should connect to.
 
 <Info>In client mode (TTY), simply create the file at `~/.chatcli/mcp_servers.json` — ChatCLI auto-detects and initializes servers without needing environment variables.</Info>
 
+### Auto-Enable (detection rules)
+
+ChatCLI initializes the MCP subsystem — manager + hot-reload watcher — automatically when **any** of the conditions below holds:
+
+| Condition | Behavior |
+|:----------|:---------|
+| `CHATCLI_MCP_ENABLED=true` | Explicit opt-in; always enables, even with nothing on disk |
+| `mcp_servers.json` file exists | Enables and loads immediately |
+| **Parent directory exists** (e.g. `~/.chatcli/`) | Enables manager + watcher even without the file, so **creating the file later** triggers hot-reload without restart |
+
+<Note>
+The third rule keeps **hot-reload working from first use**. If you open ChatCLI before having an `mcp_servers.json` (typical first-install scenario), the watcher on `~/.chatcli/` is already running — just create the file and servers come up on the spot, no `chatcli restart` needed.
+</Note>
+
+### Hot-Reload and Error Tolerance
+
+The `mcp_servers.json` watcher reconciles the live state with what's on disk via `fsnotify`. `Create`, `Write`, `Rename` and `Remove` events are debounced at 400 ms to avoid mid-write reloads when editors rewrite via rename.
+
+| Event on disk | Result |
+|:--------------|:-------|
+| Add new server | Starts the server, discovers tools |
+| Remove server from config | Stops the process, drops its tools |
+| Change `command`/`args`/`env` | Stops and restarts with the new config |
+| `enabled: false` | Same as removal (server stops) |
+| File deleted | All servers stop |
+| **0 bytes or malformed JSON** | Logs a warning, **does not abort**; fix and save to reload |
+
+<Tip>
+Saving an invalid JSON does **not** crash ChatCLI: the manager stays registered and the watcher keeps running. Fix the file in your editor, save it, and the next event triggers `Reload` normally. Useful when editing live during a session.
+</Tip>
+
 ---
 
 ## Format
@@ -56,6 +87,66 @@ The `mcp_servers.json` file defines which MCP servers ChatCLI should connect to.
 | `url` | string | sse ✅ | SSE endpoint URL for the remote server |
 | `enabled` | bool | ❌ | Default: `false`. Disable without removing from config |
 | `overrides` | string[] | ❌ | Names of built-in plugins this server replaces. When connected, the listed built-ins are **hidden** from the LLM prompt. If the server disconnects, they are **automatically restored**. E.g.: `["@webfetch", "@websearch"]` |
+
+---
+
+## Environment Variables (`env`)
+
+The `env` field accepts a key-value object that is **merged** with the parent process environment (`os.Environ()`). Two important rules:
+
+### 1. PATH and cache inheritance
+
+The MCP process **inherits** ChatCLI's full environment before the `env` overrides apply. Without that inheritance, launchers like `npx`, `uvx`, `docker` and `pipx` wouldn't find their binaries or per-user caches.
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@anthropic/mcp-server-filesystem", "/workspace"],
+  "env": {
+    "FS_LOG_LEVEL": "debug"
+  }
+}
+```
+
+The child server receives **PATH + HOME + FS_LOG_LEVEL=debug** — not `FS_LOG_LEVEL` in isolation. If a key in `env` collides with the inherited environment, **the `env` value wins** (Unix semantics: last assignment in `cmd.Env` takes precedence).
+
+### 2. `${VAR}` / `$VAR` expansion
+
+Values in `env` go through `os.Expand` against the parent environment before reaching the child. This lets you keep **secrets out of the JSON** — in shell variables, or in `.env` files loaded via `source` / `direnv` / `mise` / `asdf`.
+
+```json
+{
+  "name": "github",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@anthropic/mcp-server-github"],
+  "env": {
+    "GITHUB_TOKEN": "${GH_TOKEN}",
+    "DEBUG": "$NODE_DEBUG"
+  }
+}
+```
+
+If the shell has `GH_TOKEN=ghp_xxx` exported, the MCP server receives `GITHUB_TOKEN=ghp_xxx`. If the referenced variable **doesn't exist**, the result is the **empty string** — same behavior as the shell. Lint your shell before assuming the token made it through.
+
+<Info>
+Always prefer `${VAR}` over literal values (`"GITHUB_TOKEN": "ghp_xxx"`). Plaintext tokens in JSON end up in git history, logs, backups and screenshots. The `${VAR}` expansion is the idiomatic form — parity with Claude Desktop and OpenCode.
+</Info>
+
+<Warning>
+Expansion happens **once at process spawn**. If you change `GH_TOKEN` in the shell during a session, an MCP server already running keeps the old value. Use `/mcp restart <name>` to force re-resolution.
+</Warning>
+
+### Recommended patterns
+
+| Secret type | Where to put it | How to reference in JSON |
+|:------------|:---------------|:------------------------|
+| API token (GitHub, Slack, Stripe) | Shell env (`~/.zshenv`) or `.env` via direnv | `"TOKEN": "${GH_TOKEN}"` |
+| Connection string | Shell env | `"DATABASE_URL": "${DATABASE_URL}"` |
+| DB password | Vault / 1Password CLI / `pass` | Inject into shell before ChatCLI |
+| Non-sensitive credential (e.g. project ID) | Direct in JSON | `"GCP_PROJECT": "my-project-id"` |
 
 ---
 
@@ -126,7 +217,7 @@ The `mcp_servers.json` file defines which MCP servers ChatCLI should connect to.
       "command": "npx",
       "args": ["-y", "@anthropic/mcp-server-github"],
       "env": {
-        "GITHUB_TOKEN": "ghp_xxxxxxxxxxxxxxxxxxxx"
+        "GITHUB_TOKEN": "${GH_TOKEN}"
       },
       "enabled": true
     },
@@ -136,7 +227,7 @@ The `mcp_servers.json` file defines which MCP servers ChatCLI should connect to.
       "command": "/usr/local/bin/mcp-postgres",
       "args": ["--connection-string", "postgresql://localhost:5432/mydb"],
       "env": {
-        "PGPASSWORD": "secret"
+        "PGPASSWORD": "${POSTGRES_PASSWORD}"
       },
       "enabled": true
     },
@@ -153,7 +244,7 @@ The `mcp_servers.json` file defines which MCP servers ChatCLI should connect to.
       "command": "npx",
       "args": ["-y", "@anthropic/mcp-server-slack"],
       "env": {
-        "SLACK_BOT_TOKEN": "xoxb-xxxxxxxxxxxxxxxxxxxx"
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
       },
       "enabled": false
     }
@@ -161,7 +252,7 @@ The `mcp_servers.json` file defines which MCP servers ChatCLI should connect to.
 }
 ```
 
-<Warning>Never commit tokens or passwords in the config file. Use system environment variables or a secrets manager.</Warning>
+<Warning>Never commit tokens or passwords in the config file. Use the `${VAR}` syntax (documented above in [Environment Variables](#environment-variables-env)) so secrets come from the shell — never from the JSON.</Warning>
 
 ---
 
@@ -212,7 +303,26 @@ Description:              [MCP:filesystem] Reads a file from the filesystem
     2. Config file is at `~/.chatcli/mcp_servers.json`
     3. `enabled` is `true`
     4. Use `/mcp status` to see connection errors
-    5. Check logs with `CHATCLI_LOG_LEVEL=debug`
+    5. Use `/mcp logs <name>` to see the server's recent stderr (npm 404, panic, missing executable)
+    6. Check logs with `CHATCLI_LOG_LEVEL=debug`
+  </Accordion>
+  <Accordion title="The MCP server does not see the token / connection string">
+    The cause is almost always one of two things:
+
+    1. **Variable not exported in the shell** — `${GH_TOKEN}` in the config expands to empty if `GH_TOKEN` isn't in `os.Environ()`. Confirm with `echo $GH_TOKEN` before starting ChatCLI.
+    2. **Token rotated mid-session** — expansion happens at spawn. After exporting the new variable, run `/mcp restart <name>` to force a re-spawn with the updated environment.
+
+    To inspect what the server actually received, open `/mcp logs <name>` — MCP servers usually log "missing token" / 401 to stderr.
+  </Accordion>
+  <Accordion title="Hot-reload doesn't fire when I create mcp_servers.json">
+    With the hot-reload fixes, the watcher starts when the **parent directory** exists — even without the file. If you never created `~/.chatcli/`, there is no watcher.
+
+    **Fix**: create the directory once (`mkdir -p ~/.chatcli`) and restart ChatCLI. From then on, creating/editing `mcp_servers.json` triggers reload automatically.
+
+    To force a manual reload at any time: `/mcp reload`.
+  </Accordion>
+  <Accordion title="I edited the JSON and it has a syntax error — did I lose everything?">
+    No. When `LoadConfig` fails (0 bytes, invalid JSON), ChatCLI logs a warning but **keeps the manager + watcher running**. Fix the JSON in your editor, save it, and the next event triggers `Reload` normally — no session restart needed.
   </Accordion>
   <Accordion title="Tools not showing up">
     1. The server may not support `tools/list`
