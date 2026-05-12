@@ -58,6 +58,7 @@ Saving an invalid JSON does **not** crash ChatCLI: the manager stays registered 
 {
   "mcpServers": [
     {
+      // --- Core (always required) ---
       "name": "string",           // Unique server name
       "transport": "stdio|sse",   // Transport type
       "command": "string",        // Command to start (stdio)
@@ -67,7 +68,31 @@ Saving an invalid JSON does **not** crash ChatCLI: the manager stays registered 
       },
       "url": "string",            // Server URL (sse)
       "enabled": true,            // Enable/disable without removing
-      "overrides": ["string"]     // Built-ins this server replaces
+      "overrides": ["string"],    // Built-ins this server replaces
+
+      // --- Tier 1: typed fields with direct runtime effect ---
+      "description": "string",    // Shown under the server in /mcp status
+      "cwd": "string",            // Working directory for stdio process
+      "autoApprove": ["string"],  // Tools that bypass the approval gate (audit-logged)
+      "alwaysAllow": ["string"],  // Alias of autoApprove (Cline compat)
+      "disabledTools": ["string"],// Tools hidden from the LLM
+      "timeout": 60,              // Per-RPC timeout, in seconds
+
+      // --- Tier 2: additional capabilities ---
+      "initTimeout": 10,          // Timeout for the initialize handshake, in seconds
+      "headers": {                // Custom HTTP headers (SSE)
+        "X-Foo": "${MY_TOKEN}"
+      },
+      "auth": {                   // SSE authentication (bearer / basic / header)
+        "type": "bearer",
+        "token": "${MY_TOKEN}"
+      },
+      "enabledTools": ["string"], // Allowlist; takes precedence over disabledTools
+      "tags": ["string"],         // Markers rendered in /mcp status
+      "category": "string",       // Short classification (e.g. "aws", "io")
+      "trust": false              // Auto-approves EVERY tool (full bypass — use with care)
+
+      // Any other key is round-trip preserved but ignored at runtime
     }
   ]
 }
@@ -77,16 +102,50 @@ Saving an invalid JSON does **not** crash ChatCLI: the manager stays registered 
 
 ## Fields
 
+### Core (required)
+
 | Field | Type | Required | Description |
 |:------|:-----|:---------|:-----------|
-| `name` | string | ✅ | Unique server identifier. Used in logs and `[MCP:<name>]` tool prefix |
-| `transport` | string | ✅ | Transport type: `"stdio"` (local) or `"sse"` (remote) |
+| `name` | string | ✅ | Unique identifier. Used in logs and the `[MCP:<name>]` tool prefix |
+| `transport` | string | ✅ | `"stdio"` (local) or `"sse"` (remote) |
 | `command` | string | stdio ✅ | Command to start the MCP process |
 | `args` | string[] | ❌ | Arguments passed to the command |
-| `env` | object | ❌ | Process environment variables (key-value) |
-| `url` | string | sse ✅ | SSE endpoint URL for the remote server |
-| `enabled` | bool | ❌ | Default: `false`. Disable without removing from config |
-| `overrides` | string[] | ❌ | Names of built-in plugins this server replaces. When connected, the listed built-ins are **hidden** from the LLM prompt. If the server disconnects, they are **automatically restored**. E.g.: `["@webfetch", "@websearch"]` |
+| `env` | object | ❌ | Process environment variables (with `${VAR}` expansion) |
+| `url` | string | sse ✅ | Base URL of the remote SSE server |
+| `enabled` | bool | ❌ | Default `false`. Disable without removing from config |
+| `overrides` | string[] | ❌ | Built-in plugins this server replaces. Connected, the listed built-ins are hidden from the LLM; on disconnect, they come back automatically. E.g. `["@webfetch", "@websearch"]` |
+
+### Tier 1 — direct runtime effect
+
+| Field | Type | Description |
+|:------|:-----|:-----------|
+| `description` | string | Shown in `/mcp status` under the server line. Useful when server names are cryptic (`prod-1`, `srv-a`) |
+| `cwd` | string | Working directory for the process (`exec.Cmd.Dir`). Accepts `${VAR}` and leading `~/`. Validated at spawn — a missing path or non-directory fails the connection with an actionable error (ignored for SSE) |
+| `autoApprove` | string[] | Tool names that bypass the approval gate. `"*"` matches every tool from this server. Today produces an **info-level audit log** on every auto-approved call; the helper is in place for the future MCP approval gate in coder mode. See [Auto-approval](#auto-approval-and-trust) |
+| `alwaysAllow` | string[] | Alias of `autoApprove` adopted by Cline. The two lists are merged into a single runtime set — copy-pasting a Cline config works without renaming |
+| `disabledTools` | string[] | Tool names hidden from both `/mcp tools` and the LLM prompt. Direct token savings when a server exposes 30+ tools but the workflow only needs a handful |
+| `timeout` | int (seconds) | Per-call RPC timeout. Default `60`. Covers the worst case of a `npx -y <pkg>` cold start |
+
+### Tier 2 — additional capabilities
+
+| Field | Type | Description |
+|:------|:-----|:-----------|
+| `initTimeout` | int (seconds) | Timeout for the MCP `initialize` handshake and the SSE endpoint-event wait. Default `10`. Useful for servers that bootstrap credentials or models on startup |
+| `headers` | object | Extra HTTP headers attached to every SSE GET (stream) and every POST (calls). Values go through `${VAR}` expansion. Ignored for stdio |
+| `auth` | object | SSE authentication. See [SSE Authentication](#sse-authentication-auth). `type` accepts `"bearer"`, `"basic"`, `"header"`. Empty `type` disables auth even when other fields are populated |
+| `enabledTools` | string[] | **Allowlist** — when non-empty, **only** the listed tools are exposed. Takes precedence over `disabledTools` |
+| `tags` | string[] | Short markers rendered as `#tag1 #tag2` in `/mcp status` |
+| `category` | string | Single-word classification (e.g. `"aws"`, `"database"`) rendered as `[category]` in `/mcp status` |
+| `trust` | bool | Auto-approves **every** tool from this server, no need to consult `autoApprove`. Emits a **warn-level** log at startup to keep the choice visible. Reserved for separately-vetted servers |
+
+### Tier 3 — Catch-all (`Extensions`)
+
+Any JSON key that isn't one of the fields above is **preserved verbatim** when chatcli rewrites the file. Useful for pasting configs from other clients (AWS EKS MCP, Cline, Cursor) without losing vendor-specific annotations.
+
+Important:
+- Unknown keys are **ignored by the chatcli runtime** — they only survive the save/load round-trip.
+- They cannot **shadow** a typed field: a hand-edited JSON with `Extensions["command"]` will never override the real `command`.
+- When a key is promoted to a typed field in a future release (e.g. `oauth2`), the content already in `Extensions` migrates automatically.
 
 ---
 
@@ -147,6 +206,251 @@ Expansion happens **once at process spawn**. If you change `GH_TOKEN` in the she
 | Connection string | Shell env | `"DATABASE_URL": "${DATABASE_URL}"` |
 | DB password | Vault / 1Password CLI / `pass` | Inject into shell before ChatCLI |
 | Non-sensitive credential (e.g. project ID) | Direct in JSON | `"GCP_PROJECT": "my-project-id"` |
+
+---
+
+## Auto-approval and Trust
+
+ChatCLI's tool-execution pipeline emits an audit log for every MCP invocation that `autoApprove`, `alwaysAllow` or `trust` covers. The `Manager.ShouldAutoApprove(toolName)` helper consulted by the pipeline is already in place for the future interactive approval gate on the coder-mode MCP path.
+
+### `autoApprove` / `alwaysAllow`
+
+Lists of tool names that bypass the approval gate. Accept `"*"` (any tool on the server). Names can be used with or without the `mcp_` prefix — `"read_file"` and `"mcp_read_file"` both match.
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+  "enabled": true,
+  "autoApprove": ["read_file", "list_directory"]
+}
+```
+
+`alwaysAllow` is an alias popularized by Cline — chatcli folds the two lists into the same runtime set, so copy-pasting a Cline config works without renaming.
+
+### `trust: true`
+
+Auto-approves **every** tool on the server, no need to list them one by one:
+
+```json
+{
+  "name": "my-trusted-tools",
+  "transport": "stdio",
+  "command": "/usr/local/bin/my-mcp",
+  "enabled": true,
+  "trust": true
+}
+```
+
+<Warning>
+`trust: true` is intended for servers the operator has **separately vetted** (audited code, immutable container, etc.). ChatCLI emits a warning at startup every time it connects with `trust: true` so the choice is visible in logs — a trust config committed by accident never goes silent.
+</Warning>
+
+### Audit log
+
+Every auto-approved call produces an info-level entry:
+
+```
+MCP tool auto-approved by config  tool=read_file coder_mode=true
+```
+
+Grep the chatcli log (`CHATCLI_LOG_LEVEL=info` or higher) to audit everything that took the bypass.
+
+---
+
+## Tool filtering
+
+When a server exposes dozens of tools but the workflow only uses a subset, hiding the rest saves tokens on every LLM turn.
+
+### `disabledTools` (blocklist)
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+  "enabled": true,
+  "disabledTools": ["delete_file", "move_file"]
+}
+```
+
+Accepts `"*"` (hides everything — useful to mute a server without removing the entry).
+
+### `enabledTools` (allowlist — takes precedence)
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+  "enabled": true,
+  "enabledTools": ["read_file", "list_directory"]
+}
+```
+
+When non-empty, **only** the listed tools are exposed. `disabledTools` on the same server is ignored.
+
+`/mcp status` shows the count of hidden tools (blocklist) or the total tool count when the allowlist is active.
+
+---
+
+## Timeouts
+
+Defaults cover the common case (`npx -y` cold start). Override when a server takes longer by design.
+
+### `timeout` (seconds)
+
+Cap per RPC call. Default **60s**. Applies to both `tools/call` and `tools/list`.
+
+```json
+{
+  "name": "slow-llm-proxy",
+  "transport": "sse",
+  "url": "https://proxy.internal/sse",
+  "enabled": true,
+  "timeout": 180
+}
+```
+
+### `initTimeout` (seconds)
+
+Cap on the MCP `initialize` handshake — and, in SSE, on the endpoint-event wait. Default **10s**. Bump for servers that load credentials, perform an auth handshake, or set up the environment at startup:
+
+```json
+{
+  "name": "self-hosted-bedrock",
+  "transport": "sse",
+  "url": "https://bedrock-proxy.internal/sse",
+  "enabled": true,
+  "initTimeout": 60
+}
+```
+
+<Info>
+SSE: the `http.Client.Timeout` is set to `max(timeout, initTimeout)` so a short `timeout` does not kill the SSE GET (which stays open for the lifetime of the connection).
+</Info>
+
+---
+
+## Working directory (`cwd`) — stdio
+
+```json
+{
+  "name": "project-fs",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+  "enabled": true,
+  "cwd": "${HOME}/repos/my-project"
+}
+```
+
+- Accepts `${VAR}` / `$VAR` expansion (same lookup as `env`).
+- Accepts leading `~/` expanded against `HOME`.
+- **Validated at spawn**: a missing path or non-directory fails the connection with an actionable error instead of silently inheriting chatcli's CWD.
+- Empty = inherits chatcli's CWD (legacy behavior).
+
+Ignored for SSE.
+
+---
+
+## HTTP headers and authentication — SSE
+
+### `headers`
+
+Extra headers attached to **every** GET on the SSE stream and **every** POST of JSON-RPC messages:
+
+```json
+{
+  "name": "internal-mcp",
+  "transport": "sse",
+  "url": "https://mcp.internal/sse",
+  "enabled": true,
+  "headers": {
+    "X-Tenant-Id": "acme",
+    "X-Trace-Id": "${TRACE_ID}"
+  }
+}
+```
+
+Values go through `${VAR}` expansion (same lookup as `env`).
+
+### SSE Authentication (`auth`)
+
+Typed block with three modes:
+
+#### `bearer`
+
+```json
+{
+  "auth": {
+    "type": "bearer",
+    "token": "${MY_TOKEN}"
+  }
+}
+```
+
+Produces `Authorization: Bearer <token>`.
+
+#### `basic`
+
+```json
+{
+  "auth": {
+    "type": "basic",
+    "username": "${MY_USER}",
+    "password": "${MY_PASS}"
+  }
+}
+```
+
+Produces `Authorization: Basic base64(user:pass)`.
+
+#### `header` (custom)
+
+```json
+{
+  "auth": {
+    "type": "header",
+    "header": "X-API-Key",
+    "token": "${MY_TOKEN}"
+  }
+}
+```
+
+Produces `X-API-Key: <token>`. When `header` is omitted, the default is `X-API-Key`.
+
+<Info>
+**Safety rails**: empty `type` is no-op even with `token`/`username` populated (so a half-completed config does not leak credentials). A token whose env var is undefined **suppresses the header entirely** instead of sending an empty `Authorization: Bearer ` (which would pass a naive auth-presence check on the server).
+</Info>
+
+<Warning>
+`Authorization`/custom headers are re-applied on every request, so **rotating the env var at runtime** makes the next call carry the fresh token — no `/mcp restart` needed.
+</Warning>
+
+---
+
+## Metadata (`description`, `tags`, `category`)
+
+Cosmetic fields rendered in `/mcp status` so it's easy to tell servers apart when many are connected:
+
+```json
+{
+  "name": "prod-aws",
+  "transport": "sse",
+  "url": "https://prod-aws-mcp.internal/sse",
+  "enabled": true,
+  "description": "Read-only AWS account access via EKS MCP",
+  "category": "aws",
+  "tags": ["prod", "readonly"]
+}
+```
+
+Each output line is opt-in: configs without any of these fields render exactly like before v1.115.
 
 ---
 
@@ -330,9 +634,29 @@ Description:              [MCP:filesystem] Reads a file from the filesystem
     3. Restart with `/mcp restart`
   </Accordion>
   <Accordion title="Tool execution timeout">
-    Default timeout is 30s per call. If the server takes longer:
-    1. Check server health
-    2. Consider using SSE for slow operations
+    Default per-call timeout is **60s** (covers `npx -y` cold start). If a specific server takes longer:
+
+    1. Bump `timeout` (seconds) on that server's config only — see [Timeouts](#timeouts).
+    2. If failure is during the **handshake** (not the call), bump `initTimeout` separately.
+    3. For long-running servers (LLM proxies, slow agents), prefer SSE — the stream stays open while the server processes.
+  </Accordion>
+  <Accordion title="An MCP tool was auto-approved without me confirming">
+    Check:
+    1. `autoApprove` or `alwaysAllow` in the config lists the tool name (or `"*"`) — see [Auto-approval](#auto-approval-and-trust).
+    2. `trust: true` on the server is a full bypass. Every auto-approved call emits an info-level log `MCP tool auto-approved by config tool=<name>`. Grep the chatcli log to audit.
+    3. To remove the bypass, edit the JSON (hot-reload reapplies) or run `/mcp reload`.
+  </Accordion>
+  <Accordion title="SSE server returned 401/403">
+    1. Confirm the env var referenced by `auth.token`/`headers` is exported in the shell. `${UNSET_VAR}` expands to an empty string and ChatCLI **suppresses the entire header** instead of sending `Authorization: Bearer ` (empty) — so the server reports 401 as if no auth was attempted.
+    2. Rotated the token in the shell? Headers are re-applied on every request, no `/mcp restart` needed. But confirm the shell that started ChatCLI has the new variable (export, source, etc.).
+    3. For `type: "header"` with a custom name, confirm the server expects **exactly** the configured name (ChatCLI sends literally what's in `auth.header`).
+  </Accordion>
+  <Accordion title="An MCP tool does not show up in /mcp tools">
+    Likely hidden by config:
+
+    1. `disabledTools` lists its name — remove it or flip to `enabledTools`.
+    2. `enabledTools` is populated but the tool isn't in the allowlist — add it or clear `enabledTools` to return to the default "all visible".
+    3. `/mcp status` shows the hidden-tool count (blocklist).
   </Accordion>
   <Accordion title="Override not working — LLM still sees the built-in">
     Check:
