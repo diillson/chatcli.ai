@@ -1,0 +1,117 @@
+---
+title: "Tools Atômicos (@read, @search, @tree, @todo)"
+sidebarTitle: "Tools Atômicos"
+description: "Plugins builtin narrow com schema flat — paridade com Read, Grep, TodoWrite do Claude Code. Paralelizáveis, validados por JSON Schema, com truncation policy por tool."
+icon: "wand-magic-sparkles"
+---
+
+A partir da release pós-#920, o ChatCLI ganhou um conjunto de **tools atômicos** modelados na arquitetura narrow do Claude Code: cada operação read-only mais comum tem seu próprio plugin com schema dedicado em vez de viver dentro do envelope `@coder`.
+
+<Note>
+Os atômicos coexistem com o `@coder` — `@coder read/search/tree` continuam funcionando. A diferença é que o LLM agora pode escolher o tool narrow (mais preciso) quando quiser executar uma única operação read-only.
+</Note>
+
+---
+
+## Os quatro tools
+
+### `@read` — leitura de arquivo
+
+Equivalente ao `Read` do Claude Code. Schema flat:
+
+```json
+{"file": "main.go", "from_line": 10, "to_line": 50}
+```
+
+Aliases aceitos: `path`, `filepath`. Faixa de linhas, head/tail e encoding base64 suportados. Cap de output: **80 000 chars** (versus 30k global) — arquivos grandes (~1500 linhas) cabem inteiros.
+
+### `@search` — busca por regex
+
+Equivalente ao `Grep` do Claude Code. Schema flat:
+
+```json
+{"term": "Login", "dir": "./src", "include": "*.go"}
+```
+
+Aliases: `pattern`, `query`, `regex`. Glob de inclusão, limite configurável de resultados. Cap: **60 000 chars**.
+
+### `@tree` — árvore de diretórios
+
+Schema flat (todos opcionais — `{}` lista o cwd):
+
+```json
+{"dir": "./src", "depth": 3, "exclude": "node_modules"}
+```
+
+Profundidade limitada [1,20]. Cap: **50 000 chars**.
+
+### `@todo` — gestão de plano de tarefas
+
+Paridade com `TodoWrite` do Claude Code. Três subcomandos:
+
+```json
+// Substitui o plano completo (canonical TodoWrite)
+{"cmd":"write","args":{"todos":[
+  {"description":"Investigar bug","status":"completed"},
+  {"description":"Aplicar fix","status":"in_progress"},
+  {"description":"Adicionar testes","status":"pending"}
+]}}
+
+// Lista o estado atual
+{"cmd":"list"}
+
+// Marca UMA tarefa por id 1-indexed
+{"cmd":"mark","args":{"id":2,"status":"completed"}}
+```
+
+Status: `pending` | `in_progress` | `completed` | `failed`. O `@todo` adapter encaminha pra `cli/agent/task_tracker.go` ativo do AgentMode atual.
+
+---
+
+## Por que narrow tools importam
+
+| | `@coder` (fat) | `@read` / `@search` / `@tree` (narrow) |
+|---|---|---|
+| Acurácia do LLM | Schema único, modelo erra subcomando | Schema dedicado, ~10pp mais preciso |
+| Paralelização | Não (mistura read e write) | Sim (IsConcurrencySafe=true) |
+| Permission gate | Cai no policy regex | Auto-allow via capability |
+| Streaming UX | Generic "@coder read" | "Reading: main.go" |
+| Truncation | Global 30k | Per-tool 50k/60k/80k |
+
+---
+
+## Multipatch transacional
+
+Novidade no `@coder`:
+
+```json
+{"cmd":"multipatch","args":{"edits":[
+  {"file":"a.go","search":"old","replace":"new"},
+  {"file":"b.go","search":"foo","replace":"bar"}
+]}}
+```
+
+Phase 1 valida TODAS as edições antes de qualquer escrita. Phase 2 grava — qualquer falha restaura todos os arquivos tocados. Per-file mutex serializa transações concorrentes na mesma file. Use quando uma refatoração precisa ser all-or-nothing.
+
+---
+
+## Validação por JSON Schema
+
+Cada plugin atômico ship um JSON Schema draft-2020-12. O agent loop valida os args do LLM antes de chamar `Execute`. Falhas geram `ToolResult{IsError:true, ErrorCode:"InvalidArgs"}` com path do campo inválido — o modelo recebe feedback claro em vez de um panic/empty.
+
+Plugins legados sem `JSONSchemaAware` bypassam validação (mudança puramente aditiva).
+
+---
+
+## Capability-aware permission gate
+
+O `policy_manager` agora consulta o capability resolver antes de cair no default `ActionAsk`:
+
+1. Deny rules (estrito)
+2. Safety-immune (sempre asks)
+3. Allow/Ask explícito (longest pattern wins)
+4. Read-only exec heuristic
+5. **NOVO:** capability gate — auto-allow para plugin com `IsReadOnly=true`
+6. Default: Ask
+
+Resultado: `@read`, `@search`, `@tree`, `@websearch`, `@webfetch` (GET), `@scheduler query/list` rodam sem prompt enquanto write/exec continuam gated.
