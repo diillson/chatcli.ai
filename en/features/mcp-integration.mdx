@@ -126,6 +126,8 @@ chatcli server --mcp-config ~/.chatcli/mcp_servers.json
     }
     ```
 
+    The GET `/sse` listener is **supervised**: connection drops (proxy idle timeout, server restart) trigger reconnect with full-jitter exponential backoff (500 ms → 30 s cap), pending RPCs survive the reconnect, and push notifications on the same stream feed [MCP Channels](/en/features/mcp-channels).
+
     **Use case**: remote servers built against the HTTP+SSE model (anything predating the 2025-03-26 spec or keeping that shape for compatibility).
   </Tab>
   <Tab title="http (Streamable HTTP)">
@@ -144,6 +146,8 @@ chatcli server --mcp-config ~/.chatcli/mcp_servers.json
     ```
 
     Each call is a single POST; the response can arrive as a one-shot JSON, as an SSE upgrade on the same response (carrying the result plus any interleaved `notifications/*`), or as `202 Accepted` for client→server notifications. If the server emits an `Mcp-Session-Id` on `initialize`, the transport captures it and echoes it on every subsequent call.
+
+    Server-initiated push notifications are read by a **separate GET listener** (opt-in per spec). ChatCLI starts the listener right after `initialize`; servers that don't implement push respond 405/404/501 on the GET and the listener stops cleanly, no retries. When the listener is active, push messages land in `/channel list` and can fire trigger rules — see [MCP Channels](/en/features/mcp-channels).
 
     **Use case**: servers built against the current MCP spec. When in doubt between `sse` and `http`, hit the endpoint with `curl` — whatever answers a GET with `event: endpoint` is `sse`; whatever answers a POST directly with JSON or an SSE upgrade is `http`.
 
@@ -475,11 +479,69 @@ Useful combo for diagnosing connection issues: `/mcp status` (state), then `/mcp
 
 ---
 
+## Push notifications — MCP Channels
+
+Beyond tools (request/response), ChatCLI accepts **push notifications** from any MCP server across all three transports. Notifications are JSON-RPC messages **without `id`** (the spec form for "the server wants to tell me something, it isn't asking for anything back"). ChatCLI captures, persists, and automatically injects them into the next conversations, and — optionally — fires the agent via trigger rules.
+
+### The essentials
+
+- **Works on `stdio`, `sse`, and `http`** — each transport has its own listener:
+  - `sse`: the GET `/sse` that already carries tool responses receives notifications on the same stream.
+  - `http`: a separate GET on the endpoint (opt-in by the client, optional by the spec) pulls notifications. Servers that don't support it respond with 405/404/501 and the listener stops cleanly, no retries.
+  - `stdio`: JSON-RPC lines on stdout without `id` are treated as notifications.
+- **Durable persistence** at `~/.chatcli/mcp/channels.jsonl` (up to 10 MiB, rotates, replays on boot).
+- **Auto-injection** of the 5 most recent in the system prompt of `chat`/`agent`/`coder` (uncached so cache isn't trashed).
+- **Per-server filter**: `channels` field in `mcp_servers.json` accepts a literal allow-list.
+- **Optional rules engine** in `~/.chatcli/mcp/triggers.json` with 3 modes: `notify` (discreet banner, default), `confirm` (manual yes/no), `auto` (runs the agent — requires tool whitelist).
+- **Slash commands**: `/channel list`, `/channel ack`, `/channel pause`, `/channel rules`, `/channel confirm <id>`, `/channel run <seq>`, `/channel inject`.
+
+### Minimal example — server with channels
+
+```json
+{
+  "name": "prom-alerts",
+  "transport": "sse",
+  "url": "https://prom-alerts.internal/sse",
+  "enabled": true,
+  "channels": ["alerts/critical", "alerts/error"]
+}
+```
+
+With that, alerts land in `/channel list`, show up in the next prompt banner, and are auto-injected into the agent context.
+
+### Example — trigger that investigates CI failures
+
+`~/.chatcli/mcp/triggers.json`:
+
+```json
+{
+  "rules": [
+    {
+      "name": "ci-investigator",
+      "server": "ci-monitor",
+      "channel": "ci-pipeline",
+      "contentRegex": "(?i)fail|broken",
+      "mode": "confirm",
+      "prompt": "Investigate this CI failure: {{content}}",
+      "rateLimit": "5m"
+    }
+  ]
+}
+```
+
+Every CI failure asks the user with a prompt in the banner; `/channel confirm <id>` accepts and the agent starts investigating.
+
+<Note>
+Full channels, rules, and troubleshooting docs: [MCP Channels](/en/features/mcp-channels). Complete `channels` schema and `triggers.json` reference: [MCP Config](/en/reference/mcp-config#channel-subscriptions-channels).
+</Note>
+
+---
+
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="MCP Channels" icon="message" href="/en/features/mcp-channels">
-    Push messages from MCP servers (stdio, SSE or Streamable HTTP) to the CLI in real time.
+    Push messages across all three transports (`stdio`, `sse`, `http`) with durable persistence, per-server filter, and a rules engine (notify/confirm/auto).
   </Card>
   <Card title="Agentic plugins" icon="puzzle-piece" href="/en/features/agentic-plugins">
     ChatCLI's plugin system — compared with MCP.

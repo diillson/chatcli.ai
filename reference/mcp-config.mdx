@@ -90,7 +90,8 @@ Salvar um JSON inválido **não derruba o ChatCLI**: o manager continua registra
       "enabledTools": ["string"], // Allowlist; precede disabledTools
       "tags": ["string"],         // Marcadores rendered em /mcp status
       "category": "string",       // Classificação curta (ex: "aws", "io")
-      "trust": false              // Auto-aprova TUDO (bypass total — usar com cautela)
+      "trust": false,             // Auto-aprova TUDO (bypass total — usar com cautela)
+      "channels": ["string"]      // Allow-list de MCP push-channels (vazio = aceita tudo)
 
       // Qualquer outra chave é preservada via round-trip mas ignorada por runtime
     }
@@ -137,6 +138,7 @@ Salvar um JSON inválido **não derruba o ChatCLI**: o manager continua registra
 | `tags` | string[] | Marcadores curtos rendered como `#tag1 #tag2` no `/mcp status` |
 | `category` | string | Classificação de um termo (ex: `"aws"`, `"database"`) rendered como `[category]` no `/mcp status` |
 | `trust` | bool | Auto-aprova **toda** tool do server, sem consultar `autoApprove`. Emite **warn-level** no startup pra deixar a escolha visível em logs. Reserve para servers separadamente vetados |
+| `channels` | string[] | Allow-list de **MCP push-channels** entregues pelo server. Vazio/omitido = aceita qualquer channel; com lista, só os channels literais nela passam pelo filtro (match exato — sem glob). `"*"` explícito = aceita tudo. Filtra no momento da recepção (antes do ring/persistência). Veja [MCP Channels](/features/mcp-channels) |
 
 ### Tier 3 — Catch-all (`Extensions`)
 
@@ -459,6 +461,172 @@ Cada linha de output é opt-in: configs sem nenhum desses campos renderizam exat
 
 ---
 
+## Channel subscriptions (`channels`)
+
+Quando um servidor MCP emite **push notifications** (JSON-RPC messages sem `id`), o ChatCLI as encaminha pro [MCP Channels](/features/mcp-channels) ring — uma estrutura durável que alimenta o system prompt, o banner de inbox e o trigger engine.
+
+O campo `channels` na config do servidor é um **allow-list de channel names**: só os channels literalmente listados são aceitos para esse servidor. Útil quando um servidor é tagarela em múltiplas categorias (ex: emite tanto `ci-pipeline` quanto `deploys/staging` quanto `metrics/raw`) mas seu workflow só se importa com uma fatia.
+
+```json
+{
+  "name": "prom-alerts",
+  "transport": "sse",
+  "url": "https://prom-alerts.internal/sse",
+  "enabled": true,
+  "channels": ["alerts/critical", "alerts/error"]
+}
+```
+
+| Configuração | Comportamento |
+|:-------------|:--------------|
+| Omitido ou `[]` | Aceita **todos** os channels que o server emitir |
+| `["alerts/critical"]` | Só `alerts/critical` é aceito; `alerts/info` ou `metrics/*` são descartados (debug log) |
+| `["*"]` (explícito) | Equivale a omitido — passa tudo |
+| `["  alerts  ", ""]` | Whitespace é trimmado, strings vazias ignoradas; equivale a `["alerts"]` |
+
+<Note>
+**Match é literal** (não há glob aqui). `"channels": ["alerts"]` **não** pega `"alerts/critical"`. Use o nome exato do channel que o servidor emite. Os globs (`alerts/*`) existem só nas **rules de trigger** (`triggers.json`), que rodam depois desse filtro.
+</Note>
+
+O filtro acontece **na entrada** — antes do ring em memória e antes da persistência. Channels rejeitados não consomem o budget do ring nem aparecem em `/channel list`.
+
+Funciona com os três transports: `sse` (via stream), `http` (via listener GET) e `stdio` (via notifications no stdout). Veja [MCP Channels](/features/mcp-channels) pra detalhes do que acontece **depois** do filtro.
+
+---
+
+## Trigger rules (`~/.chatcli/mcp/triggers.json`)
+
+Arquivo separado do `mcp_servers.json`, opt-in, que descreve como o ChatCLI deve **reagir** a channel events. Sem esse arquivo, channels funcionam só como inbox passivo. Com ele, você define rules que disparam banners, perguntas yes/no ou execuções automáticas do agent.
+
+### Localização
+
+```text
+~/.chatcli/mcp/triggers.json
+```
+
+Carregado automaticamente no startup quando o MCP está habilitado. Reload manual: `/channel rules reload`.
+
+### Schema
+
+```json
+{
+  "rules": [
+    {
+      "name": "string",            // único, obrigatório
+      "server": "string",          // match exato no nome do server; vazio = qualquer
+      "channel": "string",         // literal, "*" ou prefix-glob ("alerts/*")
+      "contentRegex": "string",    // Go regexp aplicado em Content
+      "mode": "notify|confirm|auto",
+      "prompt": "string",          // template com {{content}} {{channel}} {{server}} {{seq}} {{timestamp}}
+      "tools": ["string"],         // whitelist (obrigatório quando mode=auto)
+      "rateLimit": "duration",     // formato Go: "5m", "30s", "1h"
+      "dedupWindow": "duration"
+    }
+  ]
+}
+```
+
+### Campos
+
+| Campo | Tipo | Obrigatório | Descrição |
+|:------|:-----|:------------|:----------|
+| `name` | string | ✅ | Identificador único da rule (aparece em `/channel rules` e em logs) |
+| `server` | string | ❌ | Match exato no nome do servidor MCP. Vazio = qualquer; `"*"` = qualquer (explícito) |
+| `channel` | string | ❌ | Match no channel da mensagem. Suporta literal (`"ci-pipeline"`), wildcard (`"*"`) e **prefix-glob** (`"alerts/*"` pega `alerts/critical`, `alerts/info`, etc.) |
+| `contentRegex` | string | ❌ | Regex Go aplicada sobre o `Content` da notification. Validada no parse — regex inválido rejeita o arquivo inteiro |
+| `mode` | string | ❌ | `"notify"` (default), `"confirm"`, `"auto"`. Case-sensitive |
+| `prompt` | string | obrigatório em `confirm` e `auto` | Template do prompt enviado ao agent quando a rule dispara. Vars: `{{content}}`, `{{channel}}`, `{{server}}`, `{{seq}}`, `{{timestamp}}`. Quando vazio, ChatCLI usa um default `"Investigate this <server>/<channel> event: <content>"` (válido apenas em `notify`) |
+| `tools` | string[] | obrigatório em `auto` | Whitelist de tools que o agent pode invocar. Em `mode: auto`, validação rejeita rule sem `tools` — proteção contra trigger autônomo sem floor de tools |
+| `rateLimit` | duration | ❌ | Cap por rule: após uma fire, ignora matches dentro dessa janela. Formato `time.Duration` do Go: `"5m"`, `"30s"`, `"1h"`. Vazio = sem limite |
+| `dedupWindow` | duration | ❌ | Dedup por `(rule, content prefix)`: mesma rule + mesmo prefixo (até 256 chars) dentro da janela é no-op. Vazio = sem dedup |
+
+### Modos — resumo
+
+| Modo | Quando ação ocorre | Surpresa | Caso de uso |
+|:-----|:-------------------|:---------|:------------|
+| `notify` | Nunca — só registra no banner | Zero | Inbox passivo; user investiga sob demanda |
+| `confirm` | Quando user responde `/channel confirm <id>` | Baixa | User-in-the-loop; alerta importante que merece confirmação humana |
+| `auto` | No próximo prompt tick (drained automaticamente) | Alta — opt-in explícito | Tasks padronizadas e seguras (smoke checks, sanity checks) |
+
+### Validação
+
+Falhas no parse rejeitam o arquivo **inteiro** (atomic apply — ou todas as rules entram, ou nada muda). Em `reload` com erro, o ChatCLI mantém as rules anteriores ativas e mostra o erro na saída.
+
+Erros típicos:
+
+| Erro | Causa | Fix |
+|:-----|:------|:----|
+| `rule #N (""): rule name is required` | Falta `name` ou está vazio | Toda rule precisa de um `name` único |
+| `mode "auto" requires a non-empty tools whitelist` | `mode: "auto"` sem `tools` | Adicione `"tools": [...]` ou troque pra `confirm` |
+| `mode "confirm" requires a prompt template` | `mode: "confirm"` sem `prompt` | Adicione `"prompt": "..."` |
+| `invalid contentRegex: error parsing regexp` | Regex inválido | Use `https://regex101.com` flavor "Golang" pra depurar |
+| `invalid mode "Notify"` | Case-sensitive | Use `notify`/`confirm`/`auto` em lowercase |
+| `duplicate rule name "x"` | Dois entries com mesmo `name` | Names únicos por arquivo |
+| `invalid rateLimit "5min"` | Formato Go inválido | Use `5m`, `30s`, `1h`, `500ms` |
+
+### Exemplos prontos
+
+#### CI watcher passivo
+
+```json
+{
+  "rules": [
+    {
+      "name": "ci-failures",
+      "server": "ci-monitor",
+      "channel": "ci-pipeline",
+      "contentRegex": "(?i)fail|broken|red",
+      "mode": "notify",
+      "rateLimit": "30s",
+      "dedupWindow": "1m"
+    }
+  ]
+}
+```
+
+#### Prod alerts com confirmação
+
+```json
+{
+  "rules": [
+    {
+      "name": "prod-pages",
+      "server": "prom-alerts",
+      "channel": "alerts/critical",
+      "mode": "confirm",
+      "prompt": "Critical alert on prod:\n\n{{content}}\n\nInvestigate?",
+      "rateLimit": "5m",
+      "dedupWindow": "2m"
+    }
+  ]
+}
+```
+
+#### Canary deploys autônomos
+
+```json
+{
+  "rules": [
+    {
+      "name": "canary-sanity-check",
+      "server": "deploy-tracker",
+      "channel": "deploys/canary/*",
+      "mode": "auto",
+      "prompt": "Canary deploy started: {{content}}.\nRun canary smoke checks and report.",
+      "tools": ["kubectl_get", "kubectl_logs", "http_request"],
+      "rateLimit": "1m",
+      "dedupWindow": "30s"
+    }
+  ]
+}
+```
+
+### Persistência do ring
+
+Separado das rules, o ChatCLI mantém um arquivo JSONL durável em `~/.chatcli/mcp/channels.jsonl` com todas as mensagens recebidas. Rotaciona aos 10 MiB pra `channels.jsonl.1` (um backup). Replay automático no boot (até 200 últimas mensagens). Detalhes completos: [MCP Channels — Persistência](/features/mcp-channels#persist%C3%AAncia).
+
+---
+
 ## Exemplos por Transporte
 
 <Tabs>
@@ -642,6 +810,20 @@ Se o curl funciona mas o ChatCLI dá timeout de 10s, é quase sempre **proxy cor
         "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
       },
       "enabled": false
+    },
+    {
+      "name": "prom-alerts",
+      "transport": "sse",
+      "url": "https://prom-alerts.internal/sse",
+      "enabled": true,
+      "channels": ["alerts/critical", "alerts/error"],
+      "auth": {
+        "type": "bearer",
+        "token": "${PROM_ALERTS_TOKEN}"
+      },
+      "description": "Prometheus AlertManager bridge",
+      "category": "observability",
+      "tags": ["prod"]
     }
   ]
 }

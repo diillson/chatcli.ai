@@ -1,219 +1,629 @@
 ---
 title: "MCP Channels"
 sidebarTitle: "MCP Channels"
-description: "Receive push messages from MCP servers for reactive CI notifications, alerts, and external events"
+description: "Reactive push messages from MCP servers: persistence, filters, trigger rules (notify / confirm / auto) and cross-mode injection in chat / agent / coder."
 icon: "tower-broadcast"
 ---
 
-**MCP Channels** is the ChatCLI push notification system that allows receiving real-time messages from MCP servers via SSE (Server-Sent Events). With channels, the agent can react to external events like CI failures, monitoring alerts, and deploy notifications without polling.
+**MCP Channels** is the ChatCLI **push notification** system. MCP servers send proactive messages (alerts, CI events, deploys, external webhooks) and ChatCLI stores them in a **durable ring**, injects them into the next `chat` / `agent` / `coder` turns, and — optionally — **triggers the agent automatically** via a **rules engine** with three operating modes.
 
 <Info>
-MCP Channels only works with MCP servers that support SSE transport and implement push notifications. Stdio servers do not support channels.
+Channels work across **all three MCP transports** supported by ChatCLI:
+
+- **`sse`** (classic HTTP+SSE) — persistent listener on the GET `/sse` stream.
+- **`http`** (Streamable HTTP, MCP spec 2025-03-26) — opt-in listener via GET on the configured endpoint.
+- **`stdio`** — any JSON-RPC message without `id` emitted by the child process is treated as a notification.
+
+Delivery is **passive by default** (a discreet banner on the next prompt) and **reactive by explicit opt-in** (`confirm` or `auto` rules in `~/.chatcli/mcp/triggers.json`).
 </Info>
 
 ---
 
-## Concept
-
-Unlike traditional tool calls (request-response), channels allow MCP servers to **proactively send messages** to ChatCLI:
+## Architecture at a glance
 
 ```text
-MCP Server (SSE)
-      |
-      | push notification
-      v
-ChatCLI MCP Manager
-      |
-      v
-Channel Buffer (circular, 100 msgs)
-      |
-      v
-Auto-inject (last 5) in system prompt
-      |
-      v
-Agent reacts to the event
+MCP Server                    ChatCLI
+──────────                    ───────
+
+  notification ─────►  ┌──── Transport listener (sse / http / stdio) ───────┐
+                       │                                                    │
+                       │  routes by JSON-RPC method:                        │
+                       │    notifications/<channel>  →  channel = <channel> │
+                       │    channel/message          →  channel = params... │
+                       │    notifications/initialized → swallowed (control) │
+                       │    any other method         →  channel = method    │
+                       └─────────────────────┬──────────────────────────────┘
+                                             ▼
+                       ┌─── ChannelManager ──────────────────────────────────┐
+                       │                                                    │
+                       │  1. Subscription filter (ServerConfig.channels)    │
+                       │  2. Sequence stamp (monotonic, per-instance)       │
+                       │  3. In-memory ring buffer (default 200 msgs)       │
+                       │  4. Append-only JSONL persistence (~/.chatcli/mcp) │
+                       │  5. Fan-out to OnMessage subscribers (engine, UI)  │
+                       │  6. Unread counter + LastViewedSeq                 │
+                       └─────────────────────┬──────────────────────────────┘
+                                             ▼
+       ┌──────────────────────────────────┴──────────────────────────────────┐
+       ▼                                                                     ▼
+┌─ Trigger engine (rules) ─┐                          ┌─ System-prompt injector ─┐
+│  match server/channel    │                          │  chat:   mcpChannelPart   │
+│  /content + rate-limit / │                          │  agent:  buildAgentSys-   │
+│  dedup window            │                          │  coder:  Message channels │
+│  → Action (notify /      │                          │  block (uncached so it    │
+│     confirm / auto)      │                          │  never thrashes cache)    │
+└────────────┬─────────────┘                          └───────────────────────────┘
+             ▼
+┌─ CLI pending queues ─────────────────────────────────┐
+│  notify  → inbox banner above next prompt            │
+│  confirm → toast + /channel confirm <id> hint        │
+│  auto    → drained at next prompt tick, runs agent   │
+│            inside AUTO-AGENT envelope                │
+└──────────────────────────────────────────────────────┘
 ```
+
+Each box is a real source file (`cli/mcp/channels.go`, `cli/mcp/triggers/triggers.go`, `cli/channel_triggers.go`, `cli/agent_system_prompt.go`). The split is deliberate: `ChannelManager` is process-local and independent of the CLI; the trigger engine is a separate package without a reverse dependency; the CLI plugs in via `OnMessage`.
 
 ---
 
-## How It Works
+## How a message reaches the agent
 
 <Steps>
-  <Step title="SSE connection">
-    ChatCLI maintains a persistent SSE connection with each MCP server that supports channels. The connection is established automatically on startup.
+  <Step title="Server emits notification">
+    MCP server sends a JSON-RPC message **without `id`** (a notification in the spec). Can be over the SSE stream, the GET of Streamable HTTP, or a stdout line in stdio.
   </Step>
-  <Step title="Message reception">
-    Push messages are received via SSE and stored in a circular buffer per channel. Each channel stores up to 100 messages.
+  <Step title="Transport extracts and routes">
+    The matching transport parses, identifies it as a notification (id absent) and calls `ChannelManager.ProcessSSENotification`. The **method** becomes the **channel**: `notifications/ci-pipeline` → channel `ci-pipeline`; `channel/message` with `params.channel` → channel `params.channel`.
   </Step>
-  <Step title="Auto-injection into prompt">
-    The last 5 messages from each active channel are automatically injected into the system prompt on the next turn. This allows the agent to "see" the most recent events.
+  <Step title="Subscription filter">
+    If the server config has `channels: [...]` and the channel is **not** listed, the message is dropped (debug log). Empty list means "accept everything".
   </Step>
-  <Step title="Agent reaction">
-    The agent can react to injected events, taking actions like investigating failures, reading logs, or notifying the user.
+  <Step title="Persist + ring + unread">
+    Message gets a monotonic `seq`, lands in the in-memory ring (FIFO, default 200), is **append-only** written to `~/.chatcli/mcp/channels.jsonl`, and the unread counter increments.
+  </Step>
+  <Step title="Fan-out to subscribers">
+    Each registered `OnMessage` callback receives a copy. The CLI registers two: the **trigger engine** (evaluates rules) and the **banner renderer** (prepares the UI).
+  </Step>
+  <Step title="System prompt — next turn">
+    On the next chat/agent/coder turn, the **5 most recent** messages from the ring are injected as a block into the system prompt (uncached, so the cached prefix is not invalidated).
+  </Step>
+  <Step title="Reactive trigger (optional)">
+    If any rule matched, the engine emits an `Action` that lands in one of three queues: `notify` (discreet banner), `confirm` (yes/no prompt), `auto` (runs the agent at the next prompt tick).
   </Step>
 </Steps>
 
 ---
 
-## Circular Buffer
-
-Each channel maintains a circular buffer of **100 messages**. When the buffer is full, the oldest messages are automatically discarded:
+## Persistence
 
 ```text
-Channel: ci-pipeline
-  [97] 14:30:01 Build #456 started (branch: feature/auth)
-  [98] 14:32:15 Tests passed: 142/142
-  [99] 14:32:45 Build #456 succeeded
-  [100] 14:35:00 Deploy to staging started
-  ──── buffer full, oldest messages discarded ────
+~/.chatcli/mcp/
+├── channels.jsonl       ← active file, append-only
+└── channels.jsonl.1     ← rotated (single backup)
 ```
 
-<Tip>
-The buffer size (100) is sufficient for most use cases. Important messages should be processed by the agent in real time, not stored indefinitely.
-</Tip>
+### Guarantees
+
+- **Durable across sessions**: messages received while ChatCLI was closed are visible on the next boot (up to the load limit).
+- **Append-only**: we never rewrite the file. A process crash mid-write leaves at worst one truncated line — the loader skips line-by-line, so **a single corrupt line never poisons the rest**.
+- **Automatic rotation**: when the file reaches **10 MiB**, it is renamed to `.1` and a fresh file is opened. We keep **one** historical file — channels are telemetry, not forensic audit log.
+- **Best-effort writes**: if the write fails (disk full, permissions), ChatCLI logs a warning **once**, marks persistence as disabled **only for that session**, and keeps serving the in-memory ring.
+
+### Boot — replay
+
+On startup, ChatCLI reads the **last 200 lines** combined from `channels.jsonl.1` + `channels.jsonl` in chronological order. Replayed messages:
+
+- enter the ring;
+- **do not** count as unread (they were already seen);
+- preserve their original `seq` (the internal counter is advanced past the highest observed).
+
+### How to configure
+
+Persistence is **on by default** when `HOME` is resolvable. In containerized environments without HOME (rare), `ChannelManager` falls back to in-memory-only and logs an info on startup. There is no flag to "disable persistence" — to wipe the state, delete the file manually (`rm ~/.chatcli/mcp/channels.jsonl*`).
 
 ---
 
-## Auto-Injection into System Prompt
+## Per-server filter — `channels`
 
-The last 5 messages from each active channel are automatically injected into the system prompt:
-
-```text
-## MCP Channel Notifications
-
-### ci-pipeline (last 5):
-- [14:32:45] Build #456 succeeded
-- [14:35:00] Deploy to staging started
-- [14:35:30] Staging deploy completed
-- [14:36:00] Smoke tests: 3/3 passed
-- [14:40:00] Build #457 started (branch: main)
-
-### alerts (last 5):
-- [14:33:00] WARNING: CPU usage above 80% on prod-api-2
-- [14:38:00] RESOLVED: CPU usage normalized on prod-api-2
-```
-
-<Warning>
-Auto-injection consumes system prompt tokens. If you have many active channels, consider using `/channel inject` selectively instead of auto-injection.
-</Warning>
-
----
-
-## Commands
-
-| Command | Description |
-|:--------|:-----------|
-| `/channel list` | Lists all available channels and their status (messages in buffer, last message) |
-| `/channel inject` | Manually injects the most recent messages from all channels into the next turn |
-| `/channel <name>` | Shows the messages from the specified channel |
-
-### Listing Channels
-
-```bash
-/channel list
-```
-
-```text
-MCP Channels:
-  ci-pipeline    12 messages  last: 14:40:00  (auto-inject: on)
-  alerts          3 messages  last: 14:38:00  (auto-inject: on)
-  deployments     0 messages  last: never     (auto-inject: off)
-```
-
-### Viewing a Channel
-
-```bash
-/channel ci-pipeline
-```
-
-```text
-Channel: ci-pipeline (12 messages)
-
-  [14:30:01] Build #456 started (branch: feature/auth)
-  [14:31:00] Linting passed
-  [14:31:30] Unit tests: 142/142 passed
-  [14:32:00] Integration tests: 38/38 passed
-  [14:32:15] Tests passed: 142/142
-  [14:32:45] Build #456 succeeded
-  [14:33:00] Docker image pushed: registry.io/app:456
-  [14:35:00] Deploy to staging started
-  [14:35:30] Staging deploy completed
-  [14:36:00] Smoke tests: 3/3 passed
-  [14:38:00] Build #457 started (branch: main)
-  [14:40:00] Build #457: tests running...
-```
-
-### Manual Injection
-
-```bash
-/channel inject
-```
-
-```text
-Injected 10 channel messages into next turn context.
-  ci-pipeline: 5 messages
-  alerts: 5 messages
-```
-
----
-
-## Configuring Servers with Channels
-
-MCP servers that support channels must be configured with SSE transport:
+The optional `channels` field on the MCP server config is an **allow-list** that decides which channels from that server are accepted into the ring.
 
 ```json
 {
-  "mcpServers": [
+  "name": "prom-alerts",
+  "transport": "sse",
+  "url": "https://prom-alerts.internal/sse",
+  "enabled": true,
+  "channels": ["alerts/critical", "alerts/error"]
+}
+```
+
+Rules:
+
+- **Empty/omitted** → accepts every channel the server emits.
+- **Explicit `"*"`** → equivalent to empty.
+- **List** → only literally listed channels pass; others are dropped (debug log).
+- Whitespace in entries is trimmed, so `"  alerts  "` matches `"alerts"`.
+
+Filtering happens **at receive time** (before the ring and persistence), so a noisy server emitting 20 channels when you only care about 2 doesn't pollute anything.
+
+<Note>
+**Matching is literal** (no glob support here). `"channels": ["alerts"]` does **not** match `"alerts/critical"`. Use the exact channel name the server emits. Globs (`alerts/*`) only exist in **trigger rules**, which run after this filter.
+</Note>
+
+---
+
+## Auto-injection into the system prompt
+
+On **every turn** (`chat`, `agent`, `coder`), the 5 most recent ring messages are added to the system prompt as an extra block:
+
+```text
+## MCP Channel Messages (Recent)
+
+[prom-alerts/alerts/critical 14:32:45] api-prod-3 memory > 90%
+[ci-monitor/ci-pipeline 14:33:10] PR #234 build failed: lint errors
+[prom-alerts/alerts/critical 14:33:30] payment-svc p99 > 500ms
+[ci-monitor/ci-pipeline 14:35:00] PR #234 retried by author
+[ci-monitor/deploys 14:35:42] canary-3 rollout started
+```
+
+### Important guarantees
+
+- **No cache hint**: this block is **volatile** and intentionally lives outside the Anthropic cached prefix. Putting something that changes every turn inside the cache would trash the entire KV cache — worse than not caching at all.
+- **Same content in chat / agent / coder**: the system-prompt builders for all three modes were unified to include the block.
+- **Empty ring → block omitted**: zero overhead when you have never received anything.
+
+### Why only 5?
+
+Calibrated for balance: enough to give recent context (CI running + hottest alert) without using too many tokens when the user has multiple chatty servers. If you need more history for a specific turn, use `/channel inject` (which injects the most recent **10**).
+
+---
+
+## Reactive Triggers (rules engine)
+
+This is the **opt-in** part. When you want ChatCLI to **react** to events (e.g., "if CI failed, ask the agent to investigate"; "if there's a critical alert, run the agent"), define rules in `~/.chatcli/mcp/triggers.json`.
+
+### Rule schema
+
+```json
+{
+  "rules": [
     {
-      "name": "ci-monitor",
-      "transport": "sse",
-      "url": "http://mcp-ci:8080/sse",
-      "enabled": true,
-      "channels": ["ci-pipeline", "deployments"]
-    },
-    {
-      "name": "alertmanager",
-      "transport": "sse",
-      "url": "http://mcp-alerts:8080/sse",
-      "enabled": true,
-      "channels": ["alerts"]
+      "name": "ci-investigator",
+      "server": "ci-monitor",
+      "channel": "ci-pipeline",
+      "contentRegex": "(?i)failed|broken|error",
+      "mode": "notify",
+      "prompt": "Investigate this CI failure: {{content}}",
+      "tools": ["gh_pr_diff", "gh_pr_checks"],
+      "rateLimit": "5m",
+      "dedupWindow": "1m"
     }
   ]
 }
 ```
 
-<Info>
-The `channels` field is optional. If omitted, ChatCLI accepts all channels the server sends. If specified, only the listed channels are subscribed to.
-</Info>
+Field reference:
+
+| Field | Type | Required | Description |
+|:------|:-----|:---------|:------------|
+| `name` | string | ✅ | Unique rule identifier. Appears in logs and in `/channel rules` |
+| `server` | string | ❌ | Exact match against the MCP server name. Empty = any server. `"*"` = any (explicit) |
+| `channel` | string | ❌ | Match. Supports literal (`"alerts"`), wildcard (`"*"`) and prefix-glob (`"alerts/*"`) |
+| `contentRegex` | string | ❌ | Go `regexp` against the message `Content`. Empty = any content |
+| `mode` | string | ❌ | `"notify"` (default), `"confirm"`, `"auto"` |
+| `prompt` | string | required for `confirm`/`auto` | Template sent to the agent when the rule fires. Variables: `{{content}}`, `{{channel}}`, `{{server}}`, `{{seq}}`, `{{timestamp}}` |
+| `tools` | string[] | required for `auto` | Whitelist of tools the agent can invoke. In `auto` mode, validation rejects rules without `tools` to prevent unfettered autonomous access |
+| `rateLimit` | string (Go duration) | ❌ | Per-rule cap: after a fire, ignore matches within this window. Examples: `"5m"`, `"30s"`, `"1h"` |
+| `dedupWindow` | string (Go duration) | ❌ | Per `(rule, content prefix)` dedup: same rule + same prefix within the window is a no-op |
+
+### Matching — practical examples
+
+```json
+{
+  "name": "any-critical",
+  "channel": "alerts/critical",
+  "mode": "notify"
+}
+```
+Matches **exactly** the `alerts/critical` channel on any server.
+
+```json
+{
+  "name": "all-alerts",
+  "channel": "alerts/*",
+  "mode": "notify"
+}
+```
+Matches `alerts/critical`, `alerts/warning`, `alerts/info` — any sub-channel under `alerts/`. Does **not** match `errors/critical` (different prefix).
+
+```json
+{
+  "name": "prom-only-paged",
+  "server": "prom-alerts",
+  "channel": "alerts/*",
+  "contentRegex": "(?i)\\b(pager|p1|sev1)\\b",
+  "mode": "confirm",
+  "prompt": "We got paged: {{content}}. Investigate now?"
+}
+```
+Triple condition: server `prom-alerts`, channel `alerts/*`, and content matching the regex. All must be satisfied (AND).
+
+### Modes
+
+#### `mode: notify` (default — zero surprise)
+
+When the rule matches:
+
+1. Immediately: a **toast** prints on stderr with the rule name and a content preview.
+2. The **next** time you type (next prompt tick), a **banner** shows above the prompt with the item in the inbox.
+3. Nothing runs. You decide whether to act.
+
+```text
+> _
+
+╭── 📡 MCP CHANNEL INBOX ──────────────────────────────────────────╮
+│  3 new channel message(s) since last ack                         │
+│  [prom-alerts/alerts/critical] any-critical  api-prod-3 mem >90% │
+│  [prom-alerts/alerts/critical] any-critical  payment p99 > 500ms │
+│  [ci-monitor/ci-pipeline]      ci-watcher    PR #234 lint failed │
+│                                                                  │
+│  Hint: /channel ack to clear, /channel list for full inbox       │
+╰──────────────────────────────────────────────────────────────────╯
+
+>
+```
+
+#### `mode: confirm` (user-in-the-loop)
+
+When the rule matches:
+
+1. Stderr toast + **prompt in the banner**: "run `/channel confirm <id> yes` or `/channel confirm <id> no`".
+2. Nothing runs until the user answers.
+3. `/channel confirm <id> yes` (or just `/channel confirm <id>`, defaulting to yes) fires the agent with the rule template.
+4. `/channel confirm <id> no` discards the action.
+
+Confirm actions **expire after 30 min** — if you don't reply, they leave the queue so state doesn't grow indefinitely.
+
+```text
+> /channel confirm 7 yes
+
+╭── 🤖 AUTO-AGENT ▶ ci-watcher   (ci-monitor/ci-pipeline) ──────────╮
+│  PR #234 lint failed (3 errors in src/auth/middleware.go)         │
+╰───────────────────────────────────────────────────────────────────╯
+
+▸ thinking...
+▸ tool: gh_pr_diff 234
+...
+```
+
+#### `mode: auto` (autonomous — strong opt-in)
+
+Requires `tools` whitelist (validation rejects `auto` rules without `tools`). When the rule matches:
+
+1. Stderr toast informing the trigger is queued.
+2. At the **next prompt tick** (after draining park resumes and before processing user input), the agent runs **automatically** with the rule template.
+3. Execution is rendered inside an **`AUTO-AGENT envelope box`** — visually distinct from a normal turn response.
+4. `Esc` aborts as in any agent execution.
+
+```text
+╭── 🤖 AUTO-AGENT ▶ canary-canary-alert   (prom-alerts/alerts/critical) ──╮
+│  canary-3 p99 latency exceeded SLO budget for 5 minutes                 │
+╰─────────────────────────────────────────────────────────────────────────╯
+
+▸ thinking — investigating SLO breach...
+▸ tool: kubectl_get pod -n canary -l rollout=v3
+▸ tool: kubectl_logs canary-3-7d8c... --tail=100
+...
+```
+
+### Guard-rails for `auto`
+
+- **`tools` whitelist required** — startup validation rejects an `auto` rule without `tools`.
+- **`rateLimit` and `dedupWindow` recommended** — without them, a noisy server can spawn dozens of turns per minute.
+- **`Esc` always aborts**, regardless of whether the agent was triggered by user or rule.
+- **`/channel pause` shuts everything off globally** — use before a sensitive operation to avoid interference.
 
 ---
 
-## Use Cases
+## Rules configuration
+
+```text
+~/.chatcli/mcp/triggers.json
+```
+
+Root schema:
+
+```json
+{
+  "rules": [ /* array of rules as described above */ ]
+}
+```
+
+Ready-to-use examples:
+
+### CI watcher (notify only — safe default)
+
+```json
+{
+  "rules": [
+    {
+      "name": "ci-failures",
+      "server": "ci-monitor",
+      "channel": "ci-pipeline",
+      "contentRegex": "(?i)fail|broken|red",
+      "mode": "notify",
+      "rateLimit": "30s",
+      "dedupWindow": "1m"
+    }
+  ]
+}
+```
+
+### Prod alerts → confirm
+
+```json
+{
+  "rules": [
+    {
+      "name": "prod-pages",
+      "server": "prom-alerts",
+      "channel": "alerts/critical",
+      "mode": "confirm",
+      "prompt": "We got a critical alert on prod:\n\n{{content}}\n\nInvestigate now?",
+      "rateLimit": "5m",
+      "dedupWindow": "2m"
+    }
+  ]
+}
+```
+
+### Canary deploys → auto (with tight whitelist)
+
+```json
+{
+  "rules": [
+    {
+      "name": "canary-sanity-check",
+      "server": "deploy-tracker",
+      "channel": "deploys/canary/*",
+      "mode": "auto",
+      "prompt": "A new canary deploy just started: {{content}}.\nRun the canary smoke checks and report.",
+      "tools": ["kubectl_get", "kubectl_logs", "http_request"],
+      "rateLimit": "1m",
+      "dedupWindow": "30s"
+    }
+  ]
+}
+```
+
+### Validation
+
+Schema failures reject the entire file (atomic apply — either every rule lands, or nothing changes). Common errors:
+
+| Symptom | Cause | Fix |
+|:--------|:------|:----|
+| `mode "auto" requires a non-empty tools whitelist` | `mode: "auto"` without `tools` field | Add `"tools": [...]` or switch to `mode: "confirm"` |
+| `invalid contentRegex: error parsing regexp` | Invalid regex | Test in `regex101.com` with "Golang" flavor; remember metachars need JSON double-escape (`\\b`, `\\d`) |
+| `invalid mode "Notify"` | Case-sensitive | Use lowercase: `notify`, `confirm`, `auto` |
+| `duplicate rule name "x"` | Two rules with the same `name` | Names must be unique within the file |
+| `invalid rateLimit "5min"` | Go `time.Duration` format | Use `5m`, `30s`, `1h` (not `5min`, `30sec`) |
+
+Runtime reload: `/channel rules reload`.
+
+---
+
+## `/channel` commands
+
+All subcommands support **autocomplete** (Tab after `/channel `).
+
+| Subcommand | Argument | Description |
+|:-----------|:---------|:------------|
+| `/channel` or `/channel list` | — | Lists up to 20 most recent ring messages with `seq`, timestamp, server, channel and content preview |
+| `/channel <name>` | channel name | Filters the listing by the given channel |
+| `/channel ack` | — | Marks all messages as read and clears the pending notify banner |
+| `/channel inject` | — | Splices the **last 10** messages into the history as a system message for the next turn — useful when you want to provide explicit context to the LLM without waiting for auto-injection of the 5 most recent |
+| `/channel pause` | — | Pauses the trigger engine. Messages keep entering the ring/persistence, but **no** actions are emitted (no banner, no auto, no confirm) |
+| `/channel resume` | — | Reactivates the trigger engine |
+| `/channel rules` | — | Lists active rules with their modes, filters and prompts |
+| `/channel rules reload` | — | Re-reads `~/.chatcli/mcp/triggers.json` without restarting ChatCLI. On validation error, keeps the previous rules active |
+| `/channel confirm <id>` | id required | Accepts a pending `confirm` action; defaults to `yes` |
+| `/channel confirm <id> no` | id required | Refuses a pending `confirm` action without running anything |
+| `/channel run <seq>` | seq required | Manually triggers the agent on a specific ring message (use the `seq` shown by `/channel list`) — useful to investigate something that came in as `notify` |
+
+### Examples
+
+#### Listing
+
+```text
+> /channel list
+
+╭── 📡 MCP CHANNELS ────────────────────────────────────────────────────╮
+│   #15 14:32:45  prom-alerts/alerts/critical   api-prod-3 mem > 90%    │
+│   #16 14:33:00  ci-monitor/ci-pipeline        PR #234 lint failed (3) │
+│   #17 14:33:10  ci-monitor/deploys/canary     canary-3 rollout starts │
+│                                                                       │
+│   Total: 17 messages                                                  │
+│   Unread: 3                                                           │
+╰───────────────────────────────────────────────────────────────────────╯
+```
+
+#### Filtering
+
+```text
+> /channel ci-pipeline
+
+╭── 📡 CHANNEL: ci-pipeline ────────────────────────────────────────────╮
+│   #16 14:33:00  ci-monitor/ci-pipeline   PR #234 lint failed (3)      │
+│   #14 14:30:01  ci-monitor/ci-pipeline   PR #233 merged              │
+│                                                                       │
+│   Total: 17 messages                                                  │
+╰───────────────────────────────────────────────────────────────────────╯
+```
+
+#### Manually running a message
+
+```text
+> /channel run 16
+
+╭── 🤖 AUTO-AGENT ▶ manual   (ci-monitor/ci-pipeline) ──────────────────╮
+│  PR #234 lint failed (3 errors in src/auth/middleware.go)             │
+╰───────────────────────────────────────────────────────────────────────╯
+
+▸ thinking — investigating lint failures on PR #234...
+```
+
+#### Inspecting rules
+
+```text
+> /channel rules
+
+╭── ⚙ TRIGGER RULES ────────────────────────────────────────────────────╮
+│  ci-failures   [notify]  server=ci-monitor channel=ci-pipeline        │
+│    contentRegex: (?i)fail|broken|red                                  │
+│    rate: 30s   dedup: 1m                                              │
+│                                                                       │
+│  prod-pages    [confirm] server=prom-alerts channel=alerts/critical   │
+│    rate: 5m    dedup: 2m                                              │
+│                                                                       │
+│  canary-sanity [auto]    server=deploy-tracker channel=deploys/canary/* │
+│    rate: 1m    dedup: 30s                                             │
+│    tools: kubectl_get, kubectl_logs, http_request                     │
+╰───────────────────────────────────────────────────────────────────────╯
+```
+
+---
+
+## Auto-injection vs `/channel inject` — when to use which
+
+| You want | Command | Token cost |
+|:---------|:--------|:-----------|
+| The agent to always know about the last 5 messages | nothing — automatic every turn | ~5 lines in the system prompt |
+| Force explicit (and deeper) context for the next turn | `/channel inject` | ~10 lines as a permanent system message in history |
+| Investigate a specific past message | `/channel run <seq>` | full agent run |
+
+Auto-injection is **silent and continuous** — as long as the ring has content. `/channel inject` is an explicit action that adds a system message to history (sticks until the next compaction). `/channel run` is the "investigate now" path without a registered rule.
+
+---
+
+## Reconnection and fault tolerance
+
+| Scenario | Behavior |
+|:---------|:---------|
+| SSE server drops mid-session | Supervisor reconnects with **full-jitter exponential backoff** (500ms → 30s cap). Pending RPCs wait, no extra timeout |
+| Streamable HTTP server drops mid-session | Same backoff strategy, but the **listener** (open GET) is the channel that reconnects — POSTs keep working when the server comes back |
+| Stdio server crashes | `onClose` fires, manager marks as `disconnected` in `/mcp status`. Notifications stop because the process is dead |
+| HTTP server returns 405 / 404 / 501 on GET | Server **does not support** push listener. Clean stop, **no retry storms** — log info "server does not support push" |
+| Persistence file corrupted | Invalid lines are skipped individually. File remains usable |
+| Disk full on append | Warning **once**, persistence disabled for that session, in-memory ring keeps running |
+| Notification arrives during shutdown | Push becomes a no-op once `Close()` ran — no race with the file close |
+
+<Note>
+**Server-side sessions on Streamable HTTP**: when the server emits `Mcp-Session-Id` on `initialize`, the transport echoes the header on **every** request (including the listener GET). Reconnection preserves the session automatically.
+</Note>
+
+---
+
+## Use cases
 
 <CardGroup cols={2}>
-  <Card title="CI/CD Pipeline" icon="gears">
-    Receive build, test, and deploy notifications in real time. The agent can automatically investigate failures.
+  <Card title="CI/CD" icon="gears">
+    `notify` rule on `ci-pipeline`. You see failures in the banner; `/channel run <seq>` launches the agent to investigate with tools.
   </Card>
-  <Card title="Monitoring Alerts" icon="triangle-exclamation">
-    Receive alerts from Prometheus, Grafana, or Datadog and let the agent analyze metrics and logs.
+  <Card title="Prod alerts (Prometheus/Datadog)" icon="triangle-exclamation">
+    `confirm` rule on `alerts/critical` with a prompt template. Each alert becomes an "investigate?" question you answer on demand.
   </Card>
-  <Card title="Deploy Events" icon="rocket">
-    Track staging and production deploys with real-time status notifications.
+  <Card title="Canary deploys" icon="rocket">
+    `auto` rule with a tight whitelist (`kubectl_*`, `http_request`). Every canary kicks off smoke checks automatically.
   </Card>
-  <Card title="External Webhooks" icon="webhook">
-    Convert webhooks from GitHub, Jira, or Slack into MCP notifications for the agent.
+  <Card title="External webhooks (GitHub/Jira/Slack)" icon="webhook">
+    A custom MCP server translates webhooks into notifications. ChatCLI pulls from the ring on next turns or triggers dedicated rules.
   </Card>
 </CardGroup>
 
 ---
 
-## Next Steps
+## Limits and trade-offs
+
+| Item | Value | Why |
+|:-----|:------|:----|
+| In-memory ring | 200 messages | Covers normal usage (several hours of CI/alerts) without bloating memory |
+| Auto-injection | 5 messages | Balance between useful context and token cost per turn |
+| `/channel inject` | 10 messages | More depth for explicit investigation |
+| Persistence file | 10 MiB before rotation | Enough for ~50k (short) messages |
+| Load on boot | 200 messages | Keeps the ring "warm" without reading a huge file |
+| Reconnect backoff | 500ms → 30s, full jitter | Recovers fast from blip, avoids thundering herd |
+| Confirm expiration | 30 min | Bounded memory; user who vanished for hours doesn't accumulate confirms |
+| Engine action buffer | 64 | Defense against "burst storm" — drop with warn rather than back-pressure |
+
+These numbers are **not configurable today**. They may be parametrized in a future release — open an issue if you hit any of them.
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="I see notifications in /channel list but the agent doesn't react automatically">
+    Expected behavior if you only have `notify` rules or no rules at all. `notify` is passive by design. For action:
+
+    - Add a `confirm` or `auto` rule to `~/.chatcli/mcp/triggers.json` and run `/channel rules reload`.
+    - Or run `/channel run <seq>` manually against the message.
+  </Accordion>
+  <Accordion title="HTTP server sends push, but nothing shows in /channel list">
+    May be a **listener disabled**. The Streamable HTTP listener is opt-in by spec — check:
+
+    1. `/mcp logs <name>` — if you see `server returned 405 on GET <url>`, `404`, or `501`, the server **does not implement** push and the listener stopped cleanly.
+    2. Otherwise, check that the server is emitting notifications in JSON-RPC format without `id`. Non-JSON `data:` content is also captured (lands in the `raw` channel), but doesn't trigger rules tied to specific channels.
+  </Accordion>
+  <Accordion title="The message shows in /channel list but no rule fires">
+    In order:
+
+    1. `/channel rules` — confirm the rule exists and is active.
+    2. Was `/channel pause` run? `/channel resume` reactivates.
+    3. Matching: does the `server`/`channel`/`contentRegex` actually match? Remember that `channel: "alerts"` does NOT match `"alerts/critical"` — use `"alerts/*"`.
+    4. `rateLimit` or `dedupWindow` — a recent fire may be suppressing.
+  </Accordion>
+  <Accordion title="The JSONL grew huge. Can I delete it?">
+    Yes, with the session closed: `rm ~/.chatcli/mcp/channels.jsonl*`. On next boot, the ring starts empty.
+
+    At runtime, rotation automatically cuts at 10 MiB — you can reach ~20 MiB total (active + .1) before the next cut.
+  </Accordion>
+  <Accordion title="Rules went silent after editing triggers.json">
+    `/channel rules reload`. If reload fails (invalid schema), the error appears in the response and ChatCLI **keeps the previous rules active** — no "no rules" state.
+
+    If the error is a regex, paste it into `https://regex101.com` flavor "Golang" to isolate.
+  </Accordion>
+  <Accordion title="Auto rule fires in an infinite loop">
+    Symptom: agent investigates, does something that triggers another notification, which triggers the rule again. Fix:
+
+    1. Significantly bump `rateLimit` (e.g., `"15m"`).
+    2. Refine the `contentRegex` to only catch the pathological case.
+    3. `/channel pause` while you investigate the config offline.
+  </Accordion>
+  <Accordion title="I want to see EVERYTHING that arrived (not just last 5) on the next turn">
+    Use `/channel inject` — puts the last 10 as a system message in history. Persists in history until the next compaction.
+
+    To view without injecting into the LLM: `/channel list` shows up to 20.
+  </Accordion>
+  <Accordion title="The agent is triggered in auto mode and opens a tool I didn't authorize">
+    Check the rule's `tools` whitelist. In `auto`, **only** listed tools can be invoked without extra approval; tools outside the whitelist follow the agent's normal approval flow — which may be your intent or not. Refine the whitelist in `triggers.json`.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next steps
 
 <CardGroup cols={2}>
-  <Card title="MCP Integration" icon="link" href="/en/features/mcp-integration">
-    Configure MCP servers with channel support.
+  <Card title="MCP Integration" icon="link" href="/features/mcp-integration">
+    Configure MCP servers — foundation for channels.
   </Card>
-  <Card title="Hooks System" icon="webhook" href="/en/features/hooks-system">
-    Combine channels with hooks for reactive automations.
+  <Card title="MCP Config" icon="gear" href="/reference/mcp-config">
+    Complete reference of `mcp_servers.json` (including the `channels` field).
+  </Card>
+  <Card title="Hooks System" icon="webhook" href="/features/hooks-system">
+    Lifecycle hooks — complement channels for internal events.
+  </Card>
+  <Card title="Command Reference" icon="terminal" href="/reference/command-reference">
+    Full slash command list, including `/channel`.
   </Card>
 </CardGroup>
