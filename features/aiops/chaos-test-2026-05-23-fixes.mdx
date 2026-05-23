@@ -122,6 +122,111 @@ kubectl -n <ns> logs deploy/chatcli-operator \
   | grep "Effective ExecDiagnostic allowlist loaded"
 ```
 
+## GAP-06 — CRDs não atualizados no `helm upgrade` (Alta, regressão pós-1.122.0)
+
+### Sintoma
+Após upgrade do chart, todo Issue que devia transitar para `Contained` ficava preso em `Remediating` até timeout (depois `Escalated`). Logs do operator:
+
+```
+"Issue transitioned to Contained (requires human action)"
+... Reconciler error
+Issue.platform.chatcli.io is invalid: state: Unsupported value: "Contained":
+  supported values: "Detected", "Analyzing", "Remediating", "Resolved", "Escalated", "Failed"
+unknown field spec.requiresHumanAction
+unknown field spec.requiredAction
+```
+
+O fix do GAP-03 estava no binário, mas **0% efetivo em runtime** — a API server rejeitava todo update porque o CRD instalado no cluster continuava na versão anterior.
+
+### Causa Raiz
+**Comportamento padrão do Helm 3** (restrição dura, não bug):
+
+> CRDs in the `crds/` directory are installed before any other resource on `helm install`, but they are **never** modified or deleted by `helm upgrade`.
+
+Resultado: usuários que fazem `helm upgrade` recebem o binário novo mas mantêm o CRD antigo. Toda mudança aditiva no schema (novo enum, novo campo de spec) silenciosamente quebra o reconcile.
+
+### Fix (3 camadas — defesa em profundidade)
+
+**1. Pre-install/pre-upgrade Hook** (`deploy/helm/{chatcli-operator,chatcli}/templates/crd-upgrade-hook.yaml`)
+
+Job Helm que roda ANTES do controller rollar:
+
+- `ConfigMap` com todas as CRDs do chart (via `Files.Glob "crds/*.yaml"`)
+- `ServiceAccount` + `ClusterRole` (verbs `get, list, create, update, patch` — `delete` **NÃO** concedido, hook não pode destruir CRDs)
+- Job `bitnami/kubectl:1.31` que monta o ConfigMap e roda `kubectl apply --server-side --force-conflicts -f /crds`
+- Annotations: `helm.sh/hook: pre-install,pre-upgrade`, `helm.sh/hook-weight: "-5"`, `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`
+- Bounded: `activeDeadlineSeconds: 300`, `backoffLimit: 2`, `ttlSecondsAfterFinished: 600`
+
+Configuração via `values.yaml`:
+
+```yaml
+crdUpgrade:
+  enabled: true             # opt-out via false (quando você gerencia CRDs via GitOps separado)
+  image:
+    repository: bitnami/kubectl
+    tag: "1.31"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 128Mi }
+  tolerations: []
+  nodeSelector: {}
+```
+
+**2. Floor 11 (CRD drift) estendido** (`scripts/qg/crd-drift.sh`)
+
+O gate original só comparava `operator/api/v1alpha1/*.go` (controller-gen output) com `operator/config/crd/bases/`. A extensão também compara **cada cópia em `deploy/helm/*/crds/`** file-by-file contra o canonical. Isso pega o cenário onde o canonical está em sync com o Go mas as cópias do chart divergiram (GAP-06 class, validado na primeira execução — capturou drift legítimo do enum `MOONSHOT` que escapou em um PR anterior).
+
+**3. Testes de paridade Go ↔ CRD** (`operator/api/v1alpha1/crd_enum_parity_test.go`)
+
+- `TestIssueStateEnumParity`: cada constante `IssueState` deve aparecer no enum `.status.state` das 3 cópias de CRD
+- `TestPostMortemSpecFieldParity`: `requiresHumanAction` e `requiredAction` devem estar no `.spec.properties` das 3 cópias do PostMortem CRD
+- Falhas imprimem a receita exata de sync
+
+### Como verificar pós-upgrade
+
+```bash
+# 1. Hook executou
+kubectl -n <ns> get jobs -l app.kubernetes.io/component=crd-upgrade-hook
+# STATUS COMPLETIONS DURATION
+# Complete 1/1 12s
+
+# 2. CRD tem o enum novo
+kubectl get crd issues.platform.chatcli.io -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.status.properties.state.enum}'
+# ["Detected","Analyzing","Remediating","Contained","Resolved","Escalated","Failed"]
+
+# 3. PostMortem CRD tem os novos campos
+kubectl get crd postmortems.platform.chatcli.io -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.required}'
+# ["issueRef","resource","severity"]   (requiresHumanAction/requiredAction são opcionais)
+
+# 4. Logs do Job
+kubectl -n <ns> logs job/$(kubectl -n <ns> get jobs -l app.kubernetes.io/component=crd-upgrade-hook -o jsonpath='{.items[0].metadata.name}')
+# Applying 17 CRD(s) from chart chatcli-operator-<version>
+# CRD upgrade complete
+```
+
+### Quando desabilitar o hook
+
+Apenas quando você gerencia CRDs **fora do Helm**:
+
+- Chart separado (padrão cert-manager): `helm install chatcli-crds <separate-chart>` antes do operator
+- GitOps com aplicação explícita de CRDs (ArgoCD App-of-Apps, FluxCD `Kustomization` apontando para `crds/`)
+- Operadores corporate que exigem revisão manual de CRDs pré-rollout
+
+Nesses casos: `helm install ... --set crdUpgrade.enabled=false` ou no `values-prod.yaml`:
+
+```yaml
+crdUpgrade:
+  enabled: false
+```
+
+O `NOTES.txt` printa um warning explícito com o comando manual quando o hook está desabilitado.
+
+### Schema affected
+- `values.yaml` + `values.schema.json` (ambos charts) — bloco `crdUpgrade` aditivo
+- Novos templates: `crd-upgrade-hook.yaml` em ambos charts
+- `scripts/qg/crd-drift.sh` — Floor 11 estendido
+- `operator/api/v1alpha1/crd_enum_parity_test.go` — novo arquivo de teste
+
 ## Resumo executivo
 
 | GAP | Severidade | Arquivos principais | Schema breaking? |
@@ -131,6 +236,7 @@ kubectl -n <ns> logs deploy/chatcli-operator \
 | GAP-03 | Média | `operator/controllers/issue_controller.go`, `operator/controllers/postmortem_controller.go`, `operator/api/v1alpha1/issue_types.go`, `operator/api/v1alpha1/postmortem_types.go` | Novo estado `Contained` + novos campos PostMortem |
 | GAP-04 | Baixa-Média | `operator/controllers/anomaly_controller.go`, `operator/controllers/correlation.go`, `operator/controllers/notification_controller.go` | Não (apenas labels) |
 | GAP-05 | Baixa | `operator/main.go`, `operator/controllers/remediation_actions_extended.go`, `deploy/helm/chatcli-operator/templates/NOTES.txt` | Não |
+| GAP-06 | Alta (regressão pós-release) | `deploy/helm/{chatcli-operator,chatcli}/templates/crd-upgrade-hook.yaml`, `scripts/qg/crd-drift.sh`, `operator/api/v1alpha1/crd_enum_parity_test.go` | Não (aditivo + opt-out) |
 
 Veja também:
 - [Incident Lifecycle](/features/aiops/incident-lifecycle) — máquina de estados completa
