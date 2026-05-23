@@ -272,6 +272,124 @@ O `NOTES.txt` printa um warning explícito com o comando manual quando o hook es
 - `scripts/qg/crd-drift.sh` — Floor 11 estendido
 - `operator/api/v1alpha1/crd_enum_parity_test.go` — novo arquivo de teste
 
+## GAP-07 — Campos `requiresHumanAction` / `requiredAction` `null` em runtime (Baixa)
+
+### Sintoma
+
+Após a transição do Issue para `Contained`, consultar os campos retornava `null`:
+
+```bash
+kubectl get issue chaos-crashloop-pod-not-ready-1779561258 \
+  -o jsonpath='{.status.requiresHumanAction}'
+# (vazio)
+
+kubectl get postmortem pm-chaos-crashloop-... \
+  -o jsonpath='{.spec.requiresHumanAction}'
+# (vazio)
+```
+
+O operator **logava corretamente** a ação no startup do reconcile:
+
+```
+"Issue transitioned to Contained (requires human action)"
+  required_action: "restore the deployment's replicas to the desired count after fixing the root cause"
+```
+
+Mas o valor nunca aparecia no CR — operadores tinham que `kubectl logs` no operator pra descobrir o follow-up. UX ruim em produção.
+
+### Causa Raiz
+
+Dois bugs ortogonais:
+
+1. **Convenção K8s violada no PostMortem**: os campos `RequiresHumanAction` / `RequiredAction` foram adicionados em `PostMortemSpec` no GAP-03. **Convenção K8s**: `Spec` carrega entrada do usuário; `Status` carrega fatos derivados pelo controller. Esses dois campos são 100% controller-derived (nenhum usuário os preenche). Pior: o controller escrevia via `Status().Update()` enquanto o CRD declarava os campos em `Spec` — daí o `null` silencioso.
+
+2. **Ausência no Issue**: o `IssueStatus` só registrava a condition `RequiresHumanAction: True` — nenhum field tipado. `kubectl get issue -o jsonpath='{.status.requiresHumanAction}'` retornava `null` por design.
+
+### Fix
+
+**Schema move (`operator/api/v1alpha1`)**:
+
+```diff
+ type PostMortemSpec struct {
+   IssueRef IssueRef    `json:"issueRef"`
+   Resource ResourceRef `json:"resource"`
+   Severity IssueSeverity `json:"severity"`
+-  RequiresHumanAction bool   `json:"requiresHumanAction,omitempty"`
+-  RequiredAction      string `json:"requiredAction,omitempty"`
+ }
+
+ type PostMortemStatus struct {
+   ...campos existentes...
++  RequiresHumanAction bool   `json:"requiresHumanAction,omitempty"`
++  RequiredAction      string `json:"requiredAction,omitempty"`
+ }
+
+ type IssueStatus struct {
+   ...campos existentes...
++  RequiresHumanAction bool   `json:"requiresHumanAction,omitempty"`
++  RequiredAction      string `json:"requiredAction,omitempty"`
+ }
+```
+
+**Writers (`operator/controllers`)**:
+
+- `handleRemediating` (Issue → Contained): persiste `issue.Status.RequiresHumanAction = true` e `issue.Status.RequiredAction = ...` junto com as conditions existentes.
+- `handleContained` (auto-resolve para Resolved): limpa os campos + adiciona `RequiresHumanAction: False` condition (a ação já foi tomada, o estado não pode mentir).
+- `generatePostMortem`: lê o outcome de containment up-front e o helper de status `applyPostMortemStatusFields` persiste em `pm.Status.RequiresHumanAction` via `Status().Update()` — caminho K8s correto.
+
+**4 readers atualizados**:
+
+- `PostMortemReconciler` (revert do Closed indevido): lê de `pm.Status.RequiresHumanAction` (era `Spec`)
+- `analytics.foldPostMortemSummary` (contador no dashboard): idem
+- `handlePostMortemAckHumanAction` (endpoint REST `/ack-human-action`): valida `Status`
+- `postmortemToItem` (mapper REST): lê de `Status`
+
+**REST API** (`operator/api/rest/types.go`):
+
+- `IncidentItem` ganha `requiredAction` (string) pra dashboards renderizarem a ação sem precisar fetch do PostMortem matching.
+- `issueToIncidentItem` lê `iss.Status.RequiresHumanAction` / `RequiredAction` com fallback de compatibilidade pra Issues vindas de 1.122.x (lê condition se field vazio).
+
+**CRDs**: regenerados via controller-gen e sincronizados nas 3 cópias.
+
+**Tests de paridade** (`operator/api/v1alpha1/crd_enum_parity_test.go`):
+
+- `TestPostMortemSpecFieldParity` substituído por `TestPostMortemStatusFieldParity` — também afirma que os fields **NÃO estão em Spec** (defesa em profundidade contra hand-edit que reintroduza a duplicação).
+- Novo `TestIssueStatusHumanActionParity` cobre o Issue CRD nas 3 cópias.
+
+### Verificação pós-fix
+
+```bash
+# 1. Field tipado retorna a ação direto
+kubectl get issue <name> -o jsonpath='{.status.requiredAction}'
+# restore the deployment's replicas to the desired count after fixing the root cause...
+
+kubectl get postmortem pm-<name> -o jsonpath='{.status.requiredAction}'
+# (mesmo texto)
+
+# 2. Flag boolean funciona pra dashboards
+kubectl get issue <name> -o jsonpath='{.status.requiresHumanAction}'
+# true
+
+# 3. REST API expõe o field direto no IncidentItem
+curl $AIOPS_URL/api/v1/incidents/<name> | jq '.spec.requiresHumanAction, .spec.requiredAction'
+
+# 4. Auto-resolve limpa os campos
+kubectl get issue <name> -o jsonpath='{.status.requiresHumanAction}'
+# (vazio depois que humano restaura replicas e operator transita para Resolved)
+```
+
+### Migração
+
+`PostMortemSpec.RequiresHumanAction` / `RequiredAction` → `PostMortemStatus` é uma mudança de schema **breaking** em `v1alpha1`. Os fields foram introduzidos uma release atrás (1.122.0), então impacto pra consumidores é mínimo. O data path é controller-only (nenhum usuário-input CR jamais setou esses fields), tornando a migração invisível na prática. O hook de upgrade de CRD (GAP-06) atualiza o schema automaticamente no `helm upgrade`.
+
+### Schema affected
+
+- `operator/api/v1alpha1/postmortem_types.go` — move dos campos Spec → Status
+- `operator/api/v1alpha1/issue_types.go` — adição em `IssueStatus`
+- `operator/api/rest/types.go` — `IncidentItem.RequiredAction` adicionado
+- CRDs regenerados em `operator/config/crd/bases/` + 2 cópias Helm
+- `operator/controllers/issue_controller.go`, `postmortem_controller.go`, `api/rest/analytics.go`, `api/rest/server.go` — readers e writers atualizados
+
 ## Resumo executivo
 
 | GAP | Severidade | Arquivos principais | Schema breaking? |
@@ -282,6 +400,8 @@ O `NOTES.txt` printa um warning explícito com o comando manual quando o hook es
 | GAP-04 | Baixa-Média | `operator/controllers/anomaly_controller.go`, `operator/controllers/correlation.go`, `operator/controllers/notification_controller.go` | Não (apenas labels) |
 | GAP-05 | Baixa | `operator/main.go`, `operator/controllers/remediation_actions_extended.go`, `deploy/helm/chatcli-operator/templates/NOTES.txt` | Não |
 | GAP-06 | Alta (regressão pós-release) | `deploy/helm/{chatcli-operator,chatcli}/templates/crd-upgrade-hook.yaml`, `scripts/qg/crd-drift.sh`, `operator/api/v1alpha1/crd_enum_parity_test.go` | Não (aditivo + opt-out) |
+| GAP-07 | Baixa (UX em produção) | `operator/api/v1alpha1/postmortem_types.go`, `operator/api/v1alpha1/issue_types.go`, `operator/controllers/issue_controller.go`, `operator/api/rest/types.go` | Sim — `PostMortemSpec.RequiresHumanAction/RequiredAction` moveu para `PostMortemStatus`; `IssueStatus` ganha os mesmos fields |
+| GAP-08 | Alta (regressão pós-release) | `deploy/helm/{chatcli-operator,chatcli}/values.yaml`, `templates/crd-upgrade-hook.yaml` | Não (default image swap: `bitnami/kubectl:1.31` ❌ → `registry.k8s.io/kubectl:v1.31.10` ✅) |
 
 Veja também:
 - [Incident Lifecycle](/features/aiops/incident-lifecycle) — máquina de estados completa
