@@ -14,20 +14,34 @@ A plataforma AIOps do ChatCLI gerencia incidentes através de uma máquina de es
 | `Detected` | Anomalia correlacionada em um incidente, aguardando análise | Não |
 | `Analyzing` | IA realizando análise de causa raiz | Não |
 | `Remediating` | Plano de remediação em execução | Não |
+| `Contained` | Workload silenciado via ação de contenção (ex: `ScaleDeployment replicas=0`) — **bug subjacente não resolvido, requer ação humana** | Semi-terminal |
 | `Resolved` | Incidente resolvido com sucesso | Sim |
 | `Escalated` | Todas as tentativas automáticas esgotadas — **requer intervenção humana** (auto-resolve se o recurso recuperar) | Semi-terminal |
 | `Failed` | Tentativa única falhou sem retry configurado | Sim |
+
+<Warning>
+**Novo estado `Contained` (chaos test 2026-05-23, GAP-03)** — Antes deste fix, qualquer ação `ScaleDeployment replicas=0 containment=true` declarava o Issue como `Resolved`, mascarando indisponibilidade real. Agora a plataforma transita para `Contained`, que:
+
+- **NÃO** é terminal (auto-resolve quando o recurso volta com `replicas > 0` E todos os pods ready)
+- Bloqueia o PostMortem de fechar (`requiresHumanAction: true`) até o operador confirmar via API ou anotação
+- Dispara notificações em política configurada para o estado `Contained`
+- É contado separadamente em `analytics/summary.containedIssues`
+
+Configure uma `NotificationPolicy` com `states: [Contained]` para garantir que humanos sejam paginados quando isso acontecer.
+</Warning>
 
 ## Fluxo da Máquina de Estados
 
 ```
 Detected → Analyzing → Remediating → Resolved
+                ↓              ↓        ↑
+           Escalated   Contained ───────┘ (humano restaura replicas)
+           (após max   (ação com
+            tentativas) containment=true)
                 ↓              ↓
-           Escalated      Failed/RolledBack
-           (após max          ↓
-            tentativas)  Re-análise (até 5x)
-                              ↓
-                         Escalated
+           Re-análise      Failed/RolledBack
+           (até 5x)            ↓
+                Escalated
                               ↓
                     Auto-resolve se o recurso
                     recuperar (configurável)
@@ -333,6 +347,49 @@ Quando um incidente e resolvido (automaticamente ou manualmente), um PostMortem 
 - **Análise de cascata** — incidentes relacionados entre servicos
 
 PostMortems podem ser revisados e fechados via os endpoints [Review PostMortem](/reference/api/review-postmortem) e [Close PostMortem](/reference/api/close-postmortem).
+
+### PostMortems com `requiresHumanAction`
+
+Quando o Issue pai está em estado `Contained`, o PostMortem é gerado com:
+
+- `spec.requiresHumanAction: true`
+- `spec.requiredAction`: descrição concreta do que precisa ser feito (ex: "restore deployment replicas after fixing root cause")
+- O `PostMortemReconciler` **se recusa** a transitar para `Closed` enquanto a anotação `aiops.chatcli.io/human-action-acknowledged` não for `true`
+
+Para reconhecer a ação executada e desbloquear o fechamento:
+
+```bash
+# Via API REST
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "$AIOPS_URL/api/v1/postmortems/<pm-name>/ack-human-action?namespace=default" \
+  -d '{"acknowledgedBy":"sre-team","note":"rolled back to v1.2.3 and scaled to 3 replicas"}'
+
+# Ou via kubectl
+kubectl annotate postmortem <pm-name> -n default \
+  aiops.chatcli.io/human-action-acknowledged=true \
+  aiops.chatcli.io/human-action-acknowledged-by=sre-team
+```
+
+No web dashboard, isso aparece como o botão **"Ack Human Action"** (roxo) na linha do PostMortem quando `requiresHumanAction=true`.
+
+## Correlação com Chaos Engineering
+
+Issues que disparam durante uma `ChaosExperiment` ativa no mesmo namespace recebem automaticamente os labels:
+
+- `platform.chatcli.io/source=chaos-experiment`
+- `platform.chatcli.io/chaos-experiment=<nome-do-experimento>`
+
+Esses labels alteram o comportamento da plataforma:
+
+| Comportamento | Issue produção | Issue chaos-induced |
+|---------------|----------------|---------------------|
+| Pipeline AIOps completo | ✅ | ✅ |
+| Escalação L1→L2 (paging) | ✅ | ❌ (suprimida) |
+| Métrica `issueResolutionDuration` (MTTR) | ✅ | ❌ (excluída) |
+| `analytics/summary.chaosInducedIssues` | - | Contado separadamente |
+| Label no PostMortem gerado | - | Propagado para filtragem |
+
+Veja [Chaos Engineering](/features/aiops/chaos-engineering) para detalhes da CR e do controller.
 
 ## Integração com SLA
 

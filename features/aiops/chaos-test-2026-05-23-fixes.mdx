@@ -1,0 +1,136 @@
+---
+title: "Chaos Test Fixes (2026-05-23)"
+description: "5 correções introduzidas após o relatório de teste de caos do v1.121.0 — AIInsight↔Plan, UID-aware dedup, estado Contained, correlação com ChaosExperiment, e visibilidade da allowlist"
+---
+
+import { Warning, Note, Card, CardGroup, Accordion, AccordionGroup } from '/snippets/mdx-helpers.mdx'
+
+Após o teste de caos executado em **23/05/2026** sobre a v1.121.0 (kind cluster `nginx-cluster`), 5 gaps foram identificados e corrigidos. Esta página agrega o que mudou em comportamento, schema e ferramentas.
+
+<Warning>
+**Compatibilidade**: a maioria das mudanças é aditiva. As únicas mudanças que afetam usuários existentes:
+
+- `Instance.spec.aiops.dedupTTLMinutes` default mudou de **60 para 30** minutos
+- Novo estado `Contained` no enum de `Issue.status.state` — operadores customizados que tratam Issue states explicitamente precisam reconhecer este valor
+- Action de remediação que silenciou o workload via containment **não declara mais o Issue como Resolved** (transita para `Contained`)
+</Warning>
+
+## GAP-01 — Desconexão AIInsight ↔ RemediationPlan (Alta)
+
+### Sintoma
+O AIInsight concluía corretamente "Scaling to 0 is the only correct containment action", mas o `RemediationPlan` gerado tentava `ExecDiagnostic` com um comando fora da allowlist. O Issue era marcado como Resolved por exaustão de `maxRemediationAttempts`, sem remediação real.
+
+### Fix
+- O prompt do `AgenticStep` agora recebe o AIInsight como **PRIMARY GUIDANCE** (análise + recomendações + suggested_actions + confidence), com instrução explícita: "se desviar da primeira ação sugerida, populate `divergence_reason`".
+- O servidor (handler_analysis.go) compara `next_action` com `insight_suggested_actions[0]`. Se divergir, marca `diverges_from_insight=true` na resposta.
+- O operator (remediation_controller.go) **recusa** executar uma ação divergente sem justificativa: a step é registrada como `REJECTED` no `AgenticHistory` e o controller pede uma nova proposta.
+- Validação adicional no `AnalyzeIssue`: detecta quando a prose menciona "scale to 0/containment/stop the bleeding/unrecoverable" mas a primeira ação é `ExecDiagnostic` — loga warning para auditoria.
+
+### Schema affected
+- **proto**: `AgenticStepRequest` ganha `insight_analysis`, `insight_confidence`, `insight_recommendations`, `insight_suggested_actions`. `AgenticStepResponse` ganha `diverges_from_insight` e `divergence_reason`.
+
+## GAP-02 — Dedup SHA256 ignora recriação de recursos (Alta)
+
+### Sintoma
+Deployment `chaos-crashloop` deletado e recriado com o mesmo nome ficava invisível para o AIOps por até 120 minutos (TTL antigo). Padrão comum em GitOps e rollbacks.
+
+### Fix (3 camadas)
+
+1. **UID-aware hashing** (correção estrutural): o `alertHash` agora inclui o UID do recurso K8s, obtido via lookup live. Recurso recriado → novo UID → hash diferente → novo Anomaly. Sentinela `uid:missing` quando o recurso não existe mais (ainda distinto de qualquer UID real).
+2. **TTL default reduzido**: `Instance.spec.aiops.dedupTTLMinutes` cai de **60 → 30 minutos** (range `5-1440` mantido).
+3. **InvalidateDedupForResource refatorado**: o dedup map agora carrega `(deployment, namespace)` com cada hash, permitindo invalidação por resource ref sem precisar recomputar hashes (que dependeriam do UID, que o caller não tem).
+
+### RBAC requisito
+O operator precisa de `get` em `apps/deployments,statefulsets,daemonsets,replicasets`, `batch/jobs,cronjobs`, `nodes`. Todos já cobertos pelo `chatcli-watcher` ClusterRole pré-existente.
+
+## GAP-03 — Estado `Contained` distinto de `Resolved` (Média)
+
+### Sintoma
+`ScaleDeployment replicas=0 containment=true` silenciava o workload mas marcava o Issue como **Resolved**, mascarando indisponibilidade real. PostMortem era gerado normalmente, sem indicação de que serviço estava morto.
+
+### Fix
+Novo estado `Contained` na máquina de estados, com semântica explícita "serviço silenciado, ação humana pendente":
+
+- `IssueState` ganha `Contained` (semi-terminal — auto-resolve quando humano restaura replicas)
+- `handleContained` reconcile path usa `isResourceRestored`: requer `desired > 0 AND ready >= desired AND unavailable == 0` (mais estrito que `isResourceHealthy`, que aceitaria `0/0`)
+- `PostMortemSpec` ganha `requiresHumanAction bool` e `requiredAction string`
+- `PostMortemReconciler` **reverte** PostMortems marcados como `Closed` indevidamente de volta para `Open` enquanto a anotação `aiops.chatcli.io/human-action-acknowledged` não estiver setada
+- `NotificationReconciler` dispara automaticamente em `state == Contained` se a `NotificationPolicy` incluir esse estado no filtro
+- `AuditRecorder.RecordIssueContained` registra o evento em severity `warning` (NÃO info — Issue não está resolvido)
+
+### Como reconhecer a ação humana
+```bash
+# REST API
+POST /api/v1/postmortems/<name>/ack-human-action?namespace=<ns>
+Body: {"acknowledgedBy":"sre-team","note":"rolled back to v1.2.3"}
+
+# kubectl
+kubectl annotate postmortem <name> -n <ns> \
+  aiops.chatcli.io/human-action-acknowledged=true
+
+# Dashboard
+Botão "Ack Human Action" (roxo) na linha do PostMortem
+```
+
+### REST API affected
+- `IncidentItem` ganha `requiresHumanAction bool`
+- `PostMortemItem` ganha `requiresHumanAction`, `requiredAction`
+- `AnalyticsSummary` ganha `containedIssues`, `postMortemsRequiringHumanAction`
+- Nova rota: `POST /api/v1/postmortems/{name}/ack-human-action`
+
+## GAP-04 — Contexto chaos sem comportamento diferenciado (Baixa-Média)
+
+### Sintoma
+IA identificava corretamente o cenário como chaos engineering, mas o pipeline executava idêntico a um incidente real. PostMortems de chaos drills poluíam o histórico de produção e MTTD/MTTR.
+
+### Fix
+`AnomalyReconciler` chama `FindActiveChaosExperiment(target)` ao criar Issues. Se há `ChaosExperiment` em estado `Running` (ou nos 2min após `Completed`/`Aborted` — janela de recuperação) no mesmo namespace+kind+name, o Issue recebe labels:
+
+```yaml
+platform.chatcli.io/source: chaos-experiment
+platform.chatcli.io/chaos-experiment: <nome>
+```
+
+Esses labels alteram:
+- Escalação L1→L2 suprimida (`NotificationReconciler` skipa `initiateEscalation`)
+- Métrica `issueResolutionDuration` (MTTR de produção) excluída
+- `analytics/summary.chaosInducedIssues` contado separadamente
+- Labels propagam para o PostMortem
+- Dashboard tem filtro dedicado (default: ocultar chaos drills)
+
+Veja [Chaos Engineering — Correlação Automática](/features/aiops/chaos-engineering#correlacao-automatica-gap-04-fix-2026-05-23) para detalhes.
+
+## GAP-05 — Visibilidade da allowlist `ExecDiagnostic` (Baixa)
+
+### Sintoma
+Allowlist padrão (~90 comandos) não incluía portas além das padrão (8080, 9090, 15000, 15020, 15021, 6060). Workload em `localhost:5678/health` ficava com diagnóstico cego, e o gap só era descoberto após observar falha no `RemediationPlan`. Não havia auditoria do que estava efetivamente carregado.
+
+### Fix
+- Função pública `controllers.GetDiagnosticAllowlistSummary()` retorna `{DefaultCount, CustomCount, TotalCount, Custom[]}`.
+- `operator/main.go` loga no startup:
+  ```
+  Effective ExecDiagnostic allowlist loaded total=92 defaults=90 custom_count=2 custom=[...]
+  ```
+- `deploy/helm/chatcli-operator/templates/NOTES.txt` mostra um checklist pós-install com instruções explícitas para revisar a allowlist.
+- Variável: `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` (comma-separated) continua sendo a forma de estender.
+
+### Como auditar a allowlist efetiva
+```bash
+kubectl -n <ns> logs deploy/chatcli-operator \
+  | grep "Effective ExecDiagnostic allowlist loaded"
+```
+
+## Resumo executivo
+
+| GAP | Severidade | Arquivos principais | Schema breaking? |
+|-----|-----------|---------------------|------------------|
+| GAP-01 | Alta | `server/handler_analysis.go`, `operator/controllers/remediation_controller.go`, `proto/chatcli/v1/chatcli.proto` | Não (campos aditivos) |
+| GAP-02 | Alta | `operator/controllers/watcher_bridge.go`, `operator/api/v1alpha1/instance_types.go` | Default TTL mudou (60→30min) |
+| GAP-03 | Média | `operator/controllers/issue_controller.go`, `operator/controllers/postmortem_controller.go`, `operator/api/v1alpha1/issue_types.go`, `operator/api/v1alpha1/postmortem_types.go` | Novo estado `Contained` + novos campos PostMortem |
+| GAP-04 | Baixa-Média | `operator/controllers/anomaly_controller.go`, `operator/controllers/correlation.go`, `operator/controllers/notification_controller.go` | Não (apenas labels) |
+| GAP-05 | Baixa | `operator/main.go`, `operator/controllers/remediation_actions_extended.go`, `deploy/helm/chatcli-operator/templates/NOTES.txt` | Não |
+
+Veja também:
+- [Incident Lifecycle](/features/aiops/incident-lifecycle) — máquina de estados completa
+- [Chaos Engineering](/features/aiops/chaos-engineering) — CR, controller, correlação
+- [Web Dashboard](/features/aiops/web-dashboard) — UI atualizada
