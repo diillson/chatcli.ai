@@ -1,0 +1,141 @@
+---
+title: "Chat Gateway — ChatCLI on Telegram, Slack, Discord, WhatsApp and Webhook"
+sidebarTitle: "Chat Gateway"
+description: "Run ChatCLI as a messaging daemon: every inbound message runs through the real agent loop (tools, shell, file edits) and the progress is streamed back to the chat while the agent works."
+icon: "messages"
+---
+
+The **Chat Gateway** exposes ChatCLI as a bot/service on messaging platforms. You talk to it over **Telegram, Slack, Discord, WhatsApp** or a **generic webhook**, and every inbound message runs through the **real agent loop** — the agent uses its tools (read/search, shell, file edits, web), performs the task and **streams progress back to the conversation** as it works, closing with a completion notice.
+
+<Warning>
+The agent runs with **auto-execution** (tools and shell). Treat the gateway as a privileged remote surface: **control who can reach the bot** (Telegram allow-list, Slack signing secret, webhook secret) and harden the agent with `CHATCLI_AGENT_SECURITY_MODE=strict` when exposing it. See [Coder/Agent Security](/en/features/security).
+</Warning>
+
+---
+
+## Architecture
+
+```text
+Adapter (per platform)  --inbound-->  Runner  --agent loop (streaming)-->  reply
+        ^                                |
+        └──────── Send(progress/reply) ──┘
+```
+
+- **Adapter** — a platform integration. Receives messages and sends replies using the platform's native HTTP API (no third-party SDKs in `go.mod`).
+- **Runner** — routes messages per conversation (`platform:chat`), with bounded concurrency and graceful shutdown. Installs a **progress emitter** per message.
+- **Agent loop** — each message becomes an `/agent` task (auto-execute). The narration the agent already prints is captured and streamed to the chat.
+
+### "Talking as it works" streaming and throttling
+
+While the agent works, its substantive output lines are coalesced and sent as **periodic progress messages** (at most one every few seconds, to respect the platforms' per-chat rate limits). Purely decorative lines (box-drawing, spinners) are filtered out. When it finishes, the gateway sends a completion notice.
+
+### Concurrency
+
+Because the agent loop mutates shared ChatCLI state and `os.Stdout` is process-global, agent runs are **serialized**: messages arrive in parallel (up to 4 buffered) but run one at a time. Each conversation keeps a light context (the user's recent requests) for continuity across turns; the real durable state lives in the workspace files the agent edits.
+
+---
+
+## Activation
+
+The gateway runs in the foreground via the `/gateway` command until `Ctrl+C`:
+
+```text
+/gateway start     # start the configured adapters
+/gateway status    # list registered platforms and which are ready (configured)
+```
+
+Each adapter **only starts when its required variables are present** — set only the channels you want to use. Full reference in [Environment Variables → Chat Gateway](/en/reference/environment-variables#chat-gateway-telegram-slack-discord-whatsapp-webhook).
+
+<Tabs>
+  <Tab title="Telegram">
+    Long-polling via `getUpdates` (no exposed HTTP server).
+
+    ```bash
+    export CHATCLI_TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."         # required (BotFather)
+    export CHATCLI_TELEGRAM_ALLOWED_USERS="111111111,222222222"  # optional; empty = all
+    ```
+  </Tab>
+  <Tab title="Slack">
+    Events API with HMAC signature verification.
+
+    ```bash
+    export CHATCLI_SLACK_BOT_TOKEN="xoxb-..."        # required
+    export CHATCLI_SLACK_ADDR=":8081"                # required (events server bind)
+    export CHATCLI_SLACK_SIGNING_SECRET="..."        # recommended (verifies events)
+    export CHATCLI_SLACK_PATH="/slack/events"        # optional (default)
+    ```
+  </Tab>
+  <Tab title="Discord">
+    Gateway WebSocket v10.
+
+    ```bash
+    export CHATCLI_DISCORD_BOT_TOKEN="..."           # required
+    ```
+  </Tab>
+  <Tab title="WhatsApp">
+    WhatsApp Cloud API (webhook + Meta verify handshake).
+
+    ```bash
+    export CHATCLI_WHATSAPP_ACCESS_TOKEN="..."        # required
+    export CHATCLI_WHATSAPP_PHONE_ID="123456"         # required
+    export CHATCLI_WHATSAPP_ADDR=":8082"              # required (webhook bind)
+    export CHATCLI_WHATSAPP_VERIFY_TOKEN="my-verify"  # GET handshake
+    export CHATCLI_WHATSAPP_PATH="/whatsapp/webhook"  # optional (default)
+    ```
+  </Tab>
+  <Tab title="Webhook">
+    Generic HTTP endpoint — integrate any system that can POST.
+
+    ```bash
+    export CHATCLI_WEBHOOK_ADDR=":8083"               # required (bind)
+    export CHATCLI_WEBHOOK_PATH="/inbound"            # optional (default)
+    export CHATCLI_WEBHOOK_SECRET="supersecret"       # optional; constant-time validated
+    export CHATCLI_WEBHOOK_CALLBACK_URL="https://app/cb" # optional; empty = synchronous reply
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Usage example
+
+```text
+# Server terminal
+export LLM_PROVIDER=CLAUDEAI
+export ANTHROPIC_API_KEY=sk-ant-...
+export CHATCLI_TELEGRAM_BOT_TOKEN=123456:ABC...
+export CHATCLI_TELEGRAM_ALLOWED_USERS=111111111
+chatcli
+> /gateway start
+  OK Gateway running on: telegram. Press Ctrl+C to stop.
+```
+
+On Telegram, user `111111111` sends:
+
+> *"list the Go files changed in the last commit and summarize the diff"*
+
+The bot replies with **progress messages** as the agent runs `git`, reads files and reasons, then closes with **✅ Task completed.**
+
+<Note>
+Anyone not on the allow-list is ignored. Slack and the generic webhook verify the signature/secret before processing.
+</Note>
+
+---
+
+## Supported platforms
+
+| Platform | Transport | Required | Auth |
+| --- | --- | --- | --- |
+| Telegram | long-polling | `CHATCLI_TELEGRAM_BOT_TOKEN` | user-ID allow-list |
+| Slack | Events API (HTTP) | `..._BOT_TOKEN`, `..._ADDR` | signing secret (HMAC) |
+| Discord | Gateway WebSocket v10 | `CHATCLI_DISCORD_BOT_TOKEN` | bot token |
+| WhatsApp | Cloud API (webhook) | `..._ACCESS_TOKEN`, `..._PHONE_ID`, `..._ADDR` | verify token |
+| Webhook | generic HTTP | `CHATCLI_WEBHOOK_ADDR` | secret (constant-time) |
+
+---
+
+## See also
+
+- [Agent Mode](/en/core-concepts/agent-mode) — the loop that runs each message
+- [Security](/en/features/security) — hardening auto-execution
+- [Environment Variables](/en/reference/environment-variables#chat-gateway-telegram-slack-discord-whatsapp-webhook)
