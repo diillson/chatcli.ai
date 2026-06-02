@@ -28,16 +28,31 @@ Aggregated, each turn carries 4-8k tokens of **pure overhead** × 3-5 turns in a
 
 ## 1. Structured prompt caching
 
-The agent system prompt is composed of **four semantic blocks**, ordered from most stable to most volatile:
+Anthropic caching (and OpenAI/xAI prefix auto-caching) works **by prefix**: a breakpoint only *hits* when every byte before it is identical to a prior request. The golden rule is simple — **stable blocks first, volatile blocks last**. The system prompt is assembled exactly that way:
 
-| Block | Content | Why split |
-|:------|:--------|:----------|
-| **Core** | Persona + format rules (Coder/Agent) + language hint | Never changes between turns → long cache |
+**Stable prefix (cached, `cache_control: ephemeral`):**
+
+| Block | Content | Why it's stable |
+|:------|:--------|:----------------|
+| **Core** | Persona + format rules (Coder/Agent) + language hint | Never changes between turns |
 | **Tools** | Plugin descriptions + workspace hint | Changes only when a plugin is loaded/unloaded |
-| **Workspace** | SOUL.md / MEMORY.md / IDENTITY.md / dynamic context | Varies between sessions, stable within one |
-| **Skills + Orchestrator** | Auto-activated skills and orchestrator catalog | Most volatile — placed last so it doesn't invalidate earlier blocks |
+| **Orchestrator** | Multi-agent orchestrator catalog | Stable within the session |
+| **Memory index** | Compact memory digest (`index` mode) | Turn-independent — see section 7 |
 
-Each block carries `cache_control: ephemeral` for Anthropic-family providers. For providers with automatic prefix caching (OpenAI, xAI), the stable ordering ensures cache hits naturally.
+**Volatile suffix (no cache marker — changes every turn):**
+
+| Block | Content | Why it's volatile |
+|:------|:--------|:------------------|
+| **Memory (full)** | Hint-driven MEMORY.md retrieval (`full` mode) | Varies with the turn's hints |
+| **Skills** | Query-activated skills | Depends on the question |
+| **MCP channel** | Recent push messages from MCP servers | Updates every turn |
+| **Dynamic context** | Date/time + current directory | Changes by definition |
+
+<Warning>
+**Why ordering matters (a fixed defect):** previously the workspace+memory block carried `cache_control` but held the **wall-clock timestamp to the second** plus hint-driven retrieval — both volatile — near the top of the prompt. That guaranteed a *cache miss* on that block every turn **and poisoned every cached block below it** (`/context` attachments, pinned skills, MCP catalog): you paid *cache creation* (1.25×) each time and never earned a *read*. The timestamp now lives in its own trailing block, and the volatile memory left the prefix. The genuinely stable blocks form a contiguous, cacheable prefix.
+</Warning>
+
+Each stable block carries `cache_control: ephemeral` for Anthropic-family providers (respecting the 4-breakpoint cap, with automatic coalescing). For providers with prefix auto-caching (OpenAI, xAI), the stable ordering ensures cache hits naturally. **Chat** follows the same ordering; being tool-less, it does not pull memory on demand (see section 7).
 
 ### Cache on tool definitions
 
@@ -192,6 +207,41 @@ export CHATCLI_MICROCOMPACT_MIN_CONTENT=2000
 
 ---
 
+## 7. Pull-first memory (index + recall)
+
+Pushing the whole memory into the system prompt **every turn** doesn't scale: the cost grows with the store size and is re-sent each turn. ChatCLI now defaults to a **pull** model: it injects only a stable digest and lets the agent pull detail on demand via the `@memory recall` tool.
+
+Controlled by `CHATCLI_MEMORY_MODE`:
+
+| Mode | Behavior | When to use |
+|:-----|:---------|:------------|
+| `index` (**default**) | Injects a **compact, stable index** (profile summary + top topic/project names + fact tally by category) and a directive for the agent to call `@memory recall` when it needs detail. | Default. Per-turn cost stays **bounded** as memory grows. |
+| `full` | Injects the full hint-driven retrieval every turn (previous behavior). | When you want the agent to always see relevant memory without relying on it pulling. |
+| `off` | Injects no memory (bootstrap still applies). | Sessions where long-term memory only gets in the way. |
+
+The `index` is **stable** (turn-independent, no timestamp), so it lives in the cached prefix (section 1) and is size-capped regardless of store size. `@memory recall` uses the full retrieval stack (HyDE + vector cosine search + keyword extraction), so pulled detail matches the quality of the old push.
+
+### Measured impact
+
+Measured against a real store of **500 facts** (MEMORY.md ~32KB, fact index ~270KB):
+
+| Per turn (agent/coder) | chars | ~tokens |
+|:-----------------------|------:|--------:|
+| Push (`full`) | 3,946 | ~986 |
+| **Index (`index`)** | **486** | **~121** |
+
+**−87.7% on the per-turn memory block** — and unlike `full` (capped by `CHATCLI_MEMORY_RETRIEVAL_BUDGET`), the index **does not grow** as memory grows.
+
+<Note>
+**Chat is tool-less by design** and cannot pull on demand: there `index` automatically degrades to `full`, and only `off` suppresses memory. The active mode is shown in `/config memory`.
+</Note>
+
+<Warning>
+In `index` mode the agent/coder **no longer sees the whole memory automatically** — it must call `@memory recall`. The index gives it the "map" (what exists) so it knows what to pull. If you notice the agent missing context it should recall, switch back to `CHATCLI_MEMORY_MODE=full` (the section 1 cache savings still apply).
+</Warning>
+
+---
+
 ## Measuring impact
 
 Run your session normally and check `/cost` at the end:
@@ -223,6 +273,7 @@ Every variable on this page in one place:
 
 | Variable | Default | Disable with |
 |:---------|:--------|:-------------|
+| `CHATCLI_MEMORY_MODE` | `index` | `full` (push) / `off` |
 | `CHATCLI_AGENT_EARLY_EXIT` | `1` (on) | `0` / `false` / `off` / `no` |
 | `CHATCLI_AGENT_EARLY_EXIT_TURNS` | `3` | — (clamped to [2, 10]) |
 | `CHATCLI_AGENT_SMART_ROUTE` | `hint` | `off` / `0` / `false` / `no` |

@@ -28,16 +28,31 @@ Em agregado, cada turno pesa 4-8k tokens de **overhead puro**, multiplicado por 
 
 ## 1. Prompt Caching estruturado
 
-O system prompt do agente é composto de **quatro blocos semânticos** ordenados do mais estável para o mais volátil:
+O cache da Anthropic (e o auto-cache de prefixo do OpenAI/xAI) funciona **por prefixo**: um breakpoint só dá *hit* quando todos os bytes antes dele são idênticos a uma requisição anterior. A regra de ouro é simples — **blocos estáveis primeiro, blocos voláteis no fim**. O system prompt é montado exatamente assim:
 
-| Bloco | Conteúdo | Por que separar |
-|:------|:---------|:----------------|
-| **Core** | Persona + regras de formato (Coder/Agent) + hint de idioma | Não muda entre turnos → cache longo |
+**Prefixo estável (cacheado, `cache_control: ephemeral`):**
+
+| Bloco | Conteúdo | Por que é estável |
+|:------|:---------|:------------------|
+| **Core** | Persona + regras de formato (Coder/Agent) + hint de idioma | Não muda entre turnos |
 | **Tools** | Descrições de plugins + hint do workspace | Muda só quando um plugin é carregado/descarregado |
-| **Workspace** | SOUL.md / MEMORY.md / IDENTITY.md / contexto dinâmico | Varia entre sessões, estável dentro de uma |
-| **Skills + Orchestrator** | Skills auto-ativadas e catálogo do orquestrador | Mais volátil — fica no final para não invalidar o cache dos blocos anteriores |
+| **Orchestrator** | Catálogo do orquestrador multi-agente | Estável dentro da sessão |
+| **Índice de memória** | Digest compacto da memória (modo `index`) | Não depende do turno — ver seção 7 |
 
-Cada bloco carrega `cache_control: ephemeral` para os providers Anthropic. Para providers com auto-caching de prefixo (OpenAI, xAI), a ordem estável dos blocos faz o cache casar naturalmente.
+**Sufixo volátil (sem cache marker — muda a cada turno):**
+
+| Bloco | Conteúdo | Por que é volátil |
+|:------|:---------|:------------------|
+| **Memória (full)** | Recuperação hint-driven de MEMORY.md (modo `full`) | Varia com os hints do turno |
+| **Skills** | Skills auto-ativadas pela query | Depende da pergunta |
+| **MCP channel** | Mensagens push recentes dos servidores MCP | Atualiza a cada turno |
+| **Contexto dinâmico** | Data/hora + diretório atual | Muda por definição |
+
+<Warning>
+**Por que a ordem importa (defeito corrigido):** antes, o bloco de workspace+memória carregava `cache_control` mas continha o **timestamp ao segundo** e a recuperação hint-driven — ambos voláteis — no topo do prompt. Isso garantia *cache miss* nesse bloco a cada turno **e envenenava todos os blocos cacheados abaixo dele** (contextos `/context`, pinned skills, catálogo MCP): pagava-se *cache creation* (1.25×) toda vez e nunca se colhia um *read*. O timestamp agora vive num bloco próprio no fim, e a memória volátil saiu do prefixo. Os blocos verdadeiramente estáveis formam um prefixo contíguo que casa o cache.
+</Warning>
+
+Cada bloco estável carrega `cache_control: ephemeral` para os providers Anthropic (respeitando o teto de 4 breakpoints, com coalescing automático). Para providers com auto-caching de prefixo (OpenAI, xAI), a ordem estável faz o cache casar naturalmente. O **chat** segue a mesma lógica de ordenação; como é tool-less, ele não puxa memória sob demanda (ver seção 7).
 
 ### Cache nas tool definitions
 
@@ -192,6 +207,41 @@ export CHATCLI_MICROCOMPACT_MIN_CONTENT=2000
 
 ---
 
+## 7. Memória pull-first (índice + recall)
+
+Empurrar a memória inteira no system prompt **a cada turno** não escala: o custo cresce com o tamanho do store e é re-enviado em todo turno. A partir de agora o ChatCLI usa por padrão um modelo **pull**: injeta só um digest estável e deixa o agente puxar o detalhe sob demanda via a ferramenta `@memory recall`.
+
+Controle pela variável `CHATCLI_MEMORY_MODE`:
+
+| Modo | Comportamento | Quando usar |
+|:-----|:--------------|:------------|
+| `index` (**default**) | Injeta um **índice compacto e estável** (resumo do perfil + nomes dos top topics/projects + contagem de fatos por categoria) e uma diretiva para o agente chamar `@memory recall` quando precisar de detalhe. | Default. Custo por turno **limitado** mesmo com a memória crescendo. |
+| `full` | Injeta a recuperação hint-driven completa todo turno (comportamento anterior). | Quando você quer que o agente sempre veja a memória relevante sem depender de ele puxar. |
+| `off` | Não injeta memória (bootstrap continua valendo). | Sessões onde a memória de longo prazo só atrapalha. |
+
+O `index` é **estável** (não depende dos hints do turno, sem timestamp), então entra no **prefixo cacheado** (seção 1) e tem tamanho limitado independente do tamanho do store. O `@memory recall` usa o stack completo de recuperação (HyDE + busca vetorial por cosseno + extração de keywords), então o detalhe puxado tem a mesma qualidade do antigo push.
+
+### Impacto medido
+
+Medição num store real com **500 fatos** (MEMORY.md ~32KB, índice de fatos ~270KB):
+
+| Por turno (agent/coder) | chars | ~tokens |
+|:------------------------|------:|--------:|
+| Push (`full`) | 3.946 | ~986 |
+| **Índice (`index`)** | **486** | **~121** |
+
+**−87,7% no bloco de memória por turno** — e, ao contrário do `full` (limitado pelo `CHATCLI_MEMORY_RETRIEVAL_BUDGET`), o índice **não cresce** conforme a memória cresce.
+
+<Note>
+**Chat é tool-less por design** e não pode puxar sob demanda: lá `index` cai automaticamente em `full`, e só `off` suprime a memória. O modo é exibido em `/config memory`.
+</Note>
+
+<Warning>
+No modo `index` o agente/coder **não enxerga mais a memória inteira automaticamente** — ele precisa chamar `@memory recall`. O índice dá o "mapa" (o que existe) para ele saber o que puxar. Se notar o agente perdendo contexto que deveria recordar, volte para `CHATCLI_MEMORY_MODE=full` (a economia de cache da seção 1 continua valendo).
+</Warning>
+
+---
+
 ## Como medir o impacto
 
 Rode sua sessão normalmente e olhe o `/cost` ao final:
@@ -223,6 +273,7 @@ Todas as variáveis desta página em um só lugar:
 
 | Variável | Default | Desliga com |
 |:---------|:--------|:------------|
+| `CHATCLI_MEMORY_MODE` | `index` | `full` (push) / `off` |
 | `CHATCLI_AGENT_EARLY_EXIT` | `1` (on) | `0` / `false` / `off` / `no` |
 | `CHATCLI_AGENT_EARLY_EXIT_TURNS` | `3` | — (clamp [2, 10]) |
 | `CHATCLI_AGENT_SMART_ROUTE` | `hint` | `off` / `0` / `false` / `no` |
