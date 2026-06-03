@@ -29,6 +29,15 @@ Adapter (per platform)  --inbound-->  Runner  --agent loop (streaming)-->  reply
 
 While the agent works, its substantive output lines are coalesced and sent as **periodic progress messages** (at most one every few seconds, to respect the platforms' per-chat rate limits). Purely decorative lines (box-drawing, spinners) are filtered out. When it finishes, the gateway sends a completion notice.
 
+### "The assistant is working" indicator
+
+As soon as a message arrives, the gateway signals that it was **received and is being worked on** — so you're never left wondering whether it landed on slower turns:
+
+- **Channels with a native indicator** (Telegram): show the native **"typing…"** (`sendChatAction`), auto-refreshed before it expires while the agent works — no message clutter.
+- **Other channels**: send **one** short notice ("🤔 …", localized via `gateway.thinking`) after a small delay, and **only if the reply isn't out yet** — fast replies send nothing.
+
+The signal stops the moment the agent replies.
+
 ### Concurrency
 
 Because the agent loop mutates shared ChatCLI state and `os.Stdout` is process-global, agent runs are **serialized**: messages arrive in parallel (up to 4 buffered) but run one at a time. Each conversation keeps a light context (the user's recent requests) for continuity across turns; the real durable state lives in the workspace files the agent edits.
@@ -42,6 +51,16 @@ Because the daemon runs as a **separate process**, the sync goes through a small
 <Note>
 When you switch **provider**, the daemon adopts the new provider with its correct model — as long as that provider's credentials are present in the environment the daemon inherited (usually your `.env`). Adjustments that live only in memory, such as StackSpot's `/switch --realm` / `--agent-id`, do **not** propagate through this file; set them via environment variable or restart the gateway.
 </Note>
+
+---
+
+## Conversational replies (not "coder tone")
+
+The gateway runs the same engine as `/coder` — **all the tools** (read/edit files, shell, web, MCP) are still available — but with its own **conversational voice**. The final reply is the **message the person reads in chat**, not a technical commit summary: direct, natural text, with no tables, banners, ASCII art, or long code blocks (unless code is asked for). Under the hood this is a dedicated gateway system prompt used in place of the coder prompt, preserving the tool-use mechanics.
+
+### Dynamic language (follows the sender)
+
+Replies come out **in the language of the user's message**, detected **every turn** — not pinned to the daemon locale. Portuguese → answers in Portuguese; Spanish → Spanish; and so on. The dynamic language directive is applied on **every** gateway path (including with an active persona), so the reply is never statically stuck in one language. In the **interactive CLI**, the fixed per-locale directive (`CHATCLI_LANG`) still applies — only the gateway changes.
 
 ---
 
@@ -142,6 +161,60 @@ Anyone not on the allow-list is ignored. Slack and the generic webhook verify th
 | Discord | Gateway WebSocket v10 | `CHATCLI_DISCORD_BOT_TOKEN` | bot token |
 | WhatsApp | Cloud API (webhook) | `..._ACCESS_TOKEN`, `..._PHONE_ID`, `..._ADDR` | verify token |
 | Webhook | generic HTTP | `CHATCLI_WEBHOOK_ADDR` | secret (constant-time) |
+
+---
+
+## Voice messages (transcription)
+
+The gateway accepts **audio / voice notes** on every channel. The message is **transcribed to text before the pipeline** — so it works with **any of the 14 chat providers** (they only ever see text; no multimodal model or message redesign needed). The adapter downloads the media, transcribes it, and the agent treats it as a normal text request — the transcript is even recorded in the [Conversation Hub](/features/conversation-hub).
+
+| Channel | Voice source |
+| --- | --- |
+| Telegram | voice note / audio (`getFile` → download) |
+| WhatsApp | audio message (Graph media API lookup) |
+| Discord | `audio/*` attachment (CDN) |
+| Slack | `audio/*` file (`url_private`, bearer token) |
+| Webhook | `audio_b64` (inline base64) or `audio_url` |
+
+### Transcription backend (local-first, keyless)
+
+Selection is **local/keyless first** (the same philosophy as hermes-agent: use a local engine when present instead of forcing an API key):
+
+1. **`CHATCLI_TRANSCRIPTION_CMD`** — your own local STT command (any wrapper). Reads the transcript from **stdout**, or from the `.txt` it writes into `{output_dir}`.
+2. **`CHATCLI_TRANSCRIPTION_URL`** — a **self-hosted** OpenAI-compatible endpoint (whisper.cpp `whisper-server`, faster-whisper, Speaches). Keyless (unless `CHATCLI_TRANSCRIPTION_KEY`).
+3. **A whisper CLI on PATH** — if `whisper` (openai-whisper) or `whisper-cli` (whisper.cpp) is installed, it's used **automatically, zero config**. The ggml model is **downloaded once** to the cache (`~/.cache/chatcli/whisper/`), like faster-whisper does.
+4. **`GROQ_API_KEY`** → Groq Whisper (free tier).
+5. **`OPENAI_API_KEY`** → OpenAI Whisper.
+6. **Nothing configured** → disabled: the bot **replies with a hint** on how to enable it (instead of silently dropping the audio).
+
+`CHATCLI_TRANSCRIPTION_PROVIDER` pins a backend (`command|url|groq|openai`); `CHATCLI_TRANSCRIPTION_MODEL` and `_LANG` tune model/language; `CHATCLI_GATEWAY_MAX_AUDIO_BYTES` caps the download size (default 20MB). The active backend is shown in `/config integrations`.
+
+<Warning>
+**Opus needs a decoder.** Telegram/WhatsApp/Discord voice notes are **OGG/Opus**, and whisper.cpp does **not** decode Opus natively (only WAV/MP3/FLAC/OGG-Vorbis). With **ffmpeg** installed, the gateway transcodes to 16 kHz WAV automatically and everything works; without ffmpeg, install it **or** use a cloud/self-hosted backend (which decodes server-side). The language is **auto-detected** (`whisper-cli -l auto`), so the transcript comes out in the spoken language — and so does the reply.
+</Warning>
+
+#### Quick setup
+
+100% local, no API key:
+
+```bash
+brew install whisper-cpp ffmpeg          # macOS  (Linux: apt/dnf; Windows: scoop/winget)
+# nothing else: chatcli detects whisper-cli, downloads the model on first use, and uses ffmpeg for Opus
+```
+
+Self-hosted (a whisper server that decodes Opus):
+
+```bash
+export CHATCLI_TRANSCRIPTION_URL="http://localhost:8080/v1"   # keyless
+```
+
+Cloud (decodes Opus server-side, nothing installed locally):
+
+```bash
+export CHATCLI_TRANSCRIPTION_PROVIDER=openai   # uses OPENAI_API_KEY (or =groq with GROQ_API_KEY)
+```
+
+After configuring, restart the daemon (`/gateway stop && /gateway start`) and send a voice message.
 
 ---
 
