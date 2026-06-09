@@ -1,7 +1,7 @@
 ---
 title: "#4 RAG + HyDE — Retrieval Semântico"
 sidebarTitle: "RAG + HyDE"
-description: "Duas camadas de retrieval sobre memory.Fact: Phase 3a gera uma hipótese LLM e extrai keywords para expandir a query; Phase 3b embedding vetores (Voyage / OpenAI / Bedrock Titan-Cohere) + busca cosseno pure-Go. Lazy backfill, JSON persistido, zero CGO."
+description: "Duas camadas de retrieval sobre memory.Fact: Phase 3a gera uma hipótese LLM e extrai keywords; Phase 3b embedding vetores (Voyage / OpenAI / Bedrock Titan-Cohere) + busca cosseno pure-Go com ranking fundido (semantic+lexical+temporal), floor de cosseno, auto-migração e harness de avaliação (recall@k/MRR/nDCG). Primitivo vindex reutilizável, JSON persistido, zero CGO."
 icon: "database"
 ---
 
@@ -68,9 +68,11 @@ Exemplo do gap:
 
 ---
 
-## Phase 3b — Vector embeddings
+## Phase 3b — Vector embeddings + ranking fundido
 
-Adiciona busca por **cosine similarity** sobre embeddings de facts.
+Adiciona busca por **cosine similarity** sobre embeddings de facts — e, desde a refatoração de ranking, **funde o score de cosseno** com os sinais lexical e temporal num único ranking.
+
+<Info>**O que mudou (PR #1027):** antes, os hits vetoriais eram dissolvidos de volta em keywords e o score de cosseno era **descartado** — pagava-se uma chamada de embedding e jogava-se fora justamente o sinal semântico. Agora o cosseno flui direto para o ranker fundido `SearchBlended`, então um fato achado só por paráfrase (zero overlap lexical) consegue rankear.</Info>
 
 ### Arquitetura
 
@@ -78,26 +80,41 @@ Adiciona busca por **cosine similarity** sobre embeddings de facts.
 ┌──────────────────┐
 │ Query do usuário │
 └────────┬─────────┘
+         │  Phase 3a: hipótese LLM → keywords expandidas
+         ▼
+┌──────────────────────────┐
+│ EmbeddingProvider.Embed  │  (Voyage / OpenAI / Bedrock / Null)
+└────────┬─────────────────┘
+         │  vector float32
+         ▼
+┌──────────────────────────────────────┐
+│ vindex.Index.Search(q, k, floor)     │  cosine top-K, O(n log k), pure-Go
+└────────┬─────────────────────────────┘
+         │  []Hit{ID, Score}   ← o score de cosseno é PRESERVADO
+         ▼
+┌────────────────────────────────────────────────┐
+│ FactIndex.SearchBlended(keywords, semantic, w)  │
+│   final = wSem·cosine + wLex·keyword            │
+│         + wTemp·recência   (min-max normalizado) │
+└────────┬───────────────────────────────────────┘
          │
          ▼
-┌─────────────────────────┐
-│ EmbeddingProvider.Embed │  (Voyage AI / OpenAI / Null)
-└────────┬────────────────┘
-         │
-         ▼  vector float32[1024] ou [1536]
-┌─────────────────────────┐
-│ VectorIndex.SimilarFacts│  (cosine pure-Go)
-└────────┬────────────────┘
-         │
-         ▼  top-K fact IDs
-┌─────────────────────────┐
-│ FactIndex.GetByID       │
-│ ExtractKeywords(content)│
-└────────┬────────────────┘
-         │
-         ▼
-    Hints expandidas via Phase 3a E 3b
+    Facts ranqueados por relevância FUNDIDA
 ```
+
+### Ranking fundido (`SearchBlended`)
+
+Três sinais independentes e complementares, cada um **normalizado min-max** sobre o conjunto de candidatos antes da soma ponderada:
+
+| Sinal | Origem | Captura |
+| :--- | :--- | :--- |
+| **semantic** | cosseno do vector store | sinonímia, paráfrase |
+| **lexical** | overlap de keyword/tag | termos exatos, identificadores, nomes de arquivo |
+| **temporal** | decaimento por recência × frequência de acesso | o que o usuário realmente usa |
+
+Pesos default (`DefaultRankWeights`): **semantic 0.55 · lexical 0.30 · temporal 0.15** — semantic-first, porque a chamada de embedding já foi paga. A fusão é **aditiva** (não multiplicativa) de propósito: um fato com cosseno alto e zero keyword **ainda rankeia** — um produto o zeraria. A normalização min-max é o que torna os pesos **provider-agnostic**: cosseno Voyage 1024-d e OpenAI 1536-d caem ambos em [0,1] após normalizar.
+
+<Tip>**Floor de cosseno** (`MinCosineScore`, default `0.25`): embeddings sobre texto normalizado são quase sempre fracamente positivos, então o antigo corte em `> 0` admitia ruído quase-ortogonal. O floor mantém só fatos genuinamente relacionados no top-K.</Tip>
 
 ### Providers suportados
 
@@ -165,31 +182,36 @@ Adiciona busca por **cosine similarity** sobre embeddings de facts.
   </Tab>
 </Tabs>
 
-### Vector store pure-Go
+### Vector store pure-Go — primitivo genérico `vindex`
 
 <Info>**Sem CGO, sem SQLite-vec, sem dependências externas.** Só `float32[]` + cosseno + persistência JSON em `~/.chatcli/memory/vector_index.json`.</Info>
 
+O índice cosseno vive num pacote **genérico e reutilizável**, `llm/embedding/vindex`, extraído quando um segundo consumidor (o [retrieval semântico de `/context`](/features/persistent-context)) apareceu. O `memory` é só um **adapter fino** sobre ele — sem máquina vetorial duplicada por pacote:
+
 ```go
-// cli/workspace/memory/vector_store.go
-type VectorEntry struct {
-    FactID    string    `json:"fact_id"`
-    Vector    []float32 `json:"vector"`
-    Dimension int       `json:"dim"`
-    Provider  string    `json:"provider"`
-}
+// llm/embedding/vindex — o primitivo único e agnóstico
+type Index struct { /* provider, dim, entries map[string][]float32, path */ }
+func (x *Index) Upsert(ctx, items map[string]string) error
+func (x *Index) Search(query []float32, k int, minScore float64) []Hit  // top-K via min-heap
+func (x *Index) Prune(keep map[string]struct{})                         // evita servir vetor obsoleto
+
+// cli/workspace/memory/vector_store.go — adapter de domínio "fact"
+type VectorIndex struct { idx *vindex.Index; provider embedding.Provider }
+type ScoredFact struct { ID string; Score float64 }
 ```
 
-Para `N < 1000 facts` (o caso típico do chatcli), a busca linear em memória completa em microssegundos. Sem necessidade de índice HNSW ou IVFFlat.
+A seleção top-K usa um **min-heap O(n log k)** (não full-sort O(n log n)), então o custo escala com `k`, não com o tamanho do corpus — o teto de escala deixa de ser "centenas de facts". Para o caso típico do chatcli a busca linear completa em microssegundos; sem HNSW ou IVFFlat.
 
-### Dimension lock
+### Auto-migração de provider/dimensão
 
-Trocar de provider (Voyage 1024 → OpenAI 1536) **não é automático**: o store rejeita com erro explicativo. Razão: cosine entre vetores de dimensões diferentes é inválido matematicamente.
+Trocar de provider ou dimensão (Voyage 1024 → OpenAI 1536, ou voyage→cohere no mesmo 1024) **não exige mais `rm` manual**. No load, o índice detecta o mismatch — de **dimensão** (cosseno entre arities diferentes é indefinido) **ou de provider** (dois espaços de embedding distintos não são comparáveis, mesmo na mesma dimensão) — e **auto-limpa** o cache, removendo o arquivo para o backfill repopular:
 
-```bash
-# Para migrar, limpe o arquivo
-rm ~/.chatcli/memory/vector_index.json
-# Altere o provider e reinicie — backfill lazy repopula
+```text
+WARN vindex provider changed — auto-clearing for re-embed  on_disk_provider=voyage provider=cohere
+WARN vindex dimension mismatch — auto-clearing for re-embed  on_disk_dim=1024 provider_dim=1536
 ```
+
+<Warning>O caso provider→provider no mesmo dim (ex.: voyage 1024 → cohere 1024) antes era **silenciosamente servido como lixo** — o cosseno entre espaços diferentes não tem sentido. Agora é detectado e re-embeddado.</Warning>
 
 ### Lazy backfill
 
@@ -204,7 +226,41 @@ go func(items map[string]string) { //#nosec G118 -- detached on purpose
 }(items)
 ```
 
-<Tip>O backfill é **bounded**: no máximo 500 facts por invocação de retrieve. Com Voyage (~$0.05/M tokens) isso custa cerca de US$ 0,001 num cold cache cheio. Em uma sessão normal, a maioria do index fica embeddado já na primeira interação.</Tip>
+<Tip>O backfill é **bounded** e configurável: no máximo `Config.BackfillBatchMax` facts por retrieve (default 500). Com Voyage (~$0.05/M tokens) isso custa cerca de US$ 0,001 num cold cache cheio. Em uma sessão normal, a maioria do index fica embeddado já na primeira interação.</Tip>
+
+---
+
+## Avaliação — provando o retrieval (não supondo)
+
+Antes não havia como **medir** se o retrieval era bom. Agora há um harness de avaliação dependency-free em `cli/workspace/memory/eval` — métricas padrão de IR macro-averaged:
+
+| Métrica | O que mede |
+| :--- | :--- |
+| **recall@k** | fração dos facts relevantes recuperados no top-k |
+| **precision@k** | fração do top-k que era relevante |
+| **MRR** | rank recíproco médio do primeiro acerto |
+| **nDCG@k** | ganho cumulativo descontado normalizado |
+
+O A/B versionado (em `ranking_test.go`, com um provider de embedding determinístico) compara keyword-only vs. ranking fundido sobre queries que usam **sinônimos** ausentes do texto dos facts:
+
+```text
+baseline (keyword): recall@1=0.2857  MRR=0.2857  nDCG@1=0.2857
+candidate (blended): recall@1=1.0000  MRR=1.0000  nDCG@1=1.0000
+delta              : recall@1=+0.7143
+```
+
+<Info>O harness roda igual em CI (provider determinístico, reproduzível) ou contra um backend real — ele nunca importa um provider, então fica neutro entre os 14 suportados. É o que transforma "parece bom" em "é bom, medido", e guarda contra regressões.</Info>
+
+### Tunables de ranking (sem novos env vars)
+
+Os parâmetros do ranking fundido vivem como campos de `Config` com defaults fortes — **não** foram criados novos env vars (e os `CHATCLI_MEMORY_*` que já existiam, antes ignorados no caminho estruturado, agora são aplicados via `ConfigFromEnv` + clamp):
+
+| Campo `Config` | Default | O que controla |
+| :--- | :--- | :--- |
+| `RankWeights` | `{0.55, 0.30, 0.15}` | pesos semantic / lexical / temporal |
+| `MinCosineScore` | `0.25` | floor de cosseno no top-K |
+| `VectorTopK` | `12` | candidatos vetoriais por query |
+| `BackfillBatchMax` | `500` | teto de facts embeddados por retrieve |
 
 ---
 

@@ -1,7 +1,7 @@
 ---
 title: "#4 RAG + HyDE — Semantic Retrieval"
 sidebarTitle: "RAG + HyDE"
-description: "Two retrieval layers over memory.Fact: Phase 3a generates an LLM hypothesis and extracts keywords to expand the query; Phase 3b adds vector embeddings (Voyage / OpenAI / Bedrock Titan-Cohere) + pure-Go cosine search. Lazy backfill, JSON-persisted, zero CGO."
+description: "Two retrieval layers over memory.Fact: Phase 3a generates an LLM hypothesis and extracts keywords; Phase 3b adds vector embeddings (Voyage / OpenAI / Bedrock Titan-Cohere) + pure-Go cosine search with blended ranking (semantic+lexical+temporal), a cosine floor, auto-migration and an evaluation harness (recall@k/MRR/nDCG). Reusable vindex primitive, JSON-persisted, zero CGO."
 icon: "database"
 ---
 
@@ -68,9 +68,11 @@ Gap example:
 
 ---
 
-## Phase 3b — Vector embeddings
+## Phase 3b — Vector embeddings + blended ranking
 
-Adds **cosine similarity** search over fact embeddings.
+Adds **cosine similarity** search over fact embeddings — and, since the ranking refactor, **fuses the cosine score** with the lexical and temporal signals into a single ranking.
+
+<Info>**What changed (PR #1027):** previously the vector hits were dissolved back into keywords and the cosine score was **discarded** — you paid for an embedding call and threw away the very semantic signal. Now the cosine flows straight into the `SearchBlended` ranker, so a fact matched only by paraphrase (zero lexical overlap) can still rank.</Info>
 
 ### Architecture
 
@@ -78,26 +80,41 @@ Adds **cosine similarity** search over fact embeddings.
 ┌──────────────────┐
 │ User query       │
 └────────┬─────────┘
+         │  Phase 3a: LLM hypothesis → expanded keywords
+         ▼
+┌──────────────────────────┐
+│ EmbeddingProvider.Embed  │  (Voyage / OpenAI / Bedrock / Null)
+└────────┬─────────────────┘
+         │  vector float32
+         ▼
+┌──────────────────────────────────────┐
+│ vindex.Index.Search(q, k, floor)     │  cosine top-K, O(n log k), pure-Go
+└────────┬─────────────────────────────┘
+         │  []Hit{ID, Score}   ← the cosine score is PRESERVED
+         ▼
+┌────────────────────────────────────────────────┐
+│ FactIndex.SearchBlended(keywords, semantic, w)  │
+│   final = wSem·cosine + wLex·keyword            │
+│         + wTemp·recency    (min-max normalized)  │
+└────────┬───────────────────────────────────────┘
          │
          ▼
-┌─────────────────────────┐
-│ EmbeddingProvider.Embed │  (Voyage AI / OpenAI / Null)
-└────────┬────────────────┘
-         │
-         ▼  vector float32[1024] or [1536]
-┌─────────────────────────┐
-│ VectorIndex.SimilarFacts│  (pure-Go cosine)
-└────────┬────────────────┘
-         │
-         ▼  top-K fact IDs
-┌─────────────────────────┐
-│ FactIndex.GetByID       │
-│ ExtractKeywords(content)│
-└────────┬────────────────┘
-         │
-         ▼
-    Hints expanded via Phase 3a AND 3b
+    Facts ranked by FUSED relevance
 ```
+
+### Blended ranking (`SearchBlended`)
+
+Three independent, complementary signals, each **min-max normalized** across the candidate set before the weighted sum:
+
+| Signal | Source | Captures |
+| :--- | :--- | :--- |
+| **semantic** | cosine from the vector store | synonymy, paraphrase |
+| **lexical** | keyword/tag overlap | exact terms, identifiers, file names |
+| **temporal** | recency decay × access frequency | what the user actually uses |
+
+Default weights (`DefaultRankWeights`): **semantic 0.55 · lexical 0.30 · temporal 0.15** — semantic-first, because the embedding call was already paid for. Fusion is **additive** (not multiplicative) on purpose: a fact with high cosine and zero keyword overlap **still ranks** — a product would zero it out. Min-max normalization is what makes the weights **provider-agnostic**: Voyage 1024-d and OpenAI 1536-d cosine both land in [0,1] after normalizing.
+
+<Tip>**Cosine floor** (`MinCosineScore`, default `0.25`): embeddings over normalized text are almost always weakly positive, so the old `> 0` cutoff admitted near-orthogonal noise. The floor keeps only genuinely related facts in the top-K.</Tip>
 
 ### Supported providers
 
@@ -165,31 +182,36 @@ Adds **cosine similarity** search over fact embeddings.
   </Tab>
 </Tabs>
 
-### Pure-Go vector store
+### Pure-Go vector store — generic `vindex` primitive
 
 <Info>**No CGO, no SQLite-vec, no external deps.** Just `float32[]` + cosine + JSON persistence in `~/.chatcli/memory/vector_index.json`.</Info>
 
+The cosine index lives in a **generic, reusable** package, `llm/embedding/vindex`, extracted once a second consumer (the [semantic `/context` retrieval](/features/persistent-context)) appeared. `memory` is just a **thin adapter** over it — no vector machinery duplicated per package:
+
 ```go
-// cli/workspace/memory/vector_store.go
-type VectorEntry struct {
-    FactID    string    `json:"fact_id"`
-    Vector    []float32 `json:"vector"`
-    Dimension int       `json:"dim"`
-    Provider  string    `json:"provider"`
-}
+// llm/embedding/vindex — the single, agnostic primitive
+type Index struct { /* provider, dim, entries map[string][]float32, path */ }
+func (x *Index) Upsert(ctx, items map[string]string) error
+func (x *Index) Search(query []float32, k int, minScore float64) []Hit  // top-K via min-heap
+func (x *Index) Prune(keep map[string]struct{})                         // never serve stale vectors
+
+// cli/workspace/memory/vector_store.go — fact-domain adapter
+type VectorIndex struct { idx *vindex.Index; provider embedding.Provider }
+type ScoredFact struct { ID string; Score float64 }
 ```
 
-For `N < 1000 facts` (typical chatcli case), linear in-memory search completes in microseconds. No need for HNSW or IVFFlat indexing.
+Top-K selection uses a **min-heap O(n log k)** (not a full O(n log n) sort), so cost scales with `k`, not corpus size — the scale ceiling is no longer "hundreds of facts". For the typical chatcli case linear search completes in microseconds; no HNSW or IVFFlat.
 
-### Dimension lock
+### Provider/dimension auto-migration
 
-Switching provider (Voyage 1024 → OpenAI 1536) is **not automatic**: the store rejects with an explanatory error. Reason: cosine between vectors of different dimensions is mathematically invalid.
+Switching provider or dimension (Voyage 1024 → OpenAI 1536, or voyage→cohere at the same 1024) **no longer needs a manual `rm`**. On load, the index detects the mismatch — of **dimension** (cosine between different arities is undefined) **or of provider** (two embedding spaces aren't comparable, even at the same dimension) — and **auto-clears** the cache, removing the file so backfill repopulates:
 
-```bash
-# To migrate, clear the file
-rm ~/.chatcli/memory/vector_index.json
-# Change the provider and restart — lazy backfill repopulates
+```text
+WARN vindex provider changed — auto-clearing for re-embed  on_disk_provider=voyage provider=cohere
+WARN vindex dimension mismatch — auto-clearing for re-embed  on_disk_dim=1024 provider_dim=1536
 ```
+
+<Warning>The provider→provider case at the same dim (e.g. voyage 1024 → cohere 1024) was previously **served silently as garbage** — cosine between different spaces is meaningless. It is now detected and re-embedded.</Warning>
 
 ### Lazy backfill
 
@@ -204,7 +226,41 @@ go func(items map[string]string) { //#nosec G118 -- detached on purpose
 }(items)
 ```
 
-<Tip>Backfill is **bounded**: at most 500 facts per retrieve invocation. With Voyage (~$0.05/M tokens) that costs roughly US$ 0.001 for a fully cold cache. In a normal session, most of the index is embedded on the first interaction.</Tip>
+<Tip>Backfill is **bounded** and configurable: at most `Config.BackfillBatchMax` facts per retrieve (default 500). With Voyage (~$0.05/M tokens) that costs roughly US$ 0.001 for a fully cold cache. In a normal session, most of the index is embedded on the first interaction.</Tip>
+
+---
+
+## Evaluation — proving retrieval (not assuming it)
+
+There used to be no way to **measure** whether retrieval was any good. Now there is a dependency-free evaluation harness in `cli/workspace/memory/eval` — standard macro-averaged IR metrics:
+
+| Metric | What it measures |
+| :--- | :--- |
+| **recall@k** | fraction of relevant facts retrieved in the top-k |
+| **precision@k** | fraction of the top-k that was relevant |
+| **MRR** | mean reciprocal rank of the first hit |
+| **nDCG@k** | normalized discounted cumulative gain |
+
+The versioned A/B (in `ranking_test.go`, with a deterministic embedding provider) compares keyword-only vs. blended ranking on queries phrased with **synonyms** absent from the fact text:
+
+```text
+baseline (keyword): recall@1=0.2857  MRR=0.2857  nDCG@1=0.2857
+candidate (blended): recall@1=1.0000  MRR=1.0000  nDCG@1=1.0000
+delta              : recall@1=+0.7143
+```
+
+<Info>The harness runs the same way in CI (deterministic provider, reproducible) or against a real backend — it never imports a provider, so it stays neutral across all 14 supported ones. It is what turns "looks good" into "is good, measured", and guards against regressions.</Info>
+
+### Ranking tunables (no new env vars)
+
+The blended-ranking parameters live as `Config` fields with strong defaults — **no** new env vars were introduced (and the pre-existing `CHATCLI_MEMORY_*` vars, previously ignored on the structured path, are now applied via `ConfigFromEnv` + clamping):
+
+| `Config` field | Default | Controls |
+| :--- | :--- | :--- |
+| `RankWeights` | `{0.55, 0.30, 0.15}` | semantic / lexical / temporal weights |
+| `MinCosineScore` | `0.25` | cosine floor in the top-K |
+| `VectorTopK` | `12` | vector candidates per query |
+| `BackfillBatchMax` | `500` | cap of facts embedded per retrieve |
 
 ---
 
