@@ -92,6 +92,7 @@ Endpoints como Prometheus `/metrics`, dumps de configuração ou listagens longa
 | `save_to_file` | boolean | Persiste o corpo completo (pré-filtro) no [scratch dir da sessão](/features/session-workspace) e retorna preview + caminho absoluto. Disparado **automaticamente** quando o corpo excede `CHATCLI_WEBFETCH_AUTOSAVE_BYTES` (default `10000`) e não há filtro/range definido. |
 | `save_path` | string | Sobrescreve o nome do arquivo gerado por `save_to_file` (qualquer prefixo de diretório é descartado — escrita sempre confinada ao scratch). |
 | `max_length` | integer | Tamanho máximo do conteúdo retornado inline (default: **20.000**). Conteúdo acima disso é truncado inline — ou auto-salvo no scratch dir via auto-save. |
+| `render` | boolean | Força (`true`) ou suprime (`false`) a renderização headless de páginas JS — ver [Renderização de páginas JavaScript](#renderizacao-de-paginas-javascript-spa). Sem o parâmetro, o modo `auto` decide pela heurística. |
 
 Exemplo — filtrar Prometheus por prefixo de métrica:
 
@@ -166,6 +167,41 @@ Ou, na chamada específica, passe `filter` (mesmo que `.*`), `from_line`/`to_lin
 
 Ver [Eficiência de Tokens](/features/token-efficiency) para o contexto completo dessa decisão.
 
+### Renderização de páginas JavaScript (SPA)
+
+Páginas que constroem o conteúdo no client (SPAs, tabelas montadas via JavaScript) retornam um "casco" vazio no fetch estático — `<div id="root">` e bundles, sem o conteúdo real. O `@webfetch` resolve isso com uma **cadeia de escalonamento**:
+
+<Steps>
+  <Step title="Fetch estático">
+    Sempre o primeiro passo. Páginas server-rendered param aqui — zero custo extra.
+  </Step>
+  <Step title="Detecção de shell JS">
+    Heurística: texto extraído fino + sinais estruturais (mount points vazios `#root`/`#app`, aviso `<noscript>`, marcadores de framework — React, Next, Angular, Vue, Nuxt, Svelte, Gatsby, Remix, Flutter).
+  </Step>
+  <Step title="Render headless via CDP">
+    Um Chromium real renderiza a página (espera load + DOM estável) e o DOM resultante passa pelo mesmo pipeline de extração/filtros/auto-save.
+  </Step>
+  <Step title="Fallbacks sem browser">
+    Sem browser disponível, o estado embutido `__NEXT_DATA__` (Next.js) é recuperado do HTML estático; em último caso, uma nota honesta avisa o modelo que o fetch pode estar incompleto.
+  </Step>
+</Steps>
+
+**Descoberta de browser** (ordem): Chrome → Chromium → Edge → **Brave** → caminho explícito em `CHATCLI_WEBFETCH_RENDER_BROWSER` → download opt-in de um Chromium pinado (~150 MB, uma vez) com `CHATCLI_WEBFETCH_RENDER_AUTOPROVISION=true`. Sem API keys, sem serviços externos.
+
+**Postura de produção:** um browser compartilhado por processo (lançamento lazy, reuso com health-check, shutdown após 2 min ocioso), **circuit breaker** (2 falhas de launch → 5 min de pausa), contexto incógnito por render (cookies nunca vazam entre sites) e SSRF reforçado dentro do browser — cada sub-request da página é validado via interceptação CDP, espelhando o guard do caminho HTTP normal. DOM renderizado limitado a 10 MB.
+
+| Variável | Descrição | Default |
+|:---------|:----------|:--------|
+| `CHATCLI_WEBFETCH_RENDER` | `auto` (heurística decide), `always`, `never` | `auto` |
+| `CHATCLI_WEBFETCH_RENDER_TIMEOUT` | Timeout do render em segundos | `25` |
+| `CHATCLI_WEBFETCH_RENDER_BROWSER` | Caminho **absoluto** para um binário Chromium-based específico | _(auto-detect)_ |
+| `CHATCLI_WEBFETCH_RENDER_AUTOPROVISION` | Permite o download único de um Chromium pinado quando nenhum browser existe | `false` |
+
+```text
+> @webfetch https://app-spa.example.com/dashboard
+Page appears JS-rendered; escalating to headless browser...
+```
+
 ---
 
 ## @websearch
@@ -178,6 +214,8 @@ Realiza uma busca web e retorna os resultados com título, URL e snippet. Suport
 |:--------|:----------|:--------------|:-----------|
 | **DuckDuckGo** | Nenhum | Default, funciona já, zero config | DDG eventualmente serve interstitial de anti-bot (CAPTCHA) — pode retornar zero resultados |
 | **SearxNG self-hosted** | `SEARXNG_URL` apontando para a instância | Empresa fechada em rede corporativa — você controla o backend, sem saída para scraping público, agrega vários engines (Bing/Google/Qwant) pela instância | Requer subir um container interno + habilitar JSON no `settings.yml` |
+| **Brave Search** | Nenhum | Índice **próprio e independente** (não é meta-busca) — diversidade real quando DDG bloqueia | Scraping HTML; layout pode mudar (parser ancorado em atributos semânticos estáveis) |
+| **Mojeek** | Nenhum | Índice próprio e independente, crawler britânico | Algumas redes recebem 403 para tráfego automatizado — a cadeia simplesmente avança |
 
 ### Cadeia de fallback
 
@@ -188,6 +226,8 @@ A cada query, o ChatCLI monta uma cadeia ordenada de backends. Se o primeiro fal
 ```
 1. DuckDuckGo          ← default, sempre disponível
 2. SearxNG             ← só entra na cadeia se SEARXNG_URL estiver setado
+3. Brave Search        ← índice independente, zero config
+4. Mojeek              ← índice independente, zero config
 ```
 
 **Override explícito para priorizar SearxNG:**
@@ -197,13 +237,13 @@ export CHATCLI_WEBSEARCH_PROVIDER=searxng
 export SEARXNG_URL=https://searx.internal.corp
 ```
 
-Resultado: cadeia vira `searxng → duckduckgo`. DDG continua como fallback se a instância SearxNG falhar.
+Resultado: cadeia vira `searxng → duckduckgo → brave → mojeek`. Os demais continuam como fallback se a instância SearxNG falhar. O mesmo vale para qualquer provider: `CHATCLI_WEBSEARCH_PROVIDER=brave` move o Brave para o topo e mantém o resto atrás.
 
 ### Variáveis de ambiente
 
 | Variável | Descrição | Default |
 |:---------|:----------|:--------|
-| `CHATCLI_WEBSEARCH_PROVIDER` | Força um backend específico no topo da cadeia: `searxng`, `duckduckgo`, ou `auto`. | `auto` |
+| `CHATCLI_WEBSEARCH_PROVIDER` | Força um backend específico no topo da cadeia: `searxng`, `duckduckgo`, `brave`, `mojeek`, ou `auto`. | `auto` |
 | `SEARXNG_URL` | URL raiz da instância SearxNG (ex.: `https://searx.internal.corp`). Quando setado, SearxNG entra na cadeia. | _(não setado)_ |
 
 ### Comando `/websearch`
@@ -214,7 +254,7 @@ Gerenciador interativo do backend preferido. **Autocomplete disponível** para s
 |:-----------|:-------|
 | `/websearch` ou `/websearch status` | Mostra provider atual + cadeia ativa |
 | `/websearch list` | Lista providers conhecidos e quais estão configurados |
-| `/websearch provider <searxng\|duckduckgo\|auto>` | Define provider preferido para a sessão (seta `CHATCLI_WEBSEARCH_PROVIDER` no processo) |
+| `/websearch provider <searxng\|duckduckgo\|brave\|mojeek\|auto>` | Define provider preferido para a sessão (seta `CHATCLI_WEBSEARCH_PROVIDER` no processo) |
 | `/websearch reset` | Remove o override e volta ao modo auto |
 
 O `/websearch provider` é apenas para a sessão corrente. Para persistir, exporte a env no shell ou adicione ao `.env`.
