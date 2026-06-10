@@ -1,0 +1,116 @@
+---
+title: "Knowledge Base (RAG keyless)"
+sidebarTitle: "Knowledge Base"
+description: "Transforme corpora de documentação em base de conhecimento: index card de ~900 tokens no prompt, retrieval híbrido BM25 + embeddings por turno, e a tool @knowledge para o agente investigar — tudo sem API key."
+icon: "book-open"
+---
+
+Um corpus de documentação de **6MB** vira **~1,5M de tokens** se anexado inteiro — estoura a janela de qualquer modelo no primeiro turno. O modo `knowledge` do [`/context`](/features/persistent-context) resolve com o mesmo padrão pull-first da [memória persistente](/features/bootstrap-memory): a conversa recebe só um **index card** (o que a base cobre), e o conteúdo é **recuperado sob demanda** — automaticamente a cada turno e, no agente, iterativamente via tool `@knowledge`.
+
+```bash
+# 1. Achate a doc (ex.: plugin @docs-flatten) → JSONL
+@docs-flatten --repo https://github.com/org/docs.git --format jsonl --output docs.jsonl
+
+# 2. Indexe como knowledge base (JSONL nativo; diretórios também funcionam)
+/context create minha-doc docs.jsonl --mode knowledge
+
+# 3. Anexe — custo fixo de ~900 tokens/turno, com 6MB ou 60MB
+/context attach minha-doc
+```
+
+| | Attach tradicional (`full`) | `--mode knowledge` |
+|---|---|---|
+| Custo no prompt | corpus inteiro (~1,5M tokens p/ 6MB) | **index card (~900 tokens, fixo)** |
+| Conteúdo | empurrado de uma vez | **puxado por relevância, a cada turno** |
+| API key | — | **nenhuma** (BM25 puro-Go; embeddings = boost opcional) |
+| Conhecimento | truncado/estourado | íntegro, pesquisável e citável por `source` |
+
+---
+
+## Como funciona
+
+### Ingestão nativa do JSONL (docs-flatten)
+
+Cada linha do JSONL vira um **documento virtual** preservando `source`, título e proveniência (`repoUrl`/`commit`) — em vez de entrar como um blob de texto único. Linhas malformadas são contadas e puladas, nunca fatais. Diretórios comuns também viram knowledge base (scanner normal, até 100MB).
+
+### Index card (o que entra no prompt)
+
+O attach injeta apenas um **TOC determinístico e budget-bounded** — nome, escala, origem e a lista de documentos — que vive no prefixo **cacheado** do prompt (estável byte a byte entre turnos). O modelo sabe *o que existe* sem pagar pelo conteúdo:
+
+```
+📚 KNOWLEDGE BASE: minha-doc
+Origin: https://github.com/org/docs.git @ abc123def456
+Scale: 87 document(s), 412 passage(s), ~1.5M tokens of source material (NOT in context)
+Table of contents:
+- guide/install.md (4 passages) — Install
+- guide/deploy.md (12 passages) — Deploying to production
+…
+```
+
+### Retrieval híbrido (keyless-first)
+
+A cada turno, os trechos relevantes à pergunta são injetados num bloco **volátil** (fora do prefixo cacheado):
+
+- **BM25 puro-Go** — sempre disponível, **sem API key**, neutro pt/inglês. É o piso.
+- **Embeddings** ([Voyage/OpenAI/Bedrock](/features/quality/rag-hyde), se configurados) — boost semântico, fundido por ranking normalizado (0.55/0.45). Falha de embedding **degrada para o léxico** com warn; nunca quebra o turno.
+
+---
+
+## Tool `@knowledge` — o agente investiga a base
+
+No **agent** e no **coder**, os index cards entram no system prompt e a tool `@knowledge` permite **investigação iterativa** — buscar, ler documentos inteiros em páginas, navegar a estrutura:
+
+| Subcomando | O que faz |
+|---|---|
+| `search {query, top_k?, kb?}` | Passagens ranqueadas (híbrido) com citação de `source` |
+| `get {source, offset?, kb?}` | Lê um documento inteiro, em páginas de ~3K tokens com offset de continuação |
+| `toc {prefix?, kb?}` | Lista os documentos da base (filtro por prefixo de path) |
+| `list` | Bases anexadas à sessão e suas escalas |
+
+O caso de uso que fecha o ciclo — **criar skills a partir da doc** com a tool [`@skill`](/features/skill-authoring):
+
+```
+/agent cria uma skill de deploy baseada na seção de produção da doc
+  → @knowledge search "deploy production"
+  → @knowledge get "guide/deploy.md"
+  → @skill create deploy-prod …
+```
+
+---
+
+## No chat também (exceção read-only)
+
+O chat continua [tool-less por design](/features/interactive-ask) — mas a consulta à knowledge base é a **segunda exceção sancionada** (ao lado do `ask_user`), pela mesma razão: **não executa nada, só lê** o que você anexou. Anexe a base e converse normalmente; quando os trechos automáticos não bastam, o modelo puxa mais sozinho (até 4 pulls por turno: search → get → próxima página) antes de responder.
+
+```bash
+/config chat knowledge off      # desliga a exceção (CHATCLI_CHAT_KNOWLEDGE=false)
+/config chat knowledge on       # religa (default: on)
+```
+
+Funciona no caminho de tools **nativo** (API key) e no transporte **XML** (providers OAuth) — como todo o resto, agnóstico aos 14 providers.
+
+---
+
+## Referência rápida
+
+| Superfície | Valor |
+|---|---|
+| Criar | `/context create <nome> <corpus.jsonl\|dir> --mode knowledge` |
+| Anexar / desanexar | `/context attach <nome>` / `/context detach <nome>` |
+| Custo por turno | index card (~900 tokens, cacheado) + top-K volátil |
+| Toggle no chat | `/config chat knowledge on\|off\|toggle` (`CHATCLI_CHAT_KNOWLEDGE`, default `on`) |
+| Embeddings (opcional) | `CHATCLI_EMBED_PROVIDER=voyage\|openai\|bedrock` — sem provider, BM25 cobre tudo |
+| Limites | 100MB / 5.000 documentos por base; `get` paginado em ~12K chars |
+
+<Tip>
+**Knowledge vs `--rag`:** o `/context attach --rag K` existente é vetor-puro (exige embedding provider) e só faz push por turno. O modo `knowledge` funciona **sem chave nenhuma**, dá ao modelo o índice do corpus e adiciona o lado pull (`@knowledge`) — para corpora de documentação, prefira `--mode knowledge`.
+</Tip>
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card title="Contextos Persistentes" icon="box-archive" href="/features/persistent-context"></Card>
+  <Card title="RAG + HyDE" icon="magnifying-glass" href="/features/quality/rag-hyde"></Card>
+  <Card title="Criação de Skills" icon="wand-magic-sparkles" href="/features/skill-authoring"></Card>
+  <Card title="Bootstrap e Memória" icon="brain" href="/features/bootstrap-memory"></Card>
+</CardGroup>
