@@ -1,7 +1,7 @@
 ---
 title: "Knowledge Base (keyless RAG)"
 sidebarTitle: "Knowledge Base"
-description: "Turn documentation corpora into a knowledge base: a ~900-token index card in the prompt, hybrid BM25 + embeddings retrieval per turn, and the @knowledge tool for the agent to investigate — all without an API key."
+description: "Turn documentation corpora or code/infra repositories (Terraform, Kubernetes/Argo) into a knowledge base: a ~900-token index card in the prompt, hybrid BM25 + embeddings retrieval per turn, and the @knowledge tool for the agent to investigate — all without an API key."
 icon: "book-open"
 ---
 
@@ -35,6 +35,47 @@ Each JSONL line becomes a **virtual document** preserving `source`, title and pr
 
 `@docs-flatten` accepts **three sources** for the same JSONL: `root=<dir>` (local folder), `repo=<git-url>` (shallow clone) and `url=<site>` (a bounded same-host crawl for docs that only exist as an HTML site, with no Markdown repo).
 
+### Code and infrastructure (`kind=code`)
+
+Beyond documentation, `@docs-flatten` ingests **source-code, Terraform and GitOps (Kubernetes/Argo) repositories** — into the same JSONL schema, so knowledge mode changes nothing downstream. The `kind` parameter controls what enters and how it is sliced:
+
+| `kind` | What it ingests |
+|---|---|
+| `docs` (default) | Markdown/MDX only. Legacy behavior — existing docs workflows never start absorbing code by accident. |
+| `code` | **Also** source code, Terraform, Kubernetes/Argo YAML and shell, sliced **by structure** (functions, resources, manifests) with symbol/resource titles. The "point it at an app/infra/GitOps repo" mode. |
+| `auto` | Per file: Markdown stays Markdown, code/config slice by structure, other text windows. |
+
+The **slicing is language-agnostic** — it doesn't rely on a per-language keyword list, so it doesn't break when you switch stacks:
+
+| Files | Chunk unit | Title |
+|---|---|---|
+| `.go .java .kt .ts .rs .cs .cpp .swift .scala .php` … | top-level declaration (brace balance) | symbol (`HandleCheckout`, `OrderService`) |
+| `.tf .tfvars .hcl` | Terraform block | `type.name` (`aws_eks_cluster.main`) |
+| `.yaml .yml` | document (`---`) | `Kind/name` (`Rollout/checkout-api`) |
+| `.py .rb` | top-level `def`/`class` (indentation) | symbol |
+| `.sh .bash` | function / top-level block | function name |
+| any other text | size window | file path |
+
+The title is **best-effort metadata**: if the heuristic doesn't recognize the language, it falls back to the cleaned signature line — **content is always indexed and searchable**, a missed title never costs recall. Noise is skipped by default (`vendor/`, `node_modules/`, `.terraform/`, lockfiles, minified assets, binaries) and files above **1 MiB** are ignored.
+
+```bash
+# One base per layer — app, infra and gitops
+@docs-flatten root=./app   kind=code format=jsonl output=app.jsonl
+@docs-flatten root=./infra kind=code format=jsonl output=infra.jsonl   # .tf blocks
+@docs-flatten root=./argo  kind=code format=jsonl output=argo.jsonl    # .yaml manifests
+
+/context create app   app.jsonl   --mode knowledge
+/context create infra infra.jsonl --mode knowledge
+/context create argo  argo.jsonl  --mode knowledge
+/context attach app && /context attach infra && /context attach argo
+```
+
+With the three bases attached, `@knowledge search` **fans out across all of them** (each hit tagged by its source base), so the model **connects the layers**: _"the `checkout-api` Rollout won't go ready — connect the Argo manifest, the Terraform node group and the service health check in code"_.
+
+<Note>
+You do **not** need to classify the repo manually. The default is `docs` for safety, but the agent picks `kind=code` on its own: from intent (the tool schema documents the use), from the autonomous pipeline guidance (below), and from a **self-correcting hint** — running the default `docs` on a repo with no Markdown returns _"looks like a code repo, re-run with `kind=code`"_, and it recovers in the same turn.
+</Note>
+
 ### The index card (what enters the prompt)
 
 Attaching injects only a **deterministic, budget-bounded TOC** — name, scale, origin and the document list — living in the **cached** prompt prefix (byte-stable across turns). The model knows *what exists* without paying for the content:
@@ -53,7 +94,7 @@ Table of contents:
 
 Each turn, the passages relevant to the question are injected into a **volatile** block (outside the cached prefix):
 
-- **Pure-Go BM25** — always available, **no API key**, pt/English neutral. That's the floor.
+- **Pure-Go BM25** — always available, **no API key**, pt/English neutral. That's the floor. The tokenizer splits `snake_case`, `kebab-case` and `camelCase`/`PascalCase` into sub-words (keeping the whole token), so an identifier like `getUserName` or `aws_eks_cluster` is found by `user`, `eks`, etc. — code recall without losing exact match.
 - **Embeddings** ([Voyage/OpenAI/Bedrock](/en/features/quality/rag-hyde), when configured) — semantic boost, fused by normalized ranking (0.55/0.45). An embedding failure **degrades to lexical** with a warning; it never breaks the turn.
 
 ---
@@ -89,7 +130,7 @@ The steps above (flatten → create → attach) the **agent does for you**. When
     `@websearch` for the official documentation (preferably the project's Markdown repo), or use a repo/URL/path you pointed it at.
   </Step>
   <Step title="Flatten">
-    `@docs-flatten` with `root=<dir>`, `repo=<git>` or `url=<site>` → produces the JSONL corpus.
+    `@docs-flatten` with `root=<dir>`, `repo=<git>` or `url=<site>` → produces the JSONL corpus. For a code/infra repo, it adds `kind=code` (one base per layer: app, infra, gitops).
   </Step>
   <Step title="Create and attach">
     `@context create … --mode knowledge` → `@context attach …`.
@@ -145,13 +186,14 @@ Works on the **native** tool path (API key) and the **XML** transport (OAuth pro
 | Attach / detach | `/context attach <name>` / `/context detach <name>` |
 | Agent does it itself | the `@context` tool (`create`/`attach`/`detach`/`list`/`status`/`delete`) |
 | `@docs-flatten` sources | `root=<dir>` · `repo=<git>` · `url=<site>` (crawl) |
+| `@docs-flatten` kind | `kind=docs` (default, Markdown only) · `kind=code` (code/Terraform/YAML/shell, structure-aware) · `kind=auto` |
 | Cost per turn | index card (~900 tokens, cached) + volatile top-K |
 | Chat toggle | `/config chat knowledge on\|off\|toggle` (`CHATCLI_CHAT_KNOWLEDGE`, default `on`) |
 | Embeddings (optional) | `CHATCLI_EMBED_PROVIDER=voyage\|openai\|bedrock` — without a provider, BM25 covers everything |
 | Limits | 100MB / 5,000 documents per base; `get` paged at ~12K chars |
 
 <Tip>
-**Knowledge vs `--rag`:** the existing `/context attach --rag K` is vector-only (requires an embedding provider) and only pushes per turn. `knowledge` mode works **with no key at all**, gives the model the corpus index and adds the pull side (`@knowledge`) — for documentation corpora, prefer `--mode knowledge`.
+**Knowledge vs `--rag`:** the existing `/context attach --rag K` is vector-only (requires an embedding provider) and only pushes per turn. `knowledge` mode works **with no key at all**, gives the model the corpus index and adds the pull side (`@knowledge`) — for documentation or code/infra corpora, prefer `--mode knowledge`.
 </Tip>
 
 ## Next steps
