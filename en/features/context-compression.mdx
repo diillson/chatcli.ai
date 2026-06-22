@@ -1,0 +1,145 @@
+---
+title: "Context Compression (CCR)"
+sidebarTitle: "Context Compression"
+description: "Content-aware, reversible compression layer: shrinks tool output, logs, diffs, JSON, code and prose before the model — keyless, pure-Go, lossless by design. Includes output-token reduction and image compression."
+icon: "file-zipper"
+---
+
+ChatCLI ships a native **context compression** layer that dramatically cuts the tokens consumed by the bulky payloads an agent reads (search results, logs, diffs, JSON, code) and generates (response verbosity) — **without ever losing information** and with **no external dependency**: everything is pure standard-library Go, keyless, no cgo, no trained model, no network.
+
+<Info>
+The layer is **reversible by design**: lossy reduction only happens when the original is first written to a local store (CCR) and a marker is embedded in the prompt. The model recovers the original verbatim with `@recall`. Below a size threshold the output is byte-identical to before.
+</Info>
+
+---
+
+## Why it matters
+
+A single `@search` over a large codebase, a verbose `go test ./...`, or a JSON API response can inject tens of thousands of mostly-redundant tokens into the context. Without compression that volume:
+
+1. Saturates the context window and forces aggressive compaction (which loses information).
+2. Multiplies cost on every ReAct turn.
+3. Busts the provider's prefix cache when volatile content enters raw.
+
+The compression layer attacks this at the source — keeping only what the model needs to act and sending the rest to the reversible store.
+
+---
+
+## How it works
+
+A **ContentRouter** detects the content type (or trusts a hint from the originating tool) and routes to the right compressor. Each compressor is deterministic and type-specific:
+
+| Content type | Strategy | Typical reduction | Auto-fires? |
+| --- | --- | --- | --- |
+| Search results (grep/ripgrep) | `search` — group by file, keep first/last + error lines, caps | ~78–92% | Yes |
+| Build/test/runtime logs | `log` — keep errors, stack traces, deduped warnings, summary; drop noise | ~92–99% | Yes |
+| Unified diffs (git) | `diff` — keep +/-, trim context, hunk/file caps | ~87% | Yes |
+| Large JSON arrays | `json-crush` — lossless whitespace compaction + item sample with sentinel | ~96% | Yes |
+| Source code | `code-ast` — skeleton (signatures, no bodies) via `go/ast` + heuristic | ~41% | **No** (explicit only) |
+| Prose / Markdown (web/docs) | `prose` — dedup boilerplate, collapse blank runs, trim sections | ~44% | Web/explicit only |
+
+<Warning>
+**Code is never compressed automatically.** Dropping the body of a file the agent is about to edit would be harmful. `code-ast` only runs when explicitly requested (`@compress` with `hint=code`). Prose only auto-fires on **web** content (`@webfetch`/`@websearch`/`@wikipedia`) — reference material — never on local file reads.
+</Warning>
+
+### CCR — Contextual Compression Retrieval
+
+When a compressor drops part of a payload, the **full original** is written to a local store and a `<<ccr:HASH>>` marker is embedded in the output. The store is:
+
+- **Content-addressed** (key = SHA-256 hash of the content) → natural dedup: identical content is stored once.
+- **Bounded** (size cap via LRU + TTL) and **crash-safe** (no corruptible index — the directory is the index).
+- **Boundary-validated**: keys are validated as fixed-width hex before becoming a filesystem path (no path traversal).
+
+If the model needs the dropped detail, it calls `@recall` and gets the byte-identical original.
+
+---
+
+## `@compress` and `@recall` tools
+
+<ParamField path="@compress" type="tool">
+Compresses a payload on demand. Accepts `{"content":"...","hint":"auto|log|search|diff|json|code|prose"}` and returns the reduced form with the original preserved in CCR. The `{"cmd":"stats"}` subcommand reports session savings.
+</ParamField>
+
+<ParamField path="@recall" type="tool">
+Recovers the full original from a `<<ccr:KEY>>` marker. Accepts the bare key or the full marker. Use it when the compressed view omitted something you need.
+</ParamField>
+
+Both enter the completer and palette automatically.
+
+---
+
+## Automatic compression across all modes
+
+| Mode | Where compression engages |
+| --- | --- |
+| **agent / coder** | Each tool's output is compressed at the loop chokepoint, before it enters history (covers both the structured-native and legacy paths). Errors go verbatim so the model can debug them. |
+| **chat** | During history compaction: bulky tool feedback and **attached context** are reduced reversibly (CCR) instead of truncated — the main chat win, since chat is tool-less. |
+| **sub-agents / workers** | Delegated agents compress their output through the **same shared store**. Because CCR is content-addressed, identical content read by sibling agents is stored once (**cross-agent dedup**) and recoverable from any of them. |
+
+---
+
+## Output-token reduction
+
+Complementary to input compression, ChatCLI reduces the tokens the model **generates**:
+
+- **Verbosity steering** — a static (cache-friendly) directive injected into the cached system-prompt prefix tells the model to drop preamble, restatement and ceremony and lead with the answer/action. Levels: `full` (off), `concise` (default), `minimal`.
+- **Effort routing** (opt-in) — a keyless complexity classifier lowers reasoning effort on trivial prompts. It **only lowers** effort for clearly-trivial prompts and **only when no effort was already chosen** — it never overrides a skill/user choice and never raises effort, so it cannot degrade a hard task.
+
+Control at runtime via `/config output` (see below).
+
+---
+
+## Image compression (vision)
+
+Images are shrunk before reaching vision-capable models — see the [Vision Input](/en/features/vision-input) page. In short: downscale the longest edge to 1568px (what providers already do server-side, so it is token-equivalent) + re-encode photos as JPEG, preserving transparency (PNG), never inflating the payload. Keyless, pure-Go.
+
+---
+
+## Configuration
+
+### `/config compression`
+
+```
+/config compression            # panorama: mode, threshold, CCR store, savings
+/config compression lossy      # full reduction, reversible via @recall (default)
+/config compression lossless   # lossless reductions only (no line dropping)
+/config compression off         # disable
+/config compression stats      # per-strategy savings summary
+```
+
+### `/config output`
+
+```
+/config output                 # panorama: verbosity + effort routing
+/config output concise         # trim ceremony, keep substance (default)
+/config output minimal         # fewest correct tokens
+/config output full            # no steering
+/config output effort on|off   # complexity-based effort routing (opt-in)
+```
+
+### Environment variables
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `CHATCLI_COMPRESSION` | Mode: `off`, `lossless`, `lossy-with-ccr` | `lossy-with-ccr` |
+| `CHATCLI_COMPRESSION_THRESHOLD` | Bytes below which output is byte-identical (passthrough) | `4000` |
+| `CHATCLI_COMPRESSION_CCR_DIR` | CCR store directory | `~/.chatcli/ccr` |
+| `CHATCLI_COMPRESSION_CCR_MAX_MB` | Store size cap in MiB (`0` = no cap) | `256` |
+| `CHATCLI_COMPRESSION_CCR_TTL` | CCR entry TTL (Go duration; `0` = no TTL) | `168h` |
+| `CHATCLI_OUTPUT_VERBOSITY` | Verbosity steering: `full`, `concise`, `minimal` | `concise` |
+| `CHATCLI_OUTPUT_EFFORT_ROUTING` | Complexity-based effort routing (opt-in) | `off` |
+
+Session savings also surface in the chat footer (e.g. `🗜 12K saved`).
+
+---
+
+## Guarantees (never degrade)
+
+- A result that is irreversible or does not shrink → **verbatim passthrough** (the router rejects it).
+- No CCR available (lossless mode / no store) → lossy compressors **drop nothing**.
+- Idempotent: already-compressed content (carrying a marker) is not re-compressed.
+- Tool errors go verbatim so the model can debug them.
+
+<Tip>
+To see the gains in practice: run a large `@search`/grep or a verbose `go test` in `/agent`, observe the compressed output + the `<<ccr:...>>` marker, then `@recall` to confirm the byte-identical original, and `/config compression stats` for session savings.
+</Tip>
