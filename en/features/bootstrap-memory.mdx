@@ -261,6 +261,10 @@ All memory lives in `~/.chatcli/memory/`:
 |-- projects.json          # Active projects with context
 |-- usage_stats.json       # Usage patterns and statistics
 |-- memory_archive.json    # Archived facts (low score)
+|-- weekly/                # Weekly digests (consolidated from daily notes)
+|   +-- 2026-W27.md
+|-- monthly/               # Monthly digests (kept forever)
+|   +-- 2026-06.md
 |-- 202603/                # Daily notes for March 2026
 |   |-- 20260301.md
 |   +-- 20260306.md
@@ -281,13 +285,19 @@ All memory lives in `~/.chatcli/memory/`:
     Frequently accessed and recent facts get higher scores. Old, never-accessed facts naturally decay.
   </Accordion>
   <Accordion title="UserProfile -- User Profile" icon="user">
-    Automatically detected by the AI during extraction:
-    - Name, role, expertise level
+    Automatically detected by the AI during extraction and editable by you/the model in any mode:
+    - Name, role, expertise level, company, location
     - Preferred language and communication style
-    - Most used commands (top 10)
-    - General preferences
+    - Lists with lifecycle: **certifications, skills, goals, interests and directives** (restating an item **supersedes** the old one instead of duplicating; `_replace`/`_done`/`_remove` suffixes rewrite)
+    - **Directives** with severity (hard rules vs preferences) and **per-project scope** (`[scope:<project>] rule` is only injected when that workspace is active)
+    - **Stances** — technical positions recorded **with the why** (`"position :: reason"`)
+    - **Milestones** — dated timeline of what happened
+    - Structured **Environment** (`env_os`, `env_shell`, ...) — auto-migrated from legacy preferences
+    - **Per-field provenance and freshness**: each attribute knows whether it came from you or from extraction and when it was last confirmed; fields unconfirmed for 120+ days are flagged as possibly stale in the prompt
+    - **Privacy tier**: finance/health/family/document keys are auto-tagged `[sensitive]` — they personalize answers but never enter code, examples or generated artifacts (`sensitive_mark`/`sensitive_unmark` for manual control)
+    - Most used commands (top 10) and general preferences
 
-    View your profile with `/memory profile`.
+    View your profile with `/memory profile`. Old profiles polluted by append-only versions **self-heal on the next load** (fragments, progress duplicates and completed goals leave on their own).
   </Accordion>
   <Accordion title="TopicTracker -- Recurring Topics" icon="tags">
     Tracks technical topics discussed:
@@ -324,7 +334,7 @@ Instead of dumping all memory into the system prompt, ChatCLI uses **intelligent
 1. Extracts keywords from the last few conversation messages
 2. Searches relevant facts in FactIndex by keyword match + temporal score
 3. Respects a configurable budget (default: 4000 characters)
-4. Prioritizes: Profile > Projects > Topics > Relevant facts > Recent notes
+4. Prioritizes: Profile > Projects > Topics > Relevant facts > Recent notes > Trajectory (digests) > Usage patterns
 
 <Info>
 Facts accessed by the retriever automatically get their scores bumped, creating a virtuous cycle: the more useful a fact is, the more it appears.
@@ -387,7 +397,7 @@ The Memory Worker follows this internal flow:
    - `## PROJECTS` -- Projects mentioned or worked on
 3. **ParseEnhancedResponse()**: Parses the response and extracts each section individually
 4. **Deduplication**: Each fact receives a unique ID via SHA-256 content hash. Facts with a hash matching an existing one are automatically discarded
-5. **Profile merging**: `PROFILE_UPDATE` changes are **merged** with the existing profile, never fully replaced
+5. **Profile merging with lifecycle**: `PROFILE_UPDATE` changes are merged with the existing profile. List fields **upsert** (restating an item supersedes the old one instead of duplicating), and extraction may emit rewrite operations: `goals_done=`/`goals_remove=` remove finished goals (moving them to `milestone=`/`certifications=`), `goals_replace=` replaces the whole list — the same suffixes work for certifications, skills, interests and directives. Your instructions about the profile ("remove X from my goals") are **applied**, never recorded as if they were facts
 
 ### Automatic Compaction
 
@@ -410,6 +420,17 @@ The system runs periodic compaction to prevent uncontrolled growth:
     Rewrites MEMORY.md from the FactIndex -- always up-to-date, never the source of truth.
   </Step>
 </Steps>
+
+### Weekly and Monthly Digests (Trajectory)
+
+Daily notes expire after ~30 days — **rollups** preserve the long-range narrative before that:
+
+- When an ISO week ends, that week's daily notes consolidate into `weekly/2026-W27.md` (LLM summary with a deterministic fallback — never depends on the provider being up).
+- When a month ends, its weekly digests consolidate into `monthly/2026-06.md`.
+- Retention: weeklies keep ~26 weeks; **monthlies are kept forever** (minimal cost).
+- A bounded **Trajectory** section enters the memory context with the latest monthly + recent weeklies — that is how "what you have been doing these past months" survives daily-note cleanup.
+
+The process is idempotent and runs on its own in the memory worker (startup check plus every 12h).
 
 ### Automatic Migration
 
@@ -443,17 +464,29 @@ When starting for the first time with the new system, ChatCLI detects if a legac
 
 #### Manual editing and extended profile
 
-Automatic detection doesn't always catch everything, so you can **edit memory explicitly**. The user profile now covers, beyond name/role/expertise: **company, location, skills, certifications and goals**. List fields (skills, certifications, goals) accumulate and dedupe.
+Automatic detection doesn't always catch everything, so you can **edit memory explicitly**. Beyond name/role/expertise/company/location, the profile covers **certifications, skills, goals, interests, directives, stances, milestones and environment (env_*)**.
+
+List fields have a **lifecycle**, they are not append-only: new items enter, a restated item (same text apart from status/parenthetical) **supersedes** the old one in place, and operation suffixes rewrite — `_replace` overwrites the whole list (empty value clears it), `_done`/`_remove` delete matching items. Commas inside parentheses are safe (`"Quiz X (Provider, 60 questões)"` stays whole).
 
 ```text
 > /memory profile set company=ACME Corp
-> /memory profile set location=São Paulo, BR
-> /memory profile set certifications=CKA, AWS SAA   # becomes a deduplicated list
+> /memory profile set certifications=CKA, AWS SAA        # upsert, deduplicated
+> /memory profile set goals_done=earn the CKA            # finished goal leaves the list
+> /memory profile set milestone=Earned the CKA           # ...and becomes a dated milestone
+> /memory profile set goals_replace=launch product Y     # replaces ALL goals
+> /memory profile set stance=prefer keyless backends :: less setup friction
+> /memory profile set directives=[scope:my-repo] always run the linter before pushing
+> /memory profile set env_shell=zsh
+> /memory profile set sensitive_mark=monthly_income      # marks as private
 > /memory remember [preference] Prefers Go over Python for CLIs
-> /memory forget Python                              # removes facts containing "Python"
+> /memory forget Python                                  # removes FACTS containing "Python"
 ```
 
-#### `@memory` tool (in agent mode)
+<Info>
+`forget` only acts on **facts**; to remove profile items use the suffixes (`goals_remove=...`). Directives with `[scope:<project>]` are only injected when that workspace is active; without the tag they apply globally.
+</Info>
+
+#### `@memory` tool (agent, coder and chat)
 
 Inside `/agent` and `/coder`, the model can persist and explore memory on its own via the **`@memory`** tool (cmds `remember`, `profile`, `forget`, `recall`, `neighbors`, `map`):
 
@@ -461,7 +494,9 @@ Inside `/agent` and `/coder`, the model can persist and explore memory on its ow
 <tool_call name="@memory" args='{"cmd":"remember","args":{"content":"User earned the AWS Solutions Architect certification","category":"personal"}}' />
 ```
 
-So when you tell the agent something new (e.g. a fresh certification), it records it into your profile/long-term facts without you running `/memory` manually.
+So when you tell the agent something new (e.g. a fresh certification), it records it into your profile/long-term facts without you running `/memory` manually. The `profile` subcommand accepts every lifecycle operation (`goals_done`, `goals_replace`, `stance`, `milestone`, `env_*`, `sensitive_mark`, ...).
+
+**In chat too**: memory/profile updates are the **fourth sanctioned exception** of tool-less chat (alongside `ask_user`, read-only knowledge and `@graphview`). When you reveal or correct a durable fact about yourself, the model persists it **in the same turn** — no more "I'll keep that in mind" without writing anything. Gated by `CHATCLI_CHAT_MEMORY` (**on by default**), flippable with `/config chat memory on|off`.
 
 #### Knowledge graph (`@memory neighbors` / `map`)
 
