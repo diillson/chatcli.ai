@@ -1,0 +1,248 @@
+---
+title: "Chat Gateway — ChatCLI em Telegram, Slack, Discord, WhatsApp e Webhook"
+sidebarTitle: "Chat Gateway"
+description: "Roda o ChatCLI como daemon de mensageria: cada mensagem recebida passa pelo agent loop real (tools, shell, edição de arquivos) e o progresso é transmitido de volta ao chat enquanto o agente trabalha."
+icon: "messages"
+---
+
+O **Chat Gateway** expõe o ChatCLI como um bot/serviço em plataformas de mensagem. Você conversa pelo **Telegram, Slack, Discord, WhatsApp** ou um **webhook genérico**, e cada mensagem recebida é executada pelo **agent loop real** — o agente usa suas ferramentas (read/search, shell, edição de arquivos, web), executa a tarefa e **vai transmitindo o progresso de volta para a conversa** enquanto trabalha, fechando com um aviso de conclusão.
+
+<Warning>
+O agente roda em **auto-execução** (tools e shell). Trate o gateway como uma superfície remota privilegiada: **controle quem pode falar com o bot** (allow-list do Telegram, signing secret do Slack, secret do webhook) e endureça o agente com `CHATCLI_AGENT_SECURITY_MODE=strict` quando expô-lo. Veja [Segurança do Coder/Agente](/pt/features/security).
+</Warning>
+
+---
+
+## Arquitetura
+
+```text
+Adapter (por plataforma)  --inbound-->  Runner  --agent loop (streaming)-->  resposta
+        ^                                  |
+        └──────── Send(progresso/resposta) ┘
+```
+
+- **Adapter** — integração de uma plataforma. Recebe mensagens e envia respostas usando a API HTTP nativa da plataforma (sem SDKs de terceiros no `go.mod`).
+- **Runner** — roteia mensagens por conversa (`plataforma:chat`), com concorrência limitada e shutdown gracioso. Instala um **emissor de progresso** por mensagem.
+- **Agent loop** — cada mensagem vira uma tarefa do `/agent` (auto-execução). A narração que o agente já imprime é capturada e transmitida ao chat.
+
+### Streaming "ir falando" e throttling
+
+Enquanto o agente trabalha, suas linhas de saída substantivas são coalescidas e enviadas como **mensagens de progresso periódicas** (no máximo uma a cada poucos segundos, para respeitar os limites de taxa por chat das plataformas). Linhas puramente decorativas (molduras, spinners) são filtradas. Ao terminar, o gateway envia um aviso de conclusão.
+
+### Indicador "a IA está processando"
+
+Assim que uma mensagem chega, o gateway sinaliza que **recebeu e está trabalhando** — para você não ficar sem saber se a mensagem chegou em tarefas que demoram um pouco mais:
+
+- **Canais com indicador nativo** (Telegram): mostra o **"digitando…"** nativo (`sendChatAction`), renovado automaticamente antes de expirar enquanto o agente trabalha — sem poluir o chat com mensagens.
+- **Demais canais**: envia **uma** notícia curta ("🤔 …", localizada via `gateway.thinking`) após um pequeno atraso, e **só se a resposta ainda não saiu** — respostas rápidas não geram aviso nenhum.
+
+O sinal para no instante em que o agente responde.
+
+### Concorrência
+
+Como o agent loop muta estado compartilhado do ChatCLI e o `os.Stdout` é global, as execuções de agente são **serializadas**: mensagens chegam em paralelo (até 4 em buffer) mas rodam uma de cada vez. Cada conversa mantém um contexto leve (as últimas requisições do usuário) para dar continuidade entre turnos; o estado durável de verdade vive nos arquivos do workspace que o agente edita.
+
+### Modelo em runtime
+
+O gateway **espelha o modelo (e o provider) que a sua sessão interativa está usando** — não o default do `.env`. Trocar de modelo ou de provider na REPL com `/switch`, `/model` ou `/max-tokens` propaga para o daemon: ele relê a escolha **antes de cada mensagem**, então uma conversa em andamento no Telegram passa a responder com o novo modelo sem reiniciar o gateway.
+
+Como o daemon roda em um **processo separado**, a sincronização passa por um pequeno arquivo de estado em `~/.chatcli/runtime_model.json` que a sessão interativa escreve e o daemon lê. Isso resolve os dois casos: **subir o gateway depois** de trocar o modelo, e **trocar com o gateway já rodando**.
+
+<Note>
+Ao trocar de **provider**, o daemon adota o provider novo já com o modelo correto dele — desde que as credenciais desse provider estejam no ambiente que o daemon herdou (normalmente o seu `.env`). Ajustes que vivem só em memória, como `/switch --realm` / `--agent-id` do StackSpot, **não** propagam por esse arquivo; defina-os via variável de ambiente ou reinicie o gateway.
+</Note>
+
+---
+
+## Respostas conversacionais (não "tom de coder")
+
+O gateway usa o mesmo motor do `/coder` — **todas as ferramentas** (ler/editar arquivos, shell, web, MCP) continuam disponíveis — mas com uma **voz própria, conversacional**. A resposta final é a **mensagem que a pessoa lê no chat**, não um resumo técnico de commit: texto direto e natural, sem tabelas, banners, ASCII art ou blocos de código longos (a menos que peçam código). Internamente isso é um system prompt dedicado do gateway, aplicado no lugar do prompt de coder, preservando a mecânica de tool-use.
+
+### Idioma dinâmico (segue quem fala)
+
+A resposta sai **no idioma da mensagem do usuário**, detectado **a cada turno** — e não preso à locale do daemon. Português → responde em português; espanhol → espanhol; e assim por diante. A diretiva de idioma dinâmica é aplicada em **todos** os caminhos do gateway (inclusive com persona ativa), então a resposta nunca fica estática num idioma só. No **CLI interativo**, a diretiva fixa por locale (`CHATCLI_LANG`) continua valendo — quem muda é só o gateway.
+
+---
+
+## Ativação
+
+O gateway roda como **daemon desacoplado**: `/gateway start` re-executa o binário como um processo em background (`chatcli gateway`, com stdout e log próprios) e **devolve a REPL na hora** — você continua usando o chat normalmente. O daemon é rastreado por um pidfile em `~/.chatcli/gateway.pid` e segue vivo até você pará-lo (não há `Ctrl+C`; use `/gateway stop`).
+
+```text
+/gateway start     # sobe os adaptadores configurados em background (a REPL fica livre)
+/gateway status    # mostra o pid do daemon + plataformas registradas/prontas
+/gateway stop      # encerra o daemon
+```
+
+A atividade do daemon vai para `~/.chatcli/gateway.log` (o caminho é exibido no `start`). Cada adaptador **só liga quando suas variáveis obrigatórias estão presentes** — defina apenas os canais que quiser usar. Referência completa em [Variáveis de Ambiente → Chat Gateway](/pt/reference/environment-variables#chat-gateway-telegram-slack-discord-whatsapp-webhook).
+
+<Tabs>
+  <Tab title="Telegram">
+    Long-polling via `getUpdates` (sem servidor HTTP exposto).
+
+    ```bash
+    export CHATCLI_TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."     # obrigatório (BotFather)
+    export CHATCLI_TELEGRAM_ALLOWED_USERS="111111111,222222222"  # opcional; vazio = todos
+    ```
+  </Tab>
+  <Tab title="Slack">
+    Events API com verificação de assinatura HMAC.
+
+    ```bash
+    export CHATCLI_SLACK_BOT_TOKEN="xoxb-..."        # obrigatório
+    export CHATCLI_SLACK_ADDR=":8081"                # obrigatório (bind do servidor de eventos)
+    export CHATCLI_SLACK_SIGNING_SECRET="..."        # recomendado (verifica os eventos)
+    export CHATCLI_SLACK_PATH="/slack/events"        # opcional (default)
+    ```
+  </Tab>
+  <Tab title="Discord">
+    Gateway WebSocket v10.
+
+    ```bash
+    export CHATCLI_DISCORD_BOT_TOKEN="..."           # obrigatório
+    ```
+  </Tab>
+  <Tab title="WhatsApp">
+    WhatsApp Cloud API (webhook + verify handshake da Meta).
+
+    ```bash
+    export CHATCLI_WHATSAPP_ACCESS_TOKEN="..."       # obrigatório
+    export CHATCLI_WHATSAPP_PHONE_ID="123456"        # obrigatório
+    export CHATCLI_WHATSAPP_ADDR=":8082"             # obrigatório (bind do webhook)
+    export CHATCLI_WHATSAPP_VERIFY_TOKEN="meu-verify" # handshake GET
+    export CHATCLI_WHATSAPP_PATH="/whatsapp/webhook"  # opcional (default)
+    ```
+  </Tab>
+  <Tab title="Webhook">
+    Endpoint HTTP genérico — integra qualquer sistema que faça POST.
+
+    ```bash
+    export CHATCLI_WEBHOOK_ADDR=":8083"              # obrigatório (bind)
+    export CHATCLI_WEBHOOK_PATH="/inbound"           # opcional (default)
+    export CHATCLI_WEBHOOK_SECRET="supersegredo"     # opcional; validado em tempo constante
+    export CHATCLI_WEBHOOK_CALLBACK_URL="https://app/cb" # opcional; vazio = resposta síncrona
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Exemplo de uso
+
+```text
+# Terminal do servidor
+export LLM_PROVIDER=CLAUDEAI
+export ANTHROPIC_API_KEY=sk-ant-...
+export CHATCLI_TELEGRAM_BOT_TOKEN=123456:ABC...
+export CHATCLI_TELEGRAM_ALLOWED_USERS=111111111
+chatcli
+> /gateway start
+  OK Gateway iniciado (pid=4821) em: telegram. Logs: ~/.chatcli/gateway.log
+```
+
+No Telegram, o usuário `111111111` manda:
+
+> *"liste os arquivos Go alterados no último commit e resuma o diff"*
+
+O bot responde com **mensagens de progresso** conforme o agente roda `git`, lê arquivos e raciocina, e fecha com **✅ Tarefa concluída.**
+
+<Note>
+Quem não estiver na allow-list é ignorado. Slack e o webhook genérico verificam assinatura/secret antes de processar.
+</Note>
+
+---
+
+## Plataformas suportadas
+
+| Plataforma | Transporte | Obrigatórias | Auth |
+| --- | --- | --- | --- |
+| Telegram | long-polling | `CHATCLI_TELEGRAM_BOT_TOKEN` | allow-list de user IDs |
+| Slack | Events API (HTTP) | `..._BOT_TOKEN`, `..._ADDR` | signing secret (HMAC) |
+| Discord | Gateway WebSocket v10 | `CHATCLI_DISCORD_BOT_TOKEN` | token do bot |
+| WhatsApp | Cloud API (webhook) | `..._ACCESS_TOKEN`, `..._PHONE_ID`, `..._ADDR` | verify token |
+| Webhook | HTTP genérico | `CHATCLI_WEBHOOK_ADDR` | secret (constant-time) |
+
+---
+
+## Mensagens de voz (transcrição)
+
+O gateway aceita **áudio / notas de voz** em todos os canais. A mensagem é **transcrita para texto antes do pipeline** — então funciona com **qualquer um dos 14 providers de chat** (eles só veem texto; não exige modelo multimodal nem redesenho de mensagem). O adapter baixa a mídia, transcreve, e o agente trata como um pedido em texto normal — a transcrição é inclusive gravada no [Conversation Hub](/pt/features/conversation-hub).
+
+| Canal | Origem da voz |
+| --- | --- |
+| Telegram | nota de voz / áudio (`getFile` → download) |
+| WhatsApp | mensagem de áudio (lookup da Graph media API) |
+| Discord | anexo `audio/*` (CDN) |
+| Slack | arquivo `audio/*` (`url_private`, com bearer token) |
+| Webhook | `audio_b64` (inline base64) ou `audio_url` |
+
+### Backend de transcrição (zero-config, local-first, keyless)
+
+A seleção segue **local/sem-chave primeiro** — e desde a v1.135 tem um **piso embutido**: sem nada configurado, o gateway usa o **Whisper embarcado** (multilíngue, via [sherpa-onnx](/pt/features/text-to-speech) — o mesmo engine do TTS Kokoro), sem API key e sem cgo. O daemon **pré-baixa engine + modelo no startup**, então a primeira nota de voz já chega com tudo pronto.
+
+1. **`CHATCLI_TRANSCRIPTION_CMD`** — um comando STT local seu (qualquer wrapper). Lê o transcript do **stdout**, ou do `.txt` escrito em `{output_dir}`.
+2. **`CHATCLI_TRANSCRIPTION_URL`** — endpoint OpenAI-compatível **self-hosted** (whisper.cpp `whisper-server`, faster-whisper, Speaches). Keyless (a menos que `CHATCLI_TRANSCRIPTION_KEY`).
+3. **Whisper embarcado já provisionado** — se o cache (`~/.cache/chatcli/stt/`) já tem engine + modelo, ele vence qualquer chave de cloud.
+4. **whisper CLI no PATH** — se houver `whisper` (openai-whisper) ou `whisper-cli` (whisper.cpp), é usado **automaticamente, com zero config**. O modelo ggml é **baixado uma vez** para o cache (`~/.cache/chatcli/whisper/`), como o faster-whisper faz.
+5. **`GROQ_API_KEY`** → Groq Whisper (free tier).
+6. **`OPENAI_API_KEY`** → OpenAI Whisper.
+7. **nada configurado** → **Whisper embarcado**: download único (engine ~25MB + modelo `base` ~200MB) na subida do daemon. Só plataformas sem engine prebuilt (fora de Linux/macOS/Windows x64/arm64) caem na dica de configuração.
+
+`CHATCLI_TRANSCRIPTION_PROVIDER` fixa um backend (`embedded|command|url|groq|openai`) — `=embedded` força o motor embarcado mesmo com whisper/keys presentes. `CHATCLI_TRANSCRIPTION_MODEL` escolhe o tamanho do modelo embarcado (`tiny|base|small|medium|large-v3`, default `base`) ou o modelo cloud; `_LANG` fixa o idioma (default: auto-detecção do idioma falado); `CHATCLI_TRANSCRIPTION_CACHE_DIR` realoca o cache (path absoluto — útil para pré-seed air-gapped); `CHATCLI_GATEWAY_MAX_AUDIO_BYTES` limita o tamanho do download (default 20MB). O backend ativo aparece em `/config integrations`.
+
+<Warning>
+**Opus precisa de um decoder.** As notas de voz do Telegram/WhatsApp/Discord são **OGG/Opus**, e nem o whisper.cpp nem o motor embarcado decodificam Opus nativamente. Com o **ffmpeg** instalado, o gateway converte para WAV 16 kHz automaticamente e tudo funciona; sem ffmpeg, instale-o **ou** use um backend cloud/self-hosted (que decodifica no servidor). O idioma é **auto-detectado**, então a transcrição sai no idioma falado — e a resposta também.
+</Warning>
+
+#### Setup rápido
+
+**Zero-config** (Whisper embarcado — recomendado):
+
+```bash
+brew install ffmpeg        # só o decoder de Opus; o resto é automático
+/gateway start             # o daemon baixa engine + modelo na 1ª subida
+```
+
+100% local com whisper.cpp (se preferir o engine ggml):
+
+```bash
+brew install whisper-cpp ffmpeg          # macOS  (Linux: apt/dnf; Windows: scoop/winget)
+# nada mais: o chatcli detecta o whisper-cli, baixa o modelo no 1º uso e usa o ffmpeg p/ Opus
+```
+
+Self-hosted (um servidor whisper que decodifica Opus):
+
+```bash
+export CHATCLI_TRANSCRIPTION_URL="http://localhost:8080/v1"   # keyless
+```
+
+Cloud (decodifica Opus no servidor, nada instalado localmente):
+
+```bash
+export CHATCLI_TRANSCRIPTION_PROVIDER=openai   # usa OPENAI_API_KEY (ou =groq com GROQ_API_KEY)
+```
+
+Depois de configurar, reinicie o daemon (`/gateway stop && /gateway start`) e mande um áudio.
+
+---
+
+## Respostas em voz
+
+O caminho de volta também fala: por padrão (`CHATCLI_GATEWAY_VOICE_REPLY=auto`) o gateway **responde voz com voz** — mensagem de áudio recebe voice note, texto recebe texto — com qualquer backend TTS, incluindo o [motor embarcado Kokoro](/pt/features/text-to-speech) (offline, sem API key). Cada conversa liga/desliga pedindo em linguagem natural ("responde em áudio" / "para de mandar áudio") via tool `@voice`, com a preferência persistida por sessão. A resposta falada é escrita **para o ouvido** (sem emojis, listas ou markdown no áudio) e wav/aiff é transcodado para OGG/Opus quando há ffmpeg, virando voice note nativa no Telegram. Detalhes, modos e troubleshooting em **[Respostas em Voz](/pt/features/voice-replies)**.
+
+O gateway também trata o **índice de memória** do usuário como conhecimento real: perguntas pessoais ("o que você sabe sobre mim?") consultam a [memória persistente](/pt/features/bootstrap-memory) via `@memory recall` antes de qualquer "não sei".
+
+---
+
+## Continuidade cross-channel
+
+Quando o **[Conversation Hub](/pt/features/conversation-hub)** está ativo (padrão), o gateway compartilha a conversa com o chatcli do seu notebook: um assunto começado no Telegram continua no terminal e vice-versa. Cada mensagem recebida resolve o **principal** do remetente, lê o contexto recente e grava o turno no hub — então o que você falou no notebook aparece como contexto no Telegram, sem configurar nada (modo single-user). Para push em tempo real ao CLI conectado, rode o gateway **dentro do servidor** com `CHATCLI_GATEWAY_IN_SERVER=true`. Bots multi-usuário usam `CHATCLI_HUB_ISOLATE=true` + bindings. Detalhes em [Conversation Hub](/pt/features/conversation-hub).
+
+---
+
+## Veja também
+
+- [Conversation Hub](/pt/features/conversation-hub) — continuidade da conversa entre canais e o notebook
+- [Modo Agente](/pt/core-concepts/agent-mode) — o loop que executa cada mensagem
+- [Segurança](/pt/features/security) — endurecer a auto-execução
+- [Variáveis de Ambiente](/pt/reference/environment-variables#chat-gateway-telegram-slack-discord-whatsapp-webhook)

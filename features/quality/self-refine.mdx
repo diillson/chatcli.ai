@@ -1,133 +1,133 @@
 ---
-title: "#5 Self-Refine — Crítica e Reescrita"
+title: "#5 Self-Refine — Critique and Rewrite"
 sidebarTitle: "Self-Refine"
-description: "RefinerAgent recebe o rascunho do worker anterior, emite crítica estruturada em <critique> e reescrita em <revised>. Multi-pass com convergência por EpsilonChars para não iterar em outputs já bons."
+description: "RefinerAgent receives the previous worker's draft, emits structured critique in <critique> and rewrite in <revised>. Multi-pass with EpsilonChars convergence so we don't iterate on already-good outputs."
 icon: "wand-magic-sparkles"
 ---
 
-**Self-Refine** transforma a saída bruta de qualquer worker em versão polida via um ciclo deliberado de crítica → reescrita. O `RefinerAgent` é um worker pure-reasoning (zero tool access) que opera apenas sobre texto, e pode ser invocado diretamente pelo orquestrador ou automaticamente pelo `RefineHook` como post-processamento.
+**Self-Refine** turns raw worker output into polished versions via a deliberate critique → rewrite cycle. The `RefinerAgent` is a pure-reasoning worker (zero tool access) that operates on text only, and can be invoked directly by the orchestrator or automatically by `RefineHook` as post-processing.
 
-<Info>Self-Refine é **opt-in**. Com `CHATCLI_QUALITY_REFINE_ENABLED=false` (default), o `RefineHook` não é adicionado ao pipeline e zero overhead é introduzido.</Info>
+<Info>Self-Refine is **opt-in**. With `CHATCLI_QUALITY_REFINE_ENABLED=false` (default), the `RefineHook` is not added to the pipeline and zero overhead is introduced.</Info>
 
 ---
 
-## Protocolo do RefinerAgent
+## RefinerAgent protocol
 
-O modelo recebe TASK + DRAFT e emite dois blocos XML-ish:
+The model receives TASK + DRAFT and emits two XML-ish blocks:
 
 ```text
 <critique>
-- Bullet 1: logical gap identificado
-- Bullet 2: vagueness ou falta de exemplos
-- Bullet 3: claim não suportado
+- Bullet 1: identified logical gap
+- Bullet 2: vagueness or lack of examples
+- Bullet 3: unsupported claim
 </critique>
 
 <revised>
-…versão reescrita, endereçando cada bullet da crítica,
-pronta para ir ao usuário…
+…rewritten version addressing each critique bullet,
+ready to ship to the user…
 </revised>
 ```
 
-**Regras no system prompt:**
-- Output APENAS os dois blocos — nada antes, nada depois.
-- Se o draft já está excelente, `<revised>` repete verbatim e `<critique>` diz "no material issues".
-- **Nunca inventa novos requisitos** fora da TASK.
-- Mantém o mesmo formato do draft (código → código, prosa → prosa).
+**System prompt rules:**
+- Output ONLY the two blocks — nothing before, nothing after.
+- If draft is already excellent, `<revised>` repeats verbatim and `<critique>` says "no material issues".
+- **Never invents new requirements** beyond the TASK.
+- Keeps the draft's format (code → code, prose → prose).
 
-<Tip>O parser tolerante: se o modelo violar o protocolo, `RefinerAgent.Execute` retorna o response inteiro como output — Reflexion picks up a violação como sinal de baixa qualidade.</Tip>
+<Tip>The parser is tolerant: if the model violates the protocol, `RefinerAgent.Execute` returns the full response as output — Reflexion picks up the violation as a low-quality signal.</Tip>
 
 ---
 
-## Fluxo do RefineHook
+## RefineHook flow
 
 <Steps>
-  <Step title="Worker termina">
-    Um agente qualquer (CoderAgent, FileAgent, ...) produz `result.Output`.
+  <Step title="Worker finishes">
+    Any agent (CoderAgent, FileAgent, ...) produces `result.Output`.
   </Step>
-  <Step title="PostRun do RefineHook é invocado">
+  <Step title="RefineHook.PostRun is invoked">
     ```go
-    if result.Error != nil { return }  // erros vão para Reflexion, não Refine
+    if result.Error != nil { return }  // errors go to Reflexion, not Refine
     if !cfg.Refine.Enabled { return }
     if !AppliesToAgent(agent, cfg.ExcludeAgents) { return }
-    if len(draft) < cfg.MinDraftBytes { return }  // skip outputs curtos
+    if len(draft) < cfg.MinDraftBytes { return }  // skip short outputs
     ```
   </Step>
   <Step title="Multi-pass loop">
-    Para cada pass até `MaxPasses`:
+    For each pass up to `MaxPasses`:
     - Dispatch `workers.AgentCall{Agent: refiner, Task: RefineDirective + "Task: ...\n\nDraft: ..."}`
-    - Recebe `res.Output` com o conteúdo de `<revised>`
-    - Se `convergedRefine(currentDraft, res.Output, EpsilonChars)` → break
+    - Receives `res.Output` with contents of `<revised>`
+    - If `convergedRefine(currentDraft, res.Output, EpsilonChars)` → break
   </Step>
-  <Step title="Substitui result.Output">
-    `result.Output = currentDraft` (só se houve mudança).
+  <Step title="Replace result.Output">
+    `result.Output = currentDraft` (only if it changed).
   </Step>
 </Steps>
 
 ---
 
-## Convergência — cascade semântico
+## Convergence — semantic cascade
 
-O Self-Refine usa um **cascade char → Jaccard → embedding** pra decidir quando parar. O heurístico char-level antigo (`convergedCharHeuristic`, ainda fallback) só pegava igualdade literal; o cascade pega **mesmo significado em palavras diferentes**, que é o caso real da maioria dos rewrites.
+Self-Refine uses a **char → Jaccard → embedding cascade** to decide when to stop. The old char-level heuristic (`convergedCharHeuristic`, still available as fallback) only caught literal equality; the cascade catches **same meaning in different words**, which is the real case for most rewrites.
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
-│  Pass N: revisão nova (next) vs draft atual                 │
+│  Pass N: new revision (next) vs current draft              │
 └───────────────┬────────────────────────────────────────────┘
                 ▼
-   1. Char scorer (μs)  ─────────── sim > 0.99?  ─► CONVERGIU (idêntico)
-                       │                     sim < 0.3?  ─► DIVERGIU (obviamente diferente)
+   1. Char scorer (μs)  ─────────── sim > 0.99?  ─► CONVERGED (identical)
+                       │                     sim < 0.3?  ─► DIVERGED (obviously different)
                        ▼ borderline
-   2. Jaccard scorer (ms) ────── sim > 0.95 + high conf? ─► CONVERGIU
+   2. Jaccard scorer (ms) ────── sim > 0.95 + high conf? ─► CONVERGED
                        │
-                       ▼ ainda borderline
-   3. Embedding (ms + $) ──── sim > 0.92? ─► CONVERGIU
-                       │                  senão ─► CONTINUA REFINANDO
+                       ▼ still borderline
+   3. Embedding (ms + $) ──── sim > 0.92? ─► CONVERGED
+                       │                  otherwise ─► KEEP REFINING
                        │
-                       ▼ embedder fora
-   Fallback: Jaccard → Char (com flag DegradedFrom)
+                       ▼ embedder down
+   Fallback: Jaccard → Char (with DegradedFrom flag)
 ```
 
-### Os três scorers
+### The three scorers
 
-| Scorer | Custo | Pega | Confiança |
+| Scorer | Cost | Catches | Confidence |
 |---|---|---|---|
-| **Char** | μs | Igualdade literal, length delta | Alta nos extremos, baixa no meio |
-| **Jaccard** | ms | Sets de tokens normalizados (lowercase, stop-words PT/EN, sem pontuação) — captura reordenação | Cresce com tamanho do corpus |
-| **Embedding** | 100-500ms + $ | Cosine similarity via `embedding.Provider` (Voyage/OpenAI) — captura paráfrase + sinônimos | Alta, autoritativa |
+| **Char** | μs | Literal equality, length delta | High at extremes, low in the middle |
+| **Jaccard** | ms | Normalized token sets (lowercase, EN/PT stop-words, no punctuation) — captures reordering | Grows with corpus size |
+| **Embedding** | 100-500ms + $ | Cosine similarity via `embedding.Provider` (Voyage/OpenAI) — captures paraphrase + synonyms | High, authoritative |
 
 ### Quality regression guard
 
-Além de detectar convergência, o hook compara cada nova revisão contra o **draft original**. Se a similaridade começa a **cair** entre passes (rewrite está drift-ando pra pior), reverte ao melhor draft visto e marca `refine_rolled_back=true` no metadata — sinal que Reflexion consome:
+Beyond detecting convergence, the hook compares each new revision against the **original draft**. If similarity starts **dropping** between passes (rewrite is drifting worse), it reverts to the best draft seen and sets `refine_rolled_back=true` metadata — a signal Reflexion consumes:
 
 ```text
-pass 0: draft original                        sim_best=1.0
-pass 1: rewrite v1    sim vs original = 0.95  → melhor que original, keep
-pass 2: rewrite v2    sim vs original = 0.50  → drop > 15% → REVERT a v1
+pass 0: original draft                         sim_best=1.0
+pass 1: rewrite v1    sim vs original = 0.95  → better than original, keep
+pass 2: rewrite v2    sim vs original = 0.50  → drop > 15% → REVERT to v1
                                                 refine_rolled_back=true
 ```
 
-Isso previne o modelo de iterar até uma resposta pior quando a crítica superinterpreta.
+This prevents the model from iterating toward a worse answer when critique over-interprets.
 
-### Cache LRU com TTL
+### LRU cache with TTL
 
-Embedding é caro ($). O cascade cacheia vetores por `sha256(text)` numa LRU bounded (default 256 entries, 5min TTL) — durante um loop multi-pass, a mesma string aparece em comparações consecutivas e o hit evita chamada duplicada.
+Embedding is expensive ($). The cascade caches vectors by `sha256(text)` in a bounded LRU (default 256 entries, 5min TTL) — during a multi-pass loop, the same string appears in consecutive comparisons and hits skip duplicate calls.
 
-### Circuit breaker por scorer
+### Per-scorer circuit breaker
 
-Se o embedder retorna 3 erros consecutivos (provider 429/503/timeout), o breaker abre por 30s — o cascade degrada graciosamente pro Jaccard com `DegradedFrom="embedding_unavailable"` no Score. Zero stall no refine.
+If the embedder returns 3 consecutive errors (provider 429/503/timeout), the breaker opens for 30s — the cascade gracefully degrades to Jaccard with `DegradedFrom="embedding_unavailable"` in the Score. Zero refine stall.
 
-### Modo strict vs permissive
+### Strict vs permissive mode
 
-| Modo | Embedder fora | Comportamento |
+| Mode | Embedder down | Behavior |
 |---|---|---|
-| **permissive** (default) | Degrada pra Jaccard | Marca DegradedFrom no trail, continua |
-| **strict** | Recusa convergência | Trata embedding como autoridade; sem ela, `Converged=false` |
+| **permissive** (default) | Degrades to Jaccard | Marks DegradedFrom in the trail, continues |
+| **strict** | Refuses convergence | Treats embedding as authoritative; without it, `Converged=false` |
 
-Strict é pra workloads de alta-stakes (contratos legais, código de segurança) onde false-positive convergence = ship output não-polido.
+Strict is for high-stakes workloads (legal contracts, security code) where a false-positive convergence = shipping unpolished output.
 
-### Fallback legado
+### Legacy fallback
 
-Quando nenhum checker é wirado (ou `CONVERGENCE_ENABLED=false`), cai no heurístico char-level original:
+When no checker is wired (or `CONVERGENCE_ENABLED=false`), falls back to the original char-level heuristic:
 
 ```go
 func convergedCharHeuristic(a, b string, epsilon int) bool {
@@ -143,26 +143,26 @@ func convergedCharHeuristic(a, b string, epsilon int) bool {
 }
 ```
 
-Com `EpsilonChars=50` (default), para quando duas passadas diferem por menos de 50 caracteres. Barato mas cego a paráfrase — por isso o cascade é o default enterprise.
+With `EpsilonChars=50` (default), stops when two passes differ by less than 50 chars. Cheap but blind to paraphrase — hence the cascade as enterprise default.
 
 ---
 
-## Exclude lists (anti-recursão e agents mecânicos)
+## Exclude lists (anti-recursion and mechanical agents)
 
-O default `ExcludeAgents`:
+Default `ExcludeAgents`:
 
 ```go
 ExcludeAgents: []string{"formatter", "deps", "refiner", "verifier"}
 ```
 
-| Agente | Razão |
+| Agent | Reason |
 |---|---|
-| **formatter** | Output mecânico (arquivo formatado), refinar não agrega |
-| **deps** | Output é interpretação determinística de `go list`, `npm ls`, etc. |
-| **refiner** | **Anti-recursão**: refinar a saída do refiner criaria loop infinito |
-| **verifier** | Mesma razão — verifier já entrega output polido |
+| **formatter** | Mechanical output (formatted file), refine doesn't add value |
+| **deps** | Output is deterministic interpretation of `go list`, `npm ls`, etc. |
+| **refiner** | **Anti-recursion**: refining the refiner's output creates an infinite loop |
+| **verifier** | Same reason — verifier already delivers polished output |
 
-Adicione mais via env:
+Add more via env:
 
 ```bash
 export CHATCLI_QUALITY_REFINE_EXCLUDE="formatter,deps,refiner,verifier,shell,git"
@@ -172,88 +172,88 @@ export CHATCLI_QUALITY_REFINE_EXCLUDE="formatter,deps,refiner,verifier,shell,git
 
 ## `/refine` — session toggle
 
-Em vez de editar env vars e reiniciar, use o slash:
+Instead of editing env vars and restarting, use the slash:
 
 <CodeGroup>
-```bash Liga para toda a sessão
+```bash Turn on for the session
 /refine on
 # → self-refine ON for this session
 ```
 
-```bash Desliga
+```bash Turn off
 /refine off
 ```
 
-```bash Volta ao default do /config quality
+```bash Back to /config quality default
 /refine auto
 ```
 
-```bash Só para o próximo turn
+```bash Just for the next turn
 /refine once
-# (comportamento idêntico a "on" atualmente; o flag continua on até /refine off ou fim de sessão)
+# (today identical to "on"; flag stays on until /refine off or end of session)
 ```
 
-```bash Mostra estado atual
+```bash Show current state
 /refine
 # → self-refine: ON (session override active)
 ```
 </CodeGroup>
 
-O override de sessão mora em `cli.qualityOverrides.Refine` como `*bool`:
-- `nil` → defer ao `/config quality`
-- `&true` → força on
-- `&false` → força off
+The session override lives in `cli.qualityOverrides.Refine` as `*bool`:
+- `nil` → defer to `/config quality`
+- `&true` → force on
+- `&false` → force off
 
-É aplicado em cima do env no momento que `AgentMode.Run()` constrói seu `qualityConfig`.
+It's applied on top of env when `AgentMode.Run()` builds its `qualityConfig`.
 
 ---
 
-## Variáveis de ambiente
+## Environment variables
 
-### Básicos
+### Basics
 
-| Env var | Default | O que faz |
+| Env var | Default | What it does |
 |---|---|---|
 | `CHATCLI_QUALITY_REFINE_ENABLED` | `false` | Master switch |
-| `CHATCLI_QUALITY_REFINE_MAX_PASSES` | `1` | Hard cap de passes (recomendo 1-2) |
-| `CHATCLI_QUALITY_REFINE_MIN_BYTES` | `200` | Não refina outputs menores |
-| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | Threshold char do fallback |
-| `CHATCLI_QUALITY_REFINE_EXCLUDE` | `formatter,deps,refiner,verifier` | CSV de agents que NÃO são refinados |
+| `CHATCLI_QUALITY_REFINE_MAX_PASSES` | `1` | Hard cap on passes (recommend 1-2) |
+| `CHATCLI_QUALITY_REFINE_MIN_BYTES` | `200` | Don't refine outputs smaller than this |
+| `CHATCLI_QUALITY_REFINE_EPSILON` | `50` | Char-level fallback threshold |
+| `CHATCLI_QUALITY_REFINE_EXCLUDE` | `formatter,deps,refiner,verifier` | CSV of agents that are NOT refined |
 
-### Cascade semântico de convergência
+### Semantic convergence cascade
 
-| Env var | Default | Efeito |
+| Env var | Default | Effect |
 |---|---|---|
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_ENABLED` | `true` | Master switch do cascade. `false` = fallback pro char heurístico |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING` | `false` | Inclui embedding scorer — opt-in porque custa $ |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_STRICT` | `false` | Strict mode: recusa convergência sem embedding |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_HIGH` | `0.99` | Sim ≥ X pelo char → short-circuit CONVERGIU |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_LOW` | `0.3` | Sim < X pelo char → short-circuit DIVERGIU |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_JACCARD_HIGH` | `0.95` | Sim ≥ X pelo Jaccard (com confiança ≥ 0.6) → CONVERGIU |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING_SIM` | `0.92` | Threshold final do embedding |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_SIZE` | `256` | Entries do LRU cache de embeddings |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_TTL_MIN` | `5` | TTL do cache em minutos |
-| `CHATCLI_QUALITY_REFINE_CONVERGENCE_BREAKER_THRESHOLD` | `3` | Falhas consecutivas do embedder antes do breaker abrir |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_ENABLED` | `true` | Cascade master switch. `false` = char heuristic only |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING` | `false` | Include embedding scorer — opt-in because it costs $ |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_STRICT` | `false` | Strict mode: refuse convergence without embedding |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_HIGH` | `0.99` | Sim ≥ X on char → short-circuit CONVERGED |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CHAR_LOW` | `0.3` | Sim < X on char → short-circuit DIVERGED |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_JACCARD_HIGH` | `0.95` | Sim ≥ X on Jaccard (confidence ≥ 0.6) → CONVERGED |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING_SIM` | `0.92` | Final embedding cosine threshold |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_SIZE` | `256` | LRU cache size |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_CACHE_TTL_MIN` | `5` | Cache TTL in minutes |
+| `CHATCLI_QUALITY_REFINE_CONVERGENCE_BREAKER_THRESHOLD` | `3` | Consecutive embedder failures before breaker opens |
 
-<Tip>Pra habilitar o embedding: `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING=1` + qualquer provider de embeddings (`CHATCLI_EMBED_PROVIDER=voyage` / `openai` / `bedrock`). O cascade reutiliza o mesmo provedor do HyDE — zero infra duplicada. Veja [RAG + HyDE](/features/quality/rag-hyde) para detalhes por provider.</Tip>
+<Tip>To enable embedding: `CHATCLI_QUALITY_REFINE_CONVERGENCE_EMBEDDING=1` + any embeddings provider (`CHATCLI_EMBED_PROVIDER=voyage` / `openai` / `bedrock`). The cascade reuses the same provider as HyDE — zero duplicate infra. See [RAG + HyDE](/features/quality/rag-hyde) for per-provider details.</Tip>
 
-### Override do refiner agent
+### Refiner agent override
 
-O `RefinerAgent` tem defaults de `model=""` e `effort="medium"`. Override:
+`RefinerAgent` has defaults `model=""` and `effort="medium"`. Override:
 
 ```bash
-# Use Haiku para refine barato
+# Use Haiku for cheap refine
 export CHATCLI_AGENT_REFINER_MODEL="claude-haiku-4-5"
 export CHATCLI_AGENT_REFINER_EFFORT="low"
 
-# Ou gpt-5 com high effort para máxima qualidade
+# Or gpt-5 with high effort for max quality
 export CHATCLI_AGENT_REFINER_MODEL="gpt-5"
 export CHATCLI_AGENT_REFINER_EFFORT="high"
 ```
 
 ---
 
-## Exemplo: refine em resposta de documentação
+## Example: refine on documentation response
 
 <Tabs>
   <Tab title="Draft (CoderAgent output)">
@@ -266,14 +266,14 @@ export CHATCLI_AGENT_REFINER_EFFORT="high"
 
     Just call the Do method with a request and you get a response back.
     ~~~
-    **Score qualitativo:** vago, sem exemplo, "just" dismissivo.
+    **Quality judgment:** vague, no example, dismissive "just".
   </Tab>
   <Tab title="Critique">
     ```text
-    - "used for making requests" — tautologic; remover.
-    - Nenhum exemplo de código; readers de docs precisam de snippet.
-    - "various providers" — listar quais.
-    - "Just call" minimiza complexidade real (error handling, context, timeouts).
+    - "used for making requests" — tautologic; remove.
+    - No code example; docs readers need a snippet.
+    - "various providers" — list which.
+    - "Just call" minimizes real complexity (error handling, context, timeouts).
     ```
   </Tab>
   <Tab title="Revised">
@@ -298,52 +298,52 @@ export CHATCLI_AGENT_REFINER_EFFORT="high"
     The `ctx` parameter is mandatory — requests without a cancellable
     context will be rejected with `ErrContextRequired`.
     ~~~
-    **Qualidade:** concreto, exemplo code-ready, contrato explícito sobre `ctx`.
+    **Quality:** concrete, code-ready example, explicit `ctx` contract.
   </Tab>
 </Tabs>
 
 ---
 
-## Invocação direta pelo orquestrador
+## Direct invocation by the orchestrator
 
-Além do hook automático, o orquestrador pode chamar o refiner via `<agent_call>`:
+Beyond the automatic hook, the orchestrator can call the refiner via `<agent_call>`:
 
 ```xml
 <agent_call agent="refiner" task="Polish this draft doc section: [paste draft here]" />
 ```
 
-Útil quando:
-- Você quer refinar uma saída específica sem ligar o hook global.
-- A tarefa **em si** é "melhorar este texto".
-- Chains complexas: coder escreve → reviewer analisa → refiner poliaça a análise antes de entregar.
+Useful when:
+- You want to refine a specific output without enabling the global hook.
+- The task **itself** is "improve this text".
+- Complex chains: coder writes → reviewer analyzes → refiner polishes the analysis before delivery.
 
 ---
 
-## Custo e latência
+## Cost and latency
 
-| Config | Calls LLM extras por turn | Latência típica |
+| Config | Extra LLM calls per turn | Typical latency |
 |---|---|---|
-| `MaxPasses=1` (default) | +1 | 1-3s com Haiku, 3-8s com Sonnet |
-| `MaxPasses=2` | +1 a +2 (converge pode parar em 1) | até 2x |
-| `MaxPasses=3+` | Raramente converge → gasto | Evitar |
+| `MaxPasses=1` (default) | +1 | 1-3s with Haiku, 3-8s with Sonnet |
+| `MaxPasses=2` | +1 to +2 (convergence may stop at 1) | up to 2x |
+| `MaxPasses=3+` | Rarely converges → expensive | Avoid |
 
-<Warning>Refine brilha em tarefas de **escrita**: documentação, summaries, relatórios. É menos útil em tool-heavy workflows (shell, git, file) porque outputs já são mecânicos.</Warning>
+<Warning>Refine shines in **writing** tasks: documentation, summaries, reports. Less useful in tool-heavy workflows (shell, git, file) because outputs are already mechanical.</Warning>
 
 ---
 
-## Leia também
+## See also
 
 <CardGroup cols={2}>
   <Card title="#6 CoVe" icon="check-double" href="/features/quality/cove">
-    Chain-of-Verification complementa refine com checagem factual.
+    Chain-of-Verification complements refine with factual checking.
   </Card>
   <Card title="#3 Reflexion" icon="lightbulb" href="/features/quality/reflexion">
-    Se refine flagga low-quality em múltiplos turns, Reflexion persiste a lição.
+    If refine flags low-quality across multiple turns, Reflexion persists the lesson.
   </Card>
   <Card title="ReviewerAgent" icon="magnifying-glass-chart" href="/features/customizable-agents">
-    Agent pré-pipeline que faz code review. Refiner é complementar: um analisa, o outro reescreve.
+    Pre-pipeline agent that does code review. Refiner is complementary: one analyzes, the other rewrites.
   </Card>
-  <Card title="Configuração" icon="sliders" href="/features/quality/configuration">
-    Todos os CHATCLI_QUALITY_REFINE_* num lugar só.
+  <Card title="Configuration" icon="sliders" href="/features/quality/configuration">
+    All CHATCLI_QUALITY_REFINE_* in one place.
   </Card>
 </CardGroup>

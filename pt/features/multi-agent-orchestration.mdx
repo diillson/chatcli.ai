@@ -1,0 +1,726 @@
+---
+title: "Orquestração Multi-Agent"
+sidebarTitle: "Multi-Agent"
+description: "Sistema multi-agent com 12 agents especialistas embarcados + agents customizados que trabalham em paralelo, cada um com skills próprias, scripts aceleradores e preferências de modelo/effort individuais, orquestrados automaticamente pelo LLM."
+icon: "users"
+---
+
+O **modo Multi-Agent** transforma o `/coder` e o `/agent` em um sistema de orquestração onde o LLM despacha **agents especialistas em paralelo** para resolver tarefas complexas de forma mais rápida, mais barata e mais precisa. Cada agent tem sua própria expertise, suas próprias skills e — desde a atualização recente — seu próprio modelo preferido e nível de esforço.
+
+## Ativação
+
+O modo multi-agent é **ativado por padrão**. Para desativá-lo, defina:
+
+```bash
+CHATCLI_AGENT_PARALLEL_MODE=false
+```
+
+<Info>Quando desativado, o `/coder` e o `/agent` funcionam exatamente como antes — sem nenhum impacto.</Info>
+
+---
+
+## Arquitetura
+
+```text
+User Query
+    │
+    ▼
+AgentMode (ReAct loop existente)
+    │
+    ▼  (LLM responde com <agent_call> ou <tool_call> tags)
+Dispatcher (fan-out via semaphore + per-agent Model/Effort routing)
+    │
+    ├── FileAgent         ├── CoderAgent       ├── ShellAgent
+    ├── GitAgent          ├── SearchAgent      ├── PlannerAgent
+    ├── ReviewerAgent     ├── TesterAgent      ├── RefactorAgent
+    ├── DiagnosticsAgent  ├── FormatterAgent   ├── DepsAgent
+    └── CustomAgent(s)    (devops, security-auditor, etc.)
+           │
+           │  (cada worker: Model Router → client alvo + effort hint no ctx)
+           ▼
+Results Aggregator → Feedback para o LLM orquestrador
+```
+
+O LLM orquestrador recebe um **catálogo de agents** no system prompt e aprende a rotear tarefas usando tags `<agent_call>`:
+
+```xml
+<agent_call agent="file" task="Read all .go files in pkg/coder/engine/" />
+<agent_call agent="coder" task="Add Close method to Engine struct" />
+<agent_call agent="devops" task="Configure CI/CD pipeline with GitHub Actions" />
+```
+
+<Tip>Múltiplas tags `agent_call` na mesma resposta resultam em **execução paralela**.</Tip>
+
+---
+
+## Dois Modos de Execução
+
+O orquestrador possui dois mecanismos de execução, escolhendo o mais adequado por contexto:
+
+| Modo | Sintaxe | Quando Usar |
+|------|---------|-------------|
+| **agent_call** | `<agent_call agent="..." task="..." />` | Novas fases de trabalho, tarefas paralelas, leitura exploratória, refatoração multi-arquivo |
+| **tool_call** | `<tool_call name="@coder" args="..." />` | Fixes rápidos, diagnóstico de erros, patches pontuais, validação pós-agent. **IMPORTANTE**: múltiplos tool_calls independentes devem ser emitidos em uma ÚNICA resposta |
+
+### Guia de Decisão
+
+| Situação | Modo |
+|----------|------|
+| Ler múltiplos arquivos + buscar referências | `agent_call` (file + search em paralelo) |
+| Corrigir um erro de compilação | `tool_call` (patch direto) |
+| Escrever novo módulo + testes | `agent_call` (coder + shell) |
+| Verificar resultado de um agent | `tool_call` (read/exec rápido) |
+| Fix após falha de agent | `tool_call` (diagnóstico preciso) |
+| Retomar após fix aplicado | `agent_call` (próxima fase) |
+
+---
+
+## Agents Especialistas Embarcados
+
+Os 12 agents embarcados implementam a interface `WorkerAgent` e embutem `BuiltinAgentMeta`, que declara os defaults de `model` e `effort` e lê overrides via variáveis de ambiente (`CHATCLI_AGENT_<NAME>_MODEL` / `CHATCLI_AGENT_<NAME>_EFFORT`).
+
+### Estratégia de Effort por Agente
+
+Cada built-in tem um nível de esforço calibrado para o tipo de trabalho que ele faz. Isso economiza tokens em tarefas mecânicas e garante qualidade em tarefas que exigem raciocínio profundo.
+
+| Agent | Effort Default | Racional |
+|-------|:--------------:|----------|
+| **File** | `low` | Batch reads, sem raciocínio necessário |
+| **Coder** | `medium` | Diffs seguros precisam de algum pensamento |
+| **Shell** | `low` | Execução mecânica de comandos |
+| **Git** | `low` | Operações git são determinísticas |
+| **Search** | `low` | Grep/tree/read mecânicos |
+| **Planner** | `high` | Decomposição é onde o valor mora (pure reasoning) |
+| **Reviewer** | `high` | Achar bugs sutis exige raciocínio profundo |
+| **Tester** | `medium` | Gerar boilerplate + alguma semântica |
+| **Refactor** | `high` | Rename/extract precisa de modelo de referências |
+| **Diagnostics** | `high` | Root-cause analysis é raciocínio puro |
+| **Formatter** | `low` | Tool-driven, mecânico |
+| **Deps** | `low` | Interpretação de saída de ferramenta |
+
+**Model default:** todos os built-ins deixam `model` vazio — respeitam a escolha do usuário no `/switch` como padrão. Isso garante que o usuário controla o custo e não é surpreendido por um built-in trocando de modelo silenciosamente.
+
+### Override via Variáveis de Ambiente
+
+Para forçar um modelo ou nível de esforço diferente em um agent embarcado sem recompilar, defina as variáveis:
+
+```bash
+# Força o Planner a usar Opus com effort máximo
+export CHATCLI_AGENT_PLANNER_MODEL="claude-opus-4-6"
+export CHATCLI_AGENT_PLANNER_EFFORT="max"
+
+# Força o Formatter a usar Haiku para baratear formatação
+export CHATCLI_AGENT_FORMATTER_MODEL="claude-haiku-4-5"
+
+# Roda o Reviewer em gpt-5 (cross-provider)
+export CHATCLI_AGENT_REVIEWER_MODEL="gpt-5"
+export CHATCLI_AGENT_REVIEWER_EFFORT="high"
+```
+
+O nome do token no env var é o nome do agent em **uppercase** (`FILE`, `CODER`, `SHELL`, `GIT`, `SEARCH`, `PLANNER`, `REVIEWER`, `TESTER`, `REFACTOR`, `DIAGNOSTICS`, `FORMATTER`, `DEPS`).
+
+<Tip>
+Se o provider do modelo alvo não estiver configurado (ex.: `CHATCLI_AGENT_REVIEWER_MODEL=gpt-5` mas sem `OPENAI_API_KEY`), o dispatcher cai graciosamente no provider/modelo ativo do usuário e loga um aviso claro. Nenhum turno quebra por falta de API key.
+</Tip>
+
+### Os 12 Agents e Suas Skills
+
+<AccordionGroup>
+  <Accordion title="FileAgent (Leitura e Análise)" icon="file">
+    **Acesso:** Somente leitura (`read`, `tree`, `search`)
+    **Effort default:** `low`
+
+    **Skills:**
+    - `batch-read` — *Script acelerador:* le N arquivos em goroutines paralelas sem chamar o LLM
+    - `find-pattern` — Busca padrões em arquivos
+    - `analyze-structure` — Analisa estrutura de código
+    - `map-deps` — Mapeia dependências entre módulos
+  </Accordion>
+
+  <Accordion title="CoderAgent (Escrita e Modificação)" icon="code">
+    **Acesso:** Leitura/Escrita (`write`, `patch`, `read`, `tree`)
+    **Effort default:** `medium`
+
+    **Skills:**
+    - `write-file` — Criação de novos arquivos
+    - `patch-file` — Modificação precisa de código existente
+    - `create-module` — Geração de boilerplate
+    - `refactor` — Renomeação e refatoração segura
+  </Accordion>
+
+  <Accordion title="ShellAgent (Execução e Testes)" icon="terminal">
+    **Acesso:** Execução (`exec`, `test`)
+    **Effort default:** `low`
+
+    **Skills:**
+    - `run-tests` — *Script acelerador:* executa `go test ./... -json` e parseia resultados
+    - `build-check` — *Script acelerador:* executa `go build ./... && go vet ./...`
+    - `lint-fix` — Correção automática de lint
+  </Accordion>
+
+  <Accordion title="GitAgent (Controle de Versão)" icon="code-branch">
+    **Acesso:** Git ops (`git-status`, `git-diff`, `git-log`, `git-changed`, `git-branch`, `exec`)
+    **Effort default:** `low`
+
+    **Skills:**
+    - `smart-commit` — *Script acelerador:* coleta status + diff para commit inteligente
+    - `review-changes` — *Script acelerador:* analisa alterações com changed + diff + log
+    - `create-branch` — Criação de branches
+  </Accordion>
+
+  <Accordion title="SearchAgent (Busca no Codebase)" icon="magnifying-glass">
+    **Acesso:** Somente leitura (`search`, `tree`, `read`)
+    **Effort default:** `low`
+
+    **Skills:**
+    - `find-usages` — Encontra usos de símbolos
+    - `find-definition` — Encontra definições
+    - `find-dead-code` — Detecta código morto
+    - `map-project` — *Script acelerador:* mapeia projeto em paralelo (tree + interfaces + structs + funcs)
+  </Accordion>
+
+  <Accordion title="PlannerAgent (Raciocínio Puro)" icon="brain">
+    **Acesso:** Nenhum (sem tools — puro raciocínio LLM)
+    **Effort default:** `high`
+
+    **Skills:**
+    - `analyze-task` — Análise de complexidade e riscos
+    - `create-plan` — Criação de plano de execução
+    - `decompose` — Decomposição de tarefas complexas
+
+    <Info>O Planner é o agent que mais se beneficia de extended thinking — não tem tools, todo o valor vem da qualidade da decomposição.</Info>
+  </Accordion>
+
+  <Accordion title="ReviewerAgent (Revisão de Código e Qualidade)" icon="eye">
+    **Acesso:** Somente leitura (`read`, `search`, `tree`)
+    **Effort default:** `high`
+
+    **Skills:**
+    - `review-file` — Analisa arquivo para bugs, code smells, violações SOLID e issues de segurança
+    - `diff-review` — *Script acelerador:* revisa alterações staged via git-diff e git-changed
+    - `scan-lint` — *Script acelerador:* executa `go vet` e `staticcheck` e categoriza issues
+  </Accordion>
+
+  <Accordion title="TesterAgent (Testes e Cobertura)" icon="vial">
+    **Acesso:** Leitura/Escrita/Execução (`read`, `write`, `patch`, `exec`, `test`, `search`, `tree`)
+    **Effort default:** `medium`
+
+    **Skills:**
+    - `generate-tests` — Geração de testes abrangentes para funções e pacotes (LLM-driven)
+    - `run-coverage` — *Script acelerador:* executa `go test -coverprofile` e parseia cobertura por função
+    - `find-untested` — *Script acelerador:* encontra funções exportadas sem testes correspondentes
+    - `generate-table-test` — Geração de table-driven tests idiomáticos em Go
+  </Accordion>
+
+  <Accordion title="RefactorAgent (Transformações Estruturais)" icon="arrows-rotate">
+    **Acesso:** Leitura/Escrita (`read`, `write`, `patch`, `search`, `tree`)
+    **Effort default:** `high`
+
+    **Skills:**
+    - `rename-symbol` — *Script acelerador:* renomeia símbolo em todos os `.go`, ignorando strings e comentários
+    - `extract-interface` — Extrai interface a partir dos métodos de um tipo concreto
+    - `move-function` — Move função entre pacotes ajustando imports
+    - `inline-variable` — Substitui variável pelo seu valor em todos os pontos de uso
+  </Accordion>
+
+  <Accordion title="DiagnosticsAgent (Troubleshooting e Investigação)" icon="stethoscope">
+    **Acesso:** Leitura/Execução (`read`, `search`, `tree`, `exec`)
+    **Effort default:** `high`
+
+    **Skills:**
+    - `analyze-error` — Parseia mensagens de erro e stack traces mapeando para localizações no código
+    - `check-deps` — *Script acelerador:* executa `go mod tidy`, `go mod verify` e verifica saúde das dependências
+    - `bisect-bug` — Guia investigação para encontrar o commit que introduziu um bug
+    - `profile-bottleneck` — Executa benchmarks ou pprof e analisa hotspots de performance
+  </Accordion>
+
+  <Accordion title="FormatterAgent (Formatação e Estilo)" icon="paintbrush">
+    **Acesso:** Escrita/Execução (`read`, `patch`, `exec`, `tree`)
+    **Effort default:** `low`
+
+    **Skills:**
+    - `format-code` — *Script acelerador:* executa `gofmt -w` (ou `goimports -w`) nos arquivos Go
+    - `fix-imports` — *Script acelerador:* executa `goimports` para organizar imports
+    - `normalize-style` — Aplica convenções de naming e estilo consistentes (LLM-driven)
+  </Accordion>
+
+  <Accordion title="DepsAgent (Gerenciamento de Dependências)" icon="box-open">
+    **Acesso:** Leitura/Execução (`read`, `exec`, `search`, `tree`)
+    **Effort default:** `low`
+
+    **Skills:**
+    - `audit-deps` — *Script acelerador:* executa `go mod verify` e `govulncheck` para auditoria
+    - `update-deps` — *Script acelerador:* lista dependências desatualizadas com atualizações disponíveis (dry-run)
+    - `why-dep` — *Script acelerador:* explica por que uma dependência existe via `go mod why` e `go mod graph`
+    - `find-outdated` — Encontra todas as dependências com versões mais novas disponíveis
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Catálogo Visível ao Orquestrador
+
+O catálogo que o LLM orquestrador recebe no system prompt (via `registry.CatalogString()`) agora inclui o perfil de LLM de cada agent quando ele declara preferências não-default. Isso ajuda o LLM a tomar decisões informadas — por exemplo, preferir `planner` para decomposição profunda e `formatter` para trabalho mecânico barato.
+
+Exemplo do que o orquestrador vê:
+
+```text
+## Available Specialized Agents
+
+### planner (PlannerAgent)
+Expert in analyzing tasks and creating execution plans...
+LLM profile: effort=high
+Allowed commands:
+Skills: ...
+
+### formatter (FormatterAgent)
+Expert in code formatting and style normalization.
+LLM profile: effort=low
+Allowed commands: read, patch, exec, tree
+Skills: ...
+
+### devops-senior (DevOps Senior)
+Senior DevOps focused on CI/CD...
+LLM profile: effort=high, model=claude-opus-4-6
+Allowed commands: read, search, tree, exec, test
+Skills: ...
+```
+
+O perfil só aparece quando há hint — se `Effort()` e `Model()` retornam string vazia, nenhuma linha é adicionada (evita ruído no prompt).
+
+---
+
+## Agents Customizados como Workers
+
+Agents personas definidos em `~/.chatcli/agents/` são **automaticamente carregados** como workers no sistema de orquestração ao iniciar o `/coder` ou `/agent`. O LLM pode despachá-los via `<agent_call>` com o **mesmo ReAct loop**, leitura paralela e recuperação de erros dos agents embarcados.
+
+### Paridade Total com Skills
+
+Agents customizados agora têm os mesmos campos de preferência que skills:
+
+```yaml
+---
+name: "security-auditor"
+description: "Especialista em segurança com foco em OWASP Top 10"
+tools: Read, Grep, Glob
+skills:
+  - owasp-rules
+  - compliance
+model: "claude-opus-4-6"       # modelo ideal para o trabalho pesado
+effort: "high"                 # extended thinking ligado
+category: "security"
+version: "1.0.0"
+author: "Security Team"
+tags: security, owasp, audit
+---
+# Personalidade Base
+
+Você é um Security Auditor especialista. Análise código buscando
+vulnerabilidades OWASP Top 10, injection, XSS e más práticas.
+```
+
+Quando despachado, o dispatcher roda pelo Model Router e garante que este agent rode em `claude-opus-4-6` com `effort=high` — mesmo que o usuário esteja em Sonnet. Quando o worker termina, o próximo turno do usuário volta ao modelo original.
+
+### Como Funciona
+
+<Steps>
+  <Step title="Escaneamento">
+    Ao iniciar o modo multi-agent, o sistema escaneia `~/.chatcli/agents/` (global) e `./.agent/agents/` (projeto).
+  </Step>
+  <Step title="Criação do CustomAgent">
+    Para cada agent encontrado, cria um `CustomAgent` que implementa a interface `WorkerAgent`. `Model()` e `Effort()` vêm direto do frontmatter.
+  </Step>
+  <Step title="Mapeamento de Tools">
+    O campo `tools` do frontmatter YAML define quais comandos o agent pode usar.
+  </Step>
+  <Step title="Carregamento de Skills">
+    Skills associadas são carregadas e incluídas no system prompt do worker.
+  </Step>
+  <Step title="Registro no Catálogo">
+    O agent aparece no catálogo do orquestrador (com perfil de LLM se declarado) e pode ser despachado.
+  </Step>
+  <Step title="Dispatcher aplica hints">
+    A cada `<agent_call>`, antes do worker começar, o dispatcher consulta `ResolveModelRouting` (para model) e atacha `WithEffortHint` no ctx (para effort).
+  </Step>
+</Steps>
+
+### Mapeamento de Tools
+
+O campo `tools` do YAML frontmatter mapeia ferramentas estilo Claude Code para subcomandos do @coder:
+
+| Tool no YAML | Comando(s) @coder | Descrição |
+|--------------|-------------------|-----------|
+| `Read` | `read` | Ler conteúdo de arquivos |
+| `Grep` | `search` | Buscar padrões em arquivos |
+| `Glob` | `tree` | Listar diretórios |
+| `Bash` | `exec`, `test`, `git-status`, `git-diff`, `git-log`, `git-changed`, `git-branch` | Execução e operações git |
+| `Write` | `write` | Criar/sobrescrever arquivos |
+| `Edit` | `patch` | Edição precisa (search/replace) |
+| `MultiEdit` | `multipatch` | Edição transacional de múltiplos arquivos com rollback all-or-nothing |
+
+### Regras de Proteção
+
+<Warning>
+Os 12 nomes de agents embarcados (file, coder, shell, git, search, planner, reviewer, tester, refactor, diagnostics, formatter, deps) são protegidos e não podem ser sobrescritos por agents customizados.
+</Warning>
+
+- **Sem tools = read-only**: Agents sem campo `tools` recebem automaticamente `read`, `search`, `tree` e são marcados como read-only.
+- **Duplicatas ignoradas**: Se dois agents tiverem o mesmo nome, apenas o primeiro é registrado.
+
+---
+
+## Model Router — Roteamento Inteligente de Modelos
+
+Quando um agent declara `model:`, o dispatcher usa `llm/client.ResolveModelRouting` para escolher o cliente correto. Este resolver é a mesma função usada pelas skills — garantindo comportamento consistente em ambos os fluxos.
+
+### Pipeline de Resolução
+
+O resolver tenta os seguintes sinais, em ordem:
+
+<Steps>
+  <Step title="1. API cache do provider ativo">
+    Se o modelo alvo aparece na lista de modelos descobertos pelo provider atual (via endpoint `/models`), usa o provider do usuário e só troca o `model`. Isto cobre modelos reais que o catálogo estático não conhece ainda. Nota: `api-cached`.
+  </Step>
+  <Step title="2. Catálogo no provider do usuário">
+    Se `catalog.Resolve(userProvider, hint)` bate (match exato, alias ou prefixo), swap de model no mesmo provider. Nota: `catalog-same-provider`.
+  </Step>
+  <Step title="3. Catálogo em qualquer provider conhecido">
+    Se o modelo existe no catálogo de outro provider e este provider está em `GetAvailableProviders()` (tem API key configurada), swap cross-provider. Nota: `catalog-cross-provider`.
+  </Step>
+  <Step title="4. Heurística de família">
+    `claude-*/sonnet/opus/haiku` → CLAUDEAI, `gpt-*/chatgpt-*/o1/o3/o4` → OPENAI, `gemini-*` → GOOGLEAI, `grok-*` → XAI, `glm-*` → ZAI, `minimax*` → MINIMAX, `kimi-*/moonshot-*` → MOONSHOT, `llama*/mistral*/qwen*/deepseek*` → OLLAMA. Cobre modelos futuros que ainda não entraram no catálogo. Nota: `family-same-provider` ou `family-cross-provider`.
+  </Step>
+  <Step title="5. Otimista">
+    Modelo totalmente desconhecido? Passa para o provider do usuário e deixa a API decidir. Se o factory do provider aceitar, roda; se rejeitar, cai no fallback. Nota: `optimistic-user-provider`.
+  </Step>
+  <Step title="6. Fallback gracioso">
+    Se o provider alvo não está disponível (sem API key) ou o factory falhou, usa o cliente do usuário e preenche `UserMessage` com texto legível. Nota: `fallback-unavailable` ou `fallback-build-failed`.
+  </Step>
+</Steps>
+
+### Garantias
+
+- **`cli.Client`, `cli.Provider`, `cli.Model` nunca são mutados**. Swaps são escopo de turno.
+- **OAuth é verificado implicitamente**: provider só entra em `GetAvailableProviders()` se `auth.ResolveAuth` retornou algum credential (API key, OAuth token ou GitHub token). OAuth-only users são tratados igual API-key users.
+- **Cross-provider sem API key não quebra**: fallback gracioso com mensagem visível ao usuário.
+- **Logs estruturados**: cada decisão do resolver emite log com `note`, `from_provider`, `to_provider`, `from_model`, `to_model`.
+
+### Mapeamento de Effort para Providers
+
+O hint `effort:` é propagado via `context.WithValue` e lido pelos providers dentro de `SendPrompt`. Cada provider faz sua própria conversão:
+
+| Provider | Effort → Campo no Request | Modelos Suportados |
+|----------|---------------------------|-------------------|
+| **Anthropic (Claude)** | `thinking.budget_tokens` | opus-4.x, sonnet-4.x, 3.7-sonnet |
+| **OpenAI Chat Completions** | `reasoning_effort` | o1, o3, o4, gpt-5, `*-reasoning` |
+| **OpenAI Responses** | `reasoning.effort` | o1, o3, o4, gpt-5, `*-reasoning` |
+
+Modelos sem suporte recebem o request sem o campo (ignorado silenciosamente). A tabela de mapeamento:
+
+| Effort | Anthropic `budget_tokens` | OpenAI `effort` |
+|--------|---------------------------|-----------------|
+| `unset` | *(não enviado)* | *(não enviado)* |
+| `low` | *(não enviado)* | `low` |
+| `medium` | `4096` | `medium` |
+| `high` | `16384` | `high` |
+| `max` | `32768` | `high` *(OpenAI não tem "max")* |
+
+---
+
+## Skills: Scripts vs Descritivas
+
+Cada agent possui dois tipos de skills:
+
+<Tabs>
+  <Tab title="Skills Executáveis (Scripts Aceleradores)">
+    Sequências pré-definidas de comandos que **bypassam o LLM** para operações mecânicas e repetitivas, executando diretamente no engine:
+
+    ```text
+    batch-read   → Le N arquivos em goroutines paralelas (sem LLM call)
+    run-tests    → go test ./... -json | parse automático
+    build-check  → go build ./... && go vet ./...
+    smart-commit → git status + git diff --cached → resumo
+    map-project  → tree + search interfaces/structs em paralelo
+    ```
+  </Tab>
+  <Tab title="Skills Descritivas">
+    Informam o agent sobre suas capacidades — o agent resolve via seu **mini ReAct loop** com chamadas ao LLM:
+
+    ```text
+    refactor       → Renomeação segura com verificação de referências
+    find-dead-code → Análise de código não utilizado
+    create-plan    → Plano estruturado de execução
+    ```
+  </Tab>
+</Tabs>
+
+### Skills V2 (Pacotes)
+
+Skills V2 são diretórios contendo:
+- `SKILL.md` — Conteúdo principal com frontmatter
+- Subskills (`.md`) — Documentos de conhecimento adicional
+- `scripts/` — Scripts executáveis registrados automaticamente no worker
+
+```text
+skills/
+└── clean-code/
+    ├── SKILL.md            # Conteúdo principal
+    ├── naming-rules.md     # Subskill: regras de nomenclatura
+    ├── formatting.md       # Subskill: regras de formatação
+    └── scripts/
+        └── lint_check.py   # Script executável (registrado como skill)
+```
+
+O worker pode ler subskills com o comando `read` e executar scripts com `exec` durante sua operação autônoma.
+
+---
+
+## Estratégia de Recuperação de Erros
+
+Quando um `agent_call` **falha**, o orquestrador segue um protocolo de recuperação inteligente:
+
+<Steps>
+  <Step title="Diagnóstico via tool_call">
+    Usa `tool_call` direto para ler arquivos relevantes e entender o erro (já tem o contexto).
+  </Step>
+  <Step title="Fix via tool_call">
+    Patches, correções de arquivo e retentativas são mais rápidos e seguros via `tool_call`.
+  </Step>
+  <Step title="Retoma via agent_call">
+    Após fix aplicado e verificado, retoma usando `agent_call` para a próxima fase.
+  </Step>
+</Steps>
+
+<Note>Regra chave: Recuperação de erros = `tool_call` (rápido, preciso). Novas fases de trabalho = `agent_call` (paralelo, escalável).</Note>
+
+```text
+agent_call → FALHA
+    │
+    ▼
+tool_call: read (diagnosticar o erro)
+    │
+    ▼
+tool_call: patch (aplicar fix)
+    │
+    ▼
+tool_call: exec (verificar fix)
+    │
+    ▼
+agent_call → PRÓXIMA FASE (sucesso)
+```
+
+---
+
+## Configuração
+
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `CHATCLI_AGENT_PARALLEL_MODE` | `true` | Ativa/desativa o modo multi-agent |
+| `CHATCLI_AGENT_MAX_WORKERS` | `4` | Máximo de goroutines simultâneas |
+| `CHATCLI_AGENT_WORKER_MAX_TURNS` | `10` | Máximo de turnos por worker |
+| `CHATCLI_AGENT_WORKER_TIMEOUT` | `5m` | Timeout por worker |
+| `CHATCLI_AGENT_<NAME>_MODEL` | *(depende)* | Override do modelo para um built-in específico (ex.: `CHATCLI_AGENT_PLANNER_MODEL=claude-opus-4-6`) |
+| `CHATCLI_AGENT_<NAME>_EFFORT` | *(depende)* | Override do effort para um built-in específico (ex.: `CHATCLI_AGENT_FORMATTER_EFFORT=low`) |
+
+### Exemplo de `.env`
+
+```bash
+# Multi-Agent (Orquestração Paralela)
+CHATCLI_AGENT_PARALLEL_MODE=true    # Desative com false se necessário
+CHATCLI_AGENT_MAX_WORKERS=4
+CHATCLI_AGENT_WORKER_MAX_TURNS=10
+CHATCLI_AGENT_WORKER_TIMEOUT=5m
+
+# Overrides de built-ins (opcionais)
+CHATCLI_AGENT_PLANNER_MODEL=claude-opus-4-6
+CHATCLI_AGENT_PLANNER_EFFORT=max
+CHATCLI_AGENT_FORMATTER_MODEL=claude-haiku-4-5
+CHATCLI_AGENT_REVIEWER_EFFORT=high
+```
+
+---
+
+## Segurança Anti-Race
+
+O sistema implementa múltiplas camadas de proteção contra condições de corrida:
+
+<CardGroup cols={2}>
+  <Card title="FileLockManager" icon="lock">
+    Mutex per-filepath (caminhos absolutos normalizados). Operações de escrita adquirem lock; leituras não bloqueiam.
+  </Card>
+  <Card title="Histórico Isolado" icon="list">
+    Cada worker mantém seu próprio `[]models.Message`, sem compartilhamento.
+  </Card>
+  <Card title="LLM Clients Independentes" icon="server">
+    Cada worker cria sua própria instância de LLM client via factory pattern. Com o Model Router, cada worker pode ter cliente de provider diferente.
+  </Card>
+  <Card title="Engine Stateless" icon="gears">
+    Cada worker instância seu próprio `engine.Engine` fresh.
+  </Card>
+  <Card title="Context Tree" icon="sitemap">
+    O contexto pai pode cancelar todos os workers via `context.WithCancel`. Effort hints são anexados a este ctx.
+  </Card>
+  <Card title="Policy Enforcement" icon="shield">
+    Workers respeitam integralmente o `coder_policy.json` (allow/deny/ask). Ações com policy "ask" pausam o spinner e exibem um prompt de segurança serializado para o usuário.
+  </Card>
+</CardGroup>
+
+---
+
+## Governança de Segurança no Modo Paralelo
+
+Os workers paralelos respeitam **todas as regras** do arquivo `coder_policy.json` (global e local). Isso significa que ações como `write`, `patch`, `exec` passam pela mesma verificação de policies que o modo sequencial.
+
+### Comportamento por Tipo de Regra
+
+| Regra | Comportamento no Worker |
+|-------|------------------------|
+| **allow** | Ação executada automaticamente, sem interrupção |
+| **deny** | Ação bloqueada silenciosamente; worker recebe erro `[BLOCKED BY POLICY]` |
+| **ask** | Worker **pausa**, spinner é suspenso, e um prompt de segurança é exibido ao usuário |
+
+### Serialização de Prompts
+
+Quando múltiplos workers precisam de aprovação simultaneamente, os prompts são **serializados via mutex** — apenas um prompt é exibido por vez. Após a resposta do usuário, o próximo worker na fila recebe seu prompt. Isso evita:
+
+- Sobreposição visual de prompts no terminal
+- Conflito de leitura no stdin
+- Spinner renderizando sobre o prompt de segurança
+
+### Prompt com Contexto do Agent
+
+O prompt de segurança no modo paralelo exibe **informações contextuais** sobre qual agent está solicitando a ação:
+
+```text
+╔════════════════════════════════════════════════════════╗
+║                  SECURITY CHECK                         ║
+╚════════════════════════════════════════════════════════╝
+ Agent:  coder
+ Tarefa: Refatorar módulo de autenticação
+ ────────────────────────────────────────────────────────
+ Ação:   Escrever arquivo
+         arquivo: pkg/auth/handler.go
+ Regra:  nenhuma regra para '@coder write'
+ ────────────────────────────────────────────────────────
+ Escolha:
+   [y] Sim, executar (uma vez)
+   [a] Permitir sempre (@coder write)
+   [n] Não, pular
+   [d] Bloquear sempre (@coder write)
+```
+
+Isso permite que o usuário tome decisões informadas sobre cada ação, sabendo exatamente **qual agent** está pedindo e **por que**.
+
+### Respeito ao Provider/Modelo do Usuário
+
+Os workers paralelos utilizam, por padrão, o **provider e modelo ativos** no momento do despacho. Se o usuário trocar de provider via `/switch`, os próximos despachos de agents usarão o novo provider corretamente.
+
+**Exceção:** agents (built-in ou custom) que declaram `model:` e/ou `effort:` podem usar um client diferente para aquele turno específico, resolvido pelo Model Router. `cli.Client` continua apontando para a escolha do usuário — a troca é escopo de worker.
+
+---
+
+## Fluxo de Execução (Exemplo)
+
+<Steps>
+  <Step title="Usuário envia a query">
+    *"refatore o módulo coder, separe read e write"*
+  </Step>
+  <Step title="LLM orquestrador despacha agents paralelos">
+    ```xml
+    <agent_call agent="file" task="Read all .go files in pkg/coder/engine/" />
+    <agent_call agent="search" task="Find references to handleRead and handleWrite" />
+    ```
+  </Step>
+  <Step title="Dispatcher cria goroutines com clients resolvidos">
+    FileAgent roda em `effort=low` (modelo do usuário), SearchAgent idem. Ambos em paralelo, cada um com seu LLM client e mini ReAct loop isolado (dentro do limite `maxWorkers`).
+  </Step>
+  <Step title="Resultados agregados">
+    Feedback é enviado para o orquestrador.
+  </Step>
+  <Step title="Orquestrador despacha PlannerAgent">
+    Para decompor a refatoração. Planner roda com `effort=high` (extended thinking) — mesmo que o usuário esteja em Sonnet, o Planner pensa mais profundamente nesta fase.
+  </Step>
+  <Step title="Despacha CoderAgent">
+    Para a refatoração (com `effort=medium` e FileLock nos arquivos sendo escritos).
+  </Step>
+  <Step title="Despacha ShellAgent para testes">
+    Executa testes após a escrita (`effort=low`, mecânico).
+  </Step>
+  <Step title="Recuperação de erros (se necessário)">
+    Se testes falharem, usa `tool_call` para diagnóstico e fix rápido.
+  </Step>
+  <Step title="Validação final">
+    Orquestrador valida resultado final e reporta ao usuário.
+  </Step>
+</Steps>
+
+---
+
+## Maximização de Paralelismo
+
+O sistema de prompts do ChatCLI instrui explicitamente a IA a **maximizar paralelismo** em todos os níveis:
+
+1. **tool_call**: Operações independentes (ler 3 arquivos, buscar + ler) devem ser emitidas em uma ÚNICA resposta, não em turnos separados.
+2. **agent_call**: Para 3+ tarefas independentes, preferir `agent_call` que roda em goroutines paralelas.
+3. **Per-turn anchor**: A cada turno do ReAct loop, um lembrete reforça a necessidade de paralelismo.
+
+Exemplo correto (3 leituras em UMA resposta):
+```xml
+<tool_call name="@coder" args='{"cmd":"read","args":{"file":"main.go"}}' />
+<tool_call name="@coder" args='{"cmd":"read","args":{"file":"config.go"}}' />
+<tool_call name="@coder" args='{"cmd":"read","args":{"file":"handler.go"}}' />
+```
+
+Exemplo incorreto (3 turnos para operações independentes):
+```text
+Turn 1: read main.go → wait
+Turn 2: read config.go → wait
+Turn 3: read handler.go → wait
+```
+
+---
+
+## Compatibilidade
+
+- `CHATCLI_AGENT_PARALLEL_MODE=false`: **tudo funciona exatamente como antes**
+- Tags `<tool_call>` continuam funcionando mesmo com parallel mode ativo
+- Nenhuma assinatura de função existente foi alterada (apenas adições)
+- O package `cli/agent/workers/` é completamente isolado e não impacta funcionalidades existentes
+- Agents antigos sem `model:`/`effort:` continuam funcionando sem nenhuma mudança
+- Servers gRPC mais antigos que não carregam os campos novos de `AgentInfo` retornam zero values — o client os trata como "inherit"
+- Operator e CRDs não precisam de mudanças: agents são carregados pela `persona.Loader` dentro do pod, via ConfigMap mounts
+
+---
+
+## Quando usar Multi-Agent vs Subagent Delegation
+
+Multi-Agent (`<agent_call>`) e [Subagent Delegation](/pt/features/subagent-delegation) (`delegate_subagent`) **não são alternativas** — resolvem problemas diferentes e podem coexistir num mesmo turno:
+
+| Aspecto | `<agent_call>` (Multi-Agent) | `delegate_subagent` |
+|:--------|:------------------------------|:---------------------|
+| **Paralelismo** | Sim — várias tags numa só resposta executam em paralelo | Sequencial (uma por vez) |
+| **Escolha de agent** | Despacha para um agent do catálogo (FileAgent, CoderAgent, ReviewerAgent, customizados...) | Loop ReAct genérico, sem persona específica |
+| **Roteamento por modelo/effort** | Sim — cada agent pode ter `model:` e `effort:` próprios | Não — herda o cliente LLM do pai |
+| **Janela de contexto** | Isolada por worker | Isolada por subagente |
+| **Indicado para** | Quebrar tarefas grandes em **vários** subprojetos especializados rodando em paralelo | Uma análise focada que precisa consumir muitos tokens de dados brutos sem voltar todos para o pai |
+
+Use `<agent_call>` quando há **vários tipos de trabalho** independentes (ler arquivos + rodar testes + revisar diff). Use `delegate_subagent` quando há **uma análise concentrada** sobre um payload grande (resumir `/metrics`, encontrar agulha no log).
+
+---
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card title="Agentes customizáveis" icon="user-gear" href="/pt/features/customizable-agents">
+    Crie suas próprias personas com `model:`/`effort:` por agent.
+  </Card>
+  <Card title="Subagent Delegation" icon="share" href="/pt/features/subagent-delegation">
+    Delegação focada para uma análise concentrada num payload grande.
+  </Card>
+  <Card title="Agent Progress UI" icon="chart-bar" href="/pt/features/agent-progress-ui">
+    Display em tempo real de cada worker durante execução paralela.
+  </Card>
+  <Card title="Plugins agênticos" icon="puzzle-piece" href="/pt/features/agentic-plugins">
+    Catálogo completo de plugins disponíveis para os agents.
+  </Card>
+</CardGroup>

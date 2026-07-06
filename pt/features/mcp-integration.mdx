@@ -1,0 +1,568 @@
+---
+title: "MCP (Model Context Protocol)"
+sidebarTitle: "MCP"
+description: "Integre ferramentas externas via Model Context Protocol com suporte aos transports stdio, SSE e Streamable HTTP."
+icon: "link"
+---
+
+O **MCP (Model Context Protocol)** e um protocolo aberto para interoperabilidade de ferramentas com modelos de IA. O ChatCLI integra com servidores MCP, permitindo que a IA acesse ferramentas externas como sistema de arquivos, buscas web, bancos de dados e qualquer serviço compatível.
+
+---
+
+## Visão Geral
+
+```text
+ChatCLI <-> MCP Manager <-> MCP Server (stdio | sse | http)
+                              |
+                         Ferramentas externas
+                         (filesystem, search, DB, ...)
+```
+
+<Steps>
+  <Step title="Carrega configuração">
+    O MCP Manager carrega a configuração de servidores MCP.
+  </Step>
+  <Step title="Inicia servidores">
+    Inicia os servidores configurados (stdio, SSE ou Streamable HTTP).
+  </Step>
+  <Step title="Descobre ferramentas">
+    Descobre as ferramentas disponíveis em cada servidor.
+  </Step>
+  <Step title="Expoe ao modelo">
+    Expoe as ferramentas ao modelo de IA como `ToolDefinition`.
+  </Step>
+  <Step title="Roteia chamadas">
+    Roteia chamadas de ferramentas para o servidor correto.
+  </Step>
+</Steps>
+
+---
+
+## Configuração
+
+### Arquivo de Configuração
+
+Crie `~/.chatcli/mcp_servers.json`:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-filesystem", "/workspace"],
+      "enabled": true
+    },
+    {
+      "name": "web-search",
+      "transport": "sse",
+      "url": "http://localhost:8080/sse",
+      "enabled": true,
+      "overrides": ["@webfetch", "@websearch"]
+    },
+    {
+      "name": "database",
+      "transport": "stdio",
+      "command": "/usr/local/bin/mcp-postgres",
+      "args": ["--connection-string", "postgresql://localhost/mydb"],
+      "env": {
+        "PGPASSWORD": "secret"
+      },
+      "enabled": true
+    }
+  ]
+}
+```
+
+### Capacidades estendidas do servidor
+
+Além do mínimo (`name`, `command`, `args`, `env`, `transport`, `enabled`, `overrides`), o entry de cada servidor aceita um conjunto de campos opt-in cobrindo os mesmos casos suportados por Claude Code, Cline, Cursor e AWS EKS MCP — auto-aprovação de tools, filtragem `enabledTools`/`disabledTools`, timeouts próprios, working directory, headers HTTP custom e autenticação HTTP (`bearer`/`basic`/`header`, compartilhada por `sse` e `http`), além de metadados (`description`, `tags`, `category`) que aparecem em `/mcp status`.
+
+Qualquer chave fora do schema tipado é preservada verbatim no round-trip (catch-all `Extensions`), então copiar uma config de outro cliente funciona sem perder anotações vendor-specific.
+
+Referência completa com semântica, exemplos e troubleshooting: [Configuração de MCP Servers](/pt/reference/mcp-config).
+
+### Variáveis de Ambiente
+
+```bash
+CHATCLI_MCP_ENABLED=true
+CHATCLI_MCP_CONFIG=~/.chatcli/mcp_servers.json
+```
+
+### Via Flag do Servidor
+
+```bash
+chatcli server --mcp-config ~/.chatcli/mcp_servers.json
+```
+
+---
+
+## Transportes
+
+<Tabs>
+  <Tab title="stdio">
+    O transporte `stdio` inicia um processo local e se comunica via stdin/stdout usando JSON-RPC 2.0:
+
+    ```json
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-filesystem", "/workspace"]
+    }
+    ```
+
+    **Uso**: Servidores locais distribuidos como pacotes npm, binarios standalone ou scripts.
+  </Tab>
+  <Tab title="SSE (HTTP+SSE)">
+    O transporte `sse` conecta a um servidor HTTP remoto que expõe **dois endpoints** — `/sse` para o stream e `/messages` para os POSTs JSON-RPC, conforme o modelo original da spec MCP:
+
+    ```json
+    {
+      "name": "remote-tools",
+      "transport": "sse",
+      "url": "http://mcp-server:8080/sse"
+    }
+    ```
+
+    O listener do GET `/sse` é **supervisionado**: queda de conexão (proxy idle timeout, server restart) dispara reconnect com backoff exponencial + jitter (500 ms → 30 s cap), pending RPCs sobrevivem ao reconnect, e push notifications no mesmo stream alimentam [MCP Channels](/pt/features/mcp-channels).
+
+    **Uso**: servidores remotos baseados no modelo HTTP+SSE (servers anteriores à spec 2025-03-26 ou que mantêm esse modelo por compatibilidade).
+  </Tab>
+  <Tab title="http (Streamable HTTP)">
+    O transporte `http` conecta a um servidor remoto que expõe **um único endpoint** conforme a spec MCP **2025-03-26** (Streamable HTTP). Adotado pelo SDK oficial e por hosts como Cloudflare Workers MCP, FastMCP, mcp.deepwiki.com e gateways MCP gerenciados:
+
+    ```json
+    {
+      "name": "remote-tools",
+      "transport": "http",
+      "url": "https://mcp-server.example.com/mcp/",
+      "auth": {
+        "type": "bearer",
+        "token": "${MCP_TOKEN}"
+      }
+    }
+    ```
+
+    Cada chamada é um POST único; a resposta pode chegar como JSON one-shot, como SSE upgrade no mesmo response (carregando a resposta e notificações `notifications/*` intercaladas) ou como `202 Accepted` para notificações cliente→servidor. Se o servidor emitir `Mcp-Session-Id` no `initialize`, o transport captura e ecoa em todas as chamadas seguintes.
+
+    Push notifications server-initiated são lidas por um **listener GET separado** (opt-in pela spec). O ChatCLI inicia o listener logo após `initialize`; servidores que não implementam push respondem 405/404/501 no GET e o listener para limpo, sem retry. Quando o listener está ativo, push messages chegam em `/channel list` e podem disparar rules de trigger — veja [MCP Channels](/pt/features/mcp-channels).
+
+    **Uso**: servidores construídos contra a spec atual do MCP. Quando em dúvida entre `sse` e `http`, hit o endpoint com `curl` — quem responde no GET com `event: endpoint` é `sse`; quem responde no POST diretamente com JSON ou SSE upgrade é `http`.
+
+    <Note>A barra final na `url` é significativa. Vários servidores Streamable HTTP só respondem em `/mcp/` e 307-redirecionam `/mcp`. Detalhes e troubleshooting completos: [Configuração de MCP Servers — http (Streamable HTTP)](/pt/reference/mcp-config#http-streamable-http).</Note>
+  </Tab>
+</Tabs>
+
+---
+
+## Nomeacao de Ferramentas
+
+Ferramentas MCP são automaticamente prefixadas com `mcp_` e recebem a descrição do servidor de origem:
+
+```text
+Nome original: read_file
+Nome no ChatCLI: mcp_read_file
+Descrição: [MCP:filesystem] Reads a file from the filesystem
+```
+
+<Info>O prefixo `mcp_` evita colisões com ferramentas nativas do ChatCLI.</Info>
+
+---
+
+## Overrides de Built-ins (Shadow + Fallback)
+
+Quando um servidor MCP oferece uma ferramenta que **substitui** um plugin nativo (ex: `@webfetch`, `@websearch`), use o campo `overrides` para declarar quais built-ins ele substitui. O ChatCLI **esconde automaticamente** os built-ins listados enquanto o servidor MCP estiver conectado. Se o servidor **desconectar**, os built-ins são **restaurados imediatamente** — o usuário nunca perde a capacidade.
+
+### Por que usar overrides?
+
+Sem `overrides`, o LLM vê duas ferramentas que fazem a mesma coisa (ex: `@webfetch` e `mcp_web_fetch`) e escolhe aleatoriamente. Com `overrides`, o comportamento é **determinístico**: o LLM só vê a ferramenta MCP, sem ambiguidade.
+
+### Configuração
+
+Adicione `overrides` na configuração do servidor MCP:
+
+<Tabs>
+  <Tab title="CLI (mcp_servers.json)">
+    ```json
+    {
+      "mcpServers": [
+        {
+          "name": "web-tools",
+          "transport": "sse",
+          "url": "http://mcp-web:8080/sse",
+          "enabled": true,
+          "overrides": ["@webfetch", "@websearch"]
+        }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Helm (values.yaml)">
+    ```yaml
+    mcp:
+      enabled: true
+      servers:
+        - name: web-tools
+          transport: sse
+          url: "http://mcp-web:8080/sse"
+          enabled: true
+          overrides: ["@webfetch", "@websearch"]
+    ```
+  </Tab>
+  <Tab title="Operator (Instance CRD)">
+    ```yaml
+    apiVersion: platform.chatcli.dev/v1alpha1
+    kind: Instance
+    metadata:
+      name: my-chatcli
+    spec:
+      mcp:
+        enabled: true
+        servers:
+          - name: web-tools
+            transport: sse
+            url: "http://mcp-web:8080/sse"
+            enabled: true
+            overrides: ["@webfetch", "@websearch"]
+    ```
+  </Tab>
+</Tabs>
+
+### Como funciona
+
+```text
+MCP server "web-tools" CONECTADO + overrides: ["@webfetch", "@websearch"]
+  LLM vê:     mcp_web_fetch, mcp_web_search, @coder, ...
+  LLM NÃO vê: @webfetch, @websearch  (escondidos)
+
+MCP server "web-tools" DESCONECTOU (crash, rede, etc.)
+  LLM vê:     @webfetch, @websearch, @coder, ...  (restaurados automaticamente)
+  Log:         "MCP server 'web-tools' disconnected, restoring built-in overrides"
+```
+
+<Note>
+O sync de shadow acontece **a cada turno de conversa**, não apenas no startup. Isso significa que se o MCP server cair no meio de uma conversa, os built-ins voltam **na próxima mensagem** — sem restart necessário.
+</Note>
+
+### Regras importantes
+
+| Regra | Detalhe |
+|:------|:--------|
+| **Nomes exatos** | Use o nome completo do built-in, incluindo o `@` (ex: `"@webfetch"`, não `"webfetch"`) |
+| **Múltiplos servers** | Vários servers podem declarar overrides diferentes. Se dois servers fazem override do mesmo built-in, basta **um** estar conectado para manter o shadow |
+| **Server desabilitado** | `"enabled": false` no server = overrides **não** se aplicam (server nunca conecta) |
+| **Override parcial** | Você pode fazer override de apenas um built-in (ex: só `@websearch`) e manter os outros visíveis |
+| **Sem efeito no @coder** | O `@coder` não pode ser overridden via MCP — suas subcommands são tools nativas do modo /coder |
+
+<Warning>
+O campo `overrides` não desinstala nem modifica o plugin built-in. Ele apenas o **esconde do prompt** do LLM. O plugin continua disponível internamente e volta automaticamente quando necessário. Isso é **shadow, não delete**.
+</Warning>
+
+---
+
+## Deploy via Helm
+
+<Tabs>
+  <Tab title="Servidores MCP Inline">
+    ```yaml
+    # values.yaml
+    mcp:
+      enabled: true
+      servers:
+        - name: filesystem
+          transport: stdio
+          command: npx
+          args: ["-y", "@anthropic/mcp-server-filesystem", "/workspace"]
+          enabled: true
+        - name: web-tools
+          transport: sse
+          url: "http://mcp-web:8080/sse"
+          enabled: true
+          overrides: ["@webfetch", "@websearch"]  # esconde built-ins quando conectado
+    ```
+  </Tab>
+  <Tab title="ConfigMap Existente">
+    ```yaml
+    mcp:
+      enabled: true
+      existingConfigMap: "my-mcp-config"
+    ```
+  </Tab>
+</Tabs>
+
+O Helm chart cria automaticamente um ConfigMap com o `mcp_servers.json` e monta em `/etc/chatcli/mcp/`.
+
+---
+
+## Deploy via Operator (Instance CRD)
+
+Quando usando o ChatCLI Operator, configure MCP diretamente no recurso `Instance`:
+
+```yaml
+apiVersion: platform.chatcli.dev/v1alpha1
+kind: Instance
+metadata:
+  name: my-chatcli
+spec:
+  provider: CLAUDEAI
+  model: claude-sonnet-4-20250514
+  mcp:
+    enabled: true
+    servers:
+      - name: filesystem
+        transport: stdio
+        command: npx
+        args: ["-y", "@anthropic/mcp-server-filesystem", "/workspace"]
+        enabled: true
+      - name: github
+        transport: stdio
+        command: npx
+        args: ["-y", "@anthropic/mcp-server-github"]
+        env:
+          GITHUB_TOKEN: "ghp_xxxxx"
+        enabled: true
+      - name: remote-search
+        transport: sse
+        url: "http://mcp-search:8080/sse"
+        enabled: true
+        overrides: ["@webfetch", "@websearch"]  # esconde built-ins quando conectado
+```
+
+Ou referencie um ConfigMap existente:
+
+```yaml
+spec:
+  mcp:
+    enabled: true
+    existingConfigMap: "my-mcp-servers"
+```
+
+O controller automaticamente:
+1. Gera um ConfigMap `<instance>-mcp` com `mcp_servers.json`
+2. Monta em `/etc/chatcli/mcp/` (read-only)
+3. Passa `--mcp-config /etc/chatcli/mcp/mcp_servers.json` ao container
+
+<Info>O CRD `MCPSpec` espelha exatamente o formato do `mcp_servers.json`. Cada campo do `MCPServerSpec` corresponde a um campo do JSON — incluindo `overrides` para shadow de built-ins.</Info>
+
+---
+
+## Verificando Status
+
+O MCP Manager expoe o status de cada servidor:
+
+```go
+statuses := mcpMgr.GetServerStatus()
+for _, s := range statuses {
+    fmt.Printf("Server: %s, Connected: %v, Tools: %d\n",
+        s.Name, s.Connected, s.ToolCount)
+}
+```
+
+Para verificar se uma ferramenta e MCP:
+
+```go
+if mcpMgr.IsMCPTool("mcp_read_file") {
+    result, err := mcpMgr.ExecuteTool(ctx, "read_file", args)
+}
+```
+
+---
+
+## Servidores MCP Populares
+
+| Servidor | Descrição | Instalação |
+|:---------|:----------|:-----------|
+| `@anthropic/mcp-server-filesystem` | Acesso ao sistema de arquivos | `npx -y @anthropic/mcp-server-filesystem /path` |
+| `@anthropic/mcp-server-github` | Integração com GitHub | `npx -y @anthropic/mcp-server-github` |
+| `@anthropic/mcp-server-postgres` | Queries PostgreSQL | `npx -y @anthropic/mcp-server-postgres` |
+| `@anthropic/mcp-server-slack` | Integração com Slack | `npx -y @anthropic/mcp-server-slack` |
+
+<Tip>Consulte [modelcontextprotocol.io](https://modelcontextprotocol.io) para a lista completa de servidores MCP disponíveis.</Tip>
+
+---
+
+## MCP no Modo Client (TTY)
+
+<Info>
+Desde a versão mais recente, o MCP funciona diretamente no modo interativo (TTY), não apenas no modo servidor.
+O ChatCLI auto-detecta o arquivo `~/.chatcli/mcp_servers.json` e inicializa os servidores automaticamente ao iniciar.
+</Info>
+
+As ferramentas MCP são expostas nos **3 modos** do ChatCLI:
+
+| Modo | Como funciona |
+|:-----|:-------------|
+| **Chat** | Ferramentas listadas no system prompt como contexto informativo |
+| **Agent** | Ferramentas invocaveis via `<tool_call name="mcp_<tool>" args='...' />` |
+| **Coder** | Mesmo mecanismo do Agent mode |
+
+### Deferred Schemas (Economia de Tokens)
+
+Para economizar tokens no system prompt, o ChatCLI usa **deferred schemas**:
+
+1. Apenas **nome + descrição** são enviados no prompt (lightweight)
+2. Antes do primeiro uso, o modelo consulta o catálogo com `@tools describe` e recebe o bloco completo: **servidor de origem**, descrição, JSON Schema de parâmetros e forma de invocação
+3. O modelo invoca com os argumentos corretos
+
+```text
+Prompt: "mcp_read_file: [MCP:filesystem] Reads a file from the filesystem"
+
+Modelo: <tool_call name="@tools" args='{"cmd":"describe","args":{"name":"mcp_read_file"}}' />
+→ retorna servidor, descrição e JSON Schema completo
+
+Modelo invoca com args → execução real
+```
+
+`@tools list` também indexa as tools MCP junto com as builtins, **agrupadas por servidor de origem** — cada entrada carrega a tag `[MCP:servidor]`, então o modelo sempre sabe de qual servidor a tool vem.
+
+Como fallback, se o modelo invocar uma tool MCP **sem os parâmetros obrigatórios**, o schema completo é retornado como feedback para correção.
+
+<Tip>Isso pode economizar centenas de tokens por turno quando ha muitas ferramentas MCP conectadas.</Tip>
+
+---
+
+## Comando `/mcp`
+
+Gerencie servidores MCP diretamente do terminal interativo. Todos os subcomandos que aceitam um nome de servidor têm **autocomplete** — pressione `Tab` após `/mcp <subcomando>` para listar os servidores configurados.
+
+| Subcomando | Argumento | Descrição |
+|:-----------|:----------|:----------|
+| `/mcp` ou `/mcp status [nome]` | Opcional | Status de todos os servidores (sem nome) ou de um específico |
+| `/mcp tools [nome]` | Opcional | Lista todas as tools (sem nome) ou apenas as do servidor `<nome>` |
+| `/mcp start <nome>` | Obrigatório | Inicia um servidor parado (ou que falhou na inicialização) |
+| `/mcp stop <nome>` | Obrigatório | Para um servidor sem removê-lo da config — `start` depois ressuscita |
+| `/mcp restart [nome]` | Opcional | Reinicia um servidor (com nome) ou **todos** (sem nome) |
+| `/mcp reload` | — | Re-lê `mcp_servers.json` e reconcilia (mesma lógica do hot-reload, manual) |
+| `/mcp logs <nome>` | Obrigatório | Últimas 200 linhas de stderr do servidor (ring buffer em memória) |
+
+### Exemplo: status e logs
+
+```text
+> /mcp status
+
+╭── 🔌 MCP SERVERS
+│  ● filesystem    connected     3 tools  (2m 15s)
+│  ● web-search    connected     2 tools  (2m 15s)
+│  ○ database      disconnected
+│    ↳ start MCP server "mcp-postgres": exec: not found
+│
+│  Total: 3 servers, 5 tools available
+╰──────────────────────────────────────────────────────
+
+> /mcp logs filesystem
+
+╭── 📜 MCP LOGS — filesystem
+│  Server starting on /workspace
+│  Loaded 12 file watchers
+│  Tool list: read_file, write_file, list_dir
+╰──────────────────────────────────────────────────────
+```
+
+### Semântica de start/stop
+
+| Cenário | Comportamento |
+|:--------|:--------------|
+| `/mcp stop foo` em um servidor rodando | Mata o processo, drop das tools; **mantém a entry** no manager |
+| `/mcp start foo` depois de `stop` | Ressuscita usando a config atual em memória; tools voltam |
+| Hot-reload (edição do JSON) com `foo` parado pelo usuário | `Reload` **respeita** o stop manual; só reinicia se a config de `foo` mudar |
+| `/mcp restart` (sem nome) | Stop all + start all com **novo `mcpCtx`** — equivale a um reset completo |
+| `/mcp restart foo` | Stop + start apenas de `foo`, preservando o ctx global e os outros servidores |
+| Servidor que falhou no startup (LastError setado) | `/mcp start foo` limpa `LastError` e retenta — útil para retry após corrigir o command/env |
+
+<Note>
+A diferença entre `/mcp restart` e `/mcp reload`:
+
+- **`/mcp restart`** força um restart **mesmo se a config não mudou** (útil para "recarregar credentials" após editar shell env).
+- **`/mcp reload`** é um diff-and-apply contra `mcp_servers.json` — não reinicia nada que não tenha mudado.
+</Note>
+
+### Buffer de logs por servidor
+
+Cada servidor stdio mantém um **ring buffer de 200 linhas** alimentado pelo stderr do processo filho. Isso significa que:
+
+- `/mcp logs <nome>` mostra as últimas 200 linhas **sem precisar de `--debug`**;
+- Servidores muito tagarelas não consomem memória ilimitada — linhas antigas saem do início;
+- Capturas como `npm 404`, panic stacks e mensagens de inicialização ficam disponíveis mesmo após o startup terminar.
+
+<Tip>
+Combinação útil para diagnosticar conexão: `/mcp status` (estado), depois `/mcp logs <nome>` (o motivo). Sem precisar reiniciar com `CHATCLI_LOG_LEVEL=debug`.
+</Tip>
+
+---
+
+## Push notifications — MCP Channels
+
+Além de tools (request/response), o ChatCLI aceita **push notifications** de qualquer servidor MCP nos três transports. Notifications são mensagens JSON-RPC **sem `id`** (a forma que a spec reserva para "o server quer me dizer algo, não pediu nada em troca"). O ChatCLI captura, persiste e injeta automaticamente nas próximas conversas, e — opcionalmente — aciona o agent via rules de trigger.
+
+### O essencial
+
+- **Funciona em `stdio`, `sse` e `http`** — cada transport tem seu próprio listener:
+  - `sse`: o GET `/sse` que já carrega tool responses recebe notifications no mesmo stream.
+  - `http`: um GET separado no endpoint (opt-in pelo cliente, opcional pela spec) puxa notifications. Servidores que não suportam respondem 405/404/501 e o listener para limpo, sem retry.
+  - `stdio`: linhas JSON-RPC no stdout sem `id` são tratadas como notifications.
+- **Persistência durável** em `~/.chatcli/mcp/channels.jsonl` (até 10 MiB, rota­ciona, recarrega no boot).
+- **Auto-injection** das 5 mais recentes no system prompt de `chat`/`agent`/`coder` (uncached pra não trashar cache).
+- **Filtro per-server**: campo `channels` em `mcp_servers.json` aceita allow-list literal.
+- **Rules engine opcional** em `~/.chatcli/mcp/triggers.json` com 3 modos: `notify` (banner discreto, default), `confirm` (yes/no manual), `auto` (executa o agent — requer whitelist de tools).
+- **Slash commands**: `/channel list`, `/channel ack`, `/channel pause`, `/channel rules`, `/channel confirm <id>`, `/channel run <seq>`, `/channel inject`.
+
+### Exemplo mínimo — server com channels
+
+```json
+{
+  "name": "prom-alerts",
+  "transport": "sse",
+  "url": "https://prom-alerts.internal/sse",
+  "enabled": true,
+  "channels": ["alerts/critical", "alerts/error"]
+}
+```
+
+Com isso, alerts caem em `/channel list`, aparecem no banner do próximo prompt e são injetados automaticamente no contexto do agent.
+
+### Exemplo — trigger que investiga falhas de CI
+
+`~/.chatcli/mcp/triggers.json`:
+
+```json
+{
+  "rules": [
+    {
+      "name": "ci-investigator",
+      "server": "ci-monitor",
+      "channel": "ci-pipeline",
+      "contentRegex": "(?i)fail|broken",
+      "mode": "confirm",
+      "prompt": "Investigate this CI failure: {{content}}",
+      "rateLimit": "5m"
+    }
+  ]
+}
+```
+
+Cada falha de CI cita o user com um prompt no banner; `/channel confirm <id>` aceita e o agent começa a investigar.
+
+<Note>
+Documentação completa de channels, rules e troubleshooting: [MCP Channels](/pt/features/mcp-channels). Schema completo do campo `channels` e referência do `triggers.json`: [MCP Config](/pt/reference/mcp-config#channel-subscriptions-channels).
+</Note>
+
+---
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card title="MCP Channels" icon="message" href="/pt/features/mcp-channels">
+    Push messages dos três transports (`stdio`, `sse`, `http`) com persistência durável, filtro por servidor e rules engine (notify/confirm/auto).
+  </Card>
+  <Card title="Plugins agênticos" icon="puzzle-piece" href="/pt/features/agentic-plugins">
+    Sistema de plugins do ChatCLI — comparativo com MCP.
+  </Card>
+  <Card title="Tool Use Nativo" icon="wrench" href="/pt/features/native-tool-use">
+    APIs nativas Anthropic/OpenAI que potencializam MCP.
+  </Card>
+  <Card title="Configuração MCP" icon="gear" href="/pt/reference/mcp-config">
+    Formato completo de `mcp_servers.json` e exemplos.
+  </Card>
+</CardGroup>

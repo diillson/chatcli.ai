@@ -1,0 +1,149 @@
+---
+title: "Compressão de Contexto (CCR)"
+sidebarTitle: "Compressão de Contexto"
+description: "Camada de compressão content-aware e reversível: encolhe saída de tools, logs, diffs, JSON, código e prosa antes do modelo — keyless, pura-Go, sem perder informação. Inclui redução de tokens de saída e compressão de imagem."
+icon: "file-zipper"
+---
+
+O ChatCLI tem uma camada nativa de **compressão de contexto** que reduz drasticamente os tokens consumidos pelos payloads volumosos que um agente lê (resultados de busca, logs, diffs, JSON, código) e gera (verbosidade da resposta) — **sem nunca perder informação** e **sem nenhuma dependência externa**: tudo é Go puro da biblioteca padrão, keyless, sem cgo, sem modelo treinado e sem rede.
+
+<Info>
+A camada é **reversível por design**: redução com perda só acontece quando o conteúdo original é primeiro gravado num store local (CCR) e um marcador é embutido no prompt. O modelo recupera o original verbatim com `@recall`. Abaixo de um limiar de tamanho, a saída é byte-idêntica à de antes.
+</Info>
+
+---
+
+## Por que isso importa
+
+Um único `@search` em uma base grande, um `go test ./...` verboso ou uma resposta de API JSON podem injetar dezenas de milhares de tokens no contexto — a maioria redundante. Sem compressão, esse volume:
+
+1. Estoura a janela de contexto e força compactação agressiva (que perde informação).
+2. Multiplica o custo a cada turno do loop ReAct.
+3. Quebra o cache de prefixo do provedor quando conteúdo volátil entra cru.
+
+A camada de compressão ataca isso na origem, mantendo só o que o modelo precisa para agir e mandando o resto para o store reversível.
+
+---
+
+## Como funciona
+
+Um **ContentRouter** detecta o tipo de conteúdo (ou confia em uma dica da tool de origem) e roteia para o compressor certo. Cada compressor é determinístico e específico de um tipo:
+
+| Tipo de conteúdo | Estratégia | Redução típica | Auto-dispara? |
+| --- | --- | --- | --- |
+| Resultados de busca (grep/ripgrep) | `search` — agrupa por arquivo, mantém primeira/última + linhas de erro, caps | ~78–92% | Sim |
+| Logs de build/test/runtime | `log` — mantém erros, stack traces, warnings dedupados, summary; descarta ruído | ~92–99% | Sim |
+| Diffs unified (git) | `diff` — mantém +/-, apara contexto, caps de hunks/arquivos | ~87% | Sim |
+| Arrays JSON grandes | `json-crush` — compacta whitespace (lossless) + amostra de itens com sentinela | ~96% | Sim |
+| Código-fonte | `code-ast` — esqueleto (assinaturas, sem corpos) via `go/ast` + heurística | ~41% | **Não** (só explícito) |
+| Prosa / Markdown (web/docs) | `prose` — dedup de boilerplate, colapsa blank-runs, apara seções | ~44% | Só web/explícito |
+
+<Warning>
+**Código nunca é comprimido automaticamente.** Apagar o corpo de um arquivo que o agente está prestes a editar seria nocivo. O `code-ast` só roda quando explicitamente pedido (`@compress` com `hint=code`). A prosa só auto-dispara em conteúdo de **web** (`@webfetch`/`@websearch`/`@wikipedia`) — material de referência — nunca em leitura de arquivo local.
+</Warning>
+
+### CCR — Contextual Compression Retrieval
+
+Quando um compressor descarta parte de um payload, o **original completo** é gravado num store local e um marcador `<<ccr:HASH>>` é embutido na saída. O store é:
+
+- **Content-addressed** (chave = hash SHA-256 do conteúdo) → dedup natural: o mesmo conteúdo é gravado uma vez só.
+- **Bounded** (cap de tamanho via LRU + TTL) e **crash-safe** (sem índice corruptível — o diretório é o índice).
+- **Validado no boundary**: chaves são validadas como hex de largura fixa antes de virar caminho de arquivo (sem path traversal).
+
+Se o modelo precisar do detalhe descartado, ele chama `@recall` e recebe o original byte-idêntico.
+
+---
+
+## Tools `@compress` e `@recall`
+
+<ParamField path="@compress" type="tool">
+Comprime um payload sob demanda. Aceita `{"content":"...","hint":"auto|log|search|diff|json|code|prose"}` e devolve a forma reduzida com o original preservado no CCR. O subcomando `{"cmd":"stats"}` reporta a economia da sessão.
+</ParamField>
+
+<ParamField path="@recall" type="tool">
+Recupera o original completo de um marcador `<<ccr:KEY>>`. Aceita a chave nua ou o marcador inteiro. Use quando a visão comprimida omitiu algo necessário.
+</ParamField>
+
+Ambas entram automaticamente no completer e na palette.
+
+---
+
+## Compressão automática em todos os modos
+
+| Modo | Onde a compressão engata |
+| --- | --- |
+| **agent / coder** | Saída de cada tool é comprimida no chokepoint do loop, antes de entrar no histórico (cobre o caminho structured-native e o legacy). Erros vão verbatim para o modelo poder depurar. |
+| **chat** | Na compactação de histórico: feedback de tool volumoso e **contexto anexado** são reduzidos de forma reversível (CCR) em vez de truncados — ganho principal do chat, que é tool-less. |
+| **sub-agents / workers** | Agentes delegados comprimem sua saída pelo **mesmo store compartilhado**. Como o CCR é content-addressed, conteúdo idêntico lido por agentes irmãos é gravado uma vez só (**dedup cross-agent**) e recuperável de qualquer um deles. |
+
+---
+
+## Redução de tokens de saída
+
+Complementar à compressão de entrada, o ChatCLI reduz os tokens que o modelo **gera**:
+
+- **Verbosity steering** — uma diretiva estática (cache-friendly) injetada no prefixo cacheado do system prompt instrui o modelo a cortar preâmbulo, repetição da pergunta e cerimônia, e a liderar com a resposta/ação. Níveis: `full` (desligado), `concise` (padrão), `minimal`.
+- **Effort routing** (opt-in) — um classificador de complexidade keyless baixa o esforço de raciocínio em prompts triviais. **Só baixa** para prompts claramente triviais e **só quando nenhum esforço foi escolhido** — nunca sobrepõe escolha de skill/usuário e nunca aumenta, então não degrada tarefas difíceis.
+
+Controle em runtime via `/config output` (veja abaixo).
+
+---
+
+## Compressão de imagem (vision)
+
+Imagens são encolhidas antes de irem para modelos com visão — veja a página de [Entrada de Visão](/pt/features/vision-input). Resumo: downscale da maior aresta para 1568px (o que os provedores já fazem server-side, então é token-equivalente) + re-encode JPEG de fotos, preservando transparência (PNG), sem nunca inflar o payload. Keyless, puro-Go.
+
+---
+
+## Configuração
+
+### `/config compression`
+
+```
+/config compression            # painel: modo, threshold, store CCR, economia
+/config compression lossy      # redução total, reversível via @recall (padrão)
+/config compression lossless   # apenas reduções lossless (sem descartar linhas)
+/config compression off        # desativa
+/config compression stats      # resumo de economia por estratégia
+/config compression prune      # cura o store CCR agora (TTL + cap de tamanho)
+/config compression profile conservative|default|aggressive  # agressividade
+/config compression threshold <bytes>                        # limiar de acionamento
+```
+
+### `/config output`
+
+```
+/config output                 # painel: verbosidade + effort routing
+/config output concise         # corta cerimônia, mantém substância (padrão)
+/config output minimal         # menos tokens corretos possível
+/config output full            # sem steering
+/config output effort on|off   # roteamento de esforço por complexidade (opt-in)
+```
+
+### Variáveis de ambiente
+
+| Variável | Descrição | Padrão |
+| --- | --- | --- |
+| `CHATCLI_COMPRESSION` | Modo: `off`, `lossless`, `lossy-with-ccr` | `lossy-with-ccr` |
+| `CHATCLI_COMPRESSION_PROFILE` | Agressividade: `conservative`, `default`, `aggressive` | `default` |
+| `CHATCLI_COMPRESSION_THRESHOLD` | Bytes abaixo dos quais a saída é byte-idêntica (passthrough) | `4000` |
+| `CHATCLI_COMPRESSION_CCR_DIR` | Diretório do store CCR | `~/.chatcli/ccr` |
+| `CHATCLI_COMPRESSION_CCR_MAX_MB` | Cap de tamanho do store em MiB (`0` = sem cap) | `256` |
+| `CHATCLI_COMPRESSION_CCR_TTL` | TTL das entradas do CCR (duração Go; `0` = sem TTL) | `168h` |
+| `CHATCLI_OUTPUT_VERBOSITY` | Verbosity steering: `full`, `concise`, `minimal` | `concise` |
+| `CHATCLI_OUTPUT_EFFORT_ROUTING` | Effort routing por complexidade (opt-in) | `off` |
+
+A economia de cada turno aparece no footer do chat (ex.: `🗜 12K saved`); o acumulado da sessão fica em `/config compression stats`, junto com a taxa de acerto do `@recall`.
+
+---
+
+## Garantias (nunca degradar)
+
+- Resultado irreversível ou que não encolhe → **passthrough verbatim** (o router rejeita).
+- Sem CCR disponível (modo lossless / sem store) → compressores com perda **não descartam nada**.
+- Idempotente: conteúdo já comprimido (com marcador) não é re-comprimido.
+- Erros de tool vão verbatim para o modelo poder depurar.
+
+<Tip>
+Para ver os ganhos na prática: rode um `@search`/grep grande ou um `go test` verboso no `/agent`, observe a saída comprimida + o marcador `<<ccr:...>>`, depois `@recall` para confirmar o original byte-idêntico, e `/config compression stats` para a economia da sessão.
+</Tip>

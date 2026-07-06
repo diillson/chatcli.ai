@@ -1,62 +1,62 @@
 ---
 title: "#6 Chain-of-Verification (CoVe)"
 sidebarTitle: "CoVe"
-description: "VerifierAgent gera N perguntas de verificação independentes sobre os claims no rascunho, responde cada uma em isolamento, e reescreve a resposta quando detecta discrepâncias. Gera o signal que ativa Reflexion em alucinações."
+description: "VerifierAgent generates N independent verification questions about the draft's claims, answers each in isolation, and rewrites the response when discrepancies are detected. Emits the signal that activates Reflexion on hallucinations."
 icon: "check-double"
 ---
 
-**Chain-of-Verification** (Dhuliawala et al., 2023) é a técnica canônica para reduzir hallucination em outputs LLM. O fluxo: produzir resposta → gerar perguntas de verificação sobre as claims → responder cada pergunta **independentemente** (sem ver a resposta original) → reconciliar discrepâncias.
+**Chain-of-Verification** (Dhuliawala et al., 2023) is the canonical technique for reducing hallucination in LLM output. The flow: produce answer → generate verification questions about its claims → answer each question **independently** (without seeing the original answer) → reconcile discrepancies.
 
-O ChatCLI implementa via `VerifierAgent` (pure reasoning, zero tools) + `VerifyHook` (PostHook do pipeline). Quando discrepância é detectada, o flag `verified_with_discrepancy` é gravado em `result.Metadata`, ativando o Reflexion downstream.
+ChatCLI implements via `VerifierAgent` (pure reasoning, zero tools) + `VerifyHook` (PostHook in the pipeline). When a discrepancy is detected, the `verified_with_discrepancy` flag is recorded in `result.Metadata`, activating Reflexion downstream.
 
-<Info>CoVe é **opt-in**. Com `CHATCLI_QUALITY_VERIFY_ENABLED=false` (default), zero overhead. Quando ligado, adiciona +1 chamada LLM por ponto de uso com effort alto (default `effort="high"`).</Info>
+<Info>CoVe is **opt-in**. With `CHATCLI_QUALITY_VERIFY_ENABLED=false` (default), zero overhead. When enabled, it adds +1 LLM call per use point with high effort (default `effort="high"`).</Info>
 
 ---
 
-## Protocolo do VerifierAgent
+## VerifierAgent protocol
 
-O modelo recebe TASK + DRAFT e emite **cinco blocos**:
+The model receives TASK + DRAFT and emits **five blocks**:
 
 ```text
 <status>verified-clean OR verified-with-corrections</status>
 
 <questions>
-- Q1: claim específica 1 verificável
-- Q2: claim específica 2 verificável
-- Q3: claim específica 3 verificável
+- Q1: specific verifiable claim 1
+- Q2: specific verifiable claim 2
+- Q3: specific verifiable claim 3
 </questions>
 
 <answers>
-- A1: resposta independente a Q1 (sem olhar DRAFT)
-- A2: resposta independente a Q2
-- A3: resposta independente a Q3
+- A1: independent answer to Q1 (without looking at DRAFT)
+- A2: independent answer to Q2
+- A3: independent answer to Q3
 </answers>
 
 <discrepancies>
-- descrição da discrepância, OU "none"
+- description of discrepancy, OR "none"
 </discrepancies>
 
 <final>
-…resposta pronta para entregar ao usuário (repete DRAFT se verified-clean,
-ou reescreve se verified-with-corrections)…
+…answer ready to deliver to user (verbatim of DRAFT if verified-clean,
+or rewritten if verified-with-corrections)…
 </final>
 ```
 
-### Regra crítica: respostas INDEPENDENTES
+### Critical rule: INDEPENDENT answers
 
-O protocolo instrui o modelo a responder cada `Q<n>` **sem referenciar o DRAFT**. Isso é o coração de CoVe — se as respostas independentes contradizem o draft, há claim suspeito.
+The protocol instructs the model to answer each `Q<n>` **without referring to the DRAFT**. This is the heart of CoVe — if independent answers contradict the draft, there's a suspect claim.
 
-<Warning>Modelos que simplesmente regurgitam o draft nas respostas defeat o padrão. O system prompt enfatiza isso explicitamente; use modelos capazes de "self-distance" (Claude Sonnet, GPT-4+).</Warning>
+<Warning>Models that just parrot the draft in the answers defeat the pattern. The system prompt emphasizes this explicitly; use models capable of "self-distance" (Claude Sonnet, GPT-4+).</Warning>
 
 ---
 
-## Fluxo do VerifyHook
+## VerifyHook flow
 
 <Steps>
-  <Step title="Worker termina">
-    Qualquer agente produz `result.Output`.
+  <Step title="Worker finishes">
+    Any agent produces `result.Output`.
   </Step>
-  <Step title="PostRun do VerifyHook">
+  <Step title="VerifyHook.PostRun">
     ```go
     if result.Error != nil { return }
     if !cfg.Verify.Enabled { return }
@@ -73,12 +73,12 @@ O protocolo instrui o modelo a responder cada `Q<n>` **sem referenciar o DRAFT**
     ```
   </Step>
   <Step title="ParseVerifierOutput">
-    Extrai os 5 blocos. Tolerante a ordem, bullets com `-` ou `*`.
+    Extracts the 5 blocks. Tolerant to order, bullets with `-` or `*`.
   </Step>
   <Step title="HasDiscrepancy check">
-    `Status=="verified-with-corrections"` OU `Discrepancies!="none"`.
+    `Status=="verified-with-corrections"` OR `Discrepancies!="none"`.
   </Step>
-  <Step title="Se discrepância + RewriteOnDiscrepancy">
+  <Step title="On discrepancy + RewriteOnDiscrepancy">
     ```go
     result.SetMetadata("verified_with_discrepancy", "true")
     result.SetMetadata("verifier_discrepancies", parsed.Discrepancies)
@@ -87,45 +87,45 @@ O protocolo instrui o modelo a responder cada `Q<n>` **sem referenciar o DRAFT**
     }
     ```
   </Step>
-  <Step title="Reflexion consome o flag">
-    Na mesma execução do pipeline, `ReflexionHook.PostRun` vê o metadata e, se `OnHallucination=true`, dispara lesson generation.
+  <Step title="Reflexion consumes the flag">
+    In the same pipeline run, `ReflexionHook.PostRun` sees the metadata and, if `OnHallucination=true`, triggers lesson generation.
   </Step>
 </Steps>
 
 ---
 
-## Exclude list (anti-recursão + agents não-textuais)
+## Exclude list (anti-recursion + non-textual agents)
 
 ```go
 ExcludeAgents: []string{"formatter", "deps", "shell", "refiner", "verifier"}
 ```
 
-| Agente | Razão |
+| Agent | Reason |
 |---|---|
-| **formatter** | Output é código formatado, não claims |
-| **deps** | Output é lista determinística de pacotes |
-| **shell** | Output é stdout/stderr, não claims verificáveis |
-| **refiner** | Output já passou por crítica; verify seria redundante |
-| **verifier** | **Anti-recursão** — verificar o verifier criaria loop |
+| **formatter** | Output is formatted code, not claims |
+| **deps** | Output is deterministic package list |
+| **shell** | Output is stdout/stderr, not verifiable claims |
+| **refiner** | Output already went through critique; verify would be redundant |
+| **verifier** | **Anti-recursion** — verifying the verifier creates a loop |
 
 ---
 
 ## `/verify` — session toggle
 
 <CodeGroup>
-```bash Liga para sessão
+```bash Turn on for session
 /verify on
 ```
 
-```bash Desliga
+```bash Turn off
 /verify off
 ```
 
-```bash Retorna ao default do /config
+```bash Back to /config default
 /verify auto
 ```
 
-```bash Estado
+```bash State
 /verify
 # → verify: OFF (session override active)
 ```
@@ -133,35 +133,35 @@ ExcludeAgents: []string{"formatter", "deps", "shell", "refiner", "verifier"}
 
 ---
 
-## Variáveis de ambiente
+## Environment variables
 
-| Env var | Default | O que faz |
+| Env var | Default | What it does |
 |---|---|---|
 | `CHATCLI_QUALITY_VERIFY_ENABLED` | `false` | Master switch |
-| `CHATCLI_QUALITY_VERIFY_NUM_QUESTIONS` | `3` | Quantas perguntas de verificação |
-| `CHATCLI_QUALITY_VERIFY_REWRITE` | `true` | Reescrever output em discrepância |
-| `CHATCLI_QUALITY_VERIFY_EXCLUDE` | `formatter,deps,shell,refiner,verifier` | CSV de exclusões |
+| `CHATCLI_QUALITY_VERIFY_NUM_QUESTIONS` | `3` | How many verification questions |
+| `CHATCLI_QUALITY_VERIFY_REWRITE` | `true` | Rewrite output on discrepancy |
+| `CHATCLI_QUALITY_VERIFY_EXCLUDE` | `formatter,deps,shell,refiner,verifier` | CSV of exclusions |
 
-### Override do verifier
+### Verifier override
 
 ```bash
-# Use modelo mais forte só para verify
+# Use a stronger model just for verify
 export CHATCLI_AGENT_VERIFIER_MODEL="claude-opus-4-8"
 export CHATCLI_AGENT_VERIFIER_EFFORT="max"
 
-# Ou mais questions para workflows críticos
+# Or more questions for critical workflows
 export CHATCLI_QUALITY_VERIFY_NUM_QUESTIONS=5
 ```
 
 ---
 
-## Exemplo: catching hallucination sobre API
+## Example: catching API hallucination
 
 <Tabs>
-  <Tab title="Draft (com erro sutil)">
-    > O `http.Client` do Go tem um campo `DefaultTimeout` que você pode setar globalmente. Basta fazer `http.DefaultClient.DefaultTimeout = 30 * time.Second` no init do programa.
+  <Tab title="Draft (with subtle error)">
+    > Go's `http.Client` has a `DefaultTimeout` field you can set globally. Just do `http.DefaultClient.DefaultTimeout = 30 * time.Second` in the program's init.
 
-    **Erro:** `DefaultTimeout` **não existe**. É `Timeout` (e não há "DefaultTimeout" na stdlib).
+    **Error:** `DefaultTimeout` **doesn't exist**. It's `Timeout` (and there's no "DefaultTimeout" in stdlib).
   </Tab>
   <Tab title="Questions">
     ```
@@ -183,18 +183,18 @@ export CHATCLI_QUALITY_VERIFY_NUM_QUESTIONS=5
     ```
     `Status`: `verified-with-corrections`
   </Tab>
-  <Tab title="Final (reescrito)">
-    > O `http.Client` do Go tem um campo `Timeout` (não `DefaultTimeout`). Para aplicar globalmente, você pode fazer:
+  <Tab title="Final (rewritten)">
+    > Go's `http.Client` has a `Timeout` field (not `DefaultTimeout`). To apply globally you can do:
     >
     > ```go
     > http.DefaultClient.Timeout = 30 * time.Second
     > ```
     >
-    > Mas atenção: `DefaultClient` é compartilhado pelo processo inteiro — modificações globais afetam todo código que usa `http.Get`, `http.Post`, etc. Para isolamento, instancie seu próprio `&http.Client{Timeout: ...}`.
+    > But note: `DefaultClient` is shared across the whole process — global modifications affect every caller of `http.Get`, `http.Post`, etc. For isolation, instantiate your own `&http.Client{Timeout: ...}`.
   </Tab>
 </Tabs>
 
-Flag gravado em `result.Metadata["verified_with_discrepancy"]=true`. Se Reflexion está on (default), uma lesson é gerada em background:
+Flag recorded as `result.Metadata["verified_with_discrepancy"]=true`. If Reflexion is on (default), a lesson is generated in background:
 
 ```text
 LESSON: Citing Go stdlib API fields
@@ -205,33 +205,33 @@ TRIGGER: hallucination
 
 ---
 
-## Integração com Refine
+## Interaction with Refine
 
-Quando Refine + Verify estão ambos ligados, a ordem importa:
+When Refine + Verify are both enabled, order matters:
 
 ```go
 // cli/agent/quality/builder.go
 if cfg.Refine.Enabled && deps.Dispatch != nil {
-    p.AddPost(NewRefineHook(...))      // primeiro
+    p.AddPost(NewRefineHook(...))      // first
 }
 if cfg.Verify.Enabled && deps.Dispatch != nil {
-    p.AddPost(NewVerifyHook(...))      // depois do refine
+    p.AddPost(NewVerifyHook(...))      // after refine
 }
 ```
 
-Refine melhora a **qualidade estilística** primeiro; Verify checa **factual accuracy** sobre o output já refinado. Ordem oposta (verify → refine) funcionaria, mas a reescrita do refine poderia introduzir claims não verificados.
+Refine improves **stylistic quality** first; Verify checks **factual accuracy** over the already-refined output. Reverse order (verify → refine) would work, but a refine rewrite could introduce unverified claims.
 
-<Tip>Se você só liga **um** dos dois, prefira **Verify** para workflows factual (docs técnicas, código com API calls) e **Refine** para workflows estilísticos (summaries, relatórios).</Tip>
+<Tip>If you only enable **one** of them, prefer **Verify** for factual workflows (technical docs, API-heavy code) and **Refine** for stylistic workflows (summaries, reports).</Tip>
 
 ---
 
-## Invocação direta
+## Direct invocation
 
 ```xml
 <agent_call agent="verifier" task="[VERIFY_ANSWER] Task: X Draft: Y" />
 ```
 
-Ou com tool call direta ao verifier na orquestração de passos críticos:
+Or with direct tool-call to verifier in orchestrating critical steps:
 
 ```bash
 # Chain: search → coder → verifier before user sees
@@ -239,31 +239,31 @@ Ou com tool call direta ao verifier na orquestração de passos críticos:
 
 ---
 
-## Custo e latência
+## Cost and latency
 
-| Config | Calls extras | Latência |
+| Config | Extra calls | Latency |
 |---|---|---|
-| `NumQuestions=3` (default) | +1 verifier call | 3-8s com Sonnet |
-| `NumQuestions=5` | +1 (mesmo call, mais questions) | 5-12s |
-| `NumQuestions=7+` | +1 + modelo pode quebrar contrato | Evitar |
+| `NumQuestions=3` (default) | +1 verifier call | 3-8s with Sonnet |
+| `NumQuestions=5` | +1 (same call, more questions) | 5-12s |
+| `NumQuestions=7+` | +1 + model may break contract | Avoid |
 
-<Warning>CoVe com modelos fracos gera perguntas superficiais ou "verificações" que só parafraseiam o draft. Use Sonnet, Opus, ou GPT-4+ como `CHATCLI_AGENT_VERIFIER_MODEL`.</Warning>
+<Warning>CoVe with weak models generates shallow questions or "verifications" that just paraphrase the draft. Use Sonnet, Opus, or GPT-4+ as `CHATCLI_AGENT_VERIFIER_MODEL`.</Warning>
 
 ---
 
-## Leia também
+## See also
 
 <CardGroup cols={2}>
   <Card title="#3 Reflexion" icon="lightbulb" href="/features/quality/reflexion">
-    Consome o signal `verified_with_discrepancy` para gerar lessons sobre hallucination.
+    Consumes the `verified_with_discrepancy` signal to generate lessons about hallucination.
   </Card>
   <Card title="#5 Self-Refine" icon="wand-magic-sparkles" href="/features/quality/self-refine">
-    Complemento estilístico: Refine poliaça, CoVe verifica factualmente.
+    Stylistic complement: Refine polishes, CoVe verifies factually.
   </Card>
-  <Card title="Paper original (Dhuliawala et al.)" icon="book" href="https://arxiv.org/abs/2309.11495">
+  <Card title="Original paper (Dhuliawala et al.)" icon="book" href="https://arxiv.org/abs/2309.11495">
     Chain-of-Verification Reduces Hallucination in Large Language Models
   </Card>
-  <Card title="Configuração" icon="sliders" href="/features/quality/configuration">
-    Env vars e slashes num lugar só.
+  <Card title="Configuration" icon="sliders" href="/features/quality/configuration">
+    Env vars and slashes in one place.
   </Card>
 </CardGroup>

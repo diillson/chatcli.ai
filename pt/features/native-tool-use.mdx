@@ -1,0 +1,193 @@
+---
+title: "Tool Use Nativo (API Estruturada)"
+sidebarTitle: "Tool Use Nativo"
+description: "Chamadas de ferramentas via API nativa da OpenAI e Anthropic, com suporte a cache_control para otimização de KV cache."
+icon: "wrench"
+---
+
+O ChatCLI suporta **chamadas de ferramentas via API nativa** para OpenAI, Anthropic, ZAI (Zhipu AI), MiniMax, Moonshot (Kimi) e OpenRouter, substituindo a abordagem de XML embutido no prompt por chamadas estruturadas via API. Isso melhora a precisao, reduz o consumo de tokens e habilita otimizações de cache.
+
+---
+
+## Por que Tool Use Nativo?
+
+| Aspecto | XML no Prompt | API Nativa |
+|:--------|:-------------|:-----------|
+| Precisao | Depende do modelo parsear XML | Estruturado pela API, sem ambiguidade |
+| Tokens | XML consome tokens do context window | Campos separados, mais eficientes |
+| Cache | Sem otimização | `cache_control:ephemeral` na Anthropic |
+| Validação | Manual | Automática pela API do provedor |
+| Compatibilidade | Qualquer provedor | OpenAI, Anthropic, ZAI, MiniMax, Moonshot e OpenRouter (outros continuam com XML) |
+
+---
+
+## Arquitetura
+
+### Interface ToolAwareClient
+
+A interface `ToolAwareClient` estende a `LLMClient` base com suporte a ferramentas:
+
+```go
+type ToolAwareClient interface {
+    LLMClient
+    SendPromptWithTools(ctx context.Context, prompt string, history []models.Message,
+        tools []models.ToolDefinition, maxTokens int) (*models.LLMResponse, error)
+    SupportsNativeTools() bool
+}
+```
+
+### Detecção Automatica
+
+A detecção e feita via type assertion, sem configuração necessaria:
+
+```go
+if client.IsToolAware(c) {
+    tac, _ := client.AsToolAware(c)
+    resp, err := tac.SendPromptWithTools(ctx, prompt, history, tools, maxTokens)
+    // resp.ToolCalls contem as chamadas estruturadas
+}
+```
+
+<Info>Provedores que não implementam `ToolAwareClient` continuam funcionando normalmente via `SendPrompt`.</Info>
+
+### Suporte a Tool Use por Provedor
+
+Nem todos os provedores implementam tool use nativo. Funcionalidades como `/coder` e orquestracao multi-agente funcionam melhor com provedores que suportam `SendPromptWithTools`:
+
+| Provedor | Tool Use Nativo | Streaming | Impacto |
+|----------|----------------|-----------|---------|
+| **OpenAI** | Sim | Sim | Suporte completo a `/coder` e multi-agente |
+| **Anthropic (Claude)** | Sim | Sim (OAuth) | Suporte completo a `/coder` e multi-agente |
+| **ZAI (Zhipu AI)** | Sim | Sim | Suporte completo a `/coder` e multi-agente |
+| **MiniMax** | Sim | Sim | Suporte completo a `/coder` e multi-agente. Desabilitado quando `MINIMAX_API_COMPAT=anthropic` (fallback para XML). |
+| **OpenRouter** | Sim | Sim | Suporte completo a `/coder` e multi-agente. Usa API compatível com OpenAI. Funcionalidade depende do modelo escolhido no OpenRouter. |
+| **Google (Gemini)** | Não | Não | Fallback para parsing de tool calls via texto — `/coder` funciona via extracao XML |
+| **xAI (Grok)** | Não | Não | Fallback para parsing de tool calls via texto |
+| **GitHub Copilot** | Não | Não | Fallback para parsing de tool calls via texto |
+| **GitHub Models** | Não | Não | Fallback para parsing de tool calls via texto (API OpenAI-compatible) |
+| **Ollama** | Não | Não | Fallback para parsing de tool calls via texto |
+| **StackSpot** | Não | Não | Fallback para parsing de tool calls via texto |
+
+<Warning>
+Ao usar provedores sem tool use nativo, os modos agent e coder ainda funcionam mas dependem de parsing baseado em XML do texto de saída do LLM. Isso e menos confiavel que tool calling nativo e pode ocasionalmente precisar de retentativas de correcao de formato (até 3 tentativas). Para workflows `/coder` em produção, **OpenAI, Claude, ZAI, MiniMax ou OpenRouter são recomendados**.
+</Warning>
+
+---
+
+## Tipos de Dados
+
+<AccordionGroup>
+  <Accordion title="ToolDefinition" icon="cube">
+    Define uma ferramenta disponível para o modelo:
+
+    ```go
+    type ToolDefinition struct {
+        Type     string          `json:"type"`     // "function"
+        Function ToolFunctionDef `json:"function"`
+    }
+
+    type ToolFunctionDef struct {
+        Name        string                 `json:"name"`
+        Description string                 `json:"description"`
+        Parameters  map[string]interface{} `json:"parameters"` // JSON Schema
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="ToolCall e ToolResult" icon="arrow-right-arrow-left">
+    Representam uma chamada de ferramenta pelo modelo e seu resultado:
+
+    ```go
+    type ToolCall struct {
+        ID        string                 `json:"id"`
+        Type      string                 `json:"type"`       // "function"
+        Name      string                 `json:"name"`
+        Arguments map[string]interface{} `json:"arguments"`
+    }
+
+    type ToolResult struct {
+        ToolCallID string `json:"tool_call_id"`
+        Content    string `json:"content"`
+        IsError    bool   `json:"is_error,omitempty"`
+    }
+    ```
+
+    O campo `IsError` (alinhado com a Anthropic Messages API) é emitido nativamente como `is_error: true` no `tool_result` block do Claude. Para provedores OpenAI-compatible (OpenAI, Moonshot, MiniMax, ZAI, OpenRouter), o `models.Message` carrega também `ErrorCode` (`ENOENT`, `Timeout`, `ExitCode:N`, `InvalidArgs`, …) e o adapter prefixa o content com `[ERROR:<code>]` — o modelo recebe o sinal mesmo sem campo nativo de erro.
+  </Accordion>
+
+  <Accordion title="LLMResponse" icon="reply">
+    Resposta unificada que pode conter texto e/ou tool calls:
+
+    ```go
+    type LLMResponse struct {
+        Content    string     `json:"content"`
+        ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+        Usage      *UsageInfo `json:"usage,omitempty"`
+        StopReason string     `json:"stop_reason,omitempty"`
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Implementações por Provedor
+
+<Tabs>
+  <Tab title="OpenAI">
+    Usa o campo `tools` na API de Chat Completions:
+
+    - Envia ferramentas como array de `tools` com `tool_choice: "auto"`
+    - Processa `tool_calls` em `choices[0].message`
+    - Mensagens `tool` no histórico vinculam resultado ao `tool_call_id`
+  </Tab>
+
+  <Tab title="Anthropic (Claude)">
+    Usa o campo `tools` na Messages API com otimização de cache:
+
+    - Envia ferramentas no campo `tools` do request
+    - System prompt inclui `cache_control: { type: "ephemeral" }` para reuso de KV cache
+    - Tool results são enviados como content blocks `tool_result` em mensagens `user`
+    - Quando o resultado tem `IsError=true`, o adapter seta `is_error: true` nativo + prefixo defensivo `[ERROR:<code>]` no content
+    - Suporte a todos os tipos de autenticação (API key, OAuth token)
+  </Tab>
+</Tabs>
+
+### Tool result com is_error / ErrorCode (provider-agnostic)
+
+Resultados de ferramenta carregam dois sinais ortogonais que viajam até o modelo:
+
+- **`IsError bool`** — true quando o tool executou mas reportou falha de negócio (exit code não-zero, HTTP 4xx, arquivo não encontrado, schema args inválido). False = sucesso.
+- **`ErrorCode string`** — classificação locale-independente: `ENOENT`, `EACCES`, `EISDIR`, `EEXIST`, `Timeout`, `Canceled`, `ExitCode:N`, `NetworkError`, `DNSError`, `InvalidArgs`, etc. Vazio quando `IsError=false`.
+
+| Provider family | Como emite |
+|---|---|
+| Anthropic (claudeai, Bedrock Claude, StackSpot Claude) | `{"type":"tool_result","is_error":true,"content":"[ERROR:ENOENT] <body>"}` |
+| OpenAI Chat Completions (openai, moonshot, minimax, zai, openrouter, xai, copilot) | `{"role":"tool","tool_call_id":...,"content":"[ERROR:ENOENT] <body>"}` |
+| Outros (sem suporte nativo) | content com header `[ERROR]` quando aplicável |
+
+O modelo pattern-match no `[ERROR:<code>]` para decidir retry/recovery sem precisar parsear inglês — `InvalidArgs` significa "corrigir schema", `Timeout` significa "tentar novamente", `ENOENT` significa "arquivo errado".
+
+### ContentBlock com Cache Control
+
+Para Anthropic, o system prompt e dividido em blocos com controle de cache:
+
+```go
+type ContentBlock struct {
+    Type         string        `json:"type"`
+    Text         string        `json:"text"`
+    CacheControl *CacheControl `json:"cache_control,omitempty"`
+}
+
+type CacheControl struct {
+    Type string `json:"type"` // "ephemeral"
+}
+```
+
+<Tip>O `cache_control:ephemeral` informa a Anthropic que o bloco do system prompt pode ser cacheado entre requests, reduzindo significativamente a latência e custo em conversas longas.</Tip>
+
+---
+
+## Integração com Fallback
+
+A cadeia de fallback (`llm/fallback`) suporta `SendPromptWithTools` automaticamente. Provedores sem suporte a tool use nativo são ignorados na cadeia de tool calls, mas continuam disponíveis para requests de texto simples.

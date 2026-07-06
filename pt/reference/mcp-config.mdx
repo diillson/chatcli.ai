@@ -1,0 +1,978 @@
+---
+title: "Configuração MCP (mcp_servers.json)"
+sidebarTitle: "MCP Config"
+description: "Referência completa do formato de configuração de servidores MCP com exemplos práticos para cada transporte."
+icon: "gear"
+---
+
+O arquivo `mcp_servers.json` define quais servidores MCP o ChatCLI deve conectar. Ele é carregado automaticamente no início da sessão.
+
+---
+
+## Localização
+
+| Local | Prioridade | Descrição |
+|:------|:-----------|:----------|
+| `~/.chatcli/mcp_servers.json` | Padrão | Configuração global do usuário |
+| `$CHATCLI_MCP_CONFIG` | Override | Caminho customizado via variável de ambiente |
+| Flag `--mcp-config` | Maior | Override via flag do servidor |
+
+<Info>No modo client (TTY), basta criar o arquivo em `~/.chatcli/mcp_servers.json` — o ChatCLI detecta automaticamente e inicializa os servidores sem precisar de variáveis de ambiente.</Info>
+
+### Auto-Enable (regras de detecção)
+
+O ChatCLI inicializa o subsistema MCP automaticamente — manager + watcher de hot-reload — quando **qualquer uma** das condições abaixo é verdadeira:
+
+| Condição | Comportamento |
+|:---------|:--------------|
+| `CHATCLI_MCP_ENABLED=true` | Opt-in explícito; sempre habilita, mesmo se nada existir em disco |
+| O arquivo `mcp_servers.json` existe | Habilita e carrega imediatamente |
+| **O diretório pai existe** (ex: `~/.chatcli/`) | Habilita o manager + watcher mesmo sem o arquivo, para que **criar o arquivo depois** dispare hot-reload sem reiniciar |
+
+<Note>
+A terceira regra é o que mantém o **hot-reload funcional desde o primeiro uso**. Se você abre o ChatCLI antes de ter um `mcp_servers.json` (cenário comum em primeira instalação), o watcher do `~/.chatcli/` já está rodando — basta criar o arquivo e os servidores sobem na hora, sem `chatcli restart`.
+</Note>
+
+### Hot-Reload e Tolerância a Erros
+
+O watcher do `mcp_servers.json` reconcilia o estado vivo com o que está em disco usando `fsnotify`. Eventos de `Create`, `Write`, `Rename` e `Remove` são debounced em 400 ms para evitar reload mid-write quando editores reescrevem via rename.
+
+| Evento em disco | Resultado |
+|:----------------|:----------|
+| Adicionar servidor novo | Inicia o servidor, descobre tools |
+| Remover servidor da config | Para o processo, drop das tools |
+| Mudar `command`/`args`/`env` | Para e reinicia com nova config |
+| `enabled: false` | Equivale a remover (servidor para) |
+| Arquivo deletado | Para todos os servidores |
+| **0 bytes ou JSON malformado** | Loga warning, **não aborta**; corrija e salve para recarregar |
+
+<Tip>
+Salvar um JSON inválido **não derruba o ChatCLI**: o manager continua registrado e o watcher segue ativo. Você corrige o arquivo no editor, salva, e o próximo evento dispara `Reload` normalmente. Útil quando você está editando ao vivo durante uma sessão.
+</Tip>
+
+---
+
+## Formato
+
+```json
+{
+  "mcpServers": [
+    {
+      // --- Core (sempre necessário) ---
+      "name": "string",                // Nome único do servidor
+      "transport": "stdio|sse|http",   // Tipo de transporte
+      "command": "string",             // Comando para iniciar (stdio)
+      "args": ["string"],              // Argumentos do comando (stdio)
+      "env": {                         // Variáveis de ambiente (stdio)
+        "KEY": "VALUE"
+      },
+      "url": "string",                 // URL do servidor (sse / http)
+      "enabled": true,                 // Ativa/desativa sem remover
+      "overrides": ["string"],         // Built-ins que este server substitui
+
+      // --- Tier 1: campos tipados com efeito direto em runtime ---
+      "description": "string",         // Mostrado em /mcp status sob o servidor
+      "cwd": "string",                 // Working directory do processo (stdio)
+      "autoApprove": ["string"],       // Tools que dispensam aprovação (audit-logged)
+      "alwaysAllow": ["string"],       // Alias de autoApprove (Cline-compat)
+      "disabledTools": ["string"],     // Tools escondidas do LLM
+      "timeout": 60,                   // Timeout por RPC, em segundos
+
+      // --- Tier 2: capacidades adicionais ---
+      "initTimeout": 10,               // Timeout do handshake initialize, em segundos
+      "headers": {                     // Headers HTTP custom (sse / http)
+        "X-Foo": "${MY_TOKEN}"
+      },
+      "auth": {                        // Autenticação HTTP (bearer / basic / header)
+        "type": "bearer",
+        "token": "${MY_TOKEN}"
+      },
+      "enabledTools": ["string"], // Allowlist; precede disabledTools
+      "tags": ["string"],         // Marcadores rendered em /mcp status
+      "category": "string",       // Classificação curta (ex: "aws", "io")
+      "trust": false,             // Auto-aprova TUDO (bypass total — usar com cautela)
+      "channels": ["string"]      // Allow-list de MCP push-channels (vazio = aceita tudo)
+
+      // Qualquer outra chave é preservada via round-trip mas ignorada por runtime
+    }
+  ]
+}
+```
+
+---
+
+## Campos
+
+### Core (obrigatórios)
+
+| Campo | Tipo | Obrigatório | Descrição |
+|:------|:-----|:------------|:----------|
+| `name` | string | ✅ | Identificador único. Aparece em logs e no prefixo `[MCP:<name>]` das tools |
+| `transport` | string | ✅ | `"stdio"` (local), `"sse"` (HTTP+SSE — dois endpoints) ou `"http"` (Streamable HTTP da spec 2025-03-26 — endpoint único) |
+| `command` | string | stdio ✅ | Comando para iniciar o processo MCP |
+| `args` | string[] | ❌ | Argumentos passados ao comando |
+| `env` | object | ❌ | Variáveis de ambiente do processo (com `${VAR}` expansion) |
+| `url` | string | sse / http ✅ | URL completa do endpoint MCP. Para `http`, **a barra final é significativa** — `https://srv/mcp/` e `https://srv/mcp` são paths diferentes; o transport preserva exatamente o que está no JSON |
+| `enabled` | bool | ❌ | Padrão `false`. Permite desabilitar sem remover da config |
+| `overrides` | string[] | ❌ | Plugins built-in que este server substitui. Conectado, os built-ins listados ficam escondidos do LLM; ao desconectar voltam automaticamente. Ex: `["@webfetch", "@websearch"]` |
+
+### Tier 1 — efeito direto em runtime
+
+| Campo | Tipo | Descrição |
+|:------|:-----|:----------|
+| `description` | string | Mostrado em `/mcp status` sob a linha do servidor. Útil quando o nome do server é cifrado (`prod-1`, `srv-a`) |
+| `cwd` | string | Working directory do processo (`exec.Cmd.Dir`). Aceita `${VAR}` e leading `~/`. Validado no spawn — caminho inexistente ou non-directory falha a conexão com erro acionável (ignorado em SSE) |
+| `autoApprove` | string[] | Lista de tool names que dispensam aprovação. Aceita `"*"` (toda tool do server). Hoje gera **info-level audit log** em cada chamada auto-aprovada; o helper já está pronto pro futuro gate de MCP no coder-mode. Veja [Auto-aprovação](#auto-aprovação-e-trust) |
+| `alwaysAllow` | string[] | Alias de `autoApprove` adotado pelo Cline. As duas listas se fundem num único set runtime — copy-paste de configs do Cline funciona sem renomear |
+| `disabledTools` | string[] | Tool names escondidas tanto de `/mcp tools` quanto do prompt do LLM. Economia direta de tokens quando o servidor expõe 30+ tools mas o workflow só usa um punhado |
+| `timeout` | int (segundos) | Timeout por chamada RPC. Padrão `60`. Cobre o pior caso de `npx -y <pkg>` cold-start |
+
+### Tier 2 — capacidades adicionais
+
+| Campo | Tipo | Descrição |
+|:------|:-----|:----------|
+| `initTimeout` | int (segundos) | Timeout do handshake MCP `initialize` e do endpoint-event SSE. Padrão `10`. Útil pra servidores que carregam credenciais ou modelos no startup |
+| `headers` | object | Headers HTTP extra anexados a toda request HTTP do transport (SSE: GET do stream + POST das mensagens; http: cada POST JSON-RPC). Values passam por `${VAR}` expansion. Ignorado em stdio |
+| `auth` | object | Autenticação para os transports HTTP (`sse` e `http`). Veja [Autenticação HTTP](#autenticação-http-auth). `type` aceita `"bearer"`, `"basic"`, `"header"`. Empty `type` desabilita auth mesmo com outros campos preenchidos |
+| `enabledTools` | string[] | **Allowlist** — quando não-vazio, **apenas** essas tools são expostas. Tem precedência sobre `disabledTools` |
+| `tags` | string[] | Marcadores curtos rendered como `#tag1 #tag2` no `/mcp status` |
+| `category` | string | Classificação de um termo (ex: `"aws"`, `"database"`) rendered como `[category]` no `/mcp status` |
+| `trust` | bool | Auto-aprova **toda** tool do server, sem consultar `autoApprove`. Emite **warn-level** no startup pra deixar a escolha visível em logs. Reserve para servers separadamente vetados |
+| `channels` | string[] | Allow-list de **MCP push-channels** entregues pelo server. Vazio/omitido = aceita qualquer channel; com lista, só os channels literais nela passam pelo filtro (match exato — sem glob). `"*"` explícito = aceita tudo. Filtra no momento da recepção (antes do ring/persistência). Veja [MCP Channels](/pt/features/mcp-channels) |
+
+### Tier 3 — Catch-all (`Extensions`)
+
+Qualquer chave JSON que não seja um dos campos acima é **preservada verbatim** quando o chatcli regrava o arquivo. Útil pra colar configs de outros clientes (AWS EKS MCP, Cline, Cursor) sem perder anotações vendor-specific.
+
+Importante:
+- As chaves extra são **ignoradas pelo runtime** do chatcli — só sobrevivem ao round-trip de save/load.
+- Não podem **shadow** um campo tipado: um JSON manual com `Extensions["command"]` nunca substitui o `command` real.
+- Quando promovermos uma chave (e.g. `oauth2`) pra campo tipado em uma release futura, o conteúdo já existente em `Extensions` migra automaticamente.
+
+---
+
+## Variáveis de Ambiente (`env`)
+
+O campo `env` aceita um objeto chave-valor que é **mesclado** com o ambiente do processo pai (`os.Environ()`). Duas regras importantes:
+
+### 1. Herança do PATH e caches
+
+O processo MCP **herda** todo o ambiente do ChatCLI antes de aplicar os valores de `env`. Sem essa herança, launchers como `npx`, `uvx`, `docker` e `pipx` não encontrariam seus binários nem seus caches por usuário.
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@anthropic/mcp-server-filesystem", "/workspace"],
+  "env": {
+    "FS_LOG_LEVEL": "debug"
+  }
+}
+```
+
+Aqui o servidor filho recebe **PATH + HOME + FS_LOG_LEVEL=debug** — não apenas `FS_LOG_LEVEL` isolado. Se a chave do `env` colidir com o ambiente herdado, **o valor do `env` ganha** (semântica do Unix: última atribuição no `cmd.Env` prevalece).
+
+### 2. Expansão `${VAR}` / `$VAR`
+
+Valores em `env` passam por `os.Expand` contra o ambiente pai antes de ir pro processo filho. Isso permite manter **secrets fora do JSON** — em variáveis de shell, ou em arquivos `.env` carregados via `source`/`direnv`/`mise`/`asdf`.
+
+```json
+{
+  "name": "github",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@anthropic/mcp-server-github"],
+  "env": {
+    "GITHUB_TOKEN": "${GH_TOKEN}",
+    "DEBUG": "$NODE_DEBUG"
+  }
+}
+```
+
+Se o shell tem `GH_TOKEN=ghp_xxx` exportado, o servidor MCP recebe `GITHUB_TOKEN=ghp_xxx`. Se a variável referenciada **não existe**, o resultado é **string vazia** — mesmo comportamento do shell. Faça lint do seu shell antes de assumir que o token chegou.
+
+<Info>
+Use sempre `${VAR}` em vez de literais (`"GITHUB_TOKEN": "ghp_xxx"`). Tokens em plaintext no JSON acabam em git history, em logs, em backups e em screenshots. A expansão `${VAR}` é a forma idiomática — paridade com Claude Desktop e OpenCode.
+</Info>
+
+<Warning>
+A expansão acontece **uma vez no spawn do processo**. Se você mudar `GH_TOKEN` no shell durante uma sessão, o servidor MCP que já estava rodando continua com o valor antigo. Use `/mcp restart <nome>` para forçar a re-resolução.
+</Warning>
+
+### Padrões recomendados
+
+| Tipo de secret | Onde colocar | Como referenciar no JSON |
+|:---------------|:-------------|:------------------------|
+| Token de API (GitHub, Slack, Stripe) | Shell env (`~/.zshenv`) ou `.env` via direnv | `"TOKEN": "${GH_TOKEN}"` |
+| Connection string | Shell env | `"DATABASE_URL": "${DATABASE_URL}"` |
+| Senha de DB | Vault / 1Password CLI / `pass` | Inject no shell antes do ChatCLI |
+| Credencial não sensível (ex: project ID) | Direto no JSON | `"GCP_PROJECT": "my-project-id"` |
+
+---
+
+## Auto-aprovação e Trust
+
+ChatCLI's tool-execution pipeline tem um audit-log que registra toda invocação MCP coberta por `autoApprove`, `alwaysAllow` ou `trust`. O helper `Manager.ShouldAutoApprove(toolName)` consultado pelo pipeline já está pronto pro futuro gate de aprovação interativa no coder mode.
+
+### `autoApprove` / `alwaysAllow`
+
+Listas de tool names que dispensam aprovação. Aceitam `"*"` (qualquer tool do server). Os nomes podem ser usados com ou sem o prefixo `mcp_` — `"read_file"` e `"mcp_read_file"` casam.
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+  "enabled": true,
+  "autoApprove": ["read_file", "list_directory"]
+}
+```
+
+`alwaysAllow` é alias popularizado pelo Cline — chatcli funde as duas listas no mesmo set runtime, então copy-paste de configs do Cline funciona sem renomear.
+
+### `trust: true`
+
+Auto-aprova **toda** tool do server, sem precisar listar uma por uma:
+
+```json
+{
+  "name": "my-trusted-tools",
+  "transport": "stdio",
+  "command": "/usr/local/bin/my-mcp",
+  "enabled": true,
+  "trust": true
+}
+```
+
+<Warning>
+`trust: true` é destinado a servidores que o operador **separadamente verificou** (código auditado, container imutável, etc.). ChatCLI emite um warning no startup toda vez que conecta com `trust: true` pra que a escolha fique visível em logs — uma config trust commitada por engano não passa silenciosa.
+</Warning>
+
+### Audit log
+
+Toda chamada auto-aprovada gera um entry info-level:
+
+```
+MCP tool auto-approved by config  tool=read_file coder_mode=true
+```
+
+Grep no log do chatcli (`CHATCLI_LOG_LEVEL=info` ou maior) para auditar tudo que passou pelo bypass.
+
+---
+
+## Filtragem de tools
+
+Quando um servidor expõe dezenas de tools mas o workflow só usa um subconjunto, esconder o resto economiza tokens em todo turno do LLM.
+
+### `disabledTools` (blocklist)
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+  "enabled": true,
+  "disabledTools": ["delete_file", "move_file"]
+}
+```
+
+Aceita `"*"` (esconde tudo — útil pra desabilitar um server sem remover o entry).
+
+### `enabledTools` (allowlist — precede blocklist)
+
+```json
+{
+  "name": "filesystem",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+  "enabled": true,
+  "enabledTools": ["read_file", "list_directory"]
+}
+```
+
+Quando não-vazio, **apenas** as tools listadas são expostas. `disabledTools` no mesmo server é ignorado.
+
+`/mcp status` mostra a contagem de tools escondidas (blocklist) ou conta total quando a allowlist está ativa.
+
+---
+
+## Timeouts
+
+Padrões cobrem o caso comum (`npx -y` cold start). Override quando o servidor demora mais que isso por desenho.
+
+### `timeout` (segundos)
+
+Cap por chamada RPC. Padrão **60s**. Aplica-se tanto a `tools/call` quanto a `tools/list`.
+
+```json
+{
+  "name": "slow-llm-proxy",
+  "transport": "sse",
+  "url": "https://proxy.internal/sse",
+  "enabled": true,
+  "timeout": 180
+}
+```
+
+### `initTimeout` (segundos)
+
+Cap do handshake MCP `initialize` — e, em SSE, do endpoint-event wait. Padrão **10s**. Bump pra servidores que carregam credenciais, fazem auth-handshake ou montam o ambiente no startup:
+
+```json
+{
+  "name": "self-hosted-bedrock",
+  "transport": "sse",
+  "url": "https://bedrock-proxy.internal/sse",
+  "enabled": true,
+  "initTimeout": 60
+}
+```
+
+<Info>
+SSE: o `http.Client.Timeout` é setado para `max(timeout, initTimeout)` pra que um `timeout` curto não mate o GET de SSE (que fica aberto pelo tempo da conexão).
+</Info>
+
+---
+
+## Working directory (`cwd`) — stdio
+
+```json
+{
+  "name": "project-fs",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+  "enabled": true,
+  "cwd": "${HOME}/repos/my-project"
+}
+```
+
+- Aceita `${VAR}` / `$VAR` expansion (mesmo lookup do `env`).
+- Aceita leading `~/` expandido contra `HOME`.
+- **Validado no spawn**: caminho inexistente ou non-directory faz a conexão falhar com erro acionável em vez de silenciosamente herdar o CWD do chatcli.
+- Vazio = herda o CWD do chatcli (comportamento legado).
+
+Ignorado em SSE.
+
+---
+
+## Headers HTTP e autenticação — sse / http
+
+Os dois transports HTTP (`sse` e `http`) compartilham o mesmo mecanismo de headers customizados e autenticação tipada.
+
+### `headers`
+
+Headers extra anexados a **toda** request HTTP do transport:
+
+- `sse`: GET do stream + POST de mensagens JSON-RPC.
+- `http`: cada POST JSON-RPC ao endpoint Streamable HTTP.
+
+```json
+{
+  "name": "internal-mcp",
+  "transport": "http",
+  "url": "https://mcp.internal/mcp/",
+  "enabled": true,
+  "headers": {
+    "X-Tenant-Id": "acme",
+    "X-Trace-Id": "${TRACE_ID}"
+  }
+}
+```
+
+Values passam por `${VAR}` expansion (mesmo lookup do `env`).
+
+### Autenticação HTTP (`auth`)
+
+Bloco tipado com três modos:
+
+#### `bearer`
+
+```json
+{
+  "auth": {
+    "type": "bearer",
+    "token": "${MY_TOKEN}"
+  }
+}
+```
+
+Resulta em `Authorization: Bearer <token>`.
+
+#### `basic`
+
+```json
+{
+  "auth": {
+    "type": "basic",
+    "username": "${MY_USER}",
+    "password": "${MY_PASS}"
+  }
+}
+```
+
+Resulta em `Authorization: Basic base64(user:pass)`.
+
+#### `header` (custom)
+
+```json
+{
+  "auth": {
+    "type": "header",
+    "header": "X-API-Key",
+    "token": "${MY_TOKEN}"
+  }
+}
+```
+
+Resulta em `X-API-Key: <token>`. Quando `header` é omitido, o default é `X-API-Key`.
+
+<Info>
+**Salvaguardas**: empty `type` é no-op mesmo com `token`/`username` populados (evita meio-config vazando credencial). Token cuja env var não existe **suprime o header inteiro** em vez de mandar `Authorization: Bearer ` vazio (que passaria por um auth check ingênuo no server).
+</Info>
+
+<Warning>
+`Authorization`/headers customizados são re-aplicados a cada request, então **rotacionar a env var em runtime** já produz a próxima chamada com o token novo — sem `/mcp restart`.
+</Warning>
+
+---
+
+## Metadados (`description`, `tags`, `category`)
+
+Campos cosméticos rendered em `/mcp status` pra facilitar identificar quem é quem quando há muitos servers:
+
+```json
+{
+  "name": "prod-aws",
+  "transport": "sse",
+  "url": "https://prod-aws-mcp.internal/sse",
+  "enabled": true,
+  "description": "Read-only AWS account access via EKS MCP",
+  "category": "aws",
+  "tags": ["prod", "readonly"]
+}
+```
+
+Cada linha de output é opt-in: configs sem nenhum desses campos renderizam exatamente como antes da v1.115.
+
+---
+
+## Channel subscriptions (`channels`)
+
+Quando um servidor MCP emite **push notifications** (JSON-RPC messages sem `id`), o ChatCLI as encaminha pro [MCP Channels](/pt/features/mcp-channels) ring — uma estrutura durável que alimenta o system prompt, o banner de inbox e o trigger engine.
+
+O campo `channels` na config do servidor é um **allow-list de channel names**: só os channels literalmente listados são aceitos para esse servidor. Útil quando um servidor é tagarela em múltiplas categorias (ex: emite tanto `ci-pipeline` quanto `deploys/staging` quanto `metrics/raw`) mas seu workflow só se importa com uma fatia.
+
+```json
+{
+  "name": "prom-alerts",
+  "transport": "sse",
+  "url": "https://prom-alerts.internal/sse",
+  "enabled": true,
+  "channels": ["alerts/critical", "alerts/error"]
+}
+```
+
+| Configuração | Comportamento |
+|:-------------|:--------------|
+| Omitido ou `[]` | Aceita **todos** os channels que o server emitir |
+| `["alerts/critical"]` | Só `alerts/critical` é aceito; `alerts/info` ou `metrics/*` são descartados (debug log) |
+| `["*"]` (explícito) | Equivale a omitido — passa tudo |
+| `["  alerts  ", ""]` | Whitespace é trimmado, strings vazias ignoradas; equivale a `["alerts"]` |
+
+<Note>
+**Match é literal** (não há glob aqui). `"channels": ["alerts"]` **não** pega `"alerts/critical"`. Use o nome exato do channel que o servidor emite. Os globs (`alerts/*`) existem só nas **rules de trigger** (`triggers.json`), que rodam depois desse filtro.
+</Note>
+
+O filtro acontece **na entrada** — antes do ring em memória e antes da persistência. Channels rejeitados não consomem o budget do ring nem aparecem em `/channel list`.
+
+Funciona com os três transports: `sse` (via stream), `http` (via listener GET) e `stdio` (via notifications no stdout). Veja [MCP Channels](/pt/features/mcp-channels) pra detalhes do que acontece **depois** do filtro.
+
+---
+
+## Trigger rules (`~/.chatcli/mcp/triggers.json`)
+
+Arquivo separado do `mcp_servers.json`, opt-in, que descreve como o ChatCLI deve **reagir** a channel events. Sem esse arquivo, channels funcionam só como inbox passivo. Com ele, você define rules que disparam banners, perguntas yes/no ou execuções automáticas do agent.
+
+### Localização
+
+```text
+~/.chatcli/mcp/triggers.json
+```
+
+Carregado automaticamente no startup quando o MCP está habilitado. Reload manual: `/channel rules reload`.
+
+### Schema
+
+```json
+{
+  "rules": [
+    {
+      "name": "string",            // único, obrigatório
+      "server": "string",          // match exato no nome do server; vazio = qualquer
+      "channel": "string",         // literal, "*" ou prefix-glob ("alerts/*")
+      "contentRegex": "string",    // Go regexp aplicado em Content
+      "mode": "notify|confirm|auto",
+      "prompt": "string",          // template com {{content}} {{channel}} {{server}} {{seq}} {{timestamp}}
+      "tools": ["string"],         // whitelist (obrigatório quando mode=auto)
+      "rateLimit": "duration",     // formato Go: "5m", "30s", "1h"
+      "dedupWindow": "duration"
+    }
+  ]
+}
+```
+
+### Campos
+
+| Campo | Tipo | Obrigatório | Descrição |
+|:------|:-----|:------------|:----------|
+| `name` | string | ✅ | Identificador único da rule (aparece em `/channel rules` e em logs) |
+| `server` | string | ❌ | Match exato no nome do servidor MCP. Vazio = qualquer; `"*"` = qualquer (explícito) |
+| `channel` | string | ❌ | Match no channel da mensagem. Suporta literal (`"ci-pipeline"`), wildcard (`"*"`) e **prefix-glob** (`"alerts/*"` pega `alerts/critical`, `alerts/info`, etc.) |
+| `contentRegex` | string | ❌ | Regex Go aplicada sobre o `Content` da notification. Validada no parse — regex inválido rejeita o arquivo inteiro |
+| `mode` | string | ❌ | `"notify"` (default), `"confirm"`, `"auto"`. Case-sensitive |
+| `prompt` | string | obrigatório em `confirm` e `auto` | Template do prompt enviado ao agent quando a rule dispara. Vars: `{{content}}`, `{{channel}}`, `{{server}}`, `{{seq}}`, `{{timestamp}}`. Quando vazio, ChatCLI usa um default `"Investigate this <server>/<channel> event: <content>"` (válido apenas em `notify`) |
+| `tools` | string[] | obrigatório em `auto` | Whitelist de tools que o agent pode invocar. Em `mode: auto`, validação rejeita rule sem `tools` — proteção contra trigger autônomo sem floor de tools |
+| `rateLimit` | duration | ❌ | Cap por rule: após uma fire, ignora matches dentro dessa janela. Formato `time.Duration` do Go: `"5m"`, `"30s"`, `"1h"`. Vazio = sem limite |
+| `dedupWindow` | duration | ❌ | Dedup por `(rule, content prefix)`: mesma rule + mesmo prefixo (até 256 chars) dentro da janela é no-op. Vazio = sem dedup |
+
+### Modos — resumo
+
+| Modo | Quando ação ocorre | Surpresa | Caso de uso |
+|:-----|:-------------------|:---------|:------------|
+| `notify` | Nunca — só registra no banner | Zero | Inbox passivo; user investiga sob demanda |
+| `confirm` | Quando user responde `/channel confirm <id>` | Baixa | User-in-the-loop; alerta importante que merece confirmação humana |
+| `auto` | No próximo prompt tick (drained automaticamente) | Alta — opt-in explícito | Tasks padronizadas e seguras (smoke checks, sanity checks) |
+
+### Validação
+
+Falhas no parse rejeitam o arquivo **inteiro** (atomic apply — ou todas as rules entram, ou nada muda). Em `reload` com erro, o ChatCLI mantém as rules anteriores ativas e mostra o erro na saída.
+
+Erros típicos:
+
+| Erro | Causa | Fix |
+|:-----|:------|:----|
+| `rule #N (""): rule name is required` | Falta `name` ou está vazio | Toda rule precisa de um `name` único |
+| `mode "auto" requires a non-empty tools whitelist` | `mode: "auto"` sem `tools` | Adicione `"tools": [...]` ou troque pra `confirm` |
+| `mode "confirm" requires a prompt template` | `mode: "confirm"` sem `prompt` | Adicione `"prompt": "..."` |
+| `invalid contentRegex: error parsing regexp` | Regex inválido | Use `https://regex101.com` flavor "Golang" pra depurar |
+| `invalid mode "Notify"` | Case-sensitive | Use `notify`/`confirm`/`auto` em lowercase |
+| `duplicate rule name "x"` | Dois entries com mesmo `name` | Names únicos por arquivo |
+| `invalid rateLimit "5min"` | Formato Go inválido | Use `5m`, `30s`, `1h`, `500ms` |
+
+### Exemplos prontos
+
+#### CI watcher passivo
+
+```json
+{
+  "rules": [
+    {
+      "name": "ci-failures",
+      "server": "ci-monitor",
+      "channel": "ci-pipeline",
+      "contentRegex": "(?i)fail|broken|red",
+      "mode": "notify",
+      "rateLimit": "30s",
+      "dedupWindow": "1m"
+    }
+  ]
+}
+```
+
+#### Prod alerts com confirmação
+
+```json
+{
+  "rules": [
+    {
+      "name": "prod-pages",
+      "server": "prom-alerts",
+      "channel": "alerts/critical",
+      "mode": "confirm",
+      "prompt": "Critical alert on prod:\n\n{{content}}\n\nInvestigate?",
+      "rateLimit": "5m",
+      "dedupWindow": "2m"
+    }
+  ]
+}
+```
+
+#### Canary deploys autônomos
+
+```json
+{
+  "rules": [
+    {
+      "name": "canary-sanity-check",
+      "server": "deploy-tracker",
+      "channel": "deploys/canary/*",
+      "mode": "auto",
+      "prompt": "Canary deploy started: {{content}}.\nRun canary smoke checks and report.",
+      "tools": ["kubectl_get", "kubectl_logs", "http_request"],
+      "rateLimit": "1m",
+      "dedupWindow": "30s"
+    }
+  ]
+}
+```
+
+### Persistência do ring
+
+Separado das rules, o ChatCLI mantém um arquivo JSONL durável em `~/.chatcli/mcp/channels.jsonl` com todas as mensagens recebidas. Rotaciona aos 10 MiB pra `channels.jsonl.1` (um backup). Replay automático no boot (até 200 últimas mensagens). Detalhes completos: [MCP Channels — Persistência](/pt/features/mcp-channels#persist%C3%AAncia).
+
+---
+
+## Exemplos por Transporte
+
+<Tabs>
+  <Tab title="stdio (Local)">
+    Servidores locais que se comunicam via stdin/stdout com JSON-RPC 2.0:
+
+    ```json
+    {
+      "mcpServers": [
+        {
+          "name": "filesystem",
+          "transport": "stdio",
+          "command": "npx",
+          "args": ["-y", "@anthropic/mcp-server-filesystem", "/home/user/projects"],
+          "enabled": true
+        }
+      ]
+    }
+    ```
+
+    <Tip>O ChatCLI gerencia o ciclo de vida do processo: inicia no startup, mata no shutdown. Content-Length framing (LSP-style) é usado na comunicação.</Tip>
+  </Tab>
+  <Tab title="SSE (HTTP+SSE)">
+    Servidores remotos que expõem **dois endpoints** (`/sse` para o stream + `/messages` para os POSTs) conforme o modelo original da spec MCP:
+
+    ```json
+    {
+      "mcpServers": [
+        {
+          "name": "remote-tools",
+          "transport": "sse",
+          "url": "https://mcp-server.example.com/sse",
+          "enabled": true
+        }
+      ]
+    }
+    ```
+
+    O handshake SSE funciona assim:
+    1. GET `/sse` → recebe evento `endpoint` com URL de mensagens
+    2. POST mensagens JSON-RPC para a URL descoberta
+    3. Respostas chegam via SSE stream
+
+    Os dois transports remotos são igualmente suportados — escolha pelo formato que o servidor expõe:
+
+    - **`sse`** quando há dois endpoints separados (`/sse` + `/messages`). Modelo da spec MCP original.
+    - **`http`** quando há um único endpoint (`/mcp`). Modelo Streamable HTTP da spec **2025-03-26**.
+
+    Configurar o transport errado **não** auto-corrige: o ChatCLI envia a forma que você declarou. Se em dúvida, hit o endpoint com `curl` — quem responde no GET com `event: endpoint` é `sse`; quem responde no POST diretamente com JSON ou SSE upgrade é `http`.
+  </Tab>
+  <Tab title="http (Streamable HTTP)">
+    Servidores remotos que expõem **um único endpoint** conforme a spec MCP **2025-03-26** (Streamable HTTP). Este é o formato adotado pelo SDK oficial e por hosts como Cloudflare Workers MCP, FastMCP/Python SDK, mcp.deepwiki.com, gateways MCP gerenciados:
+
+    ```json
+    {
+      "mcpServers": [
+        {
+          "name": "remote-tools",
+          "transport": "http",
+          "url": "https://mcp-server.example.com/mcp/",
+          "enabled": true,
+          "auth": {
+            "type": "bearer",
+            "token": "${MCP_TOKEN}"
+          }
+        }
+      ]
+    }
+    ```
+
+    Como funciona:
+    1. Cada chamada JSON-RPC é um `POST` único ao endpoint configurado em `url`.
+    2. O servidor responde com **uma** das três formas suportadas pela spec:
+       - `Content-Type: application/json` — resposta one-shot, mesmo formato JSON-RPC do POST;
+       - `Content-Type: text/event-stream` — upgrade para SSE no mesmo response, transportando a resposta e possivelmente notificações `notifications/*` server-initiated intercaladas;
+       - `202 Accepted` (sem body) — caminho típico das notificações cliente→servidor (`notifications/initialized`).
+    3. Se o servidor emitir o header `Mcp-Session-Id` na resposta do `initialize`, o ChatCLI captura e ecoa em todas as chamadas seguintes — sessões server-side ficam preservadas sem nenhuma configuração extra.
+    4. No shutdown o transport faz um `DELETE` cortês com o `Mcp-Session-Id` pra que o servidor libere a sessão imediatamente em vez de esperar o timeout.
+
+    <Warning>
+    **A barra final na `url` é significativa.** Vários servidores Streamable HTTP (especialmente FastMCP e qualquer um montado sob router Starlette/FastAPI) só respondem em `/mcp/` e devolvem `307 Temporary Redirect` para `/mcp`. O Go segue redirect 307 com POST, mas proxies corporativos no caminho costumam descartar body ou headers durante o salto — o sintoma é um hang de exatamente `initTimeout` segundos. Configure `url` **exatamente** como o servidor responde 200 OK no `curl`.
+    </Warning>
+
+    <Tip>
+    O header `Accept` enviado é `text/event-stream, application/json` nessa ordem — atende tanto servidores `includes`-style (spec-correct) quanto os strict-first que checam só o primeiro media type. Se você precisar testar à mão, [reproduza com curl](#testando-com-curl).
+    </Tip>
+  </Tab>
+</Tabs>
+
+---
+
+## Testando com curl
+
+Útil pra isolar problemas de proxy/CA/handshake antes de envolver o ChatCLI. O wire é o mesmo que o transport `http` envia:
+
+```bash
+URL='https://seu-servidor/mcp/'   # mantenha a barra final exatamente como sua config
+
+# 1) Handshake initialize — capture o Mcp-Session-Id do response
+curl -sS -i -N "$URL" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream, application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2024-11-05","capabilities":{},
+        "clientInfo":{"name":"curl-test","version":"1"}}}'
+
+# 2) Reuse a sessão no tools/list (substitua <SID>)
+curl -sS -i -N "$URL" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream, application/json' \
+  -H 'Mcp-Session-Id: <SID>' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+```
+
+Flags importantes:
+
+- `-i` mostra response headers (pro `Mcp-Session-Id`).
+- `-N` desativa buffering — se o servidor responder SSE, você vê os eventos chegando em tempo real em vez de esperar fechar.
+
+Se o curl funciona mas o ChatCLI dá timeout de 10s, é quase sempre **proxy corporativo não exportado** (Go respeita `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` no shell — curl lê `~/.curlrc` e o Go não) ou **CA interna ausente** do trust store que o Go enxerga (`SSL_CERT_FILE=/path/corp-ca.pem` resolve).
+
+---
+
+## Exemplos Completos
+
+### Múltiplos Servidores
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-filesystem", "/workspace"],
+      "enabled": true
+    },
+    {
+      "name": "github",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-github"],
+      "env": {
+        "GITHUB_TOKEN": "${GH_TOKEN}"
+      },
+      "enabled": true
+    },
+    {
+      "name": "postgres",
+      "transport": "stdio",
+      "command": "/usr/local/bin/mcp-postgres",
+      "args": ["--connection-string", "${POSTGRES_DSN}"],
+      "env": {
+        "PGPASSWORD": "${POSTGRES_PASSWORD}"
+      },
+      "enabled": true
+    },
+    {
+      "name": "web-search",
+      "transport": "sse",
+      "url": "http://localhost:8080/sse",
+      "enabled": true,
+      "overrides": ["@webfetch", "@websearch"]
+    },
+    {
+      "name": "deepwiki",
+      "transport": "http",
+      "url": "https://mcp.deepwiki.com/mcp/",
+      "enabled": true,
+      "auth": {
+        "type": "bearer",
+        "token": "${DEEPWIKI_TOKEN}"
+      }
+    },
+    {
+      "name": "slack",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-slack"],
+      "env": {
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
+      },
+      "enabled": false
+    },
+    {
+      "name": "prom-alerts",
+      "transport": "sse",
+      "url": "https://prom-alerts.internal/sse",
+      "enabled": true,
+      "channels": ["alerts/critical", "alerts/error"],
+      "auth": {
+        "type": "bearer",
+        "token": "${PROM_ALERTS_TOKEN}"
+      },
+      "description": "Prometheus AlertManager bridge",
+      "category": "observability",
+      "tags": ["prod"]
+    }
+  ]
+}
+```
+
+<Warning>Nunca commite tokens ou senhas no arquivo. Use a sintaxe `${VAR}` (documentada acima em [Variáveis de Ambiente](#variáveis-de-ambiente-env)) para que o secret venha do shell — nunca do JSON.</Warning>
+
+### Servidor Desabilitado
+
+Defina `"enabled": false` para manter a configuração sem conectar:
+
+```json
+{
+  "name": "experimental",
+  "transport": "stdio",
+  "command": "my-experimental-mcp",
+  "enabled": false
+}
+```
+
+---
+
+## Protocolo
+
+O ChatCLI fala **MCP Protocol v2024-11-05** (anunciado no `initialize`) sobre três transports:
+
+- **stdio** — JSON-RPC 2.0 via stdin/stdout do processo filho (newline-delimited).
+- **sse** — modelo HTTP+SSE da spec original (GET `/sse` + POST `/messages`).
+- **http** — Streamable HTTP da revisão **2025-03-26** (POST único ao endpoint configurado).
+
+Métodos suportados:
+
+| Método | Direção | Descrição |
+|:-------|:--------|:----------|
+| `initialize` | Client → Server | Handshake inicial com versão e capabilities |
+| `notifications/initialized` | Client → Server | Confirma inicialização |
+| `tools/list` | Client → Server | Descobre ferramentas disponíveis |
+| `tools/call` | Client → Server | Executa uma ferramenta com argumentos |
+
+### Nomeação de Tools
+
+```text
+Nome original no servidor:  read_file
+Nome no ChatCLI:           mcp_read_file
+Descrição:                 [MCP:filesystem] Reads a file from the filesystem
+```
+
+<Info>O prefixo `mcp_` é adicionado automaticamente para evitar colisões com ferramentas nativas (plugins, @coder, @webfetch, etc.).</Info>
+
+---
+
+## Servidores MCP Populares
+
+| Servidor | Descrição | Instalação |
+|:---------|:----------|:-----------|
+| `@anthropic/mcp-server-filesystem` | Acesso ao sistema de arquivos | `npx -y @anthropic/mcp-server-filesystem /path` |
+| `@anthropic/mcp-server-github` | Integração com GitHub | `npx -y @anthropic/mcp-server-github` |
+| `@anthropic/mcp-server-postgres` | Queries PostgreSQL | `npx -y @anthropic/mcp-server-postgres` |
+| `@anthropic/mcp-server-slack` | Integração com Slack | `npx -y @anthropic/mcp-server-slack` |
+| `@anthropic/mcp-server-brave-search` | Busca web via Brave | `npx -y @anthropic/mcp-server-brave-search` |
+| `@anthropic/mcp-server-memory` | Memória persistente | `npx -y @anthropic/mcp-server-memory` |
+
+<Tip>Consulte [modelcontextprotocol.io](https://modelcontextprotocol.io) para a lista completa de servidores MCP.</Tip>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Servidor não conecta">
+    Verifique:
+    1. O comando existe e está no PATH (`which npx`)
+    2. O arquivo de config está em `~/.chatcli/mcp_servers.json`
+    3. `enabled` está `true`
+    4. Use `/mcp status` para ver erros de conexão
+    5. Use `/mcp logs <nome>` para ver as últimas linhas de stderr do servidor (npm 404, panic, missing executable)
+    6. Verifique logs com `CHATCLI_LOG_LEVEL=debug`
+  </Accordion>
+  <Accordion title="O servidor MCP não enxerga o token / connection string">
+    A causa quase sempre é uma das duas:
+
+    1. **Variável não exportada no shell** — `${GH_TOKEN}` na config expande para vazio se `GH_TOKEN` não está em `os.Environ()`. Confirme com `echo $GH_TOKEN` antes de iniciar o ChatCLI.
+    2. **Mudou o token mid-sessão** — a expansão acontece no spawn. Após exportar a variável nova, rode `/mcp restart <nome>` para forçar o re-spawn com o ambiente atualizado.
+
+    Para inspecionar o que o servidor recebeu, abra `/mcp logs <nome>` — servidores MCP costumam logar "missing token" / 401 em stderr.
+  </Accordion>
+  <Accordion title="Hot-reload não dispara quando crio o mcp_servers.json">
+    A partir das fixes de hot-reload, o watcher é iniciado quando o **diretório pai** existe — mesmo sem o arquivo. Se você nunca criou `~/.chatcli/`, não há watcher.
+
+    **Solução**: crie o diretório uma vez (`mkdir -p ~/.chatcli`) e reinicie o ChatCLI. Daí em diante, criar/editar `mcp_servers.json` dispara reload automaticamente.
+
+    Para forçar um reload manual a qualquer momento: `/mcp reload`.
+  </Accordion>
+  <Accordion title="Editei o JSON e ele tem erro de sintaxe — perdi tudo?">
+    Não. Quando o `LoadConfig` falha (0 bytes, JSON inválido), o ChatCLI loga um warning mas **mantém o manager + watcher rodando**. Você corrige o JSON no editor, salva, e o próximo evento dispara `Reload` normalmente — sem reiniciar a sessão.
+  </Accordion>
+  <Accordion title="Tools não aparecem">
+    1. O servidor pode não suportar `tools/list`
+    2. Use `/mcp tools` para listar tools descobertas
+    3. Reinicie com `/mcp restart`
+  </Accordion>
+  <Accordion title="Timeout na execução de tool">
+    O timeout padrão é **60s** por chamada RPC (cobre cold-start de `npx -y`). Se um servidor específico demora mais:
+
+    1. Suba o `timeout` (segundos) só pra esse server na config — veja [Timeouts](#timeouts).
+    2. Se a falha é no **handshake** (não na chamada), bumpe `initTimeout` separadamente.
+    3. Para servers de longa duração (proxies LLM, agentes lentos), prefira SSE — o stream fica aberto enquanto o server processa.
+  </Accordion>
+  <Accordion title="Tool MCP foi auto-aprovada sem eu confirmar">
+    Verifique:
+    1. `autoApprove` ou `alwaysAllow` no config tem o nome dela (ou `"*"`) — veja [Auto-aprovação](#auto-aprovação-e-trust).
+    2. `trust: true` no server faz bypass total. Toda chamada auto-aprovada gera log info `MCP tool auto-approved by config tool=<nome>`. Grep no log do chatcli pra auditar.
+    3. Para remover o bypass, edite o JSON (hot-reload reaplica) ou rode `/mcp reload`.
+  </Accordion>
+  <Accordion title="Servidor SSE retornou 401/403">
+    1. Confira que a env var referenciada por `auth.token`/`headers` está exportada no shell. `${UNSET_VAR}` expande para string vazia e ChatCLI **suprime o header inteiro** em vez de mandar `Authorization: Bearer ` (vazio) — então o server reporta 401 como se nem auth tivesse vindo.
+    2. Rotacionou o token no shell? Headers são re-aplicados a cada request, não precisa de `/mcp restart`. Mas confirme que o shell que iniciou o ChatCLI tem a nova variável (export, source, etc.).
+    3. Para `type: "header"` com nome custom, confirme que o server espera **exatamente** o nome configurado (ChatCLI envia literalmente o que está em `auth.header`).
+  </Accordion>
+  <Accordion title="HTTP transport: -32600 / 'Not Acceptable: Client must Accept text/event-stream'">
+    Erro retornado por servidores Streamable HTTP que checam o **primeiro** media type do `Accept` como preferência do cliente (FastMCP, alguns gateways MCP). ChatCLI envia `Accept: text/event-stream, application/json` exatamente nessa ordem desde a primeira release com `transport: "http"` — então esse erro só aparece se você sobrescrever `Accept` via `headers` na config. Remova a entrada `Accept` dos `headers` e o transport assume o padrão.
+  </Accordion>
+  <Accordion title="HTTP transport: timeout de ~10s no initialize, mas curl funciona">
+    Quase sempre é uma de três causas (em ordem de probabilidade):
+
+    1. **Proxy corporativo não exportado.** Curl lê `~/.curlrc` (com `proxy=...`), Go não. Exporte `HTTPS_PROXY`, `HTTP_PROXY` e `NO_PROXY` no shell que roda o ChatCLI — nosso `http.Client` usa `http.DefaultTransport` que respeita essas três variáveis nativamente.
+    2. **Barra final faltando na `url`.** Servidores FastMCP / Starlette / FastAPI 307-redirecionam `/mcp` para `/mcp/`. O Go segue o 307 com POST, mas proxies no caminho frequentemente quebram o redirect (body ou headers descartados). Configure `url` com a barra exatamente como o servidor responde 200 OK no curl.
+    3. **CA corporativa fora do trust store que o Go enxerga.** Em macOS especialmente, CAs adicionadas via mobile-config às vezes não são pegadas. Exporte `SSL_CERT_FILE=/etc/ssl/certs/corp-ca.pem` apontando pra mesma bundle que o curl usa.
+
+    Pra distinguir entre essas causas, bumpe `initTimeout` para `60` ou `120` na config — se passa de "hang em 10s" para "responde em 30s", é proxy lento; se continua hangando, é (1) ou (2).
+  </Accordion>
+  <Accordion title="Tool MCP não aparece no /mcp tools">
+    Provavelmente foi escondida por config:
+
+    1. `disabledTools` lista o nome dela — remova ou inverta para `enabledTools`.
+    2. `enabledTools` está populado mas a tool não está na allowlist — adicione ou esvazie `enabledTools` para voltar ao default "tudo visível".
+    3. `/mcp status` mostra a contagem de tools escondidas (blocklist).
+  </Accordion>
+  <Accordion title="Override não está funcionando — o LLM ainda vê o built-in">
+    Verifique:
+    1. O nome no `overrides` está **exatamente** como o nome do plugin, incluindo o `@` (ex: `"@webfetch"`, **não** `"webfetch"`)
+    2. O servidor MCP está **connected** (`/mcp status`)
+    3. O campo `enabled` do server está `true`
+    4. Se o server caiu e reconectou, o override volta automaticamente no **próximo turno** de conversa
+  </Accordion>
+  <Accordion title="Built-in sumiu mas o MCP server não tem a ferramenta equivalente">
+    O campo `overrides` **apenas esconde** o built-in — não valida se o MCP server realmente oferece uma ferramenta equivalente. Se você colocar `"overrides": ["@webfetch"]` mas o MCP server não tem `web_fetch`, o LLM simplesmente não terá essa capacidade. Remova o override ou adicione a ferramenta ao MCP server.
+  </Accordion>
+  <Accordion title="Quero forçar o uso do built-in mesmo com MCP ativo">
+    Remova o built-in da lista `overrides` do servidor MCP. Ambas as ferramentas (MCP e built-in) ficarão visíveis simultaneamente e o LLM escolherá baseado no nome e descrição de cada uma.
+  </Accordion>
+</AccordionGroup>

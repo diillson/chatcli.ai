@@ -1,0 +1,446 @@
+---
+title: "WebFetch & WebSearch"
+sidebarTitle: "Web Tools"
+description: "Ferramentas built-in para busca web e fetch de páginas diretamente do agent/coder mode"
+icon: "globe"
+---
+
+O ChatCLI inclui três ferramentas web nativas -- **@webfetch**, **@websearch** e **@wikipedia** -- que permitem ao agent buscar informações na internet, fazer fetch de páginas web e consultar a Wikipedia sem depender de servidores MCP externos.
+
+<Info>
+As web tools são ferramentas nativas do ChatCLI, disponíveis automaticamente nos modos agent e coder. Não e necessário configurar servidores MCP para usa-las.
+</Info>
+
+---
+
+## @webfetch
+
+Faz o fetch de uma URL, remove o HTML e retorna o conteúdo textual limpo. Ideal para ler documentações, artigos, READMEs e qualquer página web.
+
+### Como Funciona
+
+<Steps>
+  <Step title="Requisicao HTTP">
+    O ChatCLI faz uma requisicao GET para a URL fornecida com headers padrão de navegador.
+  </Step>
+  <Step title="Parse HTML">
+    O HTML recebido e parseado usando `golang.org/x/net/html`, extraindo apenas o conteúdo textual.
+  </Step>
+  <Step title="Limpeza">
+    Tags de script, style, navegacao e elementos não-textuais são removidos. O texto resultante e limpo e formatado.
+  </Step>
+  <Step title="Retorno">
+    O conteúdo textual e retornado ao agent como resultado da tool call.
+  </Step>
+</Steps>
+
+### Uso
+
+O LLM invoca `@webfetch` automaticamente quando precisa acessar conteúdo de uma URL. Você também pode solicitar explicitamente:
+
+```text
+Leia a documentação em https://pkg.go.dev/net/http e me explique o tipo Client
+```
+
+### Formatos de Argumentos
+
+<Tabs>
+  <Tab title="JSON">
+    ```json
+    {
+      "tool": "webfetch",
+      "args": {
+        "url": "https://pkg.go.dev/net/http"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Posicional">
+    ```text
+    webfetch https://pkg.go.dev/net/http
+    ```
+  </Tab>
+</Tabs>
+
+### Exemplo
+
+```text
+User: Busque o conteúdo de https://go.dev/blog/error-handling-and-go
+
+Agent: Vou buscar o conteúdo da página.
+
+[tool_call: webfetch {"url": "https://go.dev/blog/error-handling-and-go"}]
+
+Resultado: O artigo "Error handling and Go" explica os padroes de
+tratamento de erros em Go, incluindo...
+```
+
+<Tip>
+O `@webfetch` respeita redirects (até 10), timeouts (30s) e retorna erros claros para URLs inacessíveis ou com problemas de SSL.
+</Tip>
+
+### Filtros para payloads grandes
+
+Endpoints como Prometheus `/metrics`, dumps de configuração ou listagens longas podem facilmente exceder dezenas de milhares de caracteres. O `@webfetch` aceita um conjunto de parâmetros que aplicam **filtragem por linha antes do truncamento**, evitando que o miolo útil seja descartado:
+
+| Parâmetro | Tipo | Descrição |
+|:----------|:-----|:----------|
+| `filter` | string (regex Go) | Mantém apenas linhas que casam com o regex. Aplicado antes de `exclude` e `from_line`/`to_line`. |
+| `exclude` | string (regex Go) | Descarta linhas que casam com o regex. Aplicado depois de `filter`. |
+| `from_line` | integer | Início da janela na visão filtrada (1-based, inclusivo). |
+| `to_line` | integer | Fim da janela na visão filtrada (1-based, inclusivo). |
+| `save_to_file` | boolean | Persiste o corpo completo (pré-filtro) no [scratch dir da sessão](/pt/features/session-workspace) e retorna preview + caminho absoluto. Disparado **automaticamente** quando o corpo excede `CHATCLI_WEBFETCH_AUTOSAVE_BYTES` (default `10000`) e não há filtro/range definido. |
+| `save_path` | string | Sobrescreve o nome do arquivo gerado por `save_to_file` (qualquer prefixo de diretório é descartado — escrita sempre confinada ao scratch). |
+| `max_length` | integer | Tamanho máximo do conteúdo retornado inline (default: **20.000**). Conteúdo acima disso é truncado inline — ou auto-salvo no scratch dir via auto-save. |
+| `render` | boolean | Força (`true`) ou suprime (`false`) a renderização headless de páginas JS — ver [Renderização de páginas JavaScript](#renderizacao-de-paginas-javascript-spa). Sem o parâmetro, o modo `auto` decide pela heurística. |
+
+Exemplo — filtrar Prometheus por prefixo de métrica:
+
+```json
+{
+  "url": "http://payments.prod.svc:9090/metrics",
+  "filter": "^chatcli_",
+  "exclude": "^# HELP|^# TYPE"
+}
+```
+
+Exemplo — paginar dentro do payload filtrado:
+
+```json
+{
+  "url": "http://svc/very-long-changelog",
+  "filter": "^- ",
+  "from_line": 50,
+  "to_line": 80
+}
+```
+
+Exemplo — salvar tudo no scratch dir e ler trechos sob demanda depois:
+
+```json
+{
+  "url": "http://svc/metrics",
+  "save_to_file": true
+}
+```
+
+Resposta:
+
+```text
+[full response saved to /tmp/chatcli-agent-Xy7K3a/scratch/webfetch_1712...txt — 142_318 bytes.
+Use read_file with start/end to examine specific ranges.]
+
+[primeiros ~50K chars do conteúdo]
+```
+
+O agente pode então emitir um `read_file` apontando para o caminho absoluto retornado, escolhendo o intervalo exato de linhas que importa.
+
+<Warning>
+`save_to_file` sempre confina escritas a `CHATCLI_AGENT_TMPDIR`. Se `save_path` for um caminho absoluto ou contiver `..`, apenas o `filepath.Base` é usado, e a escrita é validada para garantir que o resultado fica dentro do scratch dir.
+</Warning>
+
+### Auto-save inteligente
+
+Quando o LLM chama `@webfetch` **sem** filtro, exclude, range ou `save_to_file` explícito, e o body retornado supera o threshold de auto-save, o ChatCLI **promove o fetch automaticamente** para modo `save_to_file=true`. Isso protege o contexto contra páginas gigantes sem obrigar o modelo a saber o tamanho de antemão.
+
+Default: bodies acima de **10.000 bytes** (configurável via `CHATCLI_WEBFETCH_AUTOSAVE_BYTES`) passam pelo auto-save. O resultado inline fica em um preview compacto (~5.000 chars) e a resposta começa com um marker explícito:
+
+```text
+[auto-saved: response was 142318 bytes — too large to inline.
+ Full body is at /tmp/chatcli-agent-.../scratch/webfetch_1712....txt.
+ Preview below; use read_file with start/end or rerun with
+ filter/from_line/to_line for specific ranges.]
+
+[primeiros ~5000 chars do texto extraído]
+...(auto-truncated — full body saved to disk)
+```
+
+<Tip>
+Para desativar ou relaxar o auto-save — por exemplo, em batches offline onde o agente precisa do body inteiro inline — suba o threshold:
+
+```bash
+export CHATCLI_WEBFETCH_AUTOSAVE_BYTES=1000000   # 1 MB — efetivamente desabilitado para a maioria das páginas
+```
+
+Ou, na chamada específica, passe `filter` (mesmo que `.*`), `from_line`/`to_line` explícitos, ou `save_to_file` com `false`. Presença de qualquer um desses desabilita a promoção automática.
+</Tip>
+
+Ver [Eficiência de Tokens](/pt/features/token-efficiency) para o contexto completo dessa decisão.
+
+### Renderização de páginas JavaScript (SPA)
+
+Páginas que constroem o conteúdo no client (SPAs, tabelas montadas via JavaScript) retornam um "casco" vazio no fetch estático — `<div id="root">` e bundles, sem o conteúdo real. O `@webfetch` resolve isso com uma **cadeia de escalonamento**:
+
+<Steps>
+  <Step title="Fetch estático">
+    Sempre o primeiro passo. Páginas server-rendered param aqui — zero custo extra.
+  </Step>
+  <Step title="Detecção de shell JS">
+    Heurística: texto extraído fino + sinais estruturais (mount points vazios `#root`/`#app`, aviso `<noscript>`, marcadores de framework — React, Next, Angular, Vue, Nuxt, Svelte, Gatsby, Remix, Flutter).
+  </Step>
+  <Step title="Render headless via CDP">
+    Um Chromium real renderiza a página (espera load + DOM estável) e o DOM resultante passa pelo mesmo pipeline de extração/filtros/auto-save.
+  </Step>
+  <Step title="Fallbacks sem browser">
+    Sem browser disponível, o estado embutido `__NEXT_DATA__` (Next.js) é recuperado do HTML estático; em último caso, uma nota honesta avisa o modelo que o fetch pode estar incompleto.
+  </Step>
+</Steps>
+
+**Descoberta de browser** (ordem): Chrome → Chromium → Edge → **Brave** → caminho explícito em `CHATCLI_WEBFETCH_RENDER_BROWSER` → download opt-in de um Chromium pinado (~150 MB, uma vez) com `CHATCLI_WEBFETCH_RENDER_AUTOPROVISION=true`. Sem API keys, sem serviços externos.
+
+**Postura de produção:** um browser compartilhado por processo (lançamento lazy, reuso com health-check, shutdown após 2 min ocioso), **circuit breaker** (2 falhas de launch → 5 min de pausa), contexto incógnito por render (cookies nunca vazam entre sites) e SSRF reforçado dentro do browser — cada sub-request da página é validado via interceptação CDP, espelhando o guard do caminho HTTP normal. DOM renderizado limitado a 10 MB.
+
+| Variável | Descrição | Default |
+|:---------|:----------|:--------|
+| `CHATCLI_WEBFETCH_RENDER` | `auto` (heurística decide), `always`, `never` | `auto` |
+| `CHATCLI_WEBFETCH_RENDER_TIMEOUT` | Timeout do render em segundos | `25` |
+| `CHATCLI_WEBFETCH_RENDER_BROWSER` | Caminho **absoluto** para um binário Chromium-based específico | _(auto-detect)_ |
+| `CHATCLI_WEBFETCH_RENDER_AUTOPROVISION` | Permite o download único de um Chromium pinado quando nenhum browser existe | `false` |
+
+```text
+> @webfetch https://app-spa.example.com/dashboard
+Page appears JS-rendered; escalating to headless browser...
+```
+
+---
+
+## @websearch
+
+Realiza uma busca web e retorna os resultados com título, URL e snippet. Suporta **dois backends keyless** por design — nada de API key externa para cadastrar: **DuckDuckGo** (scraping HTML) é o default zero-config, e **SearxNG self-hosted** é o preferido em ambiente corporativo quando você aponta para uma instância interna.
+
+### Backends disponíveis
+
+| Backend | Requisito | Quando brilha | Quando dói |
+|:--------|:----------|:--------------|:-----------|
+| **DuckDuckGo** | Nenhum | Default, funciona já, zero config | DDG eventualmente serve interstitial de anti-bot (CAPTCHA) — pode retornar zero resultados |
+| **SearxNG self-hosted** | `SEARXNG_URL` apontando para a instância | Empresa fechada em rede corporativa — você controla o backend, sem saída para scraping público, agrega vários engines (Bing/Google/Qwant) pela instância | Requer subir um container interno + habilitar JSON no `settings.yml` |
+| **Brave Search** | Nenhum | Índice **próprio e independente** (não é meta-busca) — diversidade real quando DDG bloqueia | Scraping HTML; layout pode mudar (parser ancorado em atributos semânticos estáveis) |
+| **Mojeek** | Nenhum | Índice próprio e independente, crawler britânico | Algumas redes recebem 403 para tráfego automatizado — a cadeia simplesmente avança |
+
+### Cadeia de fallback
+
+A cada query, o ChatCLI monta uma cadeia ordenada de backends. Se o primeiro falha ou retorna vazio, o próximo é tentado automaticamente.
+
+**Ordem default (`CHATCLI_WEBSEARCH_PROVIDER` não setado ou `auto`):**
+
+```
+1. DuckDuckGo          ← default, sempre disponível
+2. SearxNG             ← só entra na cadeia se SEARXNG_URL estiver setado
+3. Brave Search        ← índice independente, zero config
+4. Mojeek              ← índice independente, zero config
+```
+
+**Override explícito para priorizar SearxNG:**
+
+```bash
+export CHATCLI_WEBSEARCH_PROVIDER=searxng
+export SEARXNG_URL=https://searx.internal.corp
+```
+
+Resultado: cadeia vira `searxng → duckduckgo → brave → mojeek`. Os demais continuam como fallback se a instância SearxNG falhar. O mesmo vale para qualquer provider: `CHATCLI_WEBSEARCH_PROVIDER=brave` move o Brave para o topo e mantém o resto atrás.
+
+### Variáveis de ambiente
+
+| Variável | Descrição | Default |
+|:---------|:----------|:--------|
+| `CHATCLI_WEBSEARCH_PROVIDER` | Força um backend específico no topo da cadeia: `searxng`, `duckduckgo`, `brave`, `mojeek`, ou `auto`. | `auto` |
+| `SEARXNG_URL` | URL raiz da instância SearxNG (ex.: `https://searx.internal.corp`). Quando setado, SearxNG entra na cadeia. | _(não setado)_ |
+
+### Comando `/websearch`
+
+Gerenciador interativo do backend preferido. **Autocomplete disponível** para subcomandos e nomes de provider.
+
+| Subcomando | Efeito |
+|:-----------|:-------|
+| `/websearch` ou `/websearch status` | Mostra provider atual + cadeia ativa |
+| `/websearch list` | Lista providers conhecidos e quais estão configurados |
+| `/websearch provider <searxng\|duckduckgo\|brave\|mojeek\|auto>` | Define provider preferido para a sessão (seta `CHATCLI_WEBSEARCH_PROVIDER` no processo) |
+| `/websearch reset` | Remove o override e volta ao modo auto |
+
+O `/websearch provider` é apenas para a sessão corrente. Para persistir, exporte a env no shell ou adicione ao `.env`.
+
+### Configurando SearxNG self-hosted
+
+A instância SearxNG precisa ter a **JSON API habilitada** — não vem ativa por default. No `settings.yml` do SearxNG:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Se você apontar o `SEARXNG_URL` para uma instância sem JSON habilitado, o ChatCLI retorna um erro acionável ao invés de uma mensagem de decode confusa:
+
+```text
+SearxNG did not return JSON (Content-Type="text/html"). Enable JSON in settings.yml: search.formats: [html, json]
+```
+
+<Tip>
+A imagem oficial `searxng/searxng` no Docker Hub sobe em 30 segundos. Em ambiente corporativo, um único container com ingress interno já é suficiente — e resolve o problema de "DDG bloqueado pelo proxy" de uma vez.
+</Tip>
+
+### Como funciona internamente
+
+<Steps>
+  <Step title="Seleção da cadeia">
+    `SelectSearchChain()` lê `CHATCLI_WEBSEARCH_PROVIDER` e `SEARXNG_URL`, retorna uma lista ordenada de backends a tentar.
+  </Step>
+  <Step title="Tentativa sequencial">
+    Para cada backend na cadeia: chama a função de busca. Se retorna resultados, pára e formata. Se falha ou retorna zero, loga o motivo e avança para o próximo.
+  </Step>
+  <Step title="Formatação">
+    Resultados viram texto formatado com `via <provider>` no cabeçalho, numerados com título + URL + snippet.
+  </Step>
+</Steps>
+
+### Formatos de Argumentos
+
+<Tabs>
+  <Tab title="JSON">
+    ```json
+    {
+      "tool": "websearch",
+      "args": {
+        "query": "golang rate limiting best practices 2026"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Posicional">
+    ```text
+    websearch golang rate limiting best practices 2026
+    ```
+  </Tab>
+</Tabs>
+
+### Exemplo
+
+```text
+User: Pesquise como configurar OpenTelemetry com Go
+
+Agent: Vou buscar informações atualizadas sobre isso.
+
+[tool_call: websearch {"query": "opentelemetry go setup tutorial"}]
+
+Search results for: "opentelemetry go setup tutorial" (via DuckDuckGo)
+
+1. Getting Started with OpenTelemetry in Go
+   URL: https://opentelemetry.io/docs/languages/go/getting-started/
+   Official guide to instrumenting Go applications with OpenTelemetry...
+
+2. OpenTelemetry Go SDK - Complete Guide
+   URL: https://example.com/otel-go-guide
+   Step-by-step tutorial covering traces, metrics and logs...
+```
+
+O cabeçalho `(via DuckDuckGo)` ou `(via SearxNG)` deixa claro qual backend respondeu — útil para diagnosticar por que alguma query não voltou resultado (ex.: DDG serviu CAPTCHA → fallback para SearxNG).
+
+<Info>
+**Por que keyless?** O ChatCLI é usado em ambientes corporativos onde gerenciar API keys de terceiros (Brave Search, Tavily, SerpAPI) gera atrito operacional — cadastro, rotação, approvals. SearxNG self-hosted resolve fechamento de rede sem custo recorrente; DuckDuckGo cobre o caso casual sem nenhuma config.
+</Info>
+
+---
+
+## @wikipedia
+
+Consulta a Wikipedia de forma **keyless** via a API pública do MediaWiki: busca títulos de artigos que combinam com um termo, ou lê a introdução (resumo em texto puro) de um artigo específico. Companheira natural do `@websearch`/`@webfetch` para checagem factual rápida -- sem API key, sem servidor MCP.
+
+### Como Funciona
+
+São dois modos:
+
+- **search** -- recebe um termo e retorna até 5 títulos de artigos correspondentes (os títulos exatos para usar no `read`).
+- **read** -- recebe o título exato de um artigo e retorna a introdução em texto puro (sem HTML, sem markup).
+
+O idioma é configurável via `lang` (default `en`; ex.: `pt`, `es`, `fr`). Valores como `pt-BR` são normalizados para `pt`.
+
+### Uso
+
+O LLM invoca `@wikipedia` automaticamente quando precisa de um fato verificável. O fluxo típico é: buscar pelo termo, depois ler o título exato retornado.
+
+### Formatos de Argumentos
+
+<Tabs>
+  <Tab title="JSON (search)">
+    ```json
+    { "tool": "wikipedia", "args": { "query": "Alan Turing" } }
+    ```
+  </Tab>
+  <Tab title="JSON (read)">
+    ```json
+    { "tool": "wikipedia", "args": { "read": "Alan Turing", "lang": "pt" } }
+    ```
+  </Tab>
+  <Tab title="Posicional">
+    ```text
+    wikipedia computação quântica
+    ```
+  </Tab>
+</Tabs>
+
+| Argumento | Descrição | Default |
+|:----------|:----------|:--------|
+| `query` | Termo de busca -- retorna até 5 títulos correspondentes | _(obrigatório no modo search)_ |
+| `read` | Título exato do artigo -- retorna a introdução em texto puro | _(obrigatório no modo read)_ |
+| `lang` | Edição de idioma da Wikipedia (`en`, `pt`, `es`, ...) | `en` |
+
+### Exemplo
+
+```text
+User: Quem foi Ada Lovelace?
+
+Agent: Vou consultar a Wikipedia.
+
+[tool_call: wikipedia {"query": "Ada Lovelace", "lang": "pt"}]
+[tool_call: wikipedia {"read": "Ada Lovelace", "lang": "pt"}]
+
+Ada Lovelace (1815-1852) foi uma matemática e escritora inglesa, reconhecida
+por seu trabalho na máquina analítica de Charles Babbage...
+```
+
+<Tip>
+O `@wikipedia` é **keyless** e respeita a etiqueta da API do MediaWiki (User-Agent identificado). Para checagem factual rápida, ele é mais barato e direto que encadear `@websearch` + `@webfetch`.
+</Tip>
+
+---
+
+## Comparacao
+
+| Aspecto | @webfetch | @websearch | @wikipedia |
+|:--------|:----------|:-----------|:-----------|
+| **Proposito** | Ler conteúdo de uma URL específica | Buscar na web por uma query | Buscar/ler artigos da Wikipedia |
+| **Input** | URL | Query de busca | Termo (search) ou título exato (read) |
+| **Output** | Texto limpo da página | Lista de resultados (título + URL + snippet) | Títulos correspondentes ou resumo do artigo |
+| **Quando usar** | Você sabe a URL exata | Você precisa encontrar informações | Você precisa de um fato enciclopédico verificável |
+| **Motor** | HTTP GET + HTML parser | DuckDuckGo (scraping HTML) + SearxNG (JSON API) | API pública do MediaWiki (keyless) |
+
+---
+
+## Disponibilidade
+
+As web tools estão disponíveis nos seguintes modos:
+
+| Modo | @webfetch | @websearch | @wikipedia |
+|:-----|:----------|:-----------|:-----------|
+| Chat | Não | Não | Não |
+| Agent (`/agent`) | Sim | Sim | Sim |
+| Coder (`/coder`) | Sim | Sim | Sim |
+| One-shot (`-p`) | Sim (com `--agent`) | Sim (com `--agent`) | Sim (com `--agent`) |
+
+<Warning>
+No modo chat interativo, as web tools **não** estão disponíveis. Você precisa estar em agent ou coder mode para que o LLM possa invocá-las como tool calls.
+</Warning>
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="MCP Integration" icon="link" href="/pt/features/mcp-integration">
+    Integre ferramentas web adicionais via MCP servers.
+  </Card>
+  <Card title="Plugins Agenticos" icon="puzzle-piece" href="/pt/features/agentic-plugins">
+    Veja todas as ferramentas disponíveis para o agent.
+  </Card>
+</CardGroup>

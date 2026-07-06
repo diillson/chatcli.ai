@@ -1,17 +1,48 @@
 ---
 title: "AIOps Platform (Deep-Dive)"
 sidebarTitle: "AIOps Platform"
-description: "Arquitetura detalhada da plataforma AIOps autônoma: pipeline completo de detecção, correlação, análise por IA e remediação automática no Kubernetes."
+description: "Detailed architecture of the autonomous AIOps platform: complete pipeline of detection, correlation, AI analysis, and automatic remediation on Kubernetes."
 icon: "brain"
 ---
 
-A **Plataforma AIOps** do ChatCLI e um sistema autônomo que detecta problemas no Kubernetes, analisa causas raiz com IA e executa remediações automáticas — tudo orquestrado por CRDs nativos do Kubernetes.
+The ChatCLI **AIOps Platform** is an autonomous system that detects problems in Kubernetes, analyzes root causes with AI, and executes automatic remediations -- all orchestrated by native Kubernetes CRDs.
 
-Esta página cobre a arquitetura interna em profundidade. Para configuração e exemplos de uso, veja [K8s Operator](/features/k8s-operator).
+This page covers the internal architecture in depth. For configuration and usage examples, see [K8s Operator](/features/k8s-operator).
 
 
 
-## Visão Geral do Pipeline
+## Platform v2 Components
+
+<CardGroup cols={3}>
+  <Card title="Notifications" icon="bell" href="/features/aiops/notifications">
+    NotificationPolicy & EscalationPolicy
+  </Card>
+  <Card title="SLO & SLA" icon="bullseye" href="/features/aiops/slo-sla">
+    ServiceLevelObjective & IncidentSLA
+  </Card>
+  <Card title="Approvals" icon="check-double" href="/features/aiops/approvals">
+    ApprovalPolicy & ApprovalRequest
+  </Card>
+  <Card title="Multi-Cluster" icon="globe" href="/features/aiops/multi-cluster">
+    ClusterRegistration & Federation
+  </Card>
+  <Card title="Audit" icon="scroll" href="/features/aiops/audit">
+    AuditEvent (immutable trail)
+  </Card>
+  <Card title="Chaos Engineering" icon="explosion" href="/features/aiops/chaos">
+    ChaosExperiment with safety checks
+  </Card>
+</CardGroup>
+
+### REST API & Dashboard
+
+In addition to gRPC, the operator now exposes a **REST HTTP API** on port `:8090` with **30+ endpoints** covering incidents, SLOs, runbooks, approvals, postmortems, analytics, clusters and audit. Authentication is via `X-API-Key` with role mapping (viewer/operator/admin), rate limited at 100 req/min per key. A **Web Dashboard** is embedded and served at `/`.
+
+For the complete reference, see the [API Reference](/reference/api/overview).
+
+
+
+## Pipeline Overview
 
 ```mermaid
 sequenceDiagram
@@ -25,203 +56,162 @@ sequenceDiagram
     participant RR as RemediationReconciler
     participant K8s as Kubernetes API
 
-    loop a cada 30 segundos
+    loop every 30 seconds
         WB->>Server: GetAlerts(namespace)
         Server-->>WB: alerts[]
-        WB->>K8s: Cria Anomaly CRs (dedup SHA256)
+        WB->>K8s: Creates Anomaly CRs (dedup SHA256)
     end
 
     AR->>K8s: Watch Anomaly CRs
-    AR->>CE: Correlaciona anomalias
+    AR->>CE: Correlates anomalies
     CE-->>AR: risk score + severity + incident ID
-    AR->>K8s: Cria/atualiza Issue CR (com signalType)
+    AR->>K8s: Creates/updates Issue CR (with signalType)
 
     IR->>K8s: Watch Issue CRs
-    IR->>K8s: Cria AIInsight CR (estado: Analyzing)
+    IR->>K8s: Creates AIInsight CR (state: Analyzing)
 
     AIR->>K8s: Watch AIInsight CRs
-    AIR->>K8s: Coleta contexto enriquecido (K8s + logs + métricas + GitOps + código + cascade)
+    AIR->>K8s: Collects enriched context (K8s + logs + metrics + GitOps + code + cascade)
     AIR->>Server: AnalyzeIssue(enriched_context)
-    Server->>LLM: Prompt estruturado com contexto K8s
+    Server->>LLM: Structured prompt with K8s context
     LLM-->>Server: JSON (analysis + actions)
     Server-->>AIR: AnalyzeIssueResponse
-    AIR->>K8s: Atualiza AIInsight.Status
+    AIR->>K8s: Updates AIInsight.Status
 
-    IR->>K8s: Verifica AIInsight pronto
-    alt Runbook manual existe
-        IR->>K8s: Cria RemediationPlan (do Runbook manual)
-    else AI tem ações sugeridas
-        IR->>K8s: Gera Runbook auto (reutilizável)
-        IR->>K8s: Cria RemediationPlan (do Runbook auto-gerado)
-    else Nenhum disponível
-        IR->>K8s: Cria RemediationPlan agêntico (AgenticMode=true)
-        Note over IR,K8s: IA decide cada ação step-by-step
+    IR->>K8s: Checks AIInsight ready
+    alt Manual Runbook exists
+        IR->>K8s: Creates RemediationPlan (from manual Runbook)
+    else AI has suggested actions
+        IR->>K8s: Generates auto Runbook (reusable)
+        IR->>K8s: Creates RemediationPlan (from auto-generated Runbook)
+    else None available
+        IR->>K8s: Creates agentic RemediationPlan (AgenticMode=true)
+        Note over IR,K8s: AI decides each action step-by-step
     end
 
     RR->>K8s: Watch RemediationPlan CRs
 
-    alt Modo standard (Runbook)
-        RR->>K8s: Executa ações (54 tipos: Deployment/StatefulSet/DaemonSet/Job/CronJob + GitOps/Infra/Storage/Security/Network)
-    else Modo agêntico
-        loop Cada step (max 10, timeout 10min)
+    alt Standard mode (Runbook)
+        RR->>K8s: Executes actions (54 types: Deployment/StatefulSet/DaemonSet/Job/CronJob + GitOps/Infra/Storage/Security/Network)
+    else Agentic mode
+        loop Each step (max 10, timeout 10min)
             RR->>Server: AgenticStep(context + history)
-            Server->>LLM: Prompt com contexto K8s + histórico
-            LLM-->>Server: JSON (reasoning + next_action ou resolved)
+            Server->>LLM: Prompt with K8s context + history
+            LLM-->>Server: JSON (reasoning + next_action or resolved)
             Server-->>RR: AgenticStepResponse
-            RR->>K8s: Executa ação sugerida
-            RR->>K8s: Registra observação no AgenticHistory
+            RR->>K8s: Executes suggested action
+            RR->>K8s: Records observation in AgenticHistory
         end
     end
-    RR->>K8s: Atualiza RemediationPlan.Status
+    RR->>K8s: Updates RemediationPlan.Status
 
-    IR->>K8s: Verifica resultado
-    alt Sucesso
-        IR->>K8s: Issue → Resolved + invalida dedup
-    else Sucesso agêntico
-        IR->>K8s: Issue → Resolved + PostMortem CR + Runbook auto
-    else Falha + tentativas restantes
-        IR->>K8s: Issue → Analyzing (re-análise com contexto de falha)
-        AIR->>Server: Re-análise com failure_context
-        Note over AIR,Server: AI sugere estratégia diferente
-    else Max tentativas
-        IR->>K8s: Issue → Escalated + invalida dedup
+    IR->>K8s: Checks result
+    alt Success
+        IR->>K8s: Issue -> Resolved + invalidates dedup
+    else Agentic success
+        IR->>K8s: Issue -> Resolved + PostMortem CR + auto Runbook
+    else Failure + remaining attempts
+        IR->>K8s: Issue -> Analyzing (re-analysis with failure context)
+        AIR->>Server: Re-analysis with failure_context
+        Note over AIR,Server: AI suggests different strategy
+    else Max attempts
+        IR->>K8s: Issue -> Escalated + invalidates dedup
     end
 ```
 
 
 
-## Componentes da Plataforma v2
-
-A plataforma AIOps foi expandida com componentes enterprise-grade:
-
-<CardGroup cols={2}>
-  <Card title="Notificações e Escalação" icon="bell" href="/features/aiops/notifications">
-    6 canais (Slack, PagerDuty, OpsGenie, Email, Webhook, Teams) com throttling e escalação automática L1→L2→L3.
-  </Card>
-  <Card title="SLOs e SLAs" icon="gauge-high" href="/features/aiops/slo-sla">
-    Burn rate alerting multi-janela (Google SRE model), error budget tracking, business hours com timezone.
-  </Card>
-  <Card title="Workflow de Aprovação" icon="shield-check" href="/features/aiops/approval-workflow">
-    Auto/manual/quorum, blast radius, change windows, integração com Decision Engine.
-  </Card>
-  <Card title="Motor de Decisão com IA" icon="brain-circuit" href="/features/aiops/decision-engine">
-    Confiança ajustada por 5 fatores, circuit breaker, pattern learning, RCA enrichment.
-  </Card>
-  <Card title="Federação Multi-Cluster" icon="network-wired" href="/features/aiops/federation">
-    Correlação cross-cluster, cascade detection, políticas por tier.
-  </Card>
-  <Card title="Chaos Engineering" icon="explosion" href="/features/aiops/chaos-engineering">
-    7 tipos de experimento com safety checks, recovery verification, DryRun.
-  </Card>
-  <Card title="Auditoria e Compliance" icon="clipboard-check" href="/features/aiops/audit-compliance">
-    Audit trail imutável, RBAC 4 níveis, relatórios de compliance (MTTD/MTTR).
-  </Card>
-  <Card title="Capacity e Custos" icon="chart-line" href="/features/aiops/capacity-cost">
-    Forecast com regressão linear, noise reduction, ROI tracking.
-  </Card>
-</CardGroup>
-
-### REST API e Dashboard
-
-A plataforma expõe uma API REST completa na porta `:8090` com 30+ endpoints cobrindo incidents, SLOs, approvals, analytics, clusters e audit. Um Web Dashboard embutido está disponível em `http://operator:8090/`.
-
-Para referência completa da API, consulte a [API Reference](/reference/api/overview).
-
-4 dashboards Grafana pré-configurados estão disponíveis em `deploy/grafana/` para importação automática via sidecar.
-
-
-
-## Componentes Internos
+## Internal Components
 
 ### 1. WatcherBridge (`watcher_bridge.go`)
 
-O WatcherBridge e o ponto de entrada do pipeline. Implementa a interface `manager.Runnable` do controller-runtime e roda como goroutine gerenciada pelo manager.
+The WatcherBridge is the pipeline entry point. It implements the controller-runtime `manager.Runnable` interface and runs as a manager-managed goroutine.
 
-**Responsabilidades:**
+**Responsibilities:**
 
-| Função | Descrição |
-|--------|-----------|
-| `Start()` | Inicia o loop de polling (30s) com context cancelavel |
-| `poll()` | Consulta GetAlerts e cria Anomaly CRs |
-| `discoverAndConnect()` | Descobre servidor via Instance CRs no cluster |
-| `createAnomaly()` | Converte alert → Anomaly CR com labels de referência |
-| `alertHash()` | SHA256(type\|deployment\|namespace) para dedup |
-| `InvalidateDedupForResource()` | Remove entradas de dedup para um deployment+namespace |
-| `sanitizeK8sName()` | Garante nomes válidos para objetos K8s (63 chars, lowercase, sem caracteres especiais) |
+| Function | Description |
+|----------|-------------|
+| `Start()` | Starts the polling loop (30s) with cancelable context |
+| `poll()` | Queries GetAlerts and creates Anomaly CRs |
+| `discoverAndConnect()` | Discovers server via Instance CRs in the cluster |
+| `createAnomaly()` | Converts alert -> Anomaly CR with reference labels |
+| `alertHash()` | SHA256(type\|deployment\|namespace) for dedup |
+| `InvalidateDedupForResource()` | Removes dedup entries for a deployment+namespace |
+| `sanitizeK8sName()` | Ensures valid names for K8s objects (63 chars, lowercase, no special characters) |
 
-**Dedup por SHA256:**
+**SHA256 Dedup:**
 
 ```text
 hash = SHA256(alertType | deployment | namespace)
 ```
 
-- **Sem componente temporal**: Um problema contínuo (e.g. CrashLoopBackOff) gera apenas uma Anomaly
-- **TTL**: 2 horas — hashes expirados são podados automaticamente
-- **Invalidação**: Quando um Issue atinge estado terminal (Resolved/Escalated), as entradas de dedup para o recurso afetado são invalidadas, permitindo detecção imediata de recorrências
-- **Resultado**: Evita duplicatas durante problema ativo; detecta recorrência após resolução
+- **No temporal component**: A continuous problem (e.g., CrashLoopBackOff) generates only one Anomaly
+- **TTL**: 2 hours -- expired hashes are pruned automatically
+- **Invalidation**: When an Issue reaches a terminal state (Resolved/Escalated), dedup entries for the affected resource are invalidated, allowing immediate recurrence detection
+- **Result**: Avoids duplicates during an active problem; detects recurrence after resolution
 
-**Descoberta do Servidor:**
+**Server Discovery:**
 
 <Steps>
-  <Step title="Lista Instance CRs no cluster">
+  <Step title="Lists Instance CRs in the cluster">
   </Step>
-  <Step title="Seleciona o primeiro Instance com Status.Ready=true">
+  <Step title="Selects the first Instance with Status.Ready=true">
   </Step>
-  <Step title="Conecta via gRPC insecure (10s timeout)">
+  <Step title="Connects via gRPC insecure (10s timeout)">
   </Step>
   <Step title="Retry">
-    Se conexão falha, tenta novamente no próximo ciclo de poll.
+    If the connection fails, retries on the next poll cycle.
   </Step>
 </Steps>
 
 ### 2. AnomalyReconciler (`anomaly_controller.go`)
 
-Observa Anomaly CRs e os correlaciona em Issues.
+Watches Anomaly CRs and correlates them into Issues.
 
-**Fluxo:**
+**Flow:**
 
 <Steps>
-  <Step title="Recebe Anomaly CR">
-    Anomaly recém-criado com `Status.Correlated = false`.
+  <Step title="Receives Anomaly CR">
+    Newly created Anomaly with `Status.Correlated = false`.
   </Step>
-  <Step title="Agrupa anomalias">
-    Chama `CorrelationEngine.FindRelatedAnomalies()` para agrupar.
+  <Step title="Groups anomalies">
+    Calls `CorrelationEngine.FindRelatedAnomalies()` to group.
   </Step>
-  <Step title="Calcula risk score e severidade">
+  <Step title="Calculates risk score and severity">
   </Step>
-  <Step title="Cria ou atualiza Issue CR">
+  <Step title="Creates or updates Issue CR">
   </Step>
-  <Step title="Marca Anomaly como correlacionada">
-    Define `Correlated = true` com referência ao Issue.
+  <Step title="Marks Anomaly as correlated">
+    Sets `Correlated = true` with reference to the Issue.
   </Step>
 </Steps>
 
 ### 3. CorrelationEngine (`correlation.go`)
 
-Motor de correlação que agrupa anomalias em incidentes.
+Correlation engine that groups anomalies into incidents.
 
-**Algoritmo de Correlação:**
+**Correlation Algorithm:**
 
 ```text
-Para cada nova anomalia:
-  1. Gera incident_id = hash(resource_kind + resource_name + namespace + signal_type)
-  2. Busca Issue existente com mesmo incident_id
-  3. Se existe -> adiciona anomalia ao Issue, recalcula risk score
-  4. Se não existe -> cria novo Issue
+For each new anomaly:
+  1. Generates incident_id = hash(resource_kind + resource_name + namespace + signal_type)
+  2. Searches for existing Issue with the same incident_id
+  3. If exists -> adds anomaly to Issue, recalculates risk score
+  4. If not exists -> creates new Issue
 ```
 
 **Risk Scoring:**
 
-| Sinal | Peso | Justificativa |
-|-------|------|---------------|
-| `oom_kill` | 30 | Indica problema de memória severo |
-| `error_rate` | 25 | Impacto direto em usuários |
-| `deploy_failing` | 25 | Indisponibilidade do serviço |
-| `latency_spike` | 20 | Degradação de performance |
-| `pod_restart` | 20 | Instabilidade do pod |
-| `pod_not_ready` | 20 | Capacidade reduzida |
+| Signal | Weight | Justification |
+|--------|--------|---------------|
+| `oom_kill` | 30 | Indicates severe memory problem |
+| `error_rate` | 25 | Direct impact on users |
+| `deploy_failing` | 25 | Service unavailability |
+| `latency_spike` | 20 | Performance degradation |
+| `pod_restart` | 20 | Pod instability |
+| `pod_not_ready` | 20 | Reduced capacity |
 
-**Classificação de Severidade:**
+**Severity Classification:**
 
 ```text
 risk_score >= 80 -> Critical
@@ -230,9 +220,9 @@ risk_score >= 40 -> Medium
 risk_score <  40 -> Low
 ```
 
-**Exemplo**: Um deployment com `oom_kill` (30) + `pod_restart` (20) = risk 50 → **Medium**. Se adicionar `error_rate` (25) = risk 75 → **High**.
+**Example**: A deployment with `oom_kill` (30) + `pod_restart` (20) = risk 50 -> **Medium**. If adding `error_rate` (25) = risk 75 -> **High**.
 
-**Mapeamento de Fonte:**
+**Source Mapping:**
 
 | Anomaly Source | Issue Source |
 |---------------|-------------|
@@ -242,47 +232,47 @@ risk_score <  40 -> Low
 
 ### 4. IssueReconciler (`issue_controller.go`)
 
-Gerencia o ciclo de vida completo de um Issue através de uma máquina de estados.
+Manages the complete lifecycle of an Issue through a state machine.
 
-**Estados e Transições:**
+**States and Transitions:**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Detected : Anomaly correlacionada
+    [*] --> Detected : Anomaly correlated
 
     state "Detected" as D {
-        state "Adiciona finalizer" as D1
-        state "Cria AIInsight" as D2
-        state "Define detectedAt" as D3
+        state "Add finalizer" as D1
+        state "Create AIInsight" as D2
+        state "Set detectedAt" as D3
         D1 --> D2
         D2 --> D3
     }
 
-    D --> Analyzing : AIInsight criado
+    D --> Analyzing : AIInsight created
 
     state "Analyzing" as A {
-        state "Aguarda Analysis" as A1
-        state "Busca Runbook manual" as A2
-        state "Gera Runbook da IA" as A3
-        state "Cria plano agêntico" as A4
-        A1 --> A2 : Analysis preenchida
-        A2 --> A3 : Sem Runbook manual
-        A3 --> A4 : Sem AI actions
+        state "Await Analysis" as A1
+        state "Search manual Runbook" as A2
+        state "Generate Runbook from AI" as A3
+        state "Create agentic plan" as A4
+        A1 --> A2 : Analysis populated
+        A2 --> A3 : No manual Runbook
+        A3 --> A4 : No AI actions
     }
 
-    A --> Remediating : RemediationPlan criado (via Runbook ou agêntico)
+    A --> Remediating : RemediationPlan created (via Runbook or agentic)
 
     state "Remediating" as R {
-        state "Aguarda execução" as R1
-        state "Verifica resultado" as R2
+        state "Await execution" as R1
+        state "Verify result" as R2
         R1 --> R2
     }
 
-    R --> Resolved : RemediationPlan completed (invalida dedup)
-    R --> A : Retry (re-análise com failure context)
-    R --> Escalated : Max attempts (invalida dedup)
+    R --> Resolved : RemediationPlan completed (invalidates dedup)
+    R --> A : Retry (re-analysis with failure context)
+    R --> Escalated : Max attempts (invalidates dedup)
 
-    note right of Resolved : Resolução agêntica gera\nPostMortem CR + Runbook
+    note right of Resolved : Agentic resolution generates\nPostMortem CR + Runbook
 
     Resolved --> [*]
     Escalated --> [*]
@@ -290,308 +280,308 @@ stateDiagram-v2
 
 <AccordionGroup>
   <Accordion title="handleDetected()">
-    1. Define `detectedAt` e `maxRemediationAttempts` (padrão: 5, configurável via Instance `aiops.maxRemediationAttempts`)
-    2. Cria AIInsight CR com owner reference (Issue → AIInsight)
-    3. Transiciona para `Analyzing`
-    4. Requeue após 10 segundos
+    1. Sets `detectedAt` and `maxRemediationAttempts` (default: 5, configurable via Instance `aiops.maxRemediationAttempts`)
+    2. Creates AIInsight CR with owner reference (Issue -> AIInsight)
+    3. Transitions to `Analyzing`
+    4. Requeues after 10 seconds
   </Accordion>
   <Accordion title="handleAnalyzing()">
-    1. Verifica se AIInsight tem `Analysis` preenchida
-    2. Busca Runbook manual correspondente (`findMatchingRunbook` — tiered matching)
-    3. Se encontrou Runbook manual → `createRemediationPlan()` (manual tem precedência)
-    4. Se não encontrou Runbook manual mas AIInsight tem `SuggestedActions` → `generateRunbookFromAI()` → `createRemediationPlan()` usando o Runbook auto-gerado
-    5. Se nenhum → `createAgenticRemediationPlan()` (AgenticMode=true, sem ações pré-definidas — a IA decide cada passo)
-    6. Transiciona para `Remediating`
+    1. Checks if AIInsight has `Analysis` populated
+    2. Searches for matching manual Runbook (`findMatchingRunbook` -- tiered matching)
+    3. If manual Runbook found -> `createRemediationPlan()` (manual has precedence)
+    4. If no manual Runbook but AIInsight has `SuggestedActions` -> `generateRunbookFromAI()` -> `createRemediationPlan()` using the auto-generated Runbook
+    5. If none -> `createAgenticRemediationPlan()` (AgenticMode=true, no pre-defined actions -- AI decides each step)
+    6. Transitions to `Remediating`
   </Accordion>
-  <Accordion title="findMatchingRunbook() -- Matching em camadas">
-    - **Tier 1**: SignalType + Severity + ResourceKind (match exato, preferido)
-    - **Tier 2**: Severity + ResourceKind (fallback quando signal não bate)
-    - `SignalType` resolvido de: `issue.Spec.SignalType` → fallback `issue.Labels["platform.chatcli.io/signal"]`
+  <Accordion title="findMatchingRunbook() -- Tiered Matching">
+    - **Tier 1**: SignalType + Severity + ResourceKind (exact match, preferred)
+    - **Tier 2**: Severity + ResourceKind (fallback when signal doesn't match)
+    - `SignalType` resolved from: `issue.Spec.SignalType` -> fallback `issue.Labels["platform.chatcli.io/signal"]`
   </Accordion>
   <Accordion title="generateRunbookFromAI()">
-    - Materializa `SuggestedActions` do AI como Runbook CR reutilizável
-    - Nome: `auto-{signal}-{severity}-{kind}` (sanitizado)
+    - Materializes `SuggestedActions` from AI as a reusable Runbook CR
+    - Name: `auto-{signal}-{severity}-{kind}` (sanitized)
     - Labels: `platform.chatcli.io/auto-generated=true`
-    - Trigger: SignalType + Severity + ResourceKind (para reutilização futura)
-    - Usa `CreateOrUpdate` para idempotência
+    - Trigger: SignalType + Severity + ResourceKind (for future reuse)
+    - Uses `CreateOrUpdate` for idempotency
   </Accordion>
   <Accordion title="handleRemediating()">
-    1. Busca RemediationPlan mais recente (`findLatestRemediationPlan`)
-    2. Se `Completed` → Issue `Resolved` + invalida dedup do recurso
-       - Se plano agêntico: gera **PostMortem CR** (timeline, causa raiz, impacto, lições) + **Runbook reutilizável** dos passos bem-sucedidos
-    3. Se `Failed` e tentativas restantes → **re-análise**: coleta evidência de falha (`collectFailureEvidence`), limpa análise do AIInsight, volta para estado `Analyzing` com failure context
-    4. Se `Failed` e max tentativas → `Escalated` + invalida dedup do recurso
+    1. Finds the most recent RemediationPlan (`findLatestRemediationPlan`)
+    2. If `Completed` -> Issue `Resolved` + invalidates dedup for the resource
+       - If agentic plan: generates **PostMortem CR** (timeline, root cause, impact, lessons) + **reusable Runbook** from successful steps
+    3. If `Failed` and remaining attempts -> **re-analysis**: collects failure evidence (`collectFailureEvidence`), clears AIInsight analysis, returns to `Analyzing` state with failure context
+    4. If `Failed` and max attempts -> `Escalated` + invalidates dedup for the resource
   </Accordion>
 </AccordionGroup>
 
-**Retry com Escalação de Estratégia:**
-- Cada retry dispara re-análise do AI com contexto de falhas anteriores
-- O AI recebe `previous_failure_context` com evidência das tentativas que falharam
-- O prompt instrui: "Não repita as mesmas ações. Análise por que falharam e sugira uma abordagem fundamentalmente diferente"
-- Gera novo Runbook auto-gerado com estratégia diferente (nome inclui attempt)
+**Retry with Strategy Escalation:**
+- Each retry triggers AI re-analysis with context from previous failures
+- AI receives `previous_failure_context` with evidence from failed attempts
+- The prompt instructs: "Do not repeat the same actions. Analyze why they failed and suggest a fundamentally different approach"
+- Generates new auto-generated Runbook with different strategy (name includes attempt)
 
-**Prioridade de Remediação:**
+**Remediation Priority:**
 
 ```text
-1. Runbook manual existente (match tiered: SignalType+Severity+Kind -> Severity+Kind)
-2. Runbook auto-gerado pela IA (materializado como CR reutilizável)
-3. Escalonamento (último recurso)
+1. Existing manual Runbook (tiered match: SignalType+Severity+Kind -> Severity+Kind)
+2. AI auto-generated Runbook (materialized as reusable CR)
+3. Escalation (last resort)
 ```
 
 ### 5. AIInsightReconciler (`aiinsight_controller.go`)
 
-Observa AIInsight CRs e chama o `AnalyzeIssue` RPC para preencher a análise.
+Watches AIInsight CRs and calls the `AnalyzeIssue` RPC to populate the analysis.
 
-**Fluxo:**
+**Flow:**
 
 <Steps>
-  <Step title="Verifica análise existente">
-    Verifica se `Status.Analysis` já está preenchida (skip se sim).
+  <Step title="Checks existing analysis">
+    Checks if `Status.Analysis` is already populated (skip if yes).
   </Step>
-  <Step title="Verifica conectividade">
-    Verifica se servidor está conectado (requeue 15s se não).
+  <Step title="Checks connectivity">
+    Checks if server is connected (requeue 15s if not).
   </Step>
-  <Step title="Busca contexto">
-    Busca Issue pai para contexto.
+  <Step title="Fetches context">
+    Fetches parent Issue for context.
   </Step>
-  <Step title="Coleta contexto K8s">
-    Coleta contexto K8s via `KubernetesContextBuilder` (deployment, pods, eventos, revisões).
+  <Step title="Collects K8s context">
+    Collects K8s context via `KubernetesContextBuilder` (deployment, pods, events, revisions).
   </Step>
-  <Step title="Lê failure context">
-    Lê failure context de annotation `platform.chatcli.io/failure-context` (se re-análise).
+  <Step title="Reads failure context">
+    Reads failure context from annotation `platform.chatcli.io/failure-context` (if re-analysis).
   </Step>
-  <Step title="Monta request">
-    Monta `AnalyzeIssueRequest` com dados do Issue + contexto K8s + failure context.
+  <Step title="Builds request">
+    Builds `AnalyzeIssueRequest` with Issue data + K8s context + failure context.
   </Step>
-  <Step title="Chama AnalyzeIssue RPC">
-    Chama `AnalyzeIssue` RPC via `ServerClient`.
+  <Step title="Calls AnalyzeIssue RPC">
+    Calls `AnalyzeIssue` RPC via `ServerClient`.
   </Step>
-  <Step title="Preenche status">
-    Preenche `Status.Analysis`, `Confidence`, `Recommendations`, `SuggestedActions`. Limpa annotation `failure-context` após re-análise concluída.
+  <Step title="Populates status">
+    Populates `Status.Analysis`, `Confidence`, `Recommendations`, `SuggestedActions`. Clears `failure-context` annotation after re-analysis completes.
   </Step>
 </Steps>
 
 **KubernetesContextBuilder (`k8s_context.go`):**
 
-Coleta contexto real do cluster para **Deployments, StatefulSets, DaemonSets, Jobs, CronJobs e HPAs** (max 12000 chars):
-- **Resource Status**: replicas, conditions, containers, images + resources (cada tipo tem context builder dedicado)
+Collects real cluster context for **Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and HPAs** (max 12000 chars):
+- **Resource Status**: replicas, conditions, containers, images + resources (each type has a dedicated context builder)
 - **StatefulSet**: replicas, update strategy, partition, PodManagementPolicy, VolumeClaimTemplates
 - **DaemonSet**: desired/current/ready/available/unavailable, nodeSelector, tolerations
 - **Job/CronJob**: active/succeeded/failed, completions, parallelism, schedule, lastSuccessful
 - **HPA**: min/max replicas, current/desired, target utilization, current metrics, maxed-out detection
-- **Pod Details** (até 5 pods, unhealthy primeiro): phase, restart count, container states
-- **Recent Events** (últimos 15): tipo, reason, message, count
-- **Revision History**: Últimas 5 revisões (ReplicaSets) com diff de imagens
+- **Pod Details** (up to 5 pods, unhealthy first): phase, restart count, container states
+- **Recent Events** (last 15): type, reason, message, count
+- **Revision History**: Last 5 revisions (ReplicaSets) with image diff between revisions
 
 **LogAnalyzer (`log_analyzer.go`):**
 
-Análise avançada de logs de aplicação (além do tail básico de 50 linhas):
-- **Stack Trace Extraction**: detecta e extrai stack traces de **Java** (Exception/Caused by), **Go** (panic/goroutine), **Python** (Traceback), **Node.js** (Error at)
-- **Error Pattern Detection**: 24+ padrões críticos categorizados (crash, connectivity, dns, auth, storage, tls, database, cache, messaging)
-- **Structured Log Parsing**: extrai error/warn entries de logs JSON (campos level, msg, error, timestamp, logger)
-- **Init Container Logs**: analisa logs de init containers (revela falhas de startup)
-- **Sidecar Logs**: analisa logs de sidecars (istio-proxy, envoy, datadog-agent, etc.)
-- **Critical Lines**: extrai linhas FATAL/PANIC com 3 linhas de contexto antes/depois
-- **Temporal Window**: busca logs por janela temporal (10min antes do incidente), não apenas tail
+Advanced application log analysis (beyond the basic 50-line tail):
+- **Stack Trace Extraction**: detects and extracts stack traces from **Java** (Exception/Caused by), **Go** (panic/goroutine), **Python** (Traceback), **Node.js** (Error at)
+- **Error Pattern Detection**: 24+ critical patterns categorized (crash, connectivity, dns, auth, storage, tls, database, cache, messaging)
+- **Structured Log Parsing**: extracts error/warn entries from JSON logs (fields level, msg, error, timestamp, logger)
+- **Init Container Logs**: analyzes init container logs (reveals startup failures)
+- **Sidecar Logs**: analyzes sidecar logs (istio-proxy, envoy, datadog-agent, etc.)
+- **Critical Lines**: extracts FATAL/PANIC lines with 3 lines of context before/after
+- **Temporal Window**: fetches logs by temporal window (10min before the incident), not just tail
 
 **MetricsCollector (`metrics_collector.go`):**
 
-Queries ao Prometheus para dados quantitativos durante análise:
-- **CPU/Memory**: usage trends 30min antes → durante → 15min depois do incidente
-- **Request/Error Rate**: HTTP requests e 5xx por segundo
+Prometheus queries for quantitative data during analysis:
+- **CPU/Memory**: usage trends 30min before → during → 15min after the incident
+- **Request/Error Rate**: HTTP requests and 5xx per second
 - **Latency**: P50, P95, P99 histogram percentiles
 - **HPA Metrics**: current vs desired replicas, CPU target
 - **Network**: receive/transmit bytes/s
-- **Trend Analysis**: detecta spikes, drops, sustained_high/low com cálculo de % de mudança
-- **Habilitado via**: `PROMETHEUS_URL` env var no operator
+- **Trend Analysis**: detects spikes, drops, sustained_high/low with % change calculation
+- **Enabled via**: `PROMETHEUS_URL` env var on the operator
 
 **GitOpsDetector (`gitops_detector.go`):**
 
-Detecta e integra com ferramentas GitOps:
-- **Helm Releases**: detecta via Secrets type `helm.sh/release.v1`, status (deployed/failed/pending-upgrade), chart version, revisão anterior para rollback
+Detects and integrates with GitOps tools:
+- **Helm Releases**: detects via Secrets type `helm.sh/release.v1`, status (deployed/failed/pending-upgrade), chart version, previous revision for rollback
 - **ArgoCD Applications**: sync status (Synced/OutOfSync), health (Healthy/Degraded), conditions, last sync result
 - **Flux Kustomizations**: ready status, source ref, conditions, last applied
 
 **SourceCodeAnalyzer (`source_controller.go`):**
 
-Diagnóstico code-aware quando `SourceRepository` CRD está configurado:
-- **Git Correlation**: encontra commits nos 30min antes do incidente
-- **Suspected Commit**: identifica o commit mais provável (score por proximidade temporal + volume de mudanças)
-- **Code Extraction**: extrai trechos de código referenciados em stack traces (file path + line number → código fonte)
-- **Config Analysis**: lê Dockerfile, values.yaml, Chart.yaml para contexto de deploy
+Code-aware diagnostics when `SourceRepository` CRD is configured:
+- **Git Correlation**: finds commits in the 30min before the incident
+- **Suspected Commit**: identifies the most likely commit (score by temporal proximity + volume of changes)
+- **Code Extraction**: extracts code snippets referenced in stack traces (file path + line number → source code)
+- **Config Analysis**: reads Dockerfile, values.yaml, Chart.yaml for deploy context
 
 **CascadeAnalyzer (`cascade_analyzer.go`):**
 
-Análise de cascade failures cross-service:
-- **Dependency Graph**: descobre dependências via Services + EndpointSlices
-- **Temporal Correlation**: encontra issues ativos no mesmo namespace e cross-namespace em janela de 15-20min
-- **Cascade Chain**: ordena serviços por tempo de detecção (primeiro = root cause)
-- **Root Cause Service**: identifica o serviço origem do cascade
+Cross-service cascade failure analysis:
+- **Dependency Graph**: discovers dependencies via Services + EndpointSlices
+- **Temporal Correlation**: finds active issues in the same namespace and cross-namespace within a 15-20min window
+- **Cascade Chain**: orders services by detection time (first = root cause)
+- **Root Cause Service**: identifies the service that originated the cascade
 
 **BlastRadiusPredictor (`blast_radius.go`):**
 
-Predição de impacto antes da execução de ações:
-- **PDB Check**: verifica se a ação violaria PodDisruptionBudgets
-- **Quota Check**: verifica ResourceQuotas (>90% usado = warning)
-- **Node Capacity**: conta pods no node para ações de cordon/drain
-- **Affected Services**: descobre quais Services seriam impactados
-- **Risk Level**: classifica como low/medium/high/critical
+Impact prediction before action execution:
+- **PDB Check**: verifies if the action would violate PodDisruptionBudgets
+- **Quota Check**: verifies ResourceQuotas (>90% used = warning)
+- **Node Capacity**: counts pods on node for cordon/drain actions
+- **Affected Services**: discovers which Services would be impacted
+- **Risk Level**: classifies as low/medium/high/critical
 
 **AnalyzeIssueRequest:**
 
-| Campo | Origem | Descrição |
-|-------|--------|-----------|
-| `issue_name` | Issue.Name | Nome do Issue |
+| Field | Source | Description |
+|-------|--------|-------------|
+| `issue_name` | Issue.Name | Issue name |
 | `namespace` | Issue.Namespace | Namespace |
-| `resource_kind` | Issue.Spec.Resource.Kind | Tipo do recurso (Deployment) |
-| `resource_name` | Issue.Spec.Resource.Name | Nome do deployment |
-| `signal_type` | Issue.Spec.SignalType / labels | Tipo do sinal |
-| `severity` | Issue.Spec.Severity | Severidade |
-| `description` | Issue.Spec.Description | Descrição do problema |
-| `risk_score` | Issue.Spec.RiskScore | Score de risco |
-| `provider` | AIInsight.Spec.Provider | Provedor LLM |
-| `model` | AIInsight.Spec.Model | Modelo LLM |
-| `kubernetes_context` | 6 enrichers combinados | K8s status (Deploy/STS/DS/Job/CronJob/HPA) + **log analysis** (stack traces, error patterns) + **Prometheus metrics** (trends) + **GitOps** (Helm/ArgoCD/Flux) + **source code** (commits, code snippets) + **cascade analysis** + **RCA enrichment** |
-| `previous_failure_context` | Annotation no AIInsight | Evidência de tentativas anteriores (retries) |
+| `resource_kind` | Issue.Spec.Resource.Kind | Resource type (Deployment) |
+| `resource_name` | Issue.Spec.Resource.Name | Deployment name |
+| `signal_type` | Issue.Spec.SignalType / labels | Signal type |
+| `severity` | Issue.Spec.Severity | Severity |
+| `description` | Issue.Spec.Description | Problem description |
+| `risk_score` | Issue.Spec.RiskScore | Risk score |
+| `provider` | AIInsight.Spec.Provider | LLM provider |
+| `model` | AIInsight.Spec.Model | LLM model |
+| `kubernetes_context` | 6 enrichers combined | K8s status (Deploy/STS/DS/Job/CronJob/HPA) + **log analysis** (stack traces, error patterns) + **Prometheus metrics** (trends) + **GitOps** (Helm/ArgoCD/Flux) + **source code** (commits, code snippets) + **cascade analysis** + **RCA enrichment** |
+| `previous_failure_context` | Annotation on AIInsight | Evidence from previous attempts (retries) |
 
 ### 6. RemediationReconciler (`remediation_controller.go`)
 
-Executa as ações definidas em um RemediationPlan.
+Executes the actions defined in a RemediationPlan.
 
-**Ações Suportadas (54 tipos em 9 categorias):**
+**Supported Actions (54 types across 9 categories):**
 
-**Deployment / Genérico (19 ações):**
+**Deployment / Generic (19 actions):**
 
-| Categoria | Tipo | O que Faz | Parâmetros Chave |
-|-----------|------|-----------|-----------------|
-| Workload | `ScaleDeployment` | Ajusta réplicas do Deployment | `replicas` |
-| Workload | `RestartDeployment` | Rollout restart via annotation | — |
-| Workload | `RollbackDeployment` | Rollback para revisão anterior/saudável/específica (via ReplicaSet) | `toRevision` |
-| Workload | `PatchConfig` | Atualiza dados de ConfigMap | `configmap`, `key=value` |
-| Workload | `AdjustResources` | Ajusta CPU/memória nos containers do Deployment | `container`, `memory_limit`, `cpu_limit`, etc. |
-| Workload | `DeletePod` | Remove pod mais doente (auto-seleciona) | `pod` (opcional) |
-| Workload | `RestartStatefulSetPod` | Restart de pod específico ou rolling restart do StatefulSet | `pod` (opcional) |
-| GitOps | `HelmRollback` | Rollback de Helm release | `revision` |
-| GitOps | `ArgoSyncApp` | Trigger sync ArgoCD | `revision` |
-| Autoscaling | `AdjustHPA` | Modifica HPA min/max/target | `minReplicas`, `maxReplicas`, `targetCPUUtilization` |
-| Infra | `CordonNode` | Marca node como unschedulable | `node` |
-| Infra | `DrainNode` | Cordona e evicta pods do node | `node` |
-| Storage | `ResizePVC` | Expande PVC (sem encolhimento) | `pvc`, `size` |
-| Security | `RotateSecret` | Atualiza Secret ou copia de outra source | `secret`, `sourceSecret` ou `key=value` |
-| Networking | `UpdateIngress` | Modifica backend/annotations do Ingress | `ingress`, `backendService`, `backendPort` |
-| Networking | `PatchNetworkPolicy` | Adiciona portas em regras de ingress do NetworkPolicy | `networkPolicy`, `allowPort`, `protocol` |
-| Advanced | `ApplyManifest` | Aplica manifesto JSON de ConfigMap | `configmap`, `key` |
-| Advanced | `ExecDiagnostic` | Executa comando de um allowlist read-only em pod | `command` (ver [allowlist](/features/k8s-operator#execdiagnostic-allowlist)), `pod`, `container` |
-| — | `Custom` | **Bloqueado** — requer aprovação manual | — |
+| Category | Type | What It Does | Key Parameters |
+|----------|------|-------------|----------------|
+| Workload | `ScaleDeployment` | Adjusts Deployment replicas | `replicas` |
+| Workload | `RestartDeployment` | Rollout restart via annotation | -- |
+| Workload | `RollbackDeployment` | Rollback to previous/healthy/specific revision (via ReplicaSet) | `toRevision` |
+| Workload | `PatchConfig` | Updates ConfigMap data | `configmap`, `key=value` |
+| Workload | `AdjustResources` | Adjusts CPU/memory on Deployment containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| Workload | `DeletePod` | Removes the sickest pod (auto-selects) | `pod` (optional) |
+| Workload | `RestartStatefulSetPod` | Restart specific StatefulSet pod or rolling restart | `pod` (optional) |
+| GitOps | `HelmRollback` | Rollback Helm release | `revision` |
+| GitOps | `ArgoSyncApp` | Trigger ArgoCD sync | `revision` |
+| Autoscaling | `AdjustHPA` | Modifies HPA min/max/target | `minReplicas`, `maxReplicas`, `targetCPUUtilization` |
+| Infra | `CordonNode` | Marks node unschedulable | `node` |
+| Infra | `DrainNode` | Cordons and evicts pods from node | `node` |
+| Storage | `ResizePVC` | Expands PVC (no shrinking) | `pvc`, `size` |
+| Security | `RotateSecret` | Updates Secret values or copies from source | `secret`, `sourceSecret` or `key=value` |
+| Networking | `UpdateIngress` | Modifies Ingress backend/annotations | `ingress`, `backendService`, `backendPort` |
+| Networking | `PatchNetworkPolicy` | Adds ports to NetworkPolicy ingress rules | `networkPolicy`, `allowPort`, `protocol` |
+| Advanced | `ApplyManifest` | Applies JSON manifest from ConfigMap | `configmap`, `key` |
+| Advanced | `ExecDiagnostic` | Runs a command from a read-only allowlist inside a pod | `command` (see [allowlist](/features/k8s-operator#execdiagnostic-allowlist)), `pod`, `container` |
+| -- | `Custom` | **Blocked** -- requires manual approval | -- |
 
-**StatefulSet (9 ações):**
+**StatefulSet (9 actions):**
 
-| Tipo | O que Faz | Parâmetros Chave |
-|------|-----------|-----------------|
-| `ScaleStatefulSet` | Scaling ordenado de réplicas | `replicas` |
-| `RestartStatefulSet` | Rolling restart via annotation (ordenado) | — |
-| `RollbackStatefulSet` | Rollback via ControllerRevision (não ReplicaSet) | `toRevision` (previous\|N) |
-| `AdjustStatefulSetResources` | Ajusta CPU/memória nos containers do StatefulSet | `container`, `memory_limit`, `cpu_limit`, etc. |
-| `DeleteStatefulSetPod` | Deleta pod específico ou mais doente (preserva PVC) | `pod` (opcional) |
-| `ForceDeleteStatefulSetPod` | Force-delete de pod preso em Terminating (grace=0) | `pod` (OBRIGATÓRIO) |
-| `UpdateStatefulSetStrategy` | Altera tipo de updateStrategy | `type` (RollingUpdate\|OnDelete), `maxUnavailable` |
-| `RecreateStatefulSetPVC` | Deleta PVC preso para recriação pelo controlador | `pvc`, `confirm=true` (OBRIGATÓRIO) |
-| `PartitionStatefulSetUpdate` | Define partition para canary rollout | `partition` |
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `ScaleStatefulSet` | Ordered replica scaling | `replicas` |
+| `RestartStatefulSet` | Rolling restart via annotation (ordered) | -- |
+| `RollbackStatefulSet` | Rollback via ControllerRevision (not ReplicaSet) | `toRevision` (previous\|N) |
+| `AdjustStatefulSetResources` | Adjusts CPU/memory on StatefulSet containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `DeleteStatefulSetPod` | Deletes specific or unhealthiest pod (preserves PVC identity) | `pod` (optional) |
+| `ForceDeleteStatefulSetPod` | Force-delete stuck Terminating pod (grace=0) | `pod` (REQUIRED) |
+| `UpdateStatefulSetStrategy` | Changes updateStrategy type | `type` (RollingUpdate\|OnDelete), `maxUnavailable` |
+| `RecreateStatefulSetPVC` | Deletes stuck PVC for recreation | `pvc`, `confirm=true` (REQUIRED) |
+| `PartitionStatefulSetUpdate` | Sets partition for canary rollout | `partition` |
 
-**DaemonSet (7 ações):**
+**DaemonSet (7 actions):**
 
-| Tipo | O que Faz | Parâmetros Chave |
-|------|-----------|-----------------|
-| `RestartDaemonSet` | Rolling restart de todos os pods do DaemonSet em todos os nodes | — |
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `RestartDaemonSet` | Rolling restart of all DaemonSet pods across nodes | -- |
 | `RollbackDaemonSet` | Rollback via ControllerRevision | `toRevision` (previous\|N) |
-| `AdjustDaemonSetResources` | Ajusta CPU/memória nos containers do DaemonSet | `container`, `memory_limit`, `cpu_limit`, etc. |
-| `DeleteDaemonSetPod` | Deleta pod (opcionalmente em node específico) | `pod` ou `node` (opcional) |
-| `UpdateDaemonSetStrategy` | Altera estratégia de update | `type`, `maxUnavailable`, `maxSurge` |
-| `PauseDaemonSetRollout` | Pausa rollout (maxUnavailable=0) | — |
-| `CordonAndDeleteDaemonSetPod` | Cordona node + deleta pod do DaemonSet nele | `node` (OBRIGATÓRIO) |
+| `AdjustDaemonSetResources` | Adjusts CPU/memory on DaemonSet containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `DeleteDaemonSetPod` | Deletes pod (optionally on specific node) | `pod` or `node` (optional) |
+| `UpdateDaemonSetStrategy` | Changes update strategy | `type`, `maxUnavailable`, `maxSurge` |
+| `PauseDaemonSetRollout` | Pauses rollout (sets maxUnavailable=0) | -- |
+| `CordonAndDeleteDaemonSetPod` | Cordons node + deletes DaemonSet pod on it | `node` (REQUIRED) |
 
-**Job (9 ações):**
+**Job (9 actions):**
 
-| Tipo | O que Faz | Parâmetros Chave |
-|------|-----------|-----------------|
-| `RetryJob` | Deleta Job falhado + recria a partir do spec | — |
-| `AdjustJobResources` | Ajusta CPU/memória no template do Job | `container`, `memory_limit`, `cpu_limit`, etc. |
-| `DeleteFailedJob` | Limpa Job falhado e seus pods | — |
-| `SuspendJob` | Pausa Job em execução (suspend=true) | — |
-| `ResumeJob` | Retoma Job suspenso (suspend=false) | — |
-| `AdjustJobParallelism` | Altera paralelismo do Job | `parallelism` |
-| `AdjustJobDeadline` | Altera activeDeadlineSeconds | `activeDeadlineSeconds` |
-| `AdjustJobBackoffLimit` | Altera backoffLimit | `backoffLimit` |
-| `ForceDeleteJobPods` | Force-delete de todos os pods do Job (grace=0) | — |
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `RetryJob` | Deletes failed Job + recreates from spec | -- |
+| `AdjustJobResources` | Adjusts CPU/memory on Job template | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `DeleteFailedJob` | Cleans up a failed Job and its pods | -- |
+| `SuspendJob` | Pauses a running Job (suspend=true) | -- |
+| `ResumeJob` | Resumes a suspended Job (suspend=false) | -- |
+| `AdjustJobParallelism` | Changes Job parallelism | `parallelism` |
+| `AdjustJobDeadline` | Changes activeDeadlineSeconds | `activeDeadlineSeconds` |
+| `AdjustJobBackoffLimit` | Changes backoffLimit | `backoffLimit` |
+| `ForceDeleteJobPods` | Force-deletes all pods of a Job (grace=0) | -- |
 
-**CronJob (10 ações):**
+**CronJob (10 actions):**
 
-| Tipo | O que Faz | Parâmetros Chave |
-|------|-----------|-----------------|
-| `SuspendCronJob` | Pausa agendamento do CronJob (suspend=true) | — |
-| `ResumeCronJob` | Retoma agendamento (suspend=false) | — |
-| `TriggerCronJob` | Cria Job a partir do template imediatamente | — |
-| `AdjustCronJobResources` | Ajusta CPU/memória no jobTemplate | `container`, `memory_limit`, `cpu_limit`, etc. |
-| `AdjustCronJobSchedule` | Altera expressão cron do schedule | `schedule` |
-| `AdjustCronJobDeadline` | Altera startingDeadlineSeconds | `startingDeadlineSeconds` |
-| `AdjustCronJobHistory` | Altera limites de histórico | `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` |
-| `AdjustCronJobConcurrency` | Altera concurrencyPolicy | `concurrencyPolicy` (Allow\|Forbid\|Replace) |
-| `DeleteCronJobActiveJobs` | Mata todos os Jobs ativos do CronJob | — |
-| `ReplaceCronJobTemplate` | Substitui jobTemplate a partir de JSON em ConfigMap | `configmap`, `key` |
+| Type | What It Does | Key Parameters |
+|------|-------------|----------------|
+| `SuspendCronJob` | Pauses CronJob scheduling (suspend=true) | -- |
+| `ResumeCronJob` | Resumes CronJob scheduling (suspend=false) | -- |
+| `TriggerCronJob` | Creates a Job from CronJob template immediately | -- |
+| `AdjustCronJobResources` | Adjusts CPU/memory on jobTemplate containers | `container`, `memory_limit`, `cpu_limit`, etc. |
+| `AdjustCronJobSchedule` | Changes cron schedule expression | `schedule` |
+| `AdjustCronJobDeadline` | Changes startingDeadlineSeconds | `startingDeadlineSeconds` |
+| `AdjustCronJobHistory` | Changes success/failure history limits | `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` |
+| `AdjustCronJobConcurrency` | Changes concurrencyPolicy | `concurrencyPolicy` (Allow\|Forbid\|Replace) |
+| `DeleteCronJobActiveJobs` | Kills all currently running Jobs | -- |
+| `ReplaceCronJobTemplate` | Replaces jobTemplate from ConfigMap JSON | `configmap`, `key` |
 
 <Warning>
-**Safety Checks (pré-execução):** Scale to 0 bloqueado (Deployment e StatefulSet). AdjustResources limit não pode ser menor que request (todos os tipos). DeletePod/DeleteStatefulSetPod recusa se só existe 1 pod. ForceDeleteStatefulSetPod exige nome explícito do pod. RecreateStatefulSetPVC exige `confirm=true`. Custom actions bloqueadas. Blast radius prediction verifica violações de PDB, resource quotas e serviços afetados — agora generalizado para todos os workload types via `getPodTemplateLabels`.
+**Safety Checks (pre-execution):** Scale to 0 replicas blocked (Deployment and StatefulSet). AdjustResources limit cannot be less than request (all resource types). DeletePod/DeleteStatefulSetPod refuses if only 1 pod exists. ForceDeleteStatefulSetPod requires explicit pod name. RecreateStatefulSetPVC requires `confirm=true`. Custom actions are blocked. Blast radius prediction checks PDB violations, resource quotas, and affected services before execution — now generalized for all workload types via `getPodTemplateLabels`.
 
-**Rollback Automático (pós-falha):** Antes de qualquer ação, um `ResourceSnapshot` estruturado captura o estado completo do recurso. Para Deployments: réplicas, imagens, CPU/memória, HPA. Para StatefulSets: réplicas, containers, updateStrategy, partition. Para DaemonSets: containers, updateStrategy, maxUnavailable. Para Jobs: suspend, parallelism, backoffLimit, activeDeadlineSeconds, containers. Para CronJobs: suspend, schedule, concurrencyPolicy, limites de histórico, containers. Se uma ação falha ou a verificação de saúde expira (90s), o `RollbackEngine` restaura automaticamente o recurso ao estado pré-remediação. Funciona para Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Nodes e HPAs.
+**Automatic Rollback (post-failure):** Before any action, a structured `ResourceSnapshot` captures the complete resource state. For Deployments: replicas, images, CPU/memory, HPA. For StatefulSets: replicas, containers, updateStrategy, partition. For DaemonSets: containers, updateStrategy, maxUnavailable. For Jobs: suspend, parallelism, backoffLimit, activeDeadlineSeconds, containers. For CronJobs: suspend, schedule, concurrencyPolicy, history limits, containers. If an action fails or health verification expires (90s), the `RollbackEngine` automatically restores the resource to the pre-remediation state. Works for Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Nodes, and HPAs.
 </Warning>
 
-**Fluxo de Execução (Standard):**
+**Execution Flow (Standard):**
 
 ```text
-Pending -> Snapshot -> Executing -> (checkpoint + ação, para cada ação)
+Pending -> Snapshot -> Executing -> (checkpoint + action, for each action)
   -> Verifying (90s timeout) -> Completed
-  -> Se ação falha -> Rollback automático -> RolledBack
-  -> Se verificação falha -> Rollback automático -> RolledBack
-  -> Se rollback falha -> Failed
+  -> If action fails -> Automatic rollback -> RolledBack
+  -> If verification fails -> Automatic rollback -> RolledBack
+  -> If rollback fails -> Failed
 ```
 
-**Fluxo de Execução (Agentic):**
+**Execution Flow (Agentic):**
 
 ```text
-Pending -> Executing -> (loop agentico: AI decide -> executa -> observa -> repeat)
+Pending -> Executing -> (agentic loop: AI decides -> executes -> observes -> repeat)
   -> Verifying -> Completed | Failed
 
-Cada reconcile = 1 step do loop agentico:
-  1. Refresh contexto K8s (KubernetesContextBuilder)
-  2. Envia histórico + contexto -> AgenticStep RPC
-  3. AI responde: {reasoning, resolved, next_action}
-  4. Se resolved=true -> Verifying (+ annotations com dados do PostMortem)
-  5. Se next_action -> executa -> registra observação -> requeue 5s
-  6. Se observation-only -> registra -> requeue 10s
-  Safety: max 10 steps, timeout 10 minutos
+Each reconcile = 1 step of the agentic loop:
+  1. Refresh K8s context (KubernetesContextBuilder)
+  2. Send history + context -> AgenticStep RPC
+  3. AI responds: {reasoning, resolved, next_action}
+  4. If resolved=true -> Verifying (+ annotations with PostMortem data)
+  5. If next_action -> execute -> record observation -> requeue 5s
+  6. If observation-only -> record -> requeue 10s
+  Safety: max 10 steps, timeout 10 minutes
 ```
 
 ### 7. ServerClient (`grpc_client.go`)
 
-Cliente gRPC compartilhado entre WatcherBridge e AIInsightReconciler.
+Shared gRPC client between WatcherBridge and AIInsightReconciler.
 
-| Método | Descrição |
-|--------|-----------|
-| `NewServerClient()` | Cria instância (sem conexão) |
-| `Connect(addr)` | Conecta via gRPC insecure (10s timeout) |
-| `GetAlerts(namespace)` | Busca alertas do watcher |
-| `AnalyzeIssue(req)` | Envia issue para análise por IA |
-| `AgenticStep(req)` | Executa um passo do loop agêntico (context + history → next action) |
-| `IsConnected()` | Verifica se conexão está ativa |
-| `Close()` | Fecha conexão gRPC |
+| Method | Description |
+|--------|-------------|
+| `NewServerClient()` | Creates instance (no connection) |
+| `Connect(addr)` | Connects via gRPC insecure (10s timeout) |
+| `GetAlerts(namespace)` | Fetches alerts from the watcher |
+| `AnalyzeIssue(req)` | Sends issue for AI analysis |
+| `AgenticStep(req)` | Executes one step of the agentic loop (context + history -> next action) |
+| `IsConnected()` | Checks if connection is active |
+| `Close()` | Closes gRPC connection |
 
 
 
-## Interação Server e Operator
+## Server and Operator Interaction
 
 ### GetAlerts RPC
 
-O servidor expoe os alertas do K8s Watcher via gRPC:
+The server exposes K8s Watcher alerts via gRPC:
 
 ```protobuf
 rpc GetAlerts(GetAlertsRequest) returns (GetAlertsResponse);
@@ -606,11 +596,11 @@ message AlertInfo {
 }
 ```
 
-O handler no servidor itera sobre os `ObservabilityStore` de cada target do MultiWatcher, filtra por namespace se específicado, e retorna alertas ativos.
+The server handler iterates over the `ObservabilityStore` of each MultiWatcher target, filters by namespace if specified, and returns active alerts.
 
 ### AnalyzeIssue RPC
 
-O servidor recebe o contexto do Issue e chama o LLM para análise:
+The server receives the Issue context and calls the LLM for analysis:
 
 ```protobuf
 rpc AnalyzeIssue(AnalyzeIssueRequest) returns (AnalyzeIssueResponse);
@@ -632,24 +622,24 @@ message AnalyzeIssueResponse {
 }
 ```
 
-**Prompt Estruturado:**
+**Structured Prompt:**
 
-O servidor constroi um prompt que inclui:
+The server builds a prompt that includes:
 
-1. Contexto do Issue (nome, namespace, recurso, severidade, risk score, descrição)
-2. Lista de **19 ações disponíveis** organizadas por categoria (Workload, GitOps, Autoscaling, Infra, Storage, Security, Networking, Advanced)
-3. Instruções para retornar JSON estruturado com campos `analysis`, `confidence`, `recommendations` e `actions`
+1. Issue context (name, namespace, resource, severity, risk score, description)
+2. List of **19 available actions** organized by category (Workload, GitOps, Autoscaling, Infra, Storage, Security, Networking, Advanced)
+3. Instructions to return structured JSON with `analysis`, `confidence`, `recommendations`, and `actions` fields
 
-**Parsing da Resposta:**
+**Response Parsing:**
 
-1. Remove markdown codeblocks (`` ```json ... ``` ``)
-2. Parseia JSON em `analysisResult`
-3. Clamp confidence entre 0.0 e 1.0
-4. Se parsing falhar → usa resposta raw como analysis com confidence 0.5
+1. Removes markdown codeblocks (`` ```json ... ``` ``)
+2. Parses JSON into `analysisResult`
+3. Clamps confidence between 0.0 and 1.0
+4. If parsing fails -> uses raw response as analysis with confidence 0.5
 
 ### AgenticStep RPC
 
-O servidor recebe o contexto do Issue, histórico de passos anteriores e contexto K8s atualizado, e decide a próxima ação:
+The server receives the Issue context, history of previous steps, and updated K8s context, and decides the next action:
 
 ```protobuf
 rpc AgenticStep(AgenticStepRequest) returns (AgenticStepResponse);
@@ -665,17 +655,17 @@ message AgenticStepRequest {
   int32 risk_score = 8;
   string provider = 9;
   string model = 10;
-  string kubernetes_context = 11;   // refreshado a cada step
+  string kubernetes_context = 11;   // refreshed at each step
   repeated AgenticHistoryEntry history = 12;
   int32 max_steps = 13;
   int32 current_step = 14;
 }
 
 message AgenticStepResponse {
-  string reasoning = 1;              // raciocínio da IA (registrado no histórico)
-  bool resolved = 2;                 // true = problema resolvido
-  SuggestedAction next_action = 3;   // null quando resolved=true
-  // Campos abaixo só populados quando resolved=true:
+  string reasoning = 1;              // AI reasoning (recorded in history)
+  bool resolved = 2;                 // true = problem resolved
+  SuggestedAction next_action = 3;   // null when resolved=true
+  // Fields below only populated when resolved=true:
   string postmortem_summary = 4;
   string root_cause = 5;
   string impact = 6;
@@ -684,88 +674,88 @@ message AgenticStepResponse {
 }
 ```
 
-**Prompt do AgenticStep:**
+**AgenticStep Prompt:**
 
-O servidor constrói um prompt estruturado com:
+The server builds a structured prompt with:
 
-1. **Role + Issue details**: contexto do incidente (tipo, severidade, recurso)
-2. **Kubernetes context**: estado real do cluster (refreshado a cada step via KubernetesContextBuilder)
-3. **Tool definitions**: 18 ações mutantes disponíveis + "Observe" (sem ação, espera próximo contexto)
-4. **Conversation history**: cada step anterior formatado com reasoning → action → observation
-5. **Instructions**: respond JSON, budget (step N of M), regras de segurança
+1. **Role + Issue details**: incident context (type, severity, resource)
+2. **Kubernetes context**: real cluster state (refreshed at each step via KubernetesContextBuilder)
+3. **Tool definitions**: 18 available mutating actions + "Observe" (no action, wait for next context)
+4. **Conversation history**: each previous step formatted with reasoning -> action -> observation
+5. **Instructions**: respond JSON, budget (step N of M), safety rules
 
-Quando `resolved=true`, a resposta inclui dados para geração do PostMortem (summary, root_cause, impact, lessons_learned, prevention_actions).
+When `resolved=true`, the response includes data for PostMortem generation (summary, root_cause, impact, lessons_learned, prevention_actions).
 
 
 
 ## PostMortem Generation
 
-Quando **qualquer remediação** resolve um Issue (standard ou agêntica), o `IssueReconciler` gera automaticamente:
+When **any remediation** resolves an Issue (standard or agentic), the `IssueReconciler` automatically generates:
 
 ### PostMortem CR
 
-Criado via `generatePostMortem()`:
+Created via `generatePostMortem()`:
 
-| Campo | Origem |
+| Field | Source |
 |-------|--------|
-| `timeline` | Issue.DetectedAt + cada step do AgenticHistory + resolved |
-| `actionsExecuted` | Steps com Action != nil (inclui resultado) |
-| `summary` | Annotation `platform.chatcli.io/postmortem-summary` (gerado pela IA) |
+| `timeline` | Issue.DetectedAt + each step from AgenticHistory + resolved |
+| `actionsExecuted` | Steps with Action != nil (includes result) |
+| `summary` | Annotation `platform.chatcli.io/postmortem-summary` (AI-generated) |
 | `rootCause` | Annotation `platform.chatcli.io/root-cause` |
 | `impact` | Annotation `platform.chatcli.io/impact` |
 | `lessonsLearned` | Annotation `platform.chatcli.io/lessons-learned` |
 | `preventionActions` | Annotation `platform.chatcli.io/prevention-actions` |
-| `duration` | Calculado: resolvedAt - detectedAt |
+| `duration` | Calculated: resolvedAt - detectedAt |
 
-Além dos campos acima, o PostMortem é enriquecido automaticamente com:
-- **Trending**: detecção de incidentes recorrentes (contagem nos últimos 30 dias, PostMortems relacionados)
-- **Cascade Chain**: cadeia de cascade failure se houver issues correlacionados cross-service
-- **Git Correlation**: commit suspeito (SHA, autor, arquivos alterados, confiança)
-- **GitOps Context**: estado do Helm/ArgoCD/Flux no momento do incidente
+In addition to the fields above, the PostMortem is automatically enriched with:
+- **Trending**: detection of recurring incidents (count in the last 30 days, related PostMortems)
+- **Cascade Chain**: cascade failure chain if there are correlated cross-service issues
+- **Git Correlation**: suspected commit (SHA, author, changed files, confidence)
+- **GitOps Context**: Helm/ArgoCD/Flux state at the time of the incident
 
-O PostMortem CR é owned pelo Issue (cascade delete).
+The PostMortem CR is owned by the Issue (cascade delete).
 
-### Runbook Auto-gerado (Agentic)
+### Auto-generated Runbook (Agentic)
 
-Criado via `generateAgenticRunbook()`:
+Created via `generateAgenticRunbook()`:
 
-- **Nome**: `agentic-{signal}-{severity}-{kind}` (sanitizado)
-- **Steps**: apenas os passos com ação bem-sucedida
+- **Name**: `agentic-{signal}-{severity}-{kind}` (sanitized)
+- **Steps**: only steps with successful actions
 - **Labels**: `auto-generated=true`, `source=agentic`
-- Usa `CreateOrUpdate` (reutilizado para incidentes futuros do mesmo tipo)
+- Uses `CreateOrUpdate` (reused for future incidents of the same type)
 
 
 
-## Prometheus Metrics do Operator
+## Operator Prometheus Metrics
 
-O operator expoe métricas Prometheus para observabilidade:
+The operator exposes Prometheus metrics for observability:
 
-| Metrica | Tipo | Descrição |
-|---------|------|-----------|
-| `chatcli_operator_issues_total` | Counter | Total de issues por severidade e estado |
-| `chatcli_operator_issue_resolution_duration_seconds` | Histogram | Duração da detecção até resolução |
-| `chatcli_operator_active_issues` | Gauge | Número de issues não resolvidos |
+| Metric | Type | Description |
+|--------|------|-------------|
+| `chatcli_operator_issues_total` | Counter | Total issues by severity and state |
+| `chatcli_operator_issue_resolution_duration_seconds` | Histogram | Duration from detection to resolution |
+| `chatcli_operator_active_issues` | Gauge | Number of unresolved issues |
 
 
 
-## Testes
+## Tests
 
-O operator possui 130 testes (185 com subtests) cobrindo todos os componentes:
+The operator has 130 tests (185 with subtests) covering all components:
 
-| Componente | Testes | Cobertura |
-|-----------|--------|-----------|
-| InstanceReconciler | 15 | CRUD, watcher, persistence, réplicas, RBAC, deletion, deepcopy |
-| AnomalyReconciler | 4 | Criação, correlação, attachment a Issue existente |
-| IssueReconciler | 12 | Máquina de estados, fallback AI, retry, plano agêntico, geração PostMortem |
-| RemediationReconciler | 38 | Todos os 54 tipos de ação (Deployment + StatefulSet + DaemonSet + Job + CronJob), safety constraints, loop agêntico, rollback, verificação |
-| AIInsightReconciler | 12 | Conectividade, mock RPC, parsing de análise, withAuth, TLS/token |
-| PostMortemReconciler | 2 | Inicialização de estado, estado terminal |
-| WatcherBridge | 22 | Mapeamento de alertas, dedup SHA256, hash, pruning, criação de Anomaly, buildConnectionOpts (TLS, token, ambos) |
-| CorrelationEngine | 4 | Risk scoring, severidade, incident ID, anomalias relacionadas |
-| Pipeline (E2E) | 3 | Fluxo completo: Anomaly→Issue→Insight→Plan→Resolved, escalonamento, correlação |
-| MapActionType | 6+17 | Todos os 54 mapeamentos string→enum incluindo StatefulSet, DaemonSet, Job, CronJob |
+| Component | Tests | Coverage |
+|-----------|-------|---------|
+| InstanceReconciler | 15 | CRUD, watcher, persistence, replicas, RBAC, deletion, deepcopy |
+| AnomalyReconciler | 4 | Creation, correlation, attachment to existing Issue |
+| IssueReconciler | 12 | State machine, AI fallback, retry, agentic plan, PostMortem generation |
+| RemediationReconciler | 38 | All 54 action types (Deployment + StatefulSet + DaemonSet + Job + CronJob), safety constraints, agentic loop, rollback, verification |
+| AIInsightReconciler | 12 | Connectivity, mock RPC, analysis parsing, withAuth, TLS/token |
+| PostMortemReconciler | 2 | State initialization, terminal state |
+| WatcherBridge | 22 | Alert mapping, SHA256 dedup, hash, pruning, Anomaly creation, buildConnectionOpts (TLS, token, both) |
+| CorrelationEngine | 4 | Risk scoring, severity, incident ID, related anomalies |
+| Pipeline (E2E) | 3 | Complete flow: Anomaly->Issue->Insight->Plan->Resolved, escalation, correlation |
+| MapActionType | 6+17 | All 54 string->enum mappings including StatefulSet, DaemonSet, Job, CronJob actions |
 
-### Executar Testes
+### Run Tests
 
 ```bash
 cd operator
@@ -774,7 +764,7 @@ go test ./... -v
 
 
 
-## Diagrama de Ownership (Garbage Collection)
+## Ownership Diagram (Garbage Collection)
 
 ```mermaid
 graph TD
@@ -795,59 +785,59 @@ graph TD
     style PM fill:#cba6f7,color:#000
 ```
 
-- **Instance** e owner de todos os recursos Kubernetes que cria (Deployment, Service, ConfigMap, SA, PVC)
-- **Issue** e owner de AIInsight, RemediationPlan e PostMortem (cascade delete)
-- Anomalies são independentes (não tem owner) para preservar histórico
+- **Instance** is the owner of all Kubernetes resources it creates (Deployment, Service, ConfigMap, SA, PVC)
+- **Issue** is the owner of AIInsight, RemediationPlan, and PostMortem (cascade delete)
+- Anomalies are independent (no owner) to preserve history
 
 
 
-## Checklist de Implantação AIOps
+## AIOps Deployment Checklist
 
 <Steps>
-  <Step title="Instalar Operator via Helm (CRDs + RBAC + Deployment + Dashboard)">
+  <Step title="Install Operator via Helm (CRDs + RBAC + Deployment + Dashboard)">
     ```bash
     helm install chatcli-operator \
       oci://ghcr.io/diillson/charts/chatcli-operator \
       --namespace chatcli-system --create-namespace
     ```
   </Step>
-  <Step title="Criar Secret com API keys">
-    Crie o Secret com as API keys do provedor LLM escolhido.
+  <Step title="Create Secret with API keys">
+    Create the Secret with the API keys for your chosen LLM provider.
   </Step>
-  <Step title="Criar Instance CR">
-    Crie o Instance CR com `watcher.enabled: true` e targets configurados.
+  <Step title="Create Instance CR">
+    Create the Instance CR with `watcher.enabled: true` and configured targets.
   </Step>
-  <Step title="Verificar servidor">
-    `kubectl get instances` -- confirme que o servidor ChatCLI está rodando.
+  <Step title="Verify server">
+    `kubectl get instances` -- confirm that the ChatCLI server is running.
   </Step>
-  <Step title="Verificar pipeline AIOps">
-    - `kubectl get anomalies -A` -- anomalias sendo detectadas
-    - `kubectl get issues -A` -- issues sendo criados
-    - `kubectl get aiinsights -A` -- IA analisando
+  <Step title="Verify AIOps pipeline">
+    - `kubectl get anomalies -A` -- anomalies being detected
+    - `kubectl get issues -A` -- issues being created
+    - `kubectl get aiinsights -A` -- AI analyzing
   </Step>
-  <Step title="(Opcional) Criar Runbooks manuais">
-    Crie Runbooks manuais para cenários específicos.
+  <Step title="(Optional) Create manual Runbooks">
+    Create manual Runbooks for specific scenarios.
   </Step>
-  <Step title="Monitorar métricas">
-    Monitore métricas do operator via Prometheus.
+  <Step title="Monitor metrics">
+    Monitor operator metrics via Prometheus.
   </Step>
 </Steps>
 
 
 
-## Próximo Passo
+## Next Steps
 
 <CardGroup cols={2}>
   <Card title="K8s Operator" icon="dharmachakra" href="/features/k8s-operator">
-    Configuração e exemplos
+    Configuration and examples
   </Card>
   <Card title="K8s Watcher" icon="binoculars" href="/features/k8s-watcher">
-    Detalhes de coleta e budget
+    Collection and budget details
   </Card>
-  <Card title="Modo Servidor" icon="server" href="/features/server-mode">
-    RPCs GetAlerts, AnalyzeIssue e AgenticStep
+  <Card title="Server Mode" icon="server" href="/features/server-mode">
+    GetAlerts, AnalyzeIssue, and AgenticStep RPCs
   </Card>
-  <Card title="Monitoramento K8s" icon="book" href="/cookbook/k8s-monitoring">
-    Receita: Monitoramento K8s com IA
+  <Card title="K8s Monitoring" icon="book" href="/cookbook/k8s-monitoring">
+    Recipe: K8s Monitoring with AI
   </Card>
 </CardGroup>

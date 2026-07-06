@@ -1,0 +1,349 @@
+---
+title: "#4 RAG + HyDE — Retrieval Semântico"
+sidebarTitle: "RAG + HyDE"
+description: "Duas camadas de retrieval sobre memory.Fact: Phase 3a gera uma hipótese LLM e extrai keywords; Phase 3b embedding vetores (Voyage / OpenAI / Bedrock Titan-Cohere) + busca cosseno pure-Go com ranking fundido (semantic+lexical+temporal), floor de cosseno, auto-migração e harness de avaliação (recall@k/MRR/nDCG). Primitivo vindex reutilizável, JSON persistido, zero CGO."
+icon: "database"
+---
+
+**HyDE** (Hypothetical Document Embeddings) é a técnica clássica que gera uma **resposta hipotética** para a pergunta do usuário e usa essa resposta como signal adicional de retrieval. No ChatCLI, HyDE opera em duas fases complementares: **3a** expande keywords via hipótese LLM, **3b** adiciona busca vetorial por cosseno.
+
+<Info>HyDE é **opt-in** (`CHATCLI_QUALITY_HYDE_ENABLED=true`) para manter o steady-state sem custo adicional. Phase 3a custa +1 LLM call cheap; Phase 3b requer configurar um embedding provider.</Info>
+
+---
+
+## O problema que HyDE resolve
+
+O retrieval de `memory.Fact` pré-pipeline era **keyword-only**: o scorer bate tokens extraídos de mensagens recentes contra tags e content dos facts armazenados. Funciona bem quando o vocabulário bate exatamente — falha quando o usuário usa sinônimos ou faz perguntas abstratas.
+
+Exemplo do gap:
+
+<Tabs>
+  <Tab title="Sem HyDE">
+    Usuário: `como fazer X em Go?`<br/>
+    Keywords extraídas: `[fazer, go]`<br/>
+    Fact armazenado: `"use goroutines for concurrency in X pipelines"`<br/>
+    **Match: ❌** — "fazer" e "go" não aparecem literalmente no fact.
+  </Tab>
+  <Tab title="Com HyDE 3a">
+    Usuário: `como fazer X em Go?`<br/>
+    Hipótese LLM: `"In Go you would use goroutines and channels for X, leveraging the concurrency primitives..."`<br/>
+    Keywords expandidas: `[fazer, go, goroutines, channels, concurrency, primitives]`<br/>
+    **Match: ✅**
+  </Tab>
+  <Tab title="Com HyDE 3b">
+    Hipótese → embed (1024 dim via Voyage) → cosine search no vector store → top-3 facts semanticamente próximos.<br/>
+    **Match: ✅** — mesmo sem nenhum keyword em comum.
+  </Tab>
+</Tabs>
+
+---
+
+## Phase 3a — Hypothesis-based keyword expansion
+
+<Steps>
+  <Step title="Usuário digita query">
+    A query entra em `cli_llm.go` ou `agent_mode.go`.
+  </Step>
+  <Step title="HyDEAugmenter.Augment">
+    ```go
+    augmenter := memory.NewHyDEAugmenter(cfg, llmCallback, logger)
+    expanded := augmenter.Augment(ctx, query, originalHints)
+    ```
+  </Step>
+  <Step title="LLM gera hipótese curta">
+    Prompt: "Write a 2-4 sentence plausible answer that uses the technical nouns that would appear in any matching note. Bilingual if the query mixes languages."
+  </Step>
+  <Step title="ExtractKeywords da hipótese">
+    O mesmo extractor já usado no chat mode (stop words en+pt, min 3 chars).
+  </Step>
+  <Step title="Merge unique + lower-case">
+    Keywords originais + top-N da hipótese, cap configurável via `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS` (default 5).
+  </Step>
+  <Step title="FactIndex.Search usa o set expandido">
+    Scorer keyword-based existente opera sobre hints mais rico → recall muito maior.
+  </Step>
+</Steps>
+
+<Tip>Phase 3a **funciona sem configurar embedding provider**. É o default recomendado se o custo de +1 LLM call leve é aceitável.</Tip>
+
+---
+
+## Phase 3b — Vector embeddings + ranking fundido
+
+Adiciona busca por **cosine similarity** sobre embeddings de facts — e, desde a refatoração de ranking, **funde o score de cosseno** com os sinais lexical e temporal num único ranking.
+
+<Info>**O que mudou (PR #1027):** antes, os hits vetoriais eram dissolvidos de volta em keywords e o score de cosseno era **descartado** — pagava-se uma chamada de embedding e jogava-se fora justamente o sinal semântico. Agora o cosseno flui direto para o ranker fundido `SearchBlended`, então um fato achado só por paráfrase (zero overlap lexical) consegue rankear.</Info>
+
+### Arquitetura
+
+```text
+┌──────────────────┐
+│ Query do usuário │
+└────────┬─────────┘
+         │  Phase 3a: hipótese LLM → keywords expandidas
+         ▼
+┌──────────────────────────┐
+│ EmbeddingProvider.Embed  │  (Voyage / OpenAI / Bedrock / Null)
+└────────┬─────────────────┘
+         │  vector float32
+         ▼
+┌──────────────────────────────────────┐
+│ vindex.Index.Search(q, k, floor)     │  cosine top-K, O(n log k), pure-Go
+└────────┬─────────────────────────────┘
+         │  []Hit{ID, Score}   ← o score de cosseno é PRESERVADO
+         ▼
+┌────────────────────────────────────────────────┐
+│ FactIndex.SearchBlended(keywords, semantic, w)  │
+│   final = wSem·cosine + wLex·keyword            │
+│         + wTemp·recência   (min-max normalizado) │
+└────────┬───────────────────────────────────────┘
+         │
+         ▼
+    Facts ranqueados por relevância FUNDIDA
+```
+
+### Ranking fundido (`SearchBlended`)
+
+Três sinais independentes e complementares, cada um **normalizado min-max** sobre o conjunto de candidatos antes da soma ponderada:
+
+| Sinal | Origem | Captura |
+| :--- | :--- | :--- |
+| **semantic** | cosseno do vector store | sinonímia, paráfrase |
+| **lexical** | overlap de keyword/tag | termos exatos, identificadores, nomes de arquivo |
+| **temporal** | decaimento por recência × frequência de acesso | o que o usuário realmente usa |
+
+Pesos default (`DefaultRankWeights`): **semantic 0.55 · lexical 0.30 · temporal 0.15** — semantic-first, porque a chamada de embedding já foi paga. A fusão é **aditiva** (não multiplicativa) de propósito: um fato com cosseno alto e zero keyword **ainda rankeia** — um produto o zeraria. A normalização min-max é o que torna os pesos **provider-agnostic**: cosseno Voyage 1024-d e OpenAI 1536-d caem ambos em [0,1] após normalizar.
+
+<Tip>**Floor de cosseno** (`MinCosineScore`, default `0.25`): embeddings sobre texto normalizado são quase sempre fracamente positivos, então o antigo corte em `> 0` admitia ruído quase-ortogonal. O floor mantém só fatos genuinamente relacionados no top-K.</Tip>
+
+### Providers suportados
+
+<Tabs>
+  <Tab title="Voyage (recomendado)">
+    ```bash
+    export CHATCLI_QUALITY_HYDE_ENABLED=true
+    export CHATCLI_QUALITY_HYDE_USE_VECTORS=true
+    export CHATCLI_EMBED_PROVIDER=voyage
+    export VOYAGE_API_KEY=pa-...
+    # Opcional: escolher modelo (default voyage-3, 1024-dim)
+    export CHATCLI_EMBED_MODEL=voyage-3
+    ```
+
+    **Por quê Voyage:** é o provider **recomendado pela Anthropic** para workflows Claude, tem alta qualidade/$ em retrieval, e o modelo default (`voyage-3`, 1024-dim) é o sweet spot geral.
+  </Tab>
+  <Tab title="OpenAI">
+    ```bash
+    export CHATCLI_QUALITY_HYDE_ENABLED=true
+    export CHATCLI_QUALITY_HYDE_USE_VECTORS=true
+    export CHATCLI_EMBED_PROVIDER=openai
+    export OPENAI_API_KEY=sk-...
+    # Opcional: escolher modelo e dimensão custom
+    export CHATCLI_EMBED_MODEL=text-embedding-3-small
+    export CHATCLI_EMBED_DIMENSIONS=512   # pode reduzir para economizar storage
+    ```
+
+    **Modelos:** `text-embedding-3-small` (default, 1536-dim, $0.02/1M tokens) ou `text-embedding-3-large` (3072-dim, melhor qualidade). A dimensão nativa é detectada automaticamente a partir do modelo — só sete `CHATCLI_EMBED_DIMENSIONS` se quiser **truncar** via Matryoshka (ex.: 512 para reduzir storage).
+  </Tab>
+  <Tab title="Bedrock (Titan + Cohere)">
+    ```bash
+    export CHATCLI_QUALITY_HYDE_ENABLED=true
+    export CHATCLI_QUALITY_HYDE_USE_VECTORS=true
+    export CHATCLI_EMBED_PROVIDER=bedrock
+
+    # Reusa a credentials chain do chat client — sem nova API key.
+    # Defina region/profile se ainda não estão no ambiente.
+    export BEDROCK_REGION=us-east-1
+    export AWS_PROFILE=meu-profile     # opcional
+
+    # Opcional: escolher modelo
+    export CHATCLI_EMBED_MODEL=amazon.titan-embed-text-v2:0   # default
+    export CHATCLI_EMBED_DIMENSIONS=1024                      # Titan v2: 256/512/1024
+    ```
+
+    **Por quê Bedrock:** mesma cadeia de credenciais AWS do chat — billing único, compliance AWS (CloudTrail, guardrails), VPC endpoints. Ideal pra empresas que já têm chat rodando via Bedrock e querem retrieval no mesmo perímetro.
+
+    **Famílias suportadas:**
+
+    | Model ID | Família | Dim suportadas | Batch nativo |
+    | :--- | :--- | :--- | :--- |
+    | `amazon.titan-embed-text-v2:0` (default) | Titan v2 | 256, 512, 1024 | Não — paralelizado com pool de 8 workers |
+    | `amazon.titan-embed-text-v1` | Titan v1 | 1536 (fixo) | Não — paralelizado |
+    | `cohere.embed-english-v3` | Cohere v3 (en) | 1024 (fixo) | Sim — uma chamada por batch |
+    | `cohere.embed-multilingual-v3` | Cohere v3 (multi) | 1024 (fixo) | Sim — uma chamada por batch |
+
+    A dispatch entre Titan e Cohere é auto pelo prefixo do model id. `CHATCLI_EMBED_DIMENSIONS` só vale pra Titan v2 (256/512/1024); valores inválidos são rejeitados no `NewBedrock` antes de qualquer call AWS.
+
+    **Sem cobertura no Converse API:** embeddings só estão em `InvokeModel`, então cada família mantém seu body schema dedicado — diferente do chat onde Converse cobre quase tudo.
+
+<Tip>
+**Troca a quente via `/reload`:** mudar `CHATCLI_EMBED_PROVIDER` / `CHATCLI_EMBED_MODEL` / `CHATCLI_EMBED_DIMENSIONS` no `.env` e rodar `/reload` reconstrói o provider na hora — re-conectando o retrieval semântico do `/context --rag` e o vector index da memória, sem reiniciar o ChatCLI. O índice auto-migra se provider/dimensão mudarem.
+</Tip>
+
+    Veja [AWS Bedrock](/pt/features/bedrock) pra config completa da credentials chain (SSO, IAM role, proxy corporativo, VPC endpoint).
+  </Tab>
+  <Tab title="Null (default)">
+    Se `CHATCLI_EMBED_PROVIDER` não está setado, o `NullProvider` é retornado. `Embed()` retorna erro — o código chama `embedding.IsNull(p)` antes para desviar para keyword-only. **Zero surpresas, zero falhas silenciosas.**
+  </Tab>
+</Tabs>
+
+### Vector store pure-Go — primitivo genérico `vindex`
+
+<Info>**Sem CGO, sem SQLite-vec, sem dependências externas.** Só `float32[]` + cosseno + persistência JSON em `~/.chatcli/memory/vector_index.json`.</Info>
+
+O índice cosseno vive num pacote **genérico e reutilizável**, `llm/embedding/vindex`, extraído quando um segundo consumidor (o [retrieval semântico de `/context`](/pt/features/persistent-context)) apareceu. O `memory` é só um **adapter fino** sobre ele — sem máquina vetorial duplicada por pacote:
+
+```go
+// llm/embedding/vindex — o primitivo único e agnóstico
+type Index struct { /* provider, dim, entries map[string][]float32, path */ }
+func (x *Index) Upsert(ctx, items map[string]string) error
+func (x *Index) Search(query []float32, k int, minScore float64) []Hit  // top-K via min-heap
+func (x *Index) Prune(keep map[string]struct{})                         // evita servir vetor obsoleto
+
+// cli/workspace/memory/vector_store.go — adapter de domínio "fact"
+type VectorIndex struct { idx *vindex.Index; provider embedding.Provider }
+type ScoredFact struct { ID string; Score float64 }
+```
+
+A seleção top-K usa um **min-heap O(n log k)** (não full-sort O(n log n)), então o custo escala com `k`, não com o tamanho do corpus — o teto de escala deixa de ser "centenas de facts". Para o caso típico do chatcli a busca linear completa em microssegundos; sem HNSW ou IVFFlat.
+
+### Auto-migração de provider/dimensão
+
+Trocar de provider ou dimensão (Voyage 1024 → OpenAI 1536, ou voyage→cohere no mesmo 1024) **não exige mais `rm` manual**. No load, o índice detecta o mismatch — de **dimensão** (cosseno entre arities diferentes é indefinido) **ou de provider** (dois espaços de embedding distintos não são comparáveis, mesmo na mesma dimensão) — e **auto-limpa** o cache, removendo o arquivo para o backfill repopular:
+
+```text
+WARN vindex provider changed — auto-clearing for re-embed  on_disk_provider=voyage provider=cohere
+WARN vindex dimension mismatch — auto-clearing for re-embed  on_disk_dim=1024 provider_dim=1536
+```
+
+<Warning>O caso provider→provider no mesmo dim (ex.: voyage 1024 → cohere 1024) antes era **silenciosamente servido como lixo** — o cosseno entre espaços diferentes não tem sentido. Agora é detectado e re-embeddado.</Warning>
+
+### Lazy backfill
+
+Ao retrieve uma fact, se ela não tem vetor (fact pré-existe à ativação de embeddings), o index spawna goroutine **detached** para embedar as top-500 facts visíveis:
+
+```go
+// cli/workspace/memory/store.go:120
+go func(items map[string]string) { //#nosec G118 -- detached on purpose
+    if err := m.vectors.BackfillFacts(context.Background(), items); err != nil {
+        m.logger.Warn("vector backfill failed", zap.Error(err))
+    }
+}(items)
+```
+
+<Tip>O backfill é **bounded** e configurável: no máximo `Config.BackfillBatchMax` facts por retrieve (default 500). Com Voyage (~$0.05/M tokens) isso custa cerca de US$ 0,001 num cold cache cheio. Em uma sessão normal, a maioria do index fica embeddado já na primeira interação.</Tip>
+
+---
+
+## Avaliação — provando o retrieval (não supondo)
+
+Antes não havia como **medir** se o retrieval era bom. Agora há um harness de avaliação dependency-free em `cli/workspace/memory/eval` — métricas padrão de IR macro-averaged:
+
+| Métrica | O que mede |
+| :--- | :--- |
+| **recall@k** | fração dos facts relevantes recuperados no top-k |
+| **precision@k** | fração do top-k que era relevante |
+| **MRR** | rank recíproco médio do primeiro acerto |
+| **nDCG@k** | ganho cumulativo descontado normalizado |
+
+O A/B versionado (em `ranking_test.go`, com um provider de embedding determinístico) compara keyword-only vs. ranking fundido sobre queries que usam **sinônimos** ausentes do texto dos facts:
+
+```text
+baseline (keyword): recall@1=0.2857  MRR=0.2857  nDCG@1=0.2857
+candidate (blended): recall@1=1.0000  MRR=1.0000  nDCG@1=1.0000
+delta              : recall@1=+0.7143
+```
+
+<Info>O harness roda igual em CI (provider determinístico, reproduzível) ou contra um backend real — ele nunca importa um provider, então fica neutro entre os 14 suportados. É o que transforma "parece bom" em "é bom, medido", e guarda contra regressões.</Info>
+
+### Tunables de ranking (sem novos env vars)
+
+Os parâmetros do ranking fundido vivem como campos de `Config` com defaults fortes — **não** foram criados novos env vars (e os `CHATCLI_MEMORY_*` que já existiam, antes ignorados no caminho estruturado, agora são aplicados via `ConfigFromEnv` + clamp):
+
+| Campo `Config` | Default | O que controla |
+| :--- | :--- | :--- |
+| `RankWeights` | `{0.55, 0.30, 0.15}` | pesos semantic / lexical / temporal |
+| `MinCosineScore` | `0.25` | floor de cosseno no top-K |
+| `VectorTopK` | `12` | candidatos vetoriais por query |
+| `BackfillBatchMax` | `500` | teto de facts embeddados por retrieve |
+
+---
+
+## Configuração completa
+
+| Env var | Default | O que faz |
+|---|---|---|
+| `CHATCLI_QUALITY_HYDE_ENABLED` | `false` | Master switch (phase 3a) |
+| `CHATCLI_QUALITY_HYDE_USE_VECTORS` | `false` | Liga phase 3b (requer provider) |
+| `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS` | `5` | Cap de keywords da hipótese em phase 3a |
+| `CHATCLI_EMBED_PROVIDER` | — | `voyage` / `openai` / `bedrock` / `null` — **única fonte de verdade** para selecionar o provider |
+| `CHATCLI_EMBED_MODEL` | provider default | Voyage: `voyage-3`. OpenAI: `text-embedding-3-small` / `-large`. Bedrock: `amazon.titan-embed-text-v2:0` (default), `amazon.titan-embed-text-v1`, `cohere.embed-english-v3`, `cohere.embed-multilingual-v3`. |
+| `CHATCLI_EMBED_DIMENSIONS` | nativa do modelo | OpenAI: trunca via Matryoshka. Bedrock Titan v2: 256 / 512 / 1024 (rejeita outros). Bedrock Titan v1 / Cohere v3: dimensão fixa, ignorada. |
+| `BEDROCK_REGION` / `AWS_REGION` | `us-east-1` | Região AWS — só usado quando `CHATCLI_EMBED_PROVIDER=bedrock`. |
+| `AWS_PROFILE` | — | Profile AWS — só usado quando `CHATCLI_EMBED_PROVIDER=bedrock`. |
+
+---
+
+## `/config quality` expõe o estado
+
+```text
+── RAG + HyDE (#4)
+  CHATCLI_QUALITY_HYDE_ENABLED    : enabled
+  CHATCLI_QUALITY_HYDE_USE_VECTORS: enabled
+  CHATCLI_EMBED_PROVIDER          : bedrock
+  CHATCLI_EMBED_MODEL             : amazon.titan-embed-text-v2:0
+  CHATCLI_EMBED_DIMENSIONS        : 1024
+  CHATCLI_QUALITY_HYDE_NUM_KEYWORDS: 5
+  Provedor de vetores            : bedrock:amazon.titan-embed-text-v2:0
+  Entradas vetoriais             : 127
+```
+
+---
+
+## Integração com Reflexion
+
+HyDE amplifica o valor de Reflexion: as lições persistidas pela #3 são recuperadas com muito mais recall quando a próxima tarefa não usa exatamente as mesmas keywords. Workflow:
+
+<Steps>
+  <Step title="Turn 1: refactor auth.go falha (timeout)">
+    Reflexion persiste lesson: `"use Edit tool for large files"`, tags `[go, refactor, edit-tool]`.
+  </Step>
+  <Step title="Turn 5 (dias depois): 'me ajuda a dividir pkg/engine'">
+    Query não contém `refactor` ou `edit`. Keyword-only **perderia** a lesson.
+  </Step>
+  <Step title="HyDE 3a gera hipótese">
+    `"To split a Go package, identify logical groupings and use refactor patterns with Edit tool for surgical changes..."`<br/>
+    Keywords extraídas: `[split, package, refactor, edit, patterns, …]`
+  </Step>
+  <Step title="Match!">
+    Lesson aparece no system prompt. Coder escolhe `Edit` ao invés de `write` de primeira.
+  </Step>
+</Steps>
+
+---
+
+## Caveats e tuning
+
+<Warning>**Token cost** de phase 3a: ~200 tokens por turn de retrieval. Em workflows com muitos turns de leitura, o custo acumula. Use `CHATCLI_QUALITY_HYDE_NUM_KEYWORDS=3` para budget mais apertado.</Warning>
+
+<Warning>**Privacy**: a query do usuário é enviada ao provider de embedding. Para workloads sensíveis em ambientes corporativos, **Bedrock é o caminho preferido** — fica dentro do perímetro AWS (CloudTrail, VPC endpoint, IAM). Para workloads locais sem rede, considere self-host (roadmap: provider Ollama-embedding).</Warning>
+
+<Info>**Fallback gracioso**: se o LLM fail ou o provider embedding retornar erro, o retrieval cai para keyword-only silenciosamente. Nenhum turn é abortado por falha de HyDE.</Info>
+
+---
+
+## Leia também
+
+<CardGroup cols={2}>
+  <Card title="#3 Reflexion" icon="lightbulb" href="/pt/features/quality/reflexion">
+    As lições que HyDE recupera com mais recall.
+  </Card>
+  <Card title="Bootstrap Memory" icon="brain" href="/pt/features/bootstrap-memory">
+    A camada embaixo: como memory.Fact é populada e mantida.
+  </Card>
+  <Card title="Persistent Context" icon="database" href="/pt/features/persistent-context">
+    `/context attach` para contextos explícitos de arquivos.
+  </Card>
+  <Card title="Configuração completa" icon="sliders" href="/pt/features/quality/configuration">
+    Todos os env e slashes.
+  </Card>
+</CardGroup>

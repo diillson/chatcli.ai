@@ -1,0 +1,657 @@
+---
+title: "AIOps: Setup Produção Completo"
+sidebarTitle: "AIOps Production Setup"
+description: "Guia passo a passo para configurar a plataforma AIOps do ChatCLI em produção com todos os componentes: notificações, SLOs, aprovações, chaos engineering e observabilidade."
+icon: "rocket"
+---
+
+Este cookbook cobre a configuração completa da plataforma AIOps do ChatCLI para um ambiente de produção real — desde a instalação até a validação com chaos engineering.
+
+
+
+## Pré-requisitos
+
+- [x] Cluster Kubernetes 1.25+
+- [x] Helm 3.x instalado
+- [x] Prometheus Operator (para ServiceMonitor)
+- [x] Grafana (para dashboards)
+- [x] Pelo menos uma API key de LLM (OpenAI, Claude, Google AI)
+
+
+## 1. Instalar o Operator
+
+<Steps>
+  <Step title="Instalar Operator via Helm (CRDs + RBAC + Controllers + Dashboard)">
+    ```bash
+    helm install chatcli-operator \
+      oci://ghcr.io/diillson/charts/chatcli-operator \
+      --namespace chatcli-system \
+      --create-namespace
+    ```
+  </Step>
+
+  <Step title="Verificar CRDs instalados">
+    ```bash
+    kubectl get crd | grep platform.chatcli.io
+    ```
+
+    Devem aparecer 17 CRDs:
+    ```
+    aiinsights.platform.chatcli.io
+    anomalies.platform.chatcli.io
+    approvalpolicies.platform.chatcli.io
+    approvalrequests.platform.chatcli.io
+    auditevents.platform.chatcli.io
+    chaosexperiments.platform.chatcli.io
+    clusterregistrations.platform.chatcli.io
+    escalationpolicies.platform.chatcli.io
+    incidentslas.platform.chatcli.io
+    instances.platform.chatcli.io
+    issues.platform.chatcli.io
+    notificationpolicies.platform.chatcli.io
+    postmortems.platform.chatcli.io
+    remediationplans.platform.chatcli.io
+    runbooks.platform.chatcli.io
+    servicelevelobjectives.platform.chatcli.io
+    sourcerepositories.platform.chatcli.io
+    ```
+  </Step>
+
+  <Step title="Criar Secret com API Keys">
+    ```bash
+    kubectl create secret generic chatcli-api-keys \
+      --namespace chatcli-system \
+      --from-literal=ANTHROPIC_API_KEY=sk-ant-xxx \
+      --from-literal=OPENAI_API_KEY=sk-xxx
+    ```
+  </Step>
+</Steps>
+
+
+
+## 2. Criar Instância ChatCLI
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-prod
+  namespace: chatcli-system
+spec:
+  replicas: 2
+  provider: CLAUDEAI
+  model: claude-sonnet-4-20250514
+  server:
+    port: 50051
+    metricsPort: 9090
+    tls:
+      enabled: true
+      secretName: chatcli-tls
+    token:
+      name: chatcli-auth
+      key: token
+  apiKeys:
+    name: chatcli-api-keys
+  watcher:
+    enabled: true
+    targets:
+      - deployment: api-gateway
+        namespace: production
+        metricsPort: 8080
+        metricsPath: /metrics
+      - deployment: payment-service
+        namespace: production
+        metricsPort: 8080
+      - deployment: user-service
+        namespace: production
+    interval: "30s"
+    window: "2h"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  persistence:
+    enabled: true
+    size: 5Gi
+```
+
+<Tip>
+Para habilitar coleta de métricas Prometheus durante análise de incidentes, adicione a variável `PROMETHEUS_URL` ao ConfigMap ou passe via Helm:
+```bash
+helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
+  --set prometheusUrl="http://prometheus-server.monitoring.svc:9090"
+```
+</Tip>
+
+## Secret TLS: SANs e CA corretos
+
+Este é o passo onde a maioria das instalações quebra silenciosamente. O Instance CR referencia `secretName: chatcli-tls`, mas o Secret precisa ser gerado com dois cuidados que o `openssl req -x509` padrão **não** faz.
+
+### Gerar o cert com `subjectAltName`
+
+Sem SANs cobrindo o nome DNS usado pelo operator para dialar o gRPC, o handshake falha com:
+
+```
+transport: authentication handshake failed: x509: certificate is not valid for any names, but wanted to match chatcli-prod.chatcli-system.svc.cluster.local
+```
+
+Use um `openssl.cnf` explícito:
+
+```bash
+cat > openssl.cnf <<'EOF'
+[req]
+distinguished_name = req_dn
+x509_extensions    = v_ext
+prompt             = no
+
+[req_dn]
+CN = chatcli-prod.chatcli-system.svc.cluster.local
+
+[v_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = chatcli-prod.chatcli-system.svc.cluster.local
+DNS.2 = chatcli-prod.chatcli-system.svc
+DNS.3 = chatcli-prod
+DNS.4 = localhost
+EOF
+
+openssl req -x509 -newkey rsa:4096 -sha256 -days 825 -nodes \
+  -keyout tls.key -out tls.crt -config openssl.cnf -extensions v_ext
+```
+
+Verifique com:
+
+```bash
+openssl x509 -in tls.crt -noout -text | grep -A1 'Subject Alternative Name'
+```
+
+### Incluir `ca.crt` no Secret
+
+Cert self-signed é seu próprio CA. Se o Secret tiver apenas `tls.crt` e `tls.key`, o operator vai conectar mas cair em:
+
+```
+transport: authentication handshake failed: x509: certificate signed by unknown authority
+```
+
+O `WatcherBridge` lê automaticamente a chave `ca.crt` do Secret referenciado pelo Instance e usa como trust root — por isso o Secret precisa ter as **três** chaves:
+
+```bash
+kubectl -n chatcli-system create secret generic chatcli-tls \
+  --from-file=tls.crt=tls.crt \
+  --from-file=tls.key=tls.key \
+  --from-file=ca.crt=tls.crt   # em self-signed, o cert é o próprio CA
+```
+
+<Tip>
+Com `ca.crt` dentro do Secret, **não é necessário** montar ConfigMap de CA nem definir `SSL_CERT_FILE` / `CHATCLI_GRPC_TLS_CA` no deployment do operator. Essa variável é um caminho alternativo para cenários multi-Instance com CA compartilhado e exige montagem manual (`extraEnv` + volume).
+</Tip>
+
+### E se o cert for emitido por cert-manager ou ACM?
+
+O §2.1 acima cobre o caso self-signed gerado na mão, que é o mais frágil. Com cert-manager ou AWS ACM o setup simplifica, mas cada emissor tem pegadinha própria:
+
+| Emissor do cert | `ca.crt` no Secret? | Onde o SAN precisa bater | `spec.server.address` aponta para... |
+|---|---|---|---|
+| cert-manager + Let's Encrypt / ACME público | **Não** — CA já está no trust store do sistema | FQDN público (ex: `chatcli.example.com`) | FQDN público via Ingress/NLB com gRPC passthrough |
+| cert-manager + ClusterIssuer CA interno | **Sim** — cert-manager escreve `ca.crt` no Secret automaticamente | `dnsNames` do `Certificate` CR; inclua os nomes in-cluster | Service in-cluster (`<svc>.<ns>.svc.cluster.local`) |
+| AWS ACM Public | N/A — chave privada não é exportável | FQDN público | FQDN público via ALB/NLB (TLS termina no LB) |
+| AWS ACM Private CA | **Sim** — incluir o bundle da Private CA como `ca.crt` | Definido na emissão; inclua os nomes in-cluster | Service in-cluster |
+| Self-signed (openssl manual — §2.1) | **Sim** — `ca.crt=tls.crt` (o cert é seu próprio CA) | Definido via `subjectAltName` no `openssl.cnf` | Service in-cluster |
+
+**Notas importantes:**
+
+- **Cert publicamente confiável → trust já existe.** O código do operator (`grpc_client.go`) só anexa `RootCAs` quando há CA customizado; sem ele, Go usa o bundle `ca-certificates` do container. Por isso Let's Encrypt e ACM Public "funcionam sem fazer nada" no lado CA — mas o `spec.server.address` **tem que ser o FQDN público**, não o Service interno, ou o SAN não bate.
+- **cert-manager com CA interno é o caminho mais limpo em K8s.** O `Certificate` CR abaixo emite tudo pronto para o `WatcherBridge` auto-trust — zero openssl manual:
+
+  ```yaml
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: chatcli-tls
+    namespace: chatcli-system
+  spec:
+    secretName: chatcli-tls          # Mesmo Secret referenciado no Instance CR
+    issuerRef:
+      name: internal-ca              # ClusterIssuer com kind: CA
+      kind: ClusterIssuer
+    commonName: chatcli-prod.chatcli-system.svc.cluster.local
+    dnsNames:
+      - chatcli-prod.chatcli-system.svc.cluster.local
+      - chatcli-prod.chatcli-system.svc
+      - chatcli-prod
+    duration: 8760h                  # 1 ano
+    renewBefore: 720h                # renova 30 dias antes
+  ```
+
+  Com `Certificate.issuerRef.kind: CA`, o cert-manager automaticamente inclui `ca.crt` no Secret gerado — o `WatcherBridge` lê direto, sem configuração extra.
+- **ACM Public não serve para gRPC pod-a-pod.** A chave privada não é exportável; use somente quando TLS termina no ALB/NLB e o operator dialar o endpoint público.
+- **ACM Private CA** — exporte o bundle da Private CA (`aws acm-pca get-certificate-authority-certificate`) e inclua como `ca.crt` no Secret. Dali em diante segue o caminho auto-trust.
+
+## 2.2 Vincular Repositórios de Código (Opcional)
+
+Vincule os repositórios de código das aplicações monitoradas para diagnóstico code-aware. A IA receberá contexto de commits recentes, trechos de código de stack traces e arquivos de configuração.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: SourceRepository
+metadata:
+  name: api-gateway-repo
+  namespace: chatcli-system
+spec:
+  url: "https://github.com/myorg/api-gateway.git"
+  branch: main
+  authType: token
+  secretRef: git-token
+  resource:
+    kind: Deployment
+    name: api-gateway
+    namespace: production
+  paths: ["cmd/", "internal/"]
+  language: "Go"
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: SourceRepository
+metadata:
+  name: payment-service-repo
+  namespace: chatcli-system
+spec:
+  url: "git@github.com:myorg/payment-service.git"
+  branch: main
+  authType: ssh
+  secretRef: git-ssh-key
+  resource:
+    kind: Deployment
+    name: payment-service
+    namespace: production
+  language: "Java"
+```
+
+## 3. Configurar Notificações
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: NotificationPolicy
+metadata:
+  name: prod-notifications
+  namespace: chatcli-system
+spec:
+  enabled: true
+  channels:
+    - name: slack-incidents
+      type: slack
+      config:
+        webhook_url: "https://hooks.slack.com/services/T.../B.../xxx"
+        channel: "#incidents"
+    - name: pagerduty-critical
+      type: pagerduty
+      config:
+        routing_key: "R0xxxxxxxxxxxxxxxxxxxx"
+    - name: email-management
+      type: email
+      config:
+        smtp_host: smtp.gmail.com
+        smtp_port: "587"
+        from: aiops@company.com
+        to: "sre-team@company.com,management@company.com"
+      secretRef:
+        name: smtp-credentials
+  rules:
+    - name: critical-to-pagerduty
+      severities: [critical]
+      states: [Detected, Escalated]
+      channels: [pagerduty-critical, slack-incidents]
+    - name: high-to-slack
+      severities: [critical, high]
+      states: [Detected, Analyzing, Remediating, Resolved, Escalated]
+      channels: [slack-incidents]
+    - name: escalations-to-email
+      states: [Escalated]
+      channels: [email-management]
+  throttle:
+    maxPerHour: 20
+    deduplicationWindow: "5m"
+```
+
+
+
+## 4. Configurar Escalação
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: EscalationPolicy
+metadata:
+  name: prod-escalation
+  namespace: chatcli-system
+spec:
+  enabled: true
+  severities: [critical, high]
+  levels:
+    - name: L1-OnCall
+      timeoutMinutes: 5
+      targets:
+        - type: oncall
+          name: primary-oncall
+      notifyChannels: [slack-incidents, pagerduty-critical]
+      repeatIntervalMinutes: 5
+    - name: L2-SeniorSRE
+      timeoutMinutes: 15
+      targets:
+        - type: team
+          name: sre-senior
+      notifyChannels: [slack-incidents, pagerduty-critical]
+    - name: L3-Engineering-Lead
+      timeoutMinutes: 30
+      targets:
+        - type: user
+          name: eng-lead@company.com
+      notifyChannels: [slack-incidents, email-management]
+```
+
+
+
+## 5. Definir SLOs
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: api-gateway-availability
+  namespace: chatcli-system
+spec:
+  serviceName: api-gateway
+  description: "API Gateway deve manter 99.9% de disponibilidade"
+  enabled: true
+  indicator:
+    type: availability
+    metricSource: issues
+    resource:
+      kind: Deployment
+      name: api-gateway
+      namespace: production
+  target:
+    percentage: 99.9
+    window: "30d"
+  alertPolicy:
+    pageOnBudgetExhausted: true
+    notificationPolicyRef: prod-notifications
+    burnRateWindows:
+      - shortWindow: "1h"
+        longWindow: "6h"
+        burnRateThreshold: 14.4
+        severity: critical
+      - shortWindow: "6h"
+        longWindow: "72h"
+        burnRateThreshold: 6
+        severity: high
+      - shortWindow: "24h"
+        longWindow: "72h"
+        burnRateThreshold: 3
+        severity: medium
+```
+
+
+
+## 6. Definir SLAs
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: p1-sla
+  namespace: chatcli-system
+spec:
+  severity: critical
+  responseTime: "5m"
+  resolutionTime: "1h"
+  escalationPolicyRef: prod-escalation
+  notificationPolicyRef: prod-notifications
+  businessHoursOnly: false
+```
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: p2-sla
+  namespace: chatcli-system
+spec:
+  severity: high
+  responseTime: "15m"
+  resolutionTime: "4h"
+  escalationPolicyRef: prod-escalation
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
+    startHour: 9
+    endHour: 18
+    workDays: ["Monday","Tuesday","Wednesday","Thursday","Friday"]
+```
+
+
+
+## 7. Configurar Aprovações
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ApprovalPolicy
+metadata:
+  name: prod-approvals
+  namespace: chatcli-system
+spec:
+  enabled: true
+  defaultMode: manual
+  rules:
+    - name: auto-low-confidence
+      match:
+        severities: [low]
+        actionTypes: [RestartDeployment, DeletePod]
+      mode: auto
+      autoApproveConditions:
+        minConfidence: 0.95
+        maxSeverity: low
+        historicalSuccessRate: 0.90
+    - name: quorum-production-rollback
+      match:
+        severities: [critical, high]
+        actionTypes: [RollbackDeployment, ScaleDeployment]
+        namespaces: [production]
+      mode: quorum
+      requiredApprovers: 2
+      timeoutMinutes: 15
+      changeWindow:
+        timezone: "America/Sao_Paulo"
+        allowedDays: ["Monday","Tuesday","Wednesday","Thursday","Friday"]
+        startHour: 9
+        endHour: 17
+    - name: manual-resource-changes
+      match:
+        actionTypes: [AdjustResources, PatchConfig]
+      mode: manual
+      timeoutMinutes: 30
+```
+
+
+
+## 8. Instalar Grafana Dashboards
+
+```bash
+# Criar ConfigMap com dashboards
+kubectl create configmap chatcli-grafana-dashboards \
+  --from-file=deploy/grafana/ \
+  -n monitoring \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Adicionar label para Grafana sidecar auto-discovery
+kubectl label configmap chatcli-grafana-dashboards \
+  grafana_dashboard=1 -n monitoring
+
+# Instalar ServiceMonitors
+kubectl apply -f deploy/grafana/dashboards-configmap.yaml
+```
+
+
+
+## 9. Validar com Chaos Engineering
+
+<Warning>
+Execute chaos experiments apenas em ambientes com redundância. Nunca em single-replica deployments.
+</Warning>
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: validate-api-gateway-resilience
+  namespace: chatcli-system
+spec:
+  experimentType: pod_kill
+  target:
+    kind: Deployment
+    name: api-gateway
+    namespace: production
+  duration: "2m"
+  parameters:
+    count: "1"
+  dryRun: true  # Teste primeiro em dry-run!
+  enabled: true
+  safetyChecks:
+    minHealthyPods: 2
+    maxConcurrentExperiments: 1
+    abortOnIssueDetected: true
+    requireApproval: true
+    blockedNamespaces: ["kube-system", "monitoring"]
+  postExperiment:
+    verifyRecovery: true
+    recoveryTimeout: "5m"
+    runRemediationTest: false
+```
+
+<Steps>
+  <Step title="Executar em DryRun">
+    ```bash
+    kubectl apply -f chaos-experiment.yaml
+    kubectl get chaos -w
+    ```
+  </Step>
+  <Step title="Verificar resultado">
+    ```bash
+    kubectl get chaos validate-api-gateway-resilience -o yaml
+    ```
+  </Step>
+  <Step title="Executar de verdade (após validação)">
+    Edite `dryRun: false` e reaplique.
+  </Step>
+</Steps>
+
+
+
+## 10. Configurar API Keys do Dashboard
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatcli-operator-config
+  namespace: chatcli-system
+data:
+  api-keys: |
+    - key: "ck_live_admin_SUA_CHAVE"
+      role: admin
+      description: "SRE Team"
+    - key: "ck_live_viewer_SUA_CHAVE"
+      role: viewer
+      description: "Read-only NOC"
+```
+
+```bash
+kubectl apply -f operator-config.yaml
+kubectl rollout restart deployment chatcli-operator -n chatcli-system
+```
+
+<Warning>
+Sem este ConfigMap, a API REST roda em **dev mode** (sem autenticação). Sempre configure API keys antes de expor externamente.
+</Warning>
+
+
+
+## 11. Acessar o Dashboard
+
+```bash
+# Port-forward para o REST API + Web UI
+kubectl port-forward svc/chatcli-operator 8090:8090 -n chatcli-system
+
+# Abrir no browser
+open http://localhost:8090
+```
+
+O dashboard web mostra:
+- Overview com stats em tempo real
+- Incidents com filtros e ações (acknowledge, snooze)
+- SLOs com error budget e burn rates
+- Approvals pendentes
+- PostMortems com timeline
+- Clusters federados
+- Audit log pesquisável
+
+
+
+## 11.1 Expor o Dashboard via Ingress (alternativa ao port-forward)
+
+Para expor o dashboard fora do cluster, crie um Ingress apontando para o Service do operator. Quando monta-se sob sub-path, o `rewrite-target` com grupo de captura é obrigatório — os assets estáticos do dashboard são servidos de `/` e retornariam 404 sem isso:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chatcli-dashboard
+  namespace: chatcli-system
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: chatcli.example.com
+      http:
+        paths:
+          - path: /chatcli(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: chatcli-operator
+                port:
+                  number: 8090
+```
+
+## 12. Troubleshooting comum
+
+| Erro nos logs do operator | Causa | Correção |
+|---|---|---|
+| `x509: certificate is not valid for any names` | Cert do servidor gRPC sem SAN cobrindo `spec.server.address` | Regerar cert com `openssl.cnf` + `subjectAltName` apontando para o FQDN do Service (ver §2.1) |
+| `x509: certificate signed by unknown authority` | Self-signed sem trust configurado no operator | Adicionar a chave `ca.crt` ao Secret `chatcli-tls` referenciado pelo Instance (ver §2.1) |
+| `no ready Instance found` | Instance não está `Ready` ou está em outro namespace | `kubectl describe instance chatcli-prod -n chatcli-system` — conferir status e eventos |
+| `connection refused` após TLS OK | Service sem endpoints ou porta gRPC errada | `kubectl get endpoints chatcli-prod -n chatcli-system` deve listar IPs de pod |
+
+## Checklist de Produção
+
+- [x] Operator instalado com 17 CRDs
+- [x] Instance criada com TLS e auth
+- [x] Secret `chatcli-tls` contém **`tls.crt`, `tls.key` e `ca.crt`** (self-signed: `ca.crt=tls.crt`)
+- [x] `tls.crt` possui SANs para `<instance>.<ns>.svc.cluster.local`, `<instance>.<ns>.svc` e `<instance>`
+- [x] `spec.server.address` no Instance bate com uma das SANs do cert
+- [x] Logs do operator mostram `Connected to Instance` sem erros `x509:` até ~30s após Instance ficar `Ready`
+- [x] Watcher monitorando deployments alvo
+- [x] NotificationPolicy com Slack + PagerDuty
+- [x] EscalationPolicy L1 - L2 - L3
+- [x] SLOs com burn rate alerting (Google SRE model)
+- [x] SLAs com response/resolution time por severity
+- [x] ApprovalPolicy com auto/quorum para produção
+- [x] Grafana dashboards instalados
+- [x] Chaos experiment validado em dry-run
+- [x] API Keys do operator configuradas (ConfigMap chatcli-operator-config)
+- [x] Web Dashboard acessível
+- [x] REST API com autenticação configurada (header X-API-Key)

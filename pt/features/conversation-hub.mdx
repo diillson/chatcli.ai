@@ -1,0 +1,121 @@
+---
+title: "Conversation Hub — continuidade de conversa entre canais"
+sidebarTitle: "Conversation Hub"
+description: "Uma conversa que atravessa canais: o assunto começado no Telegram/Slack/WhatsApp continua no chatcli do notebook, e vice-versa, até você iniciar uma nova sessão."
+icon: "share-nodes"
+---
+
+O **Conversation Hub** faz a conversa **atravessar canais**. Um assunto começado no Telegram continua quando você abre o chatcli no notebook; o que você responde no notebook vira contexto no Telegram/Slack/WhatsApp. Os dois lados se entendem — sem você repetir nada.
+
+<Note>
+O hub é uma **ponte do momento**, não memória de longo prazo. Ele mantém a conversa **atual** sincronizada entre canais, com banco **limitado** (poda automática). Memória persistente entre projetos/sessões continua sendo o [sistema de memória](/pt/features/bootstrap-memory) (`/memory`) e o [`/session save`](/pt/features/session-management).
+</Note>
+
+## Como funciona
+
+- **Principal**: a identidade compartilhada da conversa. No modo single-user (padrão), o CLI local e o gateway colapsam no mesmo principal (`default` se você não definir nada), então tudo compartilha **sem configuração**.
+- **`hub.db`**: um log append-only em SQLite (`~/.chatcli/hub.db`). O CLI e o daemon do gateway abrem o **mesmo arquivo** — é por isso que se entendem entre processos.
+- **Efêmero por sessão**: ao abrir o chatcli, começa uma conversa **nova** e a anterior é **podada** — o banco não cresce e você não carrega um histórico gigante. Conversas ociosas além do TTL (`CHATCLI_HUB_TTL_HOURS`, padrão 24h) são varridas.
+- **Silencioso**: mensagens de outros canais entram no contexto do modelo **sem serem impressas** no seu prompt (nada de poluição, nada de "apertar Enter pra continuar").
+- **`/newsession`** zera a conversa compartilhada para todos os canais.
+
+Funciona em **chat**, **`/agent`** e **`/coder`**: o pedido e a resposta final atravessam os canais (o detalhe de execução das tools fica local em cada máquina).
+
+## Modos
+
+<Tabs>
+<Tab title="Local (mesma máquina)">
+O caso mais simples — chatcli + gateway no mesmo notebook, **zero configuração** (basta o principal padrão):
+
+```bash
+export CHATCLI_TELEGRAM_BOT_TOKEN=123:abc
+chatcli                 # abre o REPL (entra em modo hub local)
+# dentro dele:
+/gateway start          # sobe o daemon, herdando o ambiente
+```
+
+Converse no notebook, depois puxe o assunto no Telegram → tem o contexto. Mande no Telegram com o prompt aberto → entra no contexto do próximo turno do notebook.
+
+<Note>Cross-process, o notebook pega o contexto **no próximo turno** (não há push ao vivo no prompt já aberto). Para tempo real, use o modo co-locado abaixo.</Note>
+</Tab>
+
+<Tab title="Co-locado no servidor (tempo real)">
+Roda o gateway **dentro do processo do servidor**, compartilhando o broker em memória — assim uma mensagem do Telegram chega ao CLI conectado em tempo real:
+
+```bash
+CHATCLI_TELEGRAM_BOT_TOKEN=123:abc \
+CHATCLI_GATEWAY_IN_SERVER=true \
+chatcli server --port 50051
+
+# no notebook (mesma ou outra máquina):
+chatcli connect localhost:50051
+```
+</Tab>
+
+<Tab title="Multi-usuário / bot público">
+Para um bot que atende várias pessoas, **isole** cada identidade e mapeie quem é quem:
+
+```bash
+export CHATCLI_HUB_ISOLATE=true
+export CHATCLI_HUB_BINDINGS="telegram:111=alice;telegram:222=bob"
+```
+
+Com `isolate`, remetentes não-vinculados ficam cada um na sua própria conversa (um usuário nunca vê o thread de outro). Bindings explícitos colapsam identidades específicas num principal nomeado.
+</Tab>
+</Tabs>
+
+## Comandos
+
+```text
+/hub whoami                         # seu principal e a conversa ativa
+/hub bind telegram 123 alice        # vincula uma identidade de canal a um principal
+/hub bindings [principal]           # lista os vínculos canal→principal
+```
+
+As **settings** do hub são mutáveis em runtime e persistem no `hub.db` (lidas ao vivo pelo gateway, sem restart):
+
+```text
+/config hub                         # painel: valor efetivo + fonte (setting/env/default)
+/config hub set principal alice
+/config hub set isolate on
+/config hub set ttl_hours 72
+/config hub reset principal         # volta a env/default
+```
+
+Precedência de resolução: **setting (db) > variável de ambiente > default**.
+
+## Identidade compartilhada (single-user vs multi-user)
+
+| Cenário | Configuração | Resultado |
+| --- | --- | --- |
+| Só você (notebook + bot pessoal) | nada (ou `CHATCLI_HUB_PRINCIPAL=eu`) | tudo colapsa num principal → uma conversa compartilhada |
+| Bot multi-usuário/público | `CHATCLI_HUB_ISOLATE=true` (+ bindings) | cada identidade isolada; bindings mesclam quem você quiser |
+
+## Relação com memória e sessões
+
+| Mecanismo | Para quê | Persistência |
+| --- | --- | --- |
+| **Conversation Hub** | contexto cross-channel da conversa **atual** | efêmero/limitado (poda + TTL) |
+| [Memória](/pt/features/bootstrap-memory) (`/memory`) | fatos/aprendizados de longo prazo | permanente |
+| [Sessões](/pt/features/session-management) (`/session save`) | snapshot explícito de uma conversa | arquivo JSON |
+
+O hub é um **trilho paralelo aditivo**: o histórico local, o `/session save` e a memória continuam funcionando exatamente como antes.
+
+## Observabilidade — o hub nunca morre em silêncio
+
+A continuidade depende do hub estar de pé, então todo estado dele é **explícito no log**:
+
+- **Hub ativo**: o daemon loga `gateway: conversation hub active (principal=…, isolate=…, idle_ttl=…)` no boot; o CLI loga `local hub mode enabled`.
+- **Hub desligado**: um `Warn` nomeia **a fonte exata da decisão** — `db setting enabled=false`, `env CHATCLI_HUB_ENABLED=false` ou `default` — em vez de simplesmente sumir com a continuidade.
+- **Daemon servindo sem hub** (banco inacessível): um aviso único por execução deixa claro que as respostas estão sem contexto cross-channel.
+
+<Warning>
+O daemon herda o ambiente da shell que rodou `/gateway start`, e o `.env` **não** sobrescreve variáveis já exportadas. Um `CHATCLI_HUB_ENABLED=false` esquecido na shell desliga a continuidade mesmo com o `.env` correto — o log de proveniência acima existe exatamente para flagrar isso (`ps eww <pid>` confirma o ambiente real do processo).
+</Warning>
+
+## Veja também
+
+- [Chat Gateway](/pt/features/chat-gateway) — expõe o ChatCLI nos canais de mensagem
+- [Servidor Remoto (/connect)](/pt/features/remote-connect) — conectar o CLI a um hub remoto
+- [Variáveis de Ambiente](/pt/reference/environment-variables#conversation-hub-continuidade-cross-channel)
+- [Referência de Comandos](/pt/reference/command-reference)

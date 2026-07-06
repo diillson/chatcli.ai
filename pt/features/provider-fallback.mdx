@@ -1,0 +1,174 @@
+---
+title: "Fallback de Provedores"
+sidebarTitle: "Fallback de Provedores"
+description: "Configure failover automático entre provedores LLM com classificacao inteligente de erros, cooldown exponencial e monitoramento de saude."
+icon: "rotate"
+---
+
+O ChatCLI suporta uma **cadeia de failover automático** entre provedores LLM. Quando o provedor primário falha (rate limit, timeout, erro de servidor), o sistema tenta automaticamente o próximo provedor na cadeia, de forma totalmente transparente.
+
+---
+
+## Como Funciona
+
+A cadeia de fallback e uma lista ordenada de provedores. Cada request percorre a lista até obter sucesso ou esgotar todas as opcoes:
+
+```text
+Request -> OpenAI (primário)
+             | falhou (rate limit)
+           Claude (secundário)
+             | falhou (timeout)
+           Google AI (terciario)
+             | sucesso
+           Resposta retornada ao usuário
+```
+
+---
+
+## Configuração
+
+<Tabs>
+  <Tab title="Variáveis de Ambiente">
+    ```bash
+    # Lista ordenada de provedores (primeiro = maior prioridade)
+    export CHATCLI_FALLBACK_PROVIDERS="OPENAI,CLAUDEAI,GOOGLEAI,OPENROUTER,ZAI,MINIMAX,MOONSHOT,COPILOT"
+
+    # Modelo específico por provedor (opcional)
+    export CHATCLI_FALLBACK_MODEL_OPENAI="gpt-5.4"
+    export CHATCLI_FALLBACK_MODEL_CLAUDEAI="claude-sonnet-4-6"
+    export CHATCLI_FALLBACK_MODEL_GOOGLEAI="gemini-2.5-flash"
+    export CHATCLI_FALLBACK_MODEL_OPENROUTER="anthropic/claude-sonnet-4"
+    export CHATCLI_FALLBACK_MODEL_ZAI="glm-5"
+    export CHATCLI_FALLBACK_MODEL_MINIMAX="MiniMax-M2.7"
+    export CHATCLI_FALLBACK_MODEL_COPILOT="gpt-4o"
+
+    # MiniMax no modo Anthropic-compatível (opcional)
+    export MINIMAX_API_COMPAT="anthropic"
+
+    # Controle de retentativas e cooldown
+    export CHATCLI_FALLBACK_MAX_RETRIES="2"       # tentativas por provedor
+    export CHATCLI_FALLBACK_COOLDOWN_BASE="30s"    # cooldown base
+    export CHATCLI_FALLBACK_COOLDOWN_MAX="5m"      # cooldown máximo
+    ```
+  </Tab>
+  <Tab title="Flags do Servidor">
+    ```bash
+    chatcli server \
+      --fallback-providers OPENAI,CLAUDEAI,GOOGLEAI,OPENROUTER,ZAI,MINIMAX,MOONSHOT,COPILOT \
+      --fallback-max-retries 2 \
+      --fallback-cooldown-base 30s \
+      --fallback-cooldown-max 5m
+    ```
+  </Tab>
+  <Tab title="Helm Chart">
+    ```yaml
+    # values.yaml
+    fallback:
+      enabled: true
+      providers:
+        - name: OPENAI
+          model: gpt-5.4
+        - name: CLAUDEAI
+          model: claude-sonnet-4-6
+        - name: GOOGLEAI
+          model: gemini-2.5-flash
+        - name: OPENROUTER
+          model: anthropic/claude-sonnet-4
+        - name: ZAI
+          model: glm-5
+        - name: MINIMAX
+          model: MiniMax-M2.7
+        - name: COPILOT
+          model: gpt-4o
+      maxRetries: 2
+      cooldownBase: "30s"
+      cooldownMax: "5m"
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Classificacao de Erros
+
+O sistema classifica automaticamente cada falha para decidir a estrategia:
+
+| Classe | Comportamento | Exemplos |
+|:-------|:-------------|:---------|
+| `rate_limit` | Aguarda backoff, depois retenta | HTTP 429, "too many requests" |
+| `timeout` | Retenta até maxRetries | Deadline exceeded, connection timeout |
+| `server_error` | Retenta até maxRetries | HTTP 500, 502, 503 |
+| `auth_error` | **Tenta refresh do token OAuth** e retenta uma vez; se falhar, avanca na cadeia | HTTP 401, 403, "invalid api key" |
+| `model_not_found` | **Não retenta** — avanca na cadeia | HTTP 404, "model not found" |
+| `context_too_long` | **Não retenta** — avanca na cadeia | "context length exceeded" |
+
+---
+
+## Cooldown Exponencial
+
+Após falhas consecutivas, o provedor entra em cooldown com backoff exponencial:
+
+| Falhas Consecutivas | Cooldown |
+|:------------------:|:--------:|
+| 1 | 30s |
+| 2 | 60s |
+| 3 | 120s |
+| 4 | 240s |
+| 5+ | 300s (max) |
+
+<Note>No modo CLI interativo, erros de autenticação (401) disparam automaticamente o refresh do token OAuth e retentam o request. No modo servidor (fallback chain), erros de autenticação recebem cooldown máximo imediato (5m). Um request bem-sucedido limpa todo o cooldown do provedor. Use `ResetCooldowns()` para limpar manualmente (ex: após atualizar credenciais).</Note>
+
+---
+
+## Monitoramento de Saude
+
+A cadeia rastreia o estado de cada provedor em tempo real:
+
+```go
+health := chain.GetHealth()
+for _, h := range health {
+    fmt.Printf("Provider: %s, Available: %v, Fails: %d, Cooldown: %v\n",
+        h.Name, h.Available, h.ConsecutiveFails, h.CooldownUntil)
+}
+```
+
+Campos rastreados por provedor:
+
+| Campo | Descrição |
+|:------|:----------|
+| `Available` | Se o provedor está disponível para requests |
+| `ConsecutiveFails` | Número de falhas consecutivas |
+| `LastErrorClass` | Tipo da ultima falha |
+| `CooldownUntil` | Quando o cooldown expira |
+| `LastErrorAt` | Timestamp da ultima falha |
+
+---
+
+## Tool Use com Fallback
+
+A cadeia de fallback também suporta `SendPromptWithTools` para provedores que implementam a interface `ToolAwareClient`. Provedores sem suporte a tool use nativo são automaticamente ignorados na cadeia de tool calls.
+
+---
+
+## Boas Praticas
+
+<CardGroup cols={2}>
+  <Card title="Ordene por custo-beneficio" icon="ranking-star">
+    Coloque o provedor mais barato/rápido primeiro na cadeia.
+  </Card>
+  <Card title="Diversifique provedores" icon="shuffle">
+    Misture provedores de diferentes empresas para resiliencia real.
+  </Card>
+  <Card title="Configure modelos por provedor" icon="sliders">
+    Use modelos equivalentes em capacidade para manter qualidade.
+  </Card>
+  <Card title="Monitore a saude" icon="heart-pulse">
+    Verifique regularmente se algum provedor está em cooldown persistente.
+  </Card>
+</CardGroup>
+
+<Tip>
+**Fallback nativo do OpenRouter:** Além do sistema de fallback do ChatCLI (entre provedores), o OpenRouter oferece seu próprio roteamento de fallback **dentro** do provedor. Configure `OPENROUTER_FALLBACK_MODELS` com modelos alternativos (ex: `openai/gpt-4o,google/gemini-2.5-flash`). Se o modelo principal falhar, o OpenRouter tenta os alternativos antes de devolver o erro ao ChatCLI. Os dois mecanismos são complementares.
+</Tip>
+
+<Warning>Cada provedor na cadeia precisa de sua propria API key configurada. Certifique-se de configurar as chaves de todos os provedores listados em `CHATCLI_FALLBACK_PROVIDERS`.</Warning>

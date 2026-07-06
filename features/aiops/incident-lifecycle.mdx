@@ -1,166 +1,152 @@
 ---
-title: "Ciclo de Vida do Incidente"
-sidebarTitle: "Ciclo de Vida"
-description: "Guia completo de como os incidentes fluem pela detecção, análise, remediação, escalação e resolução — incluindo o que fazer quando o sistema requer intervenção humana"
+title: "Incident Lifecycle"
+sidebarTitle: "Lifecycle"
+description: "Complete guide to how incidents flow through detection, analysis, remediation, escalation, and resolution — including what to do when the system requires human intervention"
 icon: "arrows-spin"
 ---
 
-## Visão Geral
+## Overview
 
-A plataforma AIOps do ChatCLI gerencia incidentes através de uma máquina de estados bem definida com **6 estados** para incidentes e **6 estados** para planos de remediação. Entender este ciclo de vida é essencial para operadores que precisam intervir quando a remediação automática falha.
+The ChatCLI AIOps platform manages incidents through a well-defined state machine with **6 states** for incidents and **6 states** for remediation plans. Understanding this lifecycle is essential for operators who need to intervene when automatic remediation fails.
 
-## Estados do Incidente
+## Incident States
 
-| Estado | Descrição | Terminal? |
-|--------|-----------|-----------|
-| `Detected` | Anomalia correlacionada em um incidente, aguardando análise | Não |
-| `Analyzing` | IA realizando análise de causa raiz | Não |
-| `Remediating` | Plano de remediação em execução | Não |
-| `Contained` | Workload silenciado via ação de contenção (ex: `ScaleDeployment replicas=0`) — **bug subjacente não resolvido, requer ação humana** | Semi-terminal |
-| `Resolved` | Incidente resolvido com sucesso | Sim |
-| `Escalated` | Todas as tentativas automáticas esgotadas — **requer intervenção humana** (auto-resolve se o recurso recuperar) | Semi-terminal |
-| `Failed` | Tentativa única falhou sem retry configurado | Sim |
+| State | Description | Terminal? |
+|-------|-------------|-----------|
+| `Detected` | Anomaly correlated into an incident, awaiting analysis | No |
+| `Analyzing` | AI is performing root cause analysis | No |
+| `Remediating` | A remediation plan is executing | No |
+| `Resolved` | Incident successfully resolved | Yes |
+| `Escalated` | All automatic retries exhausted — **requires human intervention** (auto-resolves if resource recovers) | Semi-terminal |
+| `Failed` | Single attempt failed with no retry configured | Yes |
 
-<Warning>
-**Novo estado `Contained` (chaos test 2026-05-23, GAP-03)** — Antes deste fix, qualquer ação `ScaleDeployment replicas=0 containment=true` declarava o Issue como `Resolved`, mascarando indisponibilidade real. Agora a plataforma transita para `Contained`, que:
-
-- **NÃO** é terminal (auto-resolve quando o recurso volta com `replicas > 0` E todos os pods ready)
-- Bloqueia o PostMortem de fechar (`requiresHumanAction: true`) até o operador confirmar via API ou anotação
-- Dispara notificações em política configurada para o estado `Contained`
-- É contado separadamente em `analytics/summary.containedIssues`
-
-Configure uma `NotificationPolicy` com `states: [Contained]` para garantir que humanos sejam paginados quando isso acontecer.
-</Warning>
-
-## Fluxo da Máquina de Estados
+## State Machine Flow
 
 ```
 Detected → Analyzing → Remediating → Resolved
-                ↓              ↓        ↑
-           Escalated   Contained ───────┘ (humano restaura replicas)
-           (após max   (ação com
-            tentativas) containment=true)
                 ↓              ↓
-           Re-análise      Failed/RolledBack
-           (até 5x)            ↓
-                Escalated
+           Escalated      Failed/RolledBack
+           (after max         ↓
+            retries)     Re-analyze (up to 5x)
                               ↓
-                    Auto-resolve se o recurso
-                    recuperar (configurável)
+                         Escalated
+                              ↓
+                    Auto-resolve if resource
+                    recovers (configurable)
 ```
 
-### Fase de Detecção (`Detected`)
+### Detection Phase (`Detected`)
 
-Quando o watcher bridge detecta anomalias, o correlation engine as agrupa em incidentes:
+When the watcher bridge detects anomalies, the correlation engine groups them into incidents:
 
-1. **Pontuação de sinal** — cada tipo de sinal tem um peso (OOMKill=40, ErrorRate=30, PodRestart=25, etc.)
-2. **Cálculo do risk score** — agregado de todas as anomalias correlacionadas
-3. **Determinação da severidade** — Critical (risk &gt; 80), High (&gt; 60), Medium (&gt; 40), Low (demais)
-4. **Geração do ID do incidente** — formato: `INC-AAAAMMDD-NNN`
-5. **Máximo de tentativas de remediação** configurado para 5 (padrão, configurável via Instance `aiops.maxRemediationAttempts`)
+1. **Signal scoring** — each signal type has a weight (OOMKill=40, ErrorRate=30, PodRestart=25, etc.)
+2. **Risk score calculation** — aggregated from all correlated anomalies
+3. **Severity determination** — Critical (risk > 80), High (> 60), Medium (> 40), Low (otherwise)
+4. **Incident ID generation** — format: `INC-YYYYMMDD-NNN`
+5. **Max remediation attempts** set to 5 (default, configurable via Instance `aiops.maxRemediationAttempts`)
 
-### Fase de Análise (`Analyzing`)
+### Analysis Phase (`Analyzing`)
 
-O sistema cria um AIInsight CR para análise via IA. Durante a detecção, TODOS os runbooks candidatos são injetados no contexto da IA para validação.
+The system creates an AIInsight CR for AI-powered analysis. During detection, ALL matching runbooks are injected into the AI context for validation.
 
-1. **Descoberta de runbooks candidatos** (em camadas):
-   - **Camada 1**: Todos os runbooks com SignalType + Severity + ResourceKind
-   - **Camada 2**: Fallback por Severity + ResourceKind
-   - Multiplos runbooks podem existir por trigger (causas raiz diferentes geram runbooks diferentes)
-2. **IA válida candidatos**: O LLM recebe todos os runbooks candidatos e avalia cada um contra a análise de causa raiz atual:
-   - **`RUNBOOK_APPROVED: &lt;nome&gt;`** → usa aquele runbook específico (caminho rápido)
-   - **`RUNBOOK_REJECTED`** → ignora todos os candidatos, usa sugestões da IA ou modo agentico
-   - **Nenhum dos dois** → usa primeiro candidato como default (compatibilidade)
-3. **Se não ha candidatos** e a IA tem ações sugeridas → gera um novo runbook
-4. **Se não ha candidatos e nem ações da IA** → entra no **Modo Agentico** (IA passo-a-passo)
-5. Transiciona para `Remediating`
+1. **Runbook candidate discovery** (tiered):
+   - **Tier 1**: All runbooks matching SignalType + Severity + ResourceKind
+   - **Tier 2**: Fallback on Severity + ResourceKind
+   - Multiple runbooks can exist per trigger (different root causes produce different runbooks)
+2. **AI validates candidates**: The LLM receives all candidate runbooks and evaluates each against the current root cause analysis:
+   - **`RUNBOOK_APPROVED: &lt;name&gt;`** → uses that specific runbook (fast path)
+   - **`RUNBOOK_REJECTED`** → skips all candidates, uses AI suggestions or agentic mode
+   - **Neither** → uses first candidate as default (backward compatibility)
+3. **If no candidates exist** and AI has suggested actions → generates a new runbook
+4. **If no candidates and no AI actions** → enters **Agentic Mode** (AI-driven step-by-step)
+5. Transitions to `Remediating`
 
-### Fase de Remediação (`Remediating`)
+### Remediation Phase (`Remediating`)
 
-O remediation controller executa o plano usando um **loop ReAct** (Reason-Act-Observe):
+The remediation controller executes the plan using a **ReAct loop** (Reason-Act-Observe):
 
-1. **Snapshot pre-voo** capturado para capacidade de rollback
-2. Para **cada acao** no plano:
-   - **OBSERVE** — verifica se o recurso já está saudável (após a ação anterior). Se sim, **para imediatamente** sem executar as ações restantes (early exit)
-   - **ACT** — executa a ação com checkpoint
-   - Se a ação **falha** → rollback automático ao estado pre-voo
-3. **Verificação final de saude** (polling por até 90 segundos)
-4. **Em caso de sucesso** → `Resolved` + PostMortem gerado
-5. **Em caso de falha** → rollback automático tentado → re-análise com contexto da falha
+1. **Pre-flight snapshot** captured for rollback capability
+2. For **each action** in the plan:
+   - **OBSERVE** — checks if the resource is already healthy (after the previous action). If so, **stops immediately** without executing remaining actions (early exit)
+   - **ACT** — executes the action with checkpoint
+   - If the action **fails** → automatic rollback to pre-flight state
+3. **Final health verification** (polls for up to 90 seconds)
+4. **On success** → `Resolved` + PostMortem generated
+5. **On failure** → automatic rollback attempted → re-analyze with failure context
 
 ```
-Exemplo: plano com 3 ações (AdjustResources + DeletePod + RollbackDeployment)
+Example: plan with 3 actions (AdjustResources + DeletePod + RollbackDeployment)
 
-  Ação 1: AdjustResources → SUCCESS (memory 1Mi → 64Mi)
-  Ação 2: OBSERVE → recurso healthy (ReadyReplicas == Desired)
-          → EARLY EXIT! Pula DeletePod e RollbackDeployment
-          → Evidence: "Resource healthy after 1/3 actions — skipped remaining 2"
+  Action 1: AdjustResources → SUCCESS (memory 1Mi → 64Mi)
+  Action 2: OBSERVE → resource healthy (ReadyReplicas == Desired)
+            → EARLY EXIT! Skips DeletePod and RollbackDeployment
+            → Evidence: "Resource healthy after 1/3 actions — skipped remaining 2"
 ```
 
-Isso evita que ações contraditórias sejam executadas (ex.: `AdjustResources` seguido de `RollbackDeployment` que desfaria o ajuste) e reduz o impacto operacional ao mínimo necessário.
+This prevents contradictory actions from being executed (e.g., `AdjustResources` followed by `RollbackDeployment` which would undo the fix) and reduces operational impact to the minimum necessary.
 
-### Mecanismo de Retry
+### Retry Mechanism
 
-Quando a remediação falha:
+When remediation fails:
 
-- **Tentativa &lt; MaxAttempts (5)**: O sistema re-analisa com o contexto da falha injetado, potencialmente selecionando um runbook ou estratégia diferente
-- **Todas as tentativas esgotadas**: Transiciona para `Escalated`
+- **Attempt &lt; MaxAttempts (5)**: The system re-analyzes with the failure context injected, potentially selecting a different runbook or strategy
+- **All attempts exhausted**: Transitions to `Escalated`
 
-### Estado Escalated — O Que os Operadores Devem Fazer
+### Escalated State — What Operators Must Do
 
-Quando um incidente atinge `Escalated`, o sistema esgotou todas as opções automáticas. Veja o que acontece e o que você precisa fazer:
+When an incident reaches `Escalated`, the system has exhausted all automatic options. Here's what happens and what you need to do:
 
-**O que o sistema faz automaticamente:**
-1. Dispara a EscalationPolicy correspondente a severidade do incidente
-2. Envia notificações para L1 on-call (Slack, PagerDuty, etc.)
-3. Se não houver reconhecimento dentro do timeout configurado, escala para L2, depois L3
-4. Gera eventos de auditoria para compliance
+**What the system does automatically:**
+1. Triggers the EscalationPolicy matching the incident severity
+2. Sends notifications to L1 on-call (Slack, PagerDuty, etc.)
+3. If no acknowledgment within the configured timeout, escalates to L2, then L3
+4. Generates audit events for compliance
 
-**O que os operadores devem fazer:**
-1. **Reconhecer** o incidente (para a progressão da escalação):
+**What operators must do:**
+1. **Acknowledge** the incident (stops escalation progression):
    ```bash
    curl -X POST https://operator:8090/api/v1/incidents/INC-20260319-001/acknowledge \
      -H "X-API-Key: $API_KEY" \
-     -d '{"acknowledgedBy": "seu-email@empresa.com"}'
+     -d '{"acknowledgedBy": "your-email@company.com"}'
    ```
 
-2. **Investigar e corrigir** o problema manualmente
+2. **Investigate and fix** the issue manually
 
-3. **Resolver** o incidente via um dos tres metodos:
+3. **Resolve** the incident via one of three methods:
 
-   **Método 1: REST API** (recomendado para automacao/scripts)
+   **Method 1: REST API** (recommended for automation/scripts)
    ```bash
    curl -X POST https://operator:8090/api/v1/incidents/INC-20260319-001/resolve \
      -H "X-API-Key: $API_KEY" \
-     -d '{"resolution": "Corrigido memory leak no payment-service v2.4.1, hotfix implantado manualmente"}'
+     -d '{"resolution": "Fixed memory leak in payment-service v2.4.1, deployed hotfix manually"}'
    ```
 
-   **Método 2: Web Dashboard**
+   **Method 2: Web Dashboard**
 
-   Navegue até a página de detalhes do incidente e clique no botão **"Resolve"**. Insira a descrição da resolução no diálogo.
+   Navigate to the incident detail page and click the **"Resolve"** button. Enter the resolution description in the dialog.
 
-   **Método 3: Kubernetes Direto** (avancado)
+   **Method 3: Kubernetes Direct** (advanced)
    ```bash
    kubectl patch issue INC-20260319-001 -n production --type=merge \
-     -p '{"status":{"state":"Resolved","resolution":"Correção manual aplicada"}}'
+     -p '{"status":{"state":"Resolved","resolution":"Manual fix applied"}}'
    ```
 
-## Auto-Resolve para Issues Escalados
+## Auto-Resolve for Escalated Issues
 
-Quando um incidente atinge `Escalated`, o sistema continua monitorando o recurso a cada 30 segundos. Se o recurso recuperar (todas as replicas saudaveis), o incidente e **automaticamente resolvido** com a mensagem:
+When an incident reaches `Escalated`, the system continues monitoring the resource every 30 seconds. If the resource recovers (all replicas healthy), the issue is **automatically resolved** with the message:
 
 > "Auto-resolved: resource recovered while awaiting human intervention"
 
-Isso cobre os casos onde:
-- Um operador corrige o problema manualmente (kubectl rollout undo, etc.) sem usar a API
-- O recurso se auto-corrige (ex: problema de rede transitorio se resolve)
-- Um pipeline de CI/CD implanta uma correção enquanto o incidente ainda está aberto
+This handles cases where:
+- An operator fixes the issue manually (kubectl rollout undo, etc.) without using the API
+- The resource self-heals (e.g., transient network issue resolves)
+- A CI/CD pipeline deploys a fix while the incident is still open
 
-O auto-resolve pode ser desabilitado via Instance CRD: `spec.aiops.enableAutoResolve: false`
+Auto-resolve can be disabled via the Instance CRD: `spec.aiops.enableAutoResolve: false`
 
-## Parâmetros AIOps Configuraveis
+## Configurable AIOps Parameters
 
-Todos os parâmetros de timing e retry são configuraveis via a seção `aiops` do Instance CRD:
+All timing and retry parameters are configurable via the Instance CRD `aiops` section:
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
@@ -171,253 +157,190 @@ spec:
   provider: OPENAI
   model: gpt-5.4
   aiops:
-    maxRemediationAttempts: 5    # padrão: 5, range: 1-10
-    resolutionCooldownMinutes: 10 # padrão: 10, range: 0-120
-    dedupTTLMinutes: 60           # padrão: 60, range: 5-1440
-    enableAutoResolve: true       # padrão: true
+    maxRemediationAttempts: 5    # default: 5, range: 1-10
+    resolutionCooldownMinutes: 10 # default: 10, range: 0-120
+    dedupTTLMinutes: 60           # default: 60, range: 5-1440
+    enableAutoResolve: true       # default: true
 ```
 
-| Parâmetro | Padrão | Descrição |
-|-----------|--------|-----------|
-| `maxRemediationAttempts` | 5 | Quantas vezes a IA pode tentar antes de escalar |
-| `resolutionCooldownMinutes` | 10 | Após resolver, quanto tempo suprimir novas anomalias para o mesmo recurso |
-| `dedupTTLMinutes` | 60 | Quanto tempo o cache de dedup do bridge mantem hashes de alertas |
-| `enableAutoResolve` | true | Auto-resolver issues Escalados quando o recurso recupera |
-| `agenticMaxSteps` | 10 | Steps maximos por tentativa em modo agentico (range: 3-30) |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `maxRemediationAttempts` | 5 | How many times the AI can retry before escalating |
+| `resolutionCooldownMinutes` | 10 | After resolving, how long to suppress new anomalies for the same resource |
+| `dedupTTLMinutes` | 60 | How long the bridge dedup cache retains alert hashes |
+| `enableAutoResolve` | true | Auto-resolve Escalated issues when the resource recovers |
+| `agenticMaxSteps` | 10 | Maximum steps per agentic remediation attempt (range: 3-30) |
 
 <Tip>
-Runbooks auto-gerados pela IA (tanto standard quanto agenticos) herdam automaticamente o valor de `maxRemediationAttempts` da configuração do Instance. Runbooks criados manualmente via YAML ou API usam o default do CRD (`maxAttempts: 3`) a menos que especificado explicitamente.
+AI auto-generated runbooks (both standard and agentic) automatically inherit `maxRemediationAttempts` from the Instance configuration. Manually created runbooks via YAML or API use the CRD default (`maxAttempts: 3`) unless explicitly specified.
 </Tip>
 
-## Estados do Plano de Remediação
+## Remediation Plan States
 
-Cada incidente pode ter múltiplos planos de remediação (um por tentativa):
+Each incident may have multiple remediation plans (one per attempt):
 
-| Estado | Descrição |
-|--------|-----------|
-| `Pending` | Validação de segurança em andamento |
-| `Executing` | Ações sendo executadas sequencialmente |
-| `Verifying` | Verificação de saúde pós-ação (até 90s) |
-| `Completed` | Todas as ações bem-sucedidas e saude verificada |
-| `Failed` | Ação falhou, rollback não possível |
-| `RolledBack` | Ação falhou, rollback ao estado pre-voo bem-sucedido |
+| State | Description |
+|-------|-------------|
+| `Pending` | Safety validation in progress |
+| `Executing` | Actions being executed sequentially |
+| `Verifying` | Post-action health check (up to 90s) |
+| `Completed` | All actions succeeded and health verified |
+| `Failed` | Action failed, no rollback possible |
+| `RolledBack` | Action failed, successfully rolled back to pre-flight state |
 
-## Modo de Remediação Agentico
+## Agentic Remediation Mode
 
-Quando nenhum runbook corresponde, o sistema usa remediação agentica dirigida por IA:
+When no runbook matches, the system uses AI-driven agentic remediation:
 
-1. **IA propoe uma acao** via AgenticStep RPC
-2. **Acao e executada** e o resultado e observado
-3. **IA analisa a observacao** e propoe a proxima acao
-4. **Loop continua** até resolver ou detectar convergencia
+1. **AI proposes an action** via the AgenticStep RPC
+2. **Action is executed** and the result is observed
+3. **AI analyzes the observation** and proposes the next action
+4. **Loop continues** until resolved or convergence detected
 
-**Guardrails de segurança:**
-- **Max steps**: 10 (configurável via `AgenticMaxSteps`)
-- **Max tempo**: 10 minutos por plano agentico
-- **Detecção de convergencia**:
-  - Ultimas 3 observações identicas → parada forcada
-  - Padrão alternante A→B→A→B → parada forcada
-  - 5 ações consecutivas falharam → parada forcada
+**Safety guardrails:**
+- **Max steps**: 10 (configurable via `AgenticMaxSteps`)
+- **Max time**: 10 minutes per agentic plan
+- **Convergence detection**:
+  - Last 3 observations identical → force stop
+  - Alternating A→B→A→B pattern → force stop
+  - 5 consecutive failed actions → force stop
 
-## Limiares de Confiança do Decision Engine
+## Decision Engine Confidence Thresholds
 
-O decision engine determina se a remediação pode prosseguir automaticamente:
+The decision engine determines whether remediation can proceed automatically:
 
-| Severidade | Limiar de Auto-Aprovação | Ação |
-|------------|--------------------------|------|
-| Low | Confiança &ge; 0.95 | Auto-execução |
-| Medium | Confiança &ge; 0.85 | Auto-execução + notificação |
-| High | Confiança &ge; 0.80 | Requer aprovação |
-| Critical | Sempre | Aprovação manual obrigatória |
+| Severity | Auto-Approve Threshold | Action |
+|----------|----------------------|--------|
+| Low | Confidence >= 0.95 | Auto-execute |
+| Medium | Confidence >= 0.85 | Auto-execute + notify |
+| High | Confidence >= 0.80 | Requires approval |
+| Critical | Always | Manual approval required |
 
-**Ajustes**: Taxa de sucesso histórico, correspondência de padrão, hora do dia e contagem de issues ativas modificam o score base de confiança.
+**Adjustments**: Historical success rate, pattern match, time of day, and active issue count all modify the base confidence score.
 
-**Circuit breaker**: Se 3+ remediações falharam na última hora, a auto-remediação é bloqueada inteiramente.
+**Circuit breaker**: If 3+ remediations failed in the last hour, auto-remediation is blocked entirely.
 
 ## Rollback Engine
 
-O rollback engine fornece redes de segurança em dois níveis:
+The rollback engine provides safety nets at two levels:
 
-1. **Snapshot pré-voo** — capturado antes de QUALQUER ação. Restaura o estado completo do recurso.
-2. **Checkpoints por acao** — capturados antes de CADA acao. Permite rollback parcial.
+1. **Pre-flight snapshot** — captured before ANY actions. Restores the entire resource state.
+2. **Per-action checkpoints** — captured before EACH action. Allows partial rollback.
 
-**Gatilhos de rollback automático:**
-- Execução da ação falha
-- Verificação de saude expira (90 segundos)
+**Automatic rollback triggers:**
+- Action execution fails
+- Health verification times out (90 seconds)
 
-**Alvos de rollback suportados:**
-- Deployment: replicas, imagens de container, limites de recursos
-- StatefulSet: replicas, imagens, recursos, partition
-- DaemonSet: imagens, recursos, max unavailable
+**Supported rollback targets:**
+- Deployment: replicas, container images, resource limits
+- StatefulSet: replicas, images, resources, partition
+- DaemonSet: images, resources, max unavailable
 - Job/CronJob: suspend, deadline, backoff limit, parallelism
-- Node: uncordon (restaurar schedulable)
+- Node: uncordon (restore schedulable)
 
-## Tipos de Ação de Remediação
+## Remediation Action Types
 
-A plataforma suporta **46+ tipos de ação de remediação** entre tipos de recurso:
+The platform supports **46+ remediation action types** across resource kinds:
 
-### Deployment (18 ações)
+### Deployment (18 actions)
 `ScaleDeployment`, `RollbackDeployment`, `RestartDeployment`, `PatchConfig`, `AdjustResources`, `DeletePod`, `HelmRollback`, `ArgoSyncApp`, `AdjustHPA`, `RestartStatefulSetPod`, `CordonNode`, `DrainNode`, `ResizePVC`, `RotateSecret`, `ExecDiagnostic`, `UpdateIngress`, `PatchNetworkPolicy`, `ApplyManifest`
 
-### StatefulSet (9 ações)
+### StatefulSet (9 actions)
 `ScaleStatefulSet`, `RestartStatefulSet`, `RollbackStatefulSet`, `AdjustStatefulSetResources`, `DeleteStatefulSetPod`, `ForceDeleteStatefulSetPod`, `UpdateStatefulSetStrategy`, `RecreateStatefulSetPVC`, `PartitionStatefulSetUpdate`
 
-### DaemonSet (7 ações)
+### DaemonSet (7 actions)
 `RestartDaemonSet`, `RollbackDaemonSet`, `AdjustDaemonSetResources`, `DeleteDaemonSetPod`, `UpdateDaemonSetStrategy`, `PauseDaemonSetRollout`, `CordonAndDeleteDaemonSetPod`
 
-### Job (9 ações)
+### Job (9 actions)
 `RetryJob`, `AdjustJobResources`, `DeleteFailedJob`, `SuspendJob`, `ResumeJob`, `AdjustJobParallelism`, `AdjustJobDeadline`, `AdjustJobBackoffLimit`, `ForceDeleteJobPods`
 
-### CronJob (10 ações)
+### CronJob (10 actions)
 `SuspendCronJob`, `ResumeCronJob`, `TriggerCronJob`, `AdjustCronJobResources`, `AdjustCronJobSchedule`, `AdjustCronJobDeadline`, `AdjustCronJobHistory`, `AdjustCronJobConcurrency`, `DeleteCronJobActiveJobs`, `ReplaceCronJobTemplate`
 
-## Sistema de Aprendizado de Runbooks
+## Runbook Learning System
 
-### Node Failure — Fluxo de Remediação
+### Node Failure — Remediation Flow
 
-Quando um node apresenta problemas, o watcher detecta a condição e emite anomalias automaticamente:
-
-```
-Node MemoryPressure detectado
-  → Anomaly CR criado (signal: memory_high, severity: critical)
-    → Issue correlacionada com pods afetados
-      → IA analisa: "Node worker-2 com MemoryPressure, pods do echo-app impactados"
-        → Remediação: CordonNode (impede novos pods) + DrainNode (evacua pods existentes)
-          → Kubernetes re-schedula pods em nodes saudáveis
-            → Verificação: pods healthy em novos nodes → Resolved
-```
-
-As ações `CordonNode` e `DrainNode` respeitam PodDisruptionBudgets e fazem eviction graceful. O contexto de node (CPU, memória, pod count, condições) e incluido na análise da IA, permitindo decisões mais precisas.
-
-A plataforma constrói uma **biblioteca de estratégias aprendidas** ao longo do tempo. Cada remediação bem-sucedida gera um runbook reutilizável que pode ser aplicado a incidentes futuros com a mesma causa raiz.
-
-### Como os Runbooks São Nomeados
-
-Nomes de runbooks incluem um hash da análise de causa raiz da IA, garantindo que causas diferentes produzam runbooks diferentes:
+When a node has problems, the watcher detects the condition and emits anomalies automatically:
 
 ```
-auto-{sinal}-{severidade}-{tipo}-{hash}
-
-Exemplos:
-  auto-oom-kill-critical-deployment-a3f2b1  (causa: tail /dev/zero)
-  auto-oom-kill-critical-deployment-c7d4e9  (causa: memory limit muito baixo)
-  auto-pod-not-ready-low-deployment-e8b3d2  (causa: imagem invalida)
+Node MemoryPressure detected
+  → Anomaly CR created (signal: memory_high, severity: critical)
+    → Issue correlated with affected pods
+      → AI analyzes: "Node worker-2 with MemoryPressure, echo-app pods impacted"
+        → Remediation: CordonNode (prevent new pods) + DrainNode (evict existing pods)
+          → Kubernetes re-schedules pods on healthy nodes
+            → Verification: pods healthy on new nodes → Resolved
 ```
 
-### Seleção Multi-Runbook
+The `CordonNode` and `DrainNode` actions respect PodDisruptionBudgets and perform graceful eviction. Node context (CPU, memory, pod count, conditions) is included in the AI analysis, enabling more precise decisions.
 
-Quando múltiplos runbooks correspondem ao mesmo trigger (sinal + severidade + tipo), a IA recebe TODOS os candidatos e seleciona o mais apropriado:
+The platform builds a **library of learned strategies** over time. Each successful remediation generates a reusable runbook that can be applied to future incidents with the same root cause.
+
+### How Runbooks Are Named
+
+Runbook names include a hash of the AI's root cause analysis, ensuring different causes produce different runbooks:
 
 ```
-Novo incidente OOMKill em Deployment
+auto-{signal}-{severity}-{kind}-{hash}
+
+Examples:
+  auto-oom-kill-critical-deployment-a3f2b1  (cause: tail /dev/zero)
+  auto-oom-kill-critical-deployment-c7d4e9  (cause: memory limit too low)
+  auto-pod-not-ready-low-deployment-e8b3d2  (cause: bad image tag)
+```
+
+### Multi-Runbook Selection
+
+When multiple runbooks match the same trigger (signal + severity + kind), the AI receives ALL candidates and selects the most appropriate one:
+
+```
+New OOMKill incident on Deployment
        ↓
-3 runbooks candidatos encontrados (causas raiz diferentes)
+3 candidate runbooks found (different root causes)
        ↓
-Todos os 3 injetados no contexto da IA com seus steps e descrições
+All 3 injected into AI context with their steps and descriptions
        ↓
-IA analisa a causa raiz atual e responde:
+AI analyzes current root cause and responds:
   "RUNBOOK_APPROVED: auto-oom-kill-critical-deployment-c7d4e9"
-  (porque este incidente e causado por memory limits baixos, correspondendo ao runbook)
+  (because this incident is caused by low memory limits, matching that runbook)
        ↓
-Runbook selecionado executado → resolução rapida sem loop agentico
+Selected runbook executed → fast resolution without agentic loop
 ```
 
-Se **nenhum** dos candidatos corresponde a causa raiz atual, a IA responde com `RUNBOOK_REJECTED`, gera uma nova estratégia do zero, e um **novo runbook e criado** com hash único — expandindo a biblioteca para incidentes futuros.
+If **none** of the candidates match the current root cause, the AI responds with `RUNBOOK_REJECTED`, generates a new strategy from scratch, and a **new runbook is created** with a unique hash — expanding the library for future incidents.
 
-### Ciclo de Vida do Runbook
+### Runbook Lifecycle
 
-| Estágio | O que Acontece |
-|---------|---------------|
-| **Criado** | Auto-gerado após remediação bem-sucedida pela IA |
-| **Encontrado** | Descoberto por criterios de trigger (sinal + severidade + tipo) |
-| **Validado** | IA avalia se o runbook se aplica a causa raiz atual |
-| **Executado** | Steps executados sequencialmente com capacidade de rollback |
-| **Biblioteca cresce** | Cada nova causa raiz adiciona um novo runbook a biblioteca |
+| Stage | What Happens |
+|-------|-------------|
+| **Created** | Auto-generated after successful AI remediation |
+| **Matched** | Found by trigger criteria (signal + severity + kind) |
+| **Validated** | AI evaluates if the runbook fits the current root cause |
+| **Executed** | Steps run sequentially with rollback capability |
+| **Library grows** | Each new root cause adds a new runbook to the library |
 
-Com o tempo, a plataforma se torna mais rapida e precisa — falhas comuns são resolvidas via runbooks (segundos) em vez de análise completa da IA (minutos).
+Over time, the platform becomes faster and more accurate — common failure modes are resolved via runbooks (seconds) instead of full AI analysis (minutes).
 
-## Geração de PostMortem
+## PostMortem Generation
 
-Quando um incidente e resolvido (automaticamente ou manualmente), um PostMortem CR e auto-gerado contendo:
+When an incident is resolved (automatically or manually), a PostMortem CR is auto-generated containing:
 
-- **Timeline** — eventos cronológicos da detecção a resolução
-- **Análise de causa raiz** — gerada por IA com score de confiança
-- **Ações executadas** — histórico completo de remediação
-- **Avaliação de impacto** — pods, serviços e SLOs afetados
-- **Lições aprendidas** — recomendações da IA para prevenção
-- **Correlação com Git** — deploys recentes que podem ter causado o problema
-- **Análise de cascata** — incidentes relacionados entre servicos
+- **Timeline** — chronological events from detection to resolution
+- **Root cause analysis** — AI-generated with confidence score
+- **Actions executed** — complete remediation history
+- **Impact assessment** — affected pods, services, SLOs
+- **Lessons learned** — AI recommendations for prevention
+- **Git correlation** — recent deployments that may have caused the issue
+- **Cascade analysis** — related incidents across services
 
-PostMortems podem ser revisados e fechados via os endpoints [Review PostMortem](/reference/api/review-postmortem) e [Close PostMortem](/reference/api/close-postmortem).
+PostMortems can be reviewed and closed via the [Review PostMortem](/reference/api/review-postmortem) and [Close PostMortem](/reference/api/close-postmortem) API endpoints.
 
-### PostMortems com `requiresHumanAction`
+## SLA Integration
 
-Quando o Issue pai está em estado `Contained`, **tanto o Issue quanto o PostMortem** são gerados com os fields tipados em `status` (GAP-07 fix):
+Each incident severity can have an SLA configuration:
 
-```bash
-# Issue
-kubectl get issue <name> -o jsonpath='{.status.requiresHumanAction}'
-# true
-kubectl get issue <name> -o jsonpath='{.status.requiredAction}'
-# restore the deployment's replicas to the desired count after fixing the root cause...
-
-# PostMortem
-kubectl get postmortem pm-<name> -o jsonpath='{.status.requiresHumanAction}'
-# true
-kubectl get postmortem pm-<name> -o jsonpath='{.status.requiredAction}'
-# (mesmo texto, propagado do Issue)
-```
-
-Comportamentos garantidos:
-
-- O `PostMortemReconciler` **se recusa** a transitar para `Closed` enquanto a anotação `aiops.chatcli.io/human-action-acknowledged` não for `true` (mesmo se alguém forçar `kubectl patch`)
-- Quando o auto-resolve dispara (humano restaura replicas), o controller **limpa** os dois fields e adiciona condition `RequiresHumanAction: False` — o CR nunca mente sobre o estado atual
-- A REST API expõe os fields como top-level no `IncidentItem` (`spec.requiresHumanAction`, `spec.requiredAction`) para dashboards renderizarem direto sem precisar fetch do PostMortem matching
-
-<Note>
-**Migração de schema (v1alpha1)** — Na 1.122.x os fields viviam em `PostMortemSpec`, violando a convenção K8s (Spec = user input, Status = controller-derived facts). Pior: o valor era `null` em runtime porque o controller escrevia via `Status().Update()` enquanto o CRD declarava em `Spec`. O fix moveu para `PostMortemStatus` e adicionou em `IssueStatus`. O hook de upgrade de CRD (GAP-06) atualiza o schema automaticamente — não há ação manual necessária.
-</Note>
-
-Para reconhecer a ação executada e desbloquear o fechamento:
-
-```bash
-# Via API REST
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  "$AIOPS_URL/api/v1/postmortems/<pm-name>/ack-human-action?namespace=default" \
-  -d '{"acknowledgedBy":"sre-team","note":"rolled back to v1.2.3 and scaled to 3 replicas"}'
-
-# Ou via kubectl
-kubectl annotate postmortem <pm-name> -n default \
-  aiops.chatcli.io/human-action-acknowledged=true \
-  aiops.chatcli.io/human-action-acknowledged-by=sre-team
-```
-
-No web dashboard, isso aparece como o botão **"Ack Human Action"** (roxo) na linha do PostMortem quando `requiresHumanAction=true`.
-
-## Correlação com Chaos Engineering
-
-Issues que disparam durante uma `ChaosExperiment` ativa no mesmo namespace recebem automaticamente os labels:
-
-- `platform.chatcli.io/source=chaos-experiment`
-- `platform.chatcli.io/chaos-experiment=<nome-do-experimento>`
-
-Esses labels alteram o comportamento da plataforma:
-
-| Comportamento | Issue produção | Issue chaos-induced |
-|---------------|----------------|---------------------|
-| Pipeline AIOps completo | ✅ | ✅ |
-| Escalação L1→L2 (paging) | ✅ | ❌ (suprimida) |
-| Métrica `issueResolutionDuration` (MTTR) | ✅ | ❌ (excluída) |
-| `analytics/summary.chaosInducedIssues` | - | Contado separadamente |
-| Label no PostMortem gerado | - | Propagado para filtragem |
-
-Veja [Chaos Engineering](/features/aiops/chaos-engineering) para detalhes da CR e do controller.
-
-## Integração com SLA
-
-Cada severidade de incidente pode ter uma configuração de SLA:
-
-- **Tempo de resposta** — tempo máximo da detecção até a primeira análise
-- **Tempo de resolução** — tempo máximo da detecção até a resolução
-- **Horario comercial** — opcionalmente pausar o relogio do SLA fora do horario comercial
-- **Política de escalação** — disparada automaticamente na violação do SLA
+- **Response time** — max time from detection to first analysis
+- **Resolution time** — max time from detection to resolution
+- **Business hours** — optionally pause SLA clock outside business hours
+- **Escalation policy** — automatically triggered on SLA breach
