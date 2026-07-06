@@ -11,13 +11,15 @@
 (function () {
   "use strict";
 
-  var FLAGS = {
-    "English": "🇺🇸",
-    "Portuguese": "🇧🇷",
-    "Brazilian Portuguese": "🇧🇷",
-    "Português": "🇧🇷",
-    "Português (Brasil)": "🇧🇷"
-  };
+  // Matching is by language stem on the element's own text, because Mintlify
+  // renders variant labels ("Brazilian Portuguese", "Português (Brasil)") and
+  // may nest icons (e.g. the selected-item check) beside the label.
+  function flagFor(label) {
+    var t = label.toLowerCase();
+    if (t.indexOf("portug") !== -1) return "🇧🇷";
+    if (t.indexOf("english") !== -1) return "🇺🇸";
+    return null;
+  }
 
   // Only decorate inside chrome containers: the site header and floating
   // dropdown/popover portals. Never touch article/page content.
@@ -42,13 +44,22 @@
       try {
         if (el.getAttribute("data-lang-flag")) continue;
         if (!el.closest || !el.closest(SCOPES)) continue;
-        var label = (el.textContent || "").trim();
-        var flag = FLAGS[label];
-        if (!flag) continue;
-        // Innermost match only: skip wrappers whose child carries the label.
-        if (el.children.length > 0) continue;
+        // Decorate the element's OWN text node, so labels sitting next to
+        // nested icons (selected-item check, chevrons) still match.
+        var textNode = null;
+        for (var c = 0; c < el.childNodes.length; c++) {
+          var n = el.childNodes[c];
+          if (n.nodeType === 3 && n.data && n.data.trim().length > 1) {
+            textNode = n;
+            break;
+          }
+        }
+        if (!textNode) continue;
+        var label = textNode.data.replace(/\s+/g, " ").trim();
+        var flag = flagFor(label);
+        if (!flag || label.indexOf(flag) !== -1) continue;
         el.setAttribute("data-lang-flag", "1");
-        el.textContent = flag + " " + label;
+        textNode.data = textNode.data.replace(label, flag + " " + label);
       } catch (_) {
         /* markup changed — degrade to plain labels */
       }
