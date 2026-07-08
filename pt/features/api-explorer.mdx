@@ -1,0 +1,159 @@
+---
+title: "API Explorer (@api-explorer)"
+sidebarTitle: "API Explorer"
+description: "Mapeia uma API de ponta a ponta a partir apenas da URL base — descobre a spec OpenAPI/Swagger (JSON ou YAML), faz fingerprint da tecnologia e do modelo de auth, resolve modelos, audita a postura de segurança e faz introspection de GraphQL. Read-only e keyless."
+icon: "compass"
+---
+
+O tool **`@api-explorer`** mapeia uma API de ponta a ponta a partir de **apenas a URL base**. É a parceira fiel do agente para responder "o que essa API tem e como ela funciona?" -- ele descobre os paths, parâmetros, headers, modelos, autenticação e o funcionamento sozinho, sem você alimentar endpoints na mão. É **read-only** (só `GET`/`HEAD`/`OPTIONS` mais a query de introspection do GraphQL, que é leitura pura) e **keyless**, então roda concorrente e nunca dispara a política de confirmação.
+
+<Tip>
+Aponte para uma API com a qual você precisa integrar e deixe o agente ler: `@api-explorer discover {url}` retorna o mapa inteiro, e depois `@api-explorer endpoint {url, path}` te dá o contrato exato para chamar.
+</Tip>
+
+---
+
+## Uso
+
+```text
+<tool_call name="@api-explorer" args='{"cmd":"discover","args":{"url":"https://api.example.com"}}' />
+<tool_call name="@api-explorer" args='{"cmd":"spec","args":{"url":"https://petstore3.swagger.io/api/v3/openapi.json","filter":"/pet"}}' />
+<tool_call name="@api-explorer" args='{"cmd":"endpoint","args":{"url":"https://api.example.com","path":"/pet/{petId}","method":"get"}}' />
+<tool_call name="@api-explorer" args='{"cmd":"security","args":{"url":"https://api.example.com"}}' />
+<tool_call name="@api-explorer" args='{"cmd":"graphql","args":{"url":"https://api.example.com/graphql"}}' />
+```
+
+O LLM invoca `@api-explorer` automaticamente quando precisa entender uma API antes de chamá-la. Comece pelo `discover`; o tool te diz para onde ir em seguida.
+
+### Subcomandos
+
+| Subcomando | O que faz |
+|:-----------|:----------|
+| `discover` | **Comece aqui.** Recon multi-vetor a partir da URL base: acha a spec, faz fingerprint de tecnologia e auth, sonda OIDC, Actuator, health/metrics, versões e GraphQL, e então lista os endpoints. |
+| `spec` | Busca e parseia por completo uma spec OpenAPI 2.0/3.x num catálogo de todos os paths, métodos, parâmetros, modelos e esquemas de segurança, agrupado por tag. |
+| `endpoint` | Detalha uma única operação com schemas **resolvidos por `$ref`**: cada parâmetro com tipo e constraints, o corpo do request expandido em seus campos, os modelos de resposta por status code e a segurança exigida. |
+| `security` | Relatório de postura de segurança: TLS, security headers, um **preflight CORS ao vivo**, flags de cookie, auth challenge, OIDC discovery e fingerprint de framework. |
+| `graphql` | Roda uma query de introspection do schema GraphQL e resume as queries, mutations, subscriptions, input types e enums. |
+
+---
+
+## A descoberta é multi-vetor
+
+A descoberta não fica só chutando `/openapi.json`. A partir da URL base ela tenta, concorrentemente, todos os ângulos onde uma spec pode se esconder:
+
+<Steps>
+  <Step title="~20 locais conhecidos de spec">
+    `/openapi.json`, `/swagger.json`, `/v3/api-docs`, `/swagger/v1/swagger.json`, `/.well-known/openapi.json` e mais -- em **JSON e YAML**.
+  </Step>
+  <Step title="Embutida na página de docs">
+    A URL da spec extraída de dentro de uma página **Swagger-UI / ReDoc / RapiDoc / Stoplight** renderizada -- o caso comum em que a spec fica num path não-padrão que só o HTML conhece.
+  </Step>
+  <Step title="Manifestos /.well-known">
+    **OpenID Connect discovery** (`openid-configuration` → os endpoints reais de auth) e o **manifesto de plugin de LLM** (`ai-plugin.json` → a URL da spec).
+  </Step>
+  <Step title="Superfície operacional">
+    Endpoints de health/readiness/metrics e o **Spring Boot Actuator** -- `/actuator/mappings` enumera todas as rotas que um app Spring serve.
+  </Step>
+  <Step title="Versões & GraphQL">
+    Raízes de versão da API (`/v1`..`/v3`, `/api/v1`..) e um probe de endpoint GraphQL.
+  </Step>
+</Steps>
+
+Quando várias specs são encontradas, a mais rica (com mais paths) vence.
+
+---
+
+## Argumentos
+
+| Argumento | Descrição | Default |
+|:----------|:----------|:--------|
+| `cmd` | `discover` · `spec` · `endpoint` · `security` · `graphql` | `discover` |
+| `url` | URL base da API, URL direta de uma spec, ou URL de uma página de docs (obrigatório) | _(obrigatório)_ |
+| `path` | O path da API para detalhar, ex.: `/pet/{petId}` (só `endpoint`) | _(obrigatório no `endpoint`)_ |
+| `method` | Método HTTP para focar (só `endpoint`) | _(todos os métodos do path)_ |
+| `filter` | Só mostra paths que contêm essa substring (`spec`) | _(todos)_ |
+| `tag` | Só mostra operações com essa tag (`spec`) | _(todas)_ |
+| `limit` | Máximo de endpoints listados (`spec`) | `400` |
+| `format` | `markdown` (default) ou `json` (inventário machine-readable) para `discover`/`spec` | `markdown` |
+
+<Info>
+Uma URL solta é tratada como `discover`. Os subcomandos que consomem spec (`spec`, `endpoint`) aceitam uma URL base e localizam a spec para você -- raramente é preciso o path exato da spec.
+</Info>
+
+---
+
+## Deep-dive com resolução de `$ref`
+
+O `endpoint` resolve os ponteiros `$ref` (para `components`/`definitions`) com detecção de ciclo, então você vê os **campos reais do modelo**, enums e constraints em vez de um opaco `#/components/schemas/Pet`. `allOf`/`oneOf`/`anyOf` são achatados para exibição.
+
+```text
+## POST /pet
+
+operationId: `addPet`
+Add a new pet to the store.
+
+### Request body (required)
+
+- application/json → Pet
+  - id: integer(int64)
+  - name: string *required*
+  - status: string [enum: available, pending, sold]
+  - tags: array<Tag>
+      - id: integer(int64)
+      - name: string
+
+### Security
+
+petstore_auth[write:pets read:pets]
+```
+
+---
+
+## Postura de segurança
+
+O `security` é observação, não exploração -- um `GET` para os headers da resposta e um único `OPTIONS` de preflight CORS. Ele reporta o que um defensor quer confirmar:
+
+- **TLS** e os security headers padrão (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, …) presentes vs ausentes.
+- Um **preflight CORS ao vivo** com um `Origin` forasteiro -- ele sinaliza uma política perigosa de origem-refletida-com-credenciais.
+- **Flags de cookie** (`Secure`, `HttpOnly`, `SameSite`), o auth challenge, o OIDC discovery e um fingerprint de framework (a partir dos headers `Server`/`X-Powered-By` e dos nomes dos cookies de sessão).
+
+---
+
+## GraphQL
+
+Quando a varredura OpenAPI dá em nada, o `graphql` roda uma query de **introspection** do schema -- uma leitura pura que não muta nada -- e resume as queries, mutations, subscriptions com seus argumentos, os input types com seus campos, os enums com seus valores e quaisquer deprecações.
+
+```text
+<tool_call name="@api-explorer" args='{"cmd":"graphql","args":{"url":"https://countries.trevorblades.com/"}}' />
+```
+
+---
+
+## Saída JSON
+
+Passe `format: "json"` no `discover` ou `spec` para obter um inventário normalizado e machine-readable que o agente pode encadear -- escolher um endpoint e chamá-lo com o [`@http`](/pt/features/agentic-plugins) -- em vez de re-parsear o relatório em markdown.
+
+---
+
+## Notas
+
+- É **read-only** e concurrency-safe -- o orquestrador pode rodar vários probes em paralelo, e nenhuma chamada muda o estado remoto.
+- Usa o cliente HTTP compartilhado das web tools: respeita proxy corporativo (`HTTPS_PROXY`) e o trust de TLS global (`CHATCLI_CA_BUNDLE`).
+- APIs internas (`api.empresa.internal`, `localhost:8080`) funcionam -- só endpoints de metadata de nuvem e link-local são bloqueados (proteção SSRF), e cada hop de redirect é revalidado.
+- **Specs em YAML** são tratadas nativamente, ao lado de JSON.
+- O escopo é deliberadamente descoberta e documentação -- sem brute-force de paths nem fuzzing de parâmetros.
+
+<Tip>
+Combine com o [Scheduler](/pt/features/scheduler) para re-mapear uma API de terceiros periodicamente e ser avisado via `@send` quando a superfície dela mudar.
+</Tip>
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Plugins Agênticos" icon="plug" href="/pt/features/agentic-plugins">
+    O catálogo completo de tools builtin e como o agente os usa.
+  </Card>
+  <Card title="Web Tools" icon="globe" href="/pt/features/web-tools">
+    `@webfetch`, `@websearch` e o cliente HTTP endurecido compartilhado.
+  </Card>
+</CardGroup>
