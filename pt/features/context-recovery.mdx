@@ -112,18 +112,54 @@ Se o histórico passa de 2.5 MB, um aviso **one-shot por sessão** é emitido su
 ℹ history 2.8 MB — se seu ambiente tem proxy/gateway, export CHATCLI_MAX_PAYLOAD=5MB (ajuste p/ limite do proxy)
 ```
 
-### Auto-cap reativo após 413
+### Cap adaptativo aprendido
 
-Se um 413/WAF/EOF acontece e o usuário não configurou `CHATCLI_MAX_PAYLOAD`, o ChatCLI assume **4 MB** automaticamente para o resto da sessão — dá uma chance alta de o retry passar no mesmo proxy:
+Os providers Bedrock anotam cada erro de transporte com o **tamanho exato da requisição que o middlebox rejeitou**. Quando uma rejeição de payload acontece, o ChatCLI deriva o limite da sessão diretamente dessa observação — **¾ do tamanho rejeitado** — em vez de chutar:
 
 ```text
-⚠ Falha recuperável (proxy/WAF rejection (403 + security signals)) — compactando e tentando novamente
+⚠ Falha recuperável (rejeição do proxy/WAF (403 + sinais de segurança)) — compactando e tentando novamente
+ℹ Gateway rejeitou uma requisição de 126.4 KB — limite de payload ajustado para 94.8 KB nesta sessão (exporte CHATCLI_MAX_PAYLOAD para sobrepor)
+```
+
+Na prática isso muda tudo: gateways corporativos reais frequentemente limitam o corpo em torno de **128 KB**, onde um chute de vários megabytes não mudaria nada. O cap aprendido só **aperta** — se `CHATCLI_MAX_PAYLOAD` já estiver abaixo dele, seu valor vence; uma rejeição menor posterior aperta ainda mais.
+
+Quando o tamanho rejeitado é *desconhecido* (providers sem anotação de tamanho), vale o comportamento anterior como fallback: assumir **4 MB** para o resto da sessão.
+
+```text
 ℹ Assumindo limite de 4 MB/payload — exporte CHATCLI_MAX_PAYLOAD (ex.: 5MB, 512KB) para ajustar
 ```
 
+### Diagnóstico de piso — quando compactar não resolve
+
+O system prompt (charter do agente, personas, skills, docs de ferramentas MCP) **nunca é compactado**. Quando ele sozinho atinge o tamanho que o gateway acabou de rejeitar, nenhuma compactação de histórico produz uma requisição aceitável — repetir payloads idênticos só queimaria tentativas de recovery. O ChatCLI detecta isso e **falha rápido com uma mensagem acionável**:
+
+```text
+✖ A base não-compactável da requisição (system prompt: 131.2 KB — personas, skills,
+  docs de ferramentas MCP) atinge ou excede o tamanho rejeitado pelo gateway (126.4 KB).
+  Compactar histórico não resolve — reduza servidores MCP, skills ou personas,
+  ou aumente o limite de corpo do proxy/WAF
+```
+
+A **¾ do tamanho rejeitado** dispara um aviso — a sessão continua, mas você está perto da borda:
+
+```text
+⚠ O system prompt sozinho tem 96.1 KB — próximo do limite de rejeição do gateway;
+  considere reduzir servidores MCP, skills ou personas
+```
+
+<Tip>
+Duas features estruturais encolhem esse piso: as descrições de ferramentas MCP são limitadas a uma linha no índice do system prompt (schema completo via `@tools describe`), e os corpos de skills injetadas respeitam [`CHATCLI_SKILL_INJECT_BUDGET`](/pt/features/skill-registry#budget-de-injeção-de-skills). Veja [Integração MCP](/pt/features/mcp-integration) e [Skill Registry](/pt/features/skill-registry).
+</Tip>
+
+### Encolhimento de conteúdo — o Nível 3 que funciona de verdade
+
+Dropar mensagens inteiras é no-op quando o histórico é curto — sessões de agente frequentemente têm só o system prompt e um punhado de tool results gigantes, e o `MinKeepRecent` mantém exatamente as mensagens que carregam o volume. A truncagem de emergência ganhou por isso um passe final: **encolhe o conteúdo das mensagens não-system, da maior para a menor**, até caber no budget de payload. Mensagens system nunca são tocadas.
+
+Com a [camada de compressão](/pt/features/context-compression) ativa, cada mensagem é **arquivada verbatim no store CCR antes do primeiro corte** e o conteúdo encolhido carrega um marcador `<<ccr:KEY>>` — o modelo recupera o original a qualquer momento com `@recall`. A truncagem nuclear (nível 3 da escada de recovery) adicionalmente limita cada mensagem não-system mantida a 4.000 chars.
+
 ### System notice injetado na história
 
-Após um recovery disparado por payload limit, o ChatCLI injeta uma mensagem `user` antes do retry instruindo o modelo a fazer leituras menores no futuro. Isso quebra o loop do modelo de tentar re-ler o mesmo arquivo gigante que causou o 413 originalmente:
+Após um recovery disparado por payload limit, o ChatCLI injeta uma mensagem `user` antes do retry instruindo o modelo a fazer leituras menores no futuro. Isso quebra o loop do modelo de tentar re-ler o mesmo arquivo gigante que causou o 413 originalmente. O notice é injetado **no máximo uma vez por sessão** — o recovery detecta uma cópia existente em qualquer lugar do histórico (mesmo dobrada num summary de compactação) e nunca empilha uma segunda, já que cada byte extra trabalha contra o próprio limite sendo recuperado:
 
 ```text
 [SYSTEM NOTICE — PAYLOAD LIMIT HIT] A proxy/gateway rejected the previous
@@ -197,6 +233,8 @@ Desde esta versão, o histórico nunca mais "congela" o terminal durante uma com
 
 Antes do `NeedsCompaction` checar se o histórico excede o budget, o agent loop aplica `ApplyMicrocompact` — uma passada **pure-Go, sem LLM, sem rede** que progressivamente trunca/resume tool results antigos (2+ turnos atrás → head+tail preview; 4+ turnos atrás → one-line summary). Na maioria dos casos isso mantém o histórico dentro do budget sem disparar o Level 2 (caro).
 
+Com a [camada de compressão](/pt/features/context-compression) ativa, o microcompact é **sem perda**: o tool result original é arquivado no store CCR antes do corte e o stub de preview/summary embute um marcador `<<ccr:KEY>>`. Os marcadores sobrevivem entre níveis — quando um preview truncado depois vira um summary de uma linha, o marcador permanece no summary — então o modelo sempre pode expandir o original com `@recall`.
+
 ```text
 🗜 microcompact: 3 truncados, 2 resumidos, 1.7 MB liberados
 ```
@@ -224,7 +262,9 @@ No nivel 1, os limites de orcamento de tool results sao multiplicados por `0.5` 
 ```text
 API retorna erro recuperável (context overflow | 413 | WAF 403 | EOF c/ histórico grande)
   │
-  ├─ System notice injetado no histórico (apenas para payload-related) ──┐
+  ├─ Payload-related: cap aprendido do tamanho rejeitado (¾) ────────────┐
+  │   ├─ System prompt ≥ tamanho rejeitado → FALHA RÁPIDA c/ diagnóstico │
+  │   └─ System notice injetado no histórico (uma vez por sessão)        │
   │                                                                      │
   ├─ Tentativa 1: Orçamento agressivo (50%) + pairing cleanup            │
   │   └─ Reenvia para API                                                │
@@ -236,17 +276,18 @@ API retorna erro recuperável (context overflow | 413 | WAF 403 | EOF c/ histór
   │       ├─ Sucesso → continua com histórico reduzido                   │
   │       └─ Falha → próxima tentativa                                   │
   │                                                                      │
-  └─ Tentativa 3: Nuclear truncate (system + últimas 4 msgs)            │
+  └─ Tentativa 3: Nuclear truncate (system + últimas 4 msgs,            │
+      cada uma limitada a 4.000 chars, arquivada no CCR antes)           │
       └─ Reenvia para API                                                │
           ├─ Sucesso → continua com histórico mínimo                     │
           └─ Falha → erro reportado ao usuário                           │
                                                                          │
-  Para payload-related (413/WAF/EOF): CHATCLI_MAX_PAYLOAD auto-setado ◄──┘
-                                      para 4MB se não configurado
+  Tamanho rejeitado desconhecido: CHATCLI_MAX_PAYLOAD auto-setado ◄──────┘
+                                  para 4MB se não configurado
 ```
 
 <Warning>
-Após o truncamento nuclear (nivel 3), o modelo perde todo o contexto da conversa anterior. Apenas as ultimas 2 trocas sao mantidas. Use `/compact` proativamente para evitar chegar a esse ponto.
+Após o truncamento nuclear (nível 3), o contexto de trabalho do modelo cai para as últimas 2 trocas. Com a [camada de compressão](/pt/features/context-compression) ativa o conteúdo dropado permanece recuperável — os stubs carregam marcadores `<<ccr:KEY>>` que o modelo expande com `@recall` — mas o `/compact` proativo continua sendo a melhor experiência: um summary estruturado vale mais que uma pilha de marcadores de recall.
 </Warning>
 
 ---

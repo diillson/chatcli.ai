@@ -112,18 +112,53 @@ If history crosses 2.5 MB, a **one-shot warning per session** fires suggesting t
 ℹ history 2.8 MB — if you are behind a proxy/gateway, export CHATCLI_MAX_PAYLOAD=5MB (adjust to the proxy limit)
 ```
 
-### Reactive auto-cap after 413
+### Adaptive learned cap
 
-If a 413/WAF/EOF fires and the user hasn't configured `CHATCLI_MAX_PAYLOAD`, ChatCLI automatically assumes **4 MB** for the rest of the session — a high probability that the retry passes through the same proxy:
+Bedrock providers annotate every transport error with the **exact size of the request the middlebox rejected**. When a payload rejection fires, ChatCLI derives the session cap directly from that observation — **¾ of the rejected size** — instead of guessing:
 
 ```text
 ⚠ Recoverable failure (proxy/WAF rejection (403 + security signals)) — compacting and retrying
+ℹ Gateway rejected a 126.4 KB request — payload cap set to 94.8 KB for this session (export CHATCLI_MAX_PAYLOAD to override)
+```
+
+This matters enormously in practice: real-world corporate gateways often cap bodies around **128 KB**, where a guessed multi-megabyte cap would change nothing. The learned cap only ever **tightens** — if `CHATCLI_MAX_PAYLOAD` is already set below it, your value wins; a later, smaller rejection tightens it further.
+
+When the rejected size is *unknown* (providers without size annotation), the previous behavior remains as fallback: assume **4 MB** for the rest of the session.
+
+```text
 ℹ Assuming 4 MB payload cap — export CHATCLI_MAX_PAYLOAD (e.g. 5MB, 512KB) to adjust
 ```
 
+### Floor diagnosis — when compaction cannot help
+
+The system prompt (agent charter, personas, skills, MCP tool docs) is **never compacted**. When it alone reaches the size the gateway just rejected, no amount of history compaction can produce an acceptable request — retrying identical payloads would only burn recovery attempts. ChatCLI detects this and **fails fast with an actionable message**:
+
+```text
+✖ The non-compactable request base (system prompt: 131.2 KB — personas, skills, MCP tool docs)
+  meets or exceeds the size the gateway rejected (126.4 KB). History compaction cannot help —
+  reduce MCP servers, skills or personas, or raise the proxy/WAF body-size limit
+```
+
+At **¾ of the rejected size** a warning fires instead — the session continues, but you're near the edge:
+
+```text
+⚠ System prompt alone is 96.1 KB — close to the gateway's rejection threshold;
+  consider reducing MCP servers, skills or personas
+```
+
+<Tip>
+Two structural features shrink this floor: MCP tool descriptions are clamped to one line in the system-prompt index (full schema via `@tools describe`), and injected skill bodies respect [`CHATCLI_SKILL_INJECT_BUDGET`](/features/skill-registry#skill-injection-budget). See [MCP Integration](/features/mcp-integration) and [Skill Registry](/features/skill-registry).
+</Tip>
+
+### Content shrinking — Level 3 that actually works
+
+Whole-message dropping is a no-op when the history is short — agent sessions often hold just a system prompt plus a handful of huge tool results, and `MinKeepRecent` keeps exactly the messages that carry the bulk. Emergency truncation therefore has a final pass: it **shrinks the content of non-system messages, largest first**, until the payload budget is met. System messages are never touched.
+
+When the [compression layer](/features/context-compression) is active, each message is **archived verbatim in the CCR store before its first cut** and the shrunk content carries a `<<ccr:KEY>>` marker — the model can recover the original at any time with `@recall`. Nuclear truncation (level 3 of the recovery ladder) additionally hard-caps every kept non-system message at 4,000 chars.
+
 ### System notice injected in history
 
-After a payload-limit-triggered recovery, ChatCLI injects a `user` message before the retry instructing the model to prefer smaller reads going forward. This breaks the model's loop of trying to re-read the same huge file that caused the 413 in the first place:
+After a payload-limit-triggered recovery, ChatCLI injects a `user` message before the retry instructing the model to prefer smaller reads going forward. This breaks the model's loop of trying to re-read the same huge file that caused the 413 in the first place. The notice is injected **at most once per session** — recovery detects an existing copy anywhere in the history (even folded into a compaction summary) and never stacks a second one, since every extra byte works against the very limit being recovered from:
 
 ```text
 [SYSTEM NOTICE — PAYLOAD LIMIT HIT] A proxy/gateway rejected the previous
@@ -197,6 +232,8 @@ Since this release, the terminal never "freezes" during a long compaction anymor
 
 Before `NeedsCompaction` checks whether history exceeds budget, the agent loop applies `ApplyMicrocompact` — a **pure-Go, no-LLM, no-network** pass that progressively truncates/summarizes old tool results (2+ turns old → head+tail preview; 4+ turns old → one-line summary). In most cases this keeps history inside budget without triggering the (expensive) Level 2.
 
+With the [compression layer](/features/context-compression) active, microcompact is **lossless**: the original tool result is archived in the CCR store before the cut and the preview/summary stub embeds a `<<ccr:KEY>>` marker. Markers carry forward across levels — when a truncated preview later degrades to a one-line summary, the marker survives on the summary — so the model can always expand the original with `@recall`.
+
 ```text
 🗜 microcompact: 3 truncated, 2 summarized, 1.7 MB freed
 ```
@@ -224,7 +261,9 @@ At level 1, the tool result budget limits are multiplied by `0.5` (50%). This me
 ```text
 API returns recoverable error (context overflow | 413 | WAF 403 | EOF w/ large history)
   │
-  ├─ System notice injected into history (payload-related only) ─────┐
+  ├─ Payload-related: cap learned from the rejected size (¾) ────────┐
+  │   ├─ System prompt ≥ rejected size → FAIL FAST with diagnosis    │
+  │   └─ System notice injected into history (once per session)      │
   │                                                                   │
   ├─ Attempt 1: Aggressive budget (50%) + pairing cleanup             │
   │   └─ Resend to API                                                │
@@ -236,17 +275,18 @@ API returns recoverable error (context overflow | 413 | WAF 403 | EOF w/ large h
   │       ├─ Success → continues with reduced history                 │
   │       └─ Failure → next attempt                                   │
   │                                                                   │
-  └─ Attempt 3: Nuclear truncate (system + last 4 msgs)               │
+  └─ Attempt 3: Nuclear truncate (system + last 4 msgs,               │
+      each capped at 4,000 chars, CCR-archived first)                 │
       └─ Resend to API                                                │
           ├─ Success → continues with minimal history                 │
           └─ Failure → error reported to user                         │
                                                                       │
-  For payload-related (413/WAF/EOF): CHATCLI_MAX_PAYLOAD auto-set ◄───┘
-                                      to 4MB if not configured
+  Rejected size unknown: CHATCLI_MAX_PAYLOAD auto-set to 4MB ◄────────┘
+                         if not configured
 ```
 
 <Warning>
-After nuclear truncation (level 3), the model loses all context from the previous conversation. Only the last 2 exchanges are kept. Use `/compact` proactively to avoid reaching this point.
+After nuclear truncation (level 3), the model's working context drops to the last 2 exchanges. With the [compression layer](/features/context-compression) active the dropped content stays recoverable — stubs carry `<<ccr:KEY>>` markers the model can expand with `@recall` — but proactive `/compact` remains the better experience: a structured summary beats a pile of recall markers.
 </Warning>
 
 ---
