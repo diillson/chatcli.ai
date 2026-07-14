@@ -1,0 +1,160 @@
+---
+title: "Model Routing (@model)"
+sidebarTitle: "Model Routing"
+description: "The agent picks the right model for each phase of a task — list providers with pricing tiers, switch the loop to another model/provider, or delegate a subtask to a cheaper one."
+icon: "shuffle"
+---
+
+The **`@model` tool** gives the agent/coder loop the power to route itself: inspect every configured provider's models — enriched with a **price-derived tier**, cost per 1M tokens, context window and capabilities — and decide which model should serve the task at hand. It can **switch** the rest of the task to another model (the provider switches together with it), or **delegate** a self-contained subtask to a cheaper model without touching the main loop.
+
+<Info>
+This is the in-loop counterpart of the per-call routing the [MCP Server](/features/mcp-server) surface exposes to external clients (`provider`/`model` params + `list_providers`): the same power, now available to **the AI itself** while it works. Sub-tasks that don't need a frontier model stop paying frontier prices.
+</Info>
+
+---
+
+## How it works
+
+```text
+/agent … (session model: CLAUDEAI:claude-sonnet-5)
+     │
+     ├─ turn 1  @model list                 → tiers, $/1M, ctx, caps
+     ├─ turn 2  @model use GOOGLEAI:gemini-2.5-flash
+     │             └─ route override set (sticky)
+     ├─ turn 3+ … loop runs on gemini-2.5-flash …
+     ├─ turn N  @model reset                → back to claude-sonnet-5
+     │
+     └─ at any point:
+        @model delegate {model, prompt}     → one-shot on the cheap model,
+                                              main loop & cache untouched
+```
+
+The routing decision lives in a **route override** honored per turn by the same mechanism as skill `model:` frontmatter hints — with three guarantees:
+
+1. **Task-scoped.** The override is cleared at the start of every agent run. The AI's routing decision never silently outlives the task it was made for.
+2. **Non-invasive.** It never mutates the session's own provider/model/client — outside the task, `/model` and `/switch` remain authoritative.
+3. **Accounted.** [Cost tracking](/features/cost-tracking) attributes every turn to the model that actually served it — `/cost` shows exactly what each routed model consumed.
+
+When both are present, the AI's `@model use` decision **wins over** a skill's `model:` frontmatter hint — an explicit in-task decision outranks a static preference.
+
+---
+
+## Subcommands
+
+| Subcommand | What it does |
+| --- | --- |
+| `list [provider]` | Providers and their models with routing metadata. Live API listing merged with the static catalog (`api+catalog` / `catalog` source tag). Unfiltered output is capped at 25 models per provider; the `provider` filter lifts the cap. |
+| `use {model}` | Routes the **rest of the task** to the model. Sticky until `reset` or the task ends. The provider follows the model automatically — cross-provider switches are announced, including a note that the provider prompt cache starts cold. |
+| `reset` | Clears the override; next turns run on the session's own model. |
+| `status` | Session model and the active override, if any. |
+| `delegate {model, prompt, max_tokens?}` | Runs **one self-contained prompt** on the target model and returns its answer. The main loop, its history and its prompt cache stay untouched — the delegated model sees *only* the prompt. |
+
+```text
+<tool_call name="@model" args='{"cmd":"list","args":{"provider":"CLAUDEAI"}}' />
+<tool_call name="@model" args='{"cmd":"use","args":{"model":"CLAUDEAI:claude-haiku-4-5-20251001"}}' />
+<tool_call name="@model" args='{"cmd":"delegate","args":{"model":"GOOGLEAI:gemini-2.5-flash","prompt":"Summarize the following build log into the 3 root errors: …"}}' />
+<tool_call name="@model" args='{"cmd":"reset"}' />
+```
+
+### What `list` returns
+
+```text
+Session model: CLAUDEAI:claude-sonnet-5 — route override: none
+Pass the qualified handle exactly as listed…
+
+CLAUDEAI (20, api+catalog)
+  CLAUDEAI:claude-sonnet-5   tier=balanced   $3.00/$15.00 per 1M   ctx=1.0M   caps=vision,json_mode,tools,adaptive_thinking
+  CLAUDEAI:claude-fable-5    tier=frontier   $10.00/$50.00 per 1M  ctx=1.0M   caps=…
+  CLAUDEAI:claude-haiku-4-5… tier=fast-cheap $1.00/$5.00 per 1M    ctx=200.0K caps=…
+```
+
+---
+
+## Pricing tiers
+
+So the model reasons over a **label** instead of raw prices, `list` derives a tier from the same pricing tables [cost tracking](/features/cost-tracking) uses:
+
+| Tier | Meaning | Examples |
+| --- | --- | --- |
+| `fast-cheap` | Mechanical subtasks: summarize, extract, reformat, translate | Haiku 4.5, Gemini 2.5 Flash, GPT-4o-mini |
+| `balanced` | Day-to-day reasoning at moderate cost | Sonnet, GPT-5.6 Terra, Gemini 2.5 Pro |
+| `frontier` | Architectural reasoning, hard debugging | Fable 5, Opus 4.8, GPT-5.6 Sol, o3 |
+| `unmetered` | Local backends, flat subscriptions or unknown pricing | Ollama models, Devin |
+
+The tool's own description teaches the agent the routing policy: **delegate** mechanical subtasks to a `fast-cheap` model; use **`use`** only at a clear phase change, never per call — model switches invalidate the provider's prompt cache, and frequent flip-flopping costs more than it saves.
+
+---
+
+## Qualified handles: `PROVIDER:model`
+
+With 15 supported providers, the same model id can exist in several of them (`claude-*` on CLAUDEAI, Bedrock **and** OpenRouter; `deepseek` on Ollama and GitHub Models). The canonical, deterministic form is the **qualified handle** exactly as `list` prints it:
+
+```text
+CLAUDEAI:claude-haiku-4-5-20251001
+BEDROCK:anthropic.claude-sonnet-5
+OPENROUTER:deepseek/deepseek-r1
+```
+
+Bare model names are also accepted and resolved by the same pipeline as skill `model:` hints — active provider first, then catalog, then a family heuristic (`sonnet`→CLAUDEAI, `gpt-*`→OPENAI, `glm-*`→ZAI, …). The tool result always names the provider that was chosen, so the agent never operates blind.
+
+<Note>
+**Ollama tags are safe.** The qualified form splits only when the prefix names a real provider — `qwen2.5:14b` is *not* split (its prefix isn't a provider), and `OLLAMA:qwen2.5:14b` keeps the tag colon inside the model part.
+</Note>
+
+Errors are **actionable**: asking for a provider without credentials returns *"wanted X on PROVIDER but that provider is not configured (missing API key)"* — the agent can pick another handle or surface the problem instead of retrying blindly.
+
+---
+
+## `delegate`: the biggest token saver
+
+`use` moves the whole loop — history included — to another model. `delegate` does something cheaper: it runs **one prompt** on the target model, with **no session history attached**, and returns the answer to the main loop as a tool result.
+
+- The main loop's provider **prompt cache stays intact** (nothing about its history changes).
+- The fat agent history never travels to the cheap model — the delegated call pays only for the prompt you hand it.
+- The delegated usage is recorded in [cost tracking](/features/cost-tracking) under the delegated model.
+
+Rule of thumb the tool teaches the agent: *"summarize these files"*, *"extract this list"*, *"reformat this output"* → `delegate` to `fast-cheap`. Sustained phase change (e.g. a long mechanical migration after the design is settled) → `use`.
+
+---
+
+## Safety & governance
+
+- **Kill switch:** `CHATCLI_AGENT_MODEL_TOOL=false` unregisters the tool entirely — the AI cannot route models by itself. Surfaced in [`/config`](/features/config-migration) under agent → token efficiency.
+- **Capability guard:** when the catalog knows the target model lacks native tool support, `use` warns that the loop will fall back to the [text protocol](/features/native-tool-use) for tool calls.
+- **Permission model:** `list`/`status` are read-only; `use`/`reset` mutate the loop's routing and `delegate` spends tokens — they are declared as such to the [permission system](/features/enhanced-permissions). `use`/`reset` are also serialized (never run inside a parallel tool batch).
+- **MoA isolation:** [Mixture-of-Agents](/features/mixture-of-agents) participants run on a strict read-only whitelist — `@model` is unreachable from panel turns.
+
+---
+
+## Configuration
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `CHATCLI_AGENT_MODEL_TOOL` | Registers the `@model` tool in agent/coder mode. `false`/`0`/`off` disables it (cost-governance kill switch). | `true` |
+
+---
+
+## Usage example
+
+```text
+> /coder migrate the 40 call sites of pkg/old to pkg/new
+
+  ⚡ @model list
+     → CLAUDEAI:claude-haiku-4-5-20251001  tier=fast-cheap  $1.00/$5.00 per 1M …
+  ⚡ @model use CLAUDEAI:claude-haiku-4-5-20251001
+     → Routing the rest of this task to CLAUDEAI:claude-haiku-4-5-20251001.
+  … mechanical migration runs on Haiku …
+  ⚡ @model reset
+     → Route override cleared — back to the session model CLAUDEAI:claude-sonnet-5.
+  … final review runs on the session model …
+```
+
+---
+
+## See also
+
+- [Cost Tracking](/features/cost-tracking) — per-model attribution of every routed turn
+- [Token Efficiency](/features/token-efficiency) — the other levers the agent uses to spend less
+- [MCP Server](/features/mcp-server) — the same routing power for external MCP clients
+- [Supported Models](/reference/supported-models) — the catalog behind tiers and capabilities
+- [Environment Variables → Model routing](/reference/environment-variables#model-routing-tool)

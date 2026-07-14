@@ -1,0 +1,160 @@
+---
+title: "Roteamento de Modelo (@model)"
+sidebarTitle: "Roteamento de Modelo"
+description: "O agente escolhe o modelo certo para cada fase da tarefa — lista providers com tiers de preço, troca o loop para outro modelo/provider ou delega uma sub-tarefa a um modelo mais barato."
+icon: "shuffle"
+---
+
+A **tool `@model`** dá ao loop agent/coder o poder de se rotear sozinho: inspecionar os modelos de todos os providers configurados — enriquecidos com **tier derivado do preço**, custo por 1M de tokens, context window e capabilities — e decidir qual modelo deve servir a tarefa em questão. Ela pode **trocar** o restante da tarefa para outro modelo (o provider troca junto), ou **delegar** uma sub-tarefa autocontida a um modelo mais barato sem tocar no loop principal.
+
+<Info>
+É a contraparte in-loop do roteamento por chamada que a superfície do [MCP Server](/pt/features/mcp-server) expõe a clientes externos (params `provider`/`model` + `list_providers`): o mesmo poder, agora disponível para **a própria IA** enquanto trabalha. Sub-tarefas que não precisam de um modelo frontier param de pagar preço de frontier.
+</Info>
+
+---
+
+## Como funciona
+
+```text
+/agent … (modelo da sessão: CLAUDEAI:claude-sonnet-5)
+     │
+     ├─ turno 1  @model list                 → tiers, $/1M, ctx, caps
+     ├─ turno 2  @model use GOOGLEAI:gemini-2.5-flash
+     │              └─ override de rota definido (persistente)
+     ├─ turno 3+ … loop roda no gemini-2.5-flash …
+     ├─ turno N  @model reset                → volta ao claude-sonnet-5
+     │
+     └─ a qualquer momento:
+        @model delegate {model, prompt}      → one-shot no modelo barato,
+                                               loop principal e cache intactos
+```
+
+A decisão de roteamento vive em um **override de rota** honrado por turno pelo mesmo mecanismo dos hints `model:` de frontmatter de skills — com três garantias:
+
+1. **Escopo de tarefa.** O override é limpo no início de toda execução do agente. A decisão de roteamento da IA nunca sobrevive silenciosamente à tarefa para a qual foi tomada.
+2. **Não invasivo.** Nunca muta o provider/modelo/client da própria sessão — fora da tarefa, `/model` e `/switch` continuam mandando.
+3. **Contabilizado.** O [cost tracking](/pt/features/cost-tracking) atribui cada turno ao modelo que de fato o serviu — o `/cost` mostra exatamente o que cada modelo roteado consumiu.
+
+Quando ambos estão presentes, a decisão `@model use` da IA **vence** o hint `model:` de frontmatter de skill — uma decisão explícita tomada dentro da tarefa supera uma preferência estática.
+
+---
+
+## Subcomandos
+
+| Subcomando | O que faz |
+| --- | --- |
+| `list [provider]` | Providers e seus modelos com metadados de roteamento. Listagem viva da API mesclada com o catálogo estático (tag de origem `api+catalog` / `catalog`). Sem filtro, a saída é limitada a 25 modelos por provider; o filtro `provider` remove o limite. |
+| `use {model}` | Roteia o **restante da tarefa** para o modelo. Persiste até `reset` ou o fim da tarefa. O provider acompanha o modelo automaticamente — trocas cross-provider são anunciadas, incluindo a nota de que o prompt cache do provider começa frio. |
+| `reset` | Limpa o override; os próximos turnos rodam no modelo da própria sessão. |
+| `status` | Modelo da sessão e o override ativo, se houver. |
+| `delegate {model, prompt, max_tokens?}` | Roda **um prompt autocontido** no modelo alvo e retorna a resposta. O loop principal, seu histórico e seu prompt cache ficam intactos — o modelo delegado vê *apenas* o prompt. |
+
+```text
+<tool_call name="@model" args='{"cmd":"list","args":{"provider":"CLAUDEAI"}}' />
+<tool_call name="@model" args='{"cmd":"use","args":{"model":"CLAUDEAI:claude-haiku-4-5-20251001"}}' />
+<tool_call name="@model" args='{"cmd":"delegate","args":{"model":"GOOGLEAI:gemini-2.5-flash","prompt":"Resuma o build log a seguir nos 3 erros-raiz: …"}}' />
+<tool_call name="@model" args='{"cmd":"reset"}' />
+```
+
+### O que o `list` retorna
+
+```text
+Modelo da sessão: CLAUDEAI:claude-sonnet-5 — override de rota: nenhum
+Use o handle qualificado exatamente como listado…
+
+CLAUDEAI (20, api+catalog)
+  CLAUDEAI:claude-sonnet-5   tier=balanced   $3.00/$15.00 per 1M   ctx=1.0M   caps=vision,json_mode,tools,adaptive_thinking
+  CLAUDEAI:claude-fable-5    tier=frontier   $10.00/$50.00 per 1M  ctx=1.0M   caps=…
+  CLAUDEAI:claude-haiku-4-5… tier=fast-cheap $1.00/$5.00 per 1M    ctx=200.0K caps=…
+```
+
+---
+
+## Tiers de preço
+
+Para o modelo raciocinar sobre um **rótulo** em vez de preços brutos, o `list` deriva um tier das mesmas tabelas de preço que o [cost tracking](/pt/features/cost-tracking) usa:
+
+| Tier | Significado | Exemplos |
+| --- | --- | --- |
+| `fast-cheap` | Sub-tarefas mecânicas: resumir, extrair, reformatar, traduzir | Haiku 4.5, Gemini 2.5 Flash, GPT-4o-mini |
+| `balanced` | Raciocínio do dia a dia a custo moderado | Sonnet, GPT-5.6 Terra, Gemini 2.5 Pro |
+| `frontier` | Raciocínio arquitetural, debugging difícil | Fable 5, Opus 4.8, GPT-5.6 Sol, o3 |
+| `unmetered` | Backends locais, assinaturas flat ou preço desconhecido | Modelos Ollama, Devin |
+
+A própria descrição da tool ensina ao agente a política de roteamento: **delegue** sub-tarefas mecânicas a um modelo `fast-cheap`; use **`use`** apenas em uma mudança clara de fase, nunca por chamada — trocas de modelo invalidam o prompt cache do provider, e o vai-e-vem frequente custa mais do que economiza.
+
+---
+
+## Handles qualificados: `PROVIDER:model`
+
+Com 15 providers suportados, o mesmo id de modelo pode existir em vários deles (`claude-*` no CLAUDEAI, no Bedrock **e** no OpenRouter; `deepseek` no Ollama e no GitHub Models). A forma canônica e determinística é o **handle qualificado** exatamente como o `list` imprime:
+
+```text
+CLAUDEAI:claude-haiku-4-5-20251001
+BEDROCK:anthropic.claude-sonnet-5
+OPENROUTER:deepseek/deepseek-r1
+```
+
+Nomes pelados também são aceitos e resolvidos pelo mesmo pipeline dos hints `model:` de skills — provider ativo primeiro, depois catálogo, depois heurística de família (`sonnet`→CLAUDEAI, `gpt-*`→OPENAI, `glm-*`→ZAI, …). O resultado da tool sempre informa qual provider foi escolhido, então o agente nunca opera às cegas.
+
+<Note>
+**Tags do Ollama são seguras.** A forma qualificada só divide quando o prefixo nomeia um provider real — `qwen2.5:14b` *não* é dividido (o prefixo não é um provider), e `OLLAMA:qwen2.5:14b` mantém o dois-pontos da tag dentro da parte do modelo.
+</Note>
+
+Erros são **acionáveis**: pedir um provider sem credenciais retorna *"wanted X on PROVIDER but that provider is not configured (missing API key)"* — o agente pode escolher outro handle ou expor o problema em vez de repetir às cegas.
+
+---
+
+## `delegate`: a maior economia de tokens
+
+O `use` move o loop inteiro — histórico incluído — para outro modelo. O `delegate` faz algo mais barato: roda **um prompt** no modelo alvo, **sem nenhum histórico da sessão**, e devolve a resposta ao loop principal como resultado de tool.
+
+- O **prompt cache** do provider do loop principal **fica intacto** (nada no histórico dele muda).
+- O histórico gordo do agente nunca viaja ao modelo barato — a chamada delegada paga apenas pelo prompt entregue.
+- O uso delegado é registrado no [cost tracking](/pt/features/cost-tracking) sob o modelo delegado.
+
+Regra de bolso que a tool ensina ao agente: *"resuma esses arquivos"*, *"extraia essa lista"*, *"reformate essa saída"* → `delegate` para `fast-cheap`. Mudança de fase sustentada (ex.: uma migração mecânica longa depois do design fechado) → `use`.
+
+---
+
+## Segurança e governança
+
+- **Kill switch:** `CHATCLI_AGENT_MODEL_TOOL=false` desregistra a tool por completo — a IA não consegue rotear modelos sozinha. Exposto no [`/config`](/pt/features/config-migration) em agent → token efficiency.
+- **Guarda de capability:** quando o catálogo sabe que o modelo alvo não tem suporte nativo a tools, o `use` avisa que o loop cairá no [protocolo textual](/pt/features/native-tool-use) para tool calls.
+- **Modelo de permissões:** `list`/`status` são read-only; `use`/`reset` mutam o roteamento do loop e `delegate` gasta tokens — declarados como tal ao [sistema de permissões](/pt/features/enhanced-permissions). `use`/`reset` também são serializados (nunca rodam dentro de um batch paralelo de tools).
+- **Isolamento do MoA:** participantes do [Mixture-of-Agents](/pt/features/mixture-of-agents) rodam sob uma whitelist estritamente read-only — `@model` é inalcançável de turnos de painel.
+
+---
+
+## Configuração
+
+| Variável | Descrição | Padrão |
+| --- | --- | --- |
+| `CHATCLI_AGENT_MODEL_TOOL` | Registra a tool `@model` nos modos agent/coder. `false`/`0`/`off` desabilita (kill switch de governança de custo). | `true` |
+
+---
+
+## Exemplo de uso
+
+```text
+> /coder migre os 40 call sites de pkg/old para pkg/new
+
+  ⚡ @model list
+     → CLAUDEAI:claude-haiku-4-5-20251001  tier=fast-cheap  $1.00/$5.00 per 1M …
+  ⚡ @model use CLAUDEAI:claude-haiku-4-5-20251001
+     → Roteando o restante desta tarefa para CLAUDEAI:claude-haiku-4-5-20251001.
+  … migração mecânica roda no Haiku …
+  ⚡ @model reset
+     → Override de rota limpo — de volta ao modelo da sessão CLAUDEAI:claude-sonnet-5.
+  … revisão final roda no modelo da sessão …
+```
+
+---
+
+## Veja também
+
+- [Cost Tracking](/pt/features/cost-tracking) — atribuição por modelo de cada turno roteado
+- [Token Efficiency](/pt/features/token-efficiency) — as outras alavancas que o agente usa para gastar menos
+- [MCP Server](/pt/features/mcp-server) — o mesmo poder de roteamento para clientes MCP externos
+- [Modelos Suportados](/pt/reference/supported-models) — o catálogo por trás dos tiers e capabilities
+- [Variáveis de Ambiente → Roteamento de modelo](/pt/reference/environment-variables#tool-de-roteamento-de-modelo)
