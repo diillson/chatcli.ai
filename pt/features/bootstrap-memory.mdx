@@ -346,9 +346,11 @@ Como a memória chega ao modelo nos modos `/agent` e `/coder` é controlado por 
 
 | Modo | Comportamento |
 |------|---------------|
-| `index` (**default**) | Injeta apenas um **índice compacto e estável** (perfil resumido + nomes dos top topics/projects + contagem de fatos por categoria) e deixa o agente puxar o detalhe sob demanda via `@memory recall`. Custo por turno limitado e cacheável. |
+| `index` (**default**) | Injeta apenas um **índice compacto e estável** (perfil resumido + nomes dos top topics/projects + contagem de fatos por categoria + contagem de episódios) e deixa o agente puxar o detalhe sob demanda via `@memory recall`. Custo por turno limitado e cacheável. |
 | `full` | Injeta o Smart Retrieval completo (acima) a cada turno — o comportamento clássico de "push". |
 | `off` | Não injeta memória; os arquivos bootstrap continuam valendo. |
+
+O **auto-recall proativo** fecha a lacuna do modelo pull: modelos às vezes pulam a chamada de `@memory recall` mesmo quando um gotcha armazenado é exatamente o que precisam. No modo `index`, cada turno de agent/coder também ranqueia o índice de fatos contra palavras-chave das mensagens recentes e leva os **3 melhores matches** para o prompt num bloco minúsculo `[MEMORY AUTO-RECALL]` (cap de 700 bytes). O bloco vive na região final *não-cacheada* junto do contexto de relógio, então o digest estável permanece byte-idêntico e o cache de prompt não é afetado. Gate `CHATCLI_MEMORY_AUTORECALL` (**on** por padrão).
 
 O modo `pull` (`index`) reduz o bloco de memória por turno em ~88% num store de 500 fatos sem perder acesso ao detalhe — veja [Eficiência de Tokens › Memória pull-first](/pt/features/token-efficiency) para a medição completa. O **chat** é tool-less e não puxa sob demanda: lá `index` cai em `full`. A ferramenta `@memory recall` usa HyDE + busca vetorial, então o detalhe puxado tem a mesma qualidade do push. Veja o estado atual em `/config memory`.
 
@@ -359,6 +361,7 @@ O sistema de memória possui parâmetros configuraveis via variáveis de ambient
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `CHATCLI_MEMORY_MODE` | `index` | Modo de injeção em agent/coder: `index` (pull), `full` (push) ou `off` |
+| `CHATCLI_MEMORY_AUTORECALL` | `true` | Injeção proativa dos top-3 fatos no modo `index` (veja acima) |
 | `CHATCLI_MEMORY_MAX_SIZE` | `32768` (32KB) | Tamanho máximo do MEMORY.md renderizado |
 | `CHATCLI_MEMORY_RETENTION_DAYS` | `30` | Dias de retencao de notas diarias antes da limpeza |
 | `CHATCLI_MEMORY_MAX_FACTS` | `500` | Número máximo de fatos no FactIndex |
@@ -374,13 +377,14 @@ Alem das variáveis de ambiente, o struct `Config` interno define valores padrã
 
 ### Como as Memorias são Criadas
 
-O worker em background agora extrai **5 tipos de informação** (antes eram apenas 2):
+O worker em background agora extrai **6 tipos de informação** (antes eram apenas 2):
 
 1. **DAILY** -- O que foi feito (arquivos, comandos, erros, tarefas)
 2. **LONGTERM** -- Fatos novos para lembrar permanentemente
 3. **PROFILE_UPDATE** -- Informações sobre o usuário (nome, role, expertise)
 4. **TOPICS** -- Topicos tecnicos discutidos
 5. **PROJECTS** -- Projetos em que se trabalhou
+6. **EPISODES** -- Unidades datadas e duráveis de trabalho concluído (veja **Memória episódica: a linha do tempo de trabalho** abaixo)
 
 O worker dispara após 4+ mensagens novas com cooldown de 2 minutos, e também a cada 3 minutos em sessões longas.
 
@@ -460,6 +464,7 @@ Ao iniciar pela primeira vez com o novo sistema, o ChatCLI detecta se existe um 
 | `/memory projects` | Mostra projetos rastreados com status |
 | `/memory stats` | Estatisticas completas (sessões, horas de pico, erros, features) |
 | `/memory facts [categoria]` | Lista fatos com scores (filtro por categoria) |
+| `/memory timeline [q]` | Histórico datado de episódios; `q` filtra por tempo ("3 meses atrás", "abril", "2026-04") e/ou conteúdo |
 | `/memory compact` | Forca compactação imediata (LLM + cleanup de notas) |
 
 #### Edição manual e perfil estendido
@@ -488,7 +493,7 @@ Campos de lista têm **ciclo de vida**, não são append-only: novos itens entra
 
 #### Tool `@memory` (agent, coder e chat)
 
-Dentro do `/agent` e `/coder`, o modelo pode persistir e explorar memória sozinho via a tool **`@memory`** (cmds `remember`, `profile`, `forget`, `recall`, `neighbors`, `map`):
+Dentro do `/agent` e `/coder`, o modelo pode persistir e explorar memória sozinho via a tool **`@memory`** (cmds `remember`, `profile`, `forget`, `recall`, `timeline`, `neighbors`, `map`):
 
 ```text
 <tool_call name="@memory" args='{"cmd":"remember","args":{"content":"User earned the AWS Solutions Architect certification","category":"personal"}}' />
@@ -497,6 +502,21 @@ Dentro do `/agent` e `/coder`, o modelo pode persistir e explorar memória sozin
 Assim, quando você conta uma novidade ao agente (ex.: uma certificação nova), ele a grava no seu perfil/fatos de longo prazo sem você precisar rodar `/memory` manualmente. O subcomando `profile` aceita todas as operações de ciclo de vida (`goals_done`, `goals_replace`, `stance`, `milestone`, `env_*`, `sensitive_mark`, ...).
 
 **No chat também**: atualização de memória/perfil é a **quarta exceção sancionada** do chat tool-less (junto de `ask_user`, knowledge read-only e `@graphview`). Quando você revela ou corrige um fato durável sobre si, o modelo persiste **no mesmo turno** — nada de "vou considerar daqui pra frente" sem gravar. Controlada por `CHATCLI_CHAT_MEMORY` (**ligada por padrão**) e alternável com `/config chat memory on|off`.
+
+### Memória episódica: a linha do tempo de trabalho
+
+Fatos capturam o que é **verdade**; episódios capturam o que **aconteceu**. Um episódio é uma unidade datada e durável de trabalho concluído — resumo, desfecho e refs (arquivos, PRs, comandos) — extraída automaticamente pelo worker em background (seção `## EPISODES`) e armazenada para sempre em `~/.chatcli/memory/episodes.json`. Ao contrário das daily notes (retenção de 30 dias) e seus digests, episódios nunca expiram — "o que fizemos há três meses?" finalmente tem resposta estruturada.
+
+- **Armazenamento** segue as disciplinas do fact index: escrita atômica, quarentena em corrupção e rewrites reconciliadores multi-processo (REPL, gateway daemon e MCP server nunca se apagam). O mesmo item re-extraído no mesmo dia **deduplica e enriquece** desfecho/refs em vez de duplicar. Cap de 2000 episódios (mais antigos caem primeiro).
+- **`@memory timeline`** é a visão cronológica para o modelo: `{project?, from?, to?, query?, limit?}`. `from`/`to` aceitam datas ISO (`2026-04`, `2026-04-12`) **ou expressões naturais em português e inglês** ("há 3 meses", "3 months ago", "abril", "semana passada") — uma expressão de tempo dentro de `query` também funciona.
+- **Recall temporal**: uma query de `@memory recall` com expressão de tempo ("o que fizemos em abril?") automaticamente antepõe a fatia correspondente da timeline ao resultado — ranking por relevância sozinho não responde "quando". Quando a janela veio de linguagem natural e as palavras restantes não casam nada, a janela vence e retorna sem filtro (a data era o sinal real).
+- **`/memory timeline [q]`** é a visão humana — mesmo parsing temporal, renderizado no terminal.
+- **Rollups ancorados em episódios**: os digests semanais/mensais agora lideram com os episódios do período e usam as daily notes como contexto, então a narrativa de longo prazo para de decair — e uma semana cujas notes já expiraram ainda gera digest só dos episódios.
+
+```text
+<tool_call name="@memory" args='{"cmd":"timeline","args":{"query":"há 3 meses"}}' />
+<tool_call name="@memory" args='{"cmd":"timeline","args":{"project":"chatcli","from":"2026-04","to":"2026-06"}}' />
+```
 
 #### Grafo de conhecimento (`@memory neighbors` / `map`)
 
