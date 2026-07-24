@@ -1,0 +1,149 @@
+---
+title: "Auto-Update"
+sidebarTitle: "Auto-Update"
+description: "O ChatCLI detecta como foi instalado e se atualiza pelo mesmo canal — Homebrew, go install ou self-replace verificado do binário"
+icon: "arrows-rotate"
+---
+
+O ChatCLI se mantém atualizado sozinho. Ele detecta **por qual canal o binário em execução foi instalado** e aplica a atualização **exatamente por aquele canal** — nunca cruza canais, nunca briga com o seu gerenciador de pacotes e nunca toca um build que não produziu.
+
+```bash
+/update          # checa + aplica pelo canal detectado
+/update check    # só verifica — nunca aplica
+```
+
+---
+
+## Detecção do Canal de Instalação
+
+A detecção roda localmente (sem rede), combinando o caminho real do binário, os metadados de build do Go e o carimbo de versão injetado pelo CI de release:
+
+| Canal | Como é reconhecido | Estratégia de update |
+|---|---|---|
+| **Homebrew** | Caminho real vive sob `Cellar/chatcli` (qualquer prefixo: `/opt/homebrew`, `/usr/local`, Linuxbrew) | Executa `brew upgrade diillson/chatcli/chatcli` com saída em tempo real |
+| **go install** | Sem carimbo do CI, mas com a versão do módulo Go embutida no binário | Executa `go install github.com/diillson/chatcli@latest` |
+| **Binário da release** | Versão carimbada via ldflags pelo workflow de release | **Self-replace** verificado, no lugar |
+| **Docker** | Marcadores de container (`/.dockerenv`, `/run/.containerenv`) | Só instruções — puxe a imagem nova |
+| **Build local** | Metadados de build indicam `go build` local | **Nunca tocado** — só instruções |
+
+<Note>
+O check do Homebrew roda primeiro de propósito: o bottle instalado pelo tap é o *mesmo* asset carimbado publicado na release do GitHub — só o caminho `Cellar` distingue os dois canais.
+</Note>
+
+### Por que builds locais nunca são auto-atualizados
+
+Um binário compilado localmente pode carregar patches não commitados. Substituí-lo por um artefato de release destruiria esse trabalho em silêncio, então o ChatCLI apenas indica o caminho:
+
+```text
+Este é um build local do código-fonte e não será tocado.
+Atualize seu checkout: git pull && go build ./...
+```
+
+---
+
+## O Comando /update
+
+O `/update` puro é um pedido explícito: quando existe release mais nova num canal automatizável, ele aplica na hora — a mesma semântica do `brew upgrade`.
+
+```text
+> /update
+  Verificando atualizações...
+  Método de instalação: binário oficial da release
+  Atual: v1.169.0 · Última: v1.169.5
+  Baixando v1.169.5 (chatcli-darwin-arm64)...
+  ✅ Atualizado para v1.169.5 — reinicie o chatcli para usar a nova versão.
+```
+
+O `/update check` mostra o mesmo status, mas nunca aplica nada.
+
+O comando também está disponível na palette interativa e no completer de tab, e o `/config update` mostra a política resolvida a qualquer momento.
+
+---
+
+## Self-Replace Verificado
+
+Quando o binário veio direto de uma release do GitHub, o ChatCLI o atualiza no lugar com um pipeline endurecido:
+
+1. Baixa o `checksums.txt` da release alvo.
+2. Faz streaming do asset da plataforma para um arquivo de staging **no mesmo diretório** do binário (garantindo rename atômico no mesmo filesystem) enquanto calcula o SHA-256.
+3. Recusa a instalação em qualquer divergência de checksum — o download é descartado e o binário atual jamais é tocado.
+4. Troca atomicamente: um rename simples no macOS/Linux (o processo em execução continua no inode antigo), ou o dance de renomear para `.old` no Windows, com rollback automático se a ativação falhar. Restos são limpos no próximo boot.
+
+<Warning>
+Releases publicadas antes do `checksums.txt` existir não podem ser verificadas, e o ChatCLI **recusa instalações não verificadas** — você recebe uma instrução de download manual. Isso só afeta atualizar *para* releases muito antigas.
+</Warning>
+
+Se o diretório de instalação não for gravável (ex.: `/usr/local/bin` do root), o updater degrada para um comando pronto para copiar:
+
+```text
+❌ Sem permissão de escrita em /usr/local/bin. Atualize manualmente:
+sudo curl -fsSL -o /usr/local/bin/chatcli https://github.com/diillson/chatcli/releases/download/v1.169.5/chatcli-darwin-arm64 && sudo chmod +x /usr/local/bin/chatcli
+```
+
+---
+
+## Auto-Update em Background (Staging)
+
+Defina `CHATCLI_AUTO_UPDATE` para controlar o comportamento no boot:
+
+| Valor | Comportamento |
+|---|---|
+| `notify` *(default)* | Checa em background e mostra o aviso na tela de boas-vindas; atualizar continua sendo um `/update` manual |
+| `auto` | Além de notificar, aplica a atualização **silenciosamente em background** nos canais elegíveis (go install e binário de release) |
+| `off` | Sem checagem, sem notificação |
+
+O modo auto usa **staging**, o mesmo modelo do Claude Code: o processo em execução nunca é reiniciado nem interrompido. O binário novo pousa no disco enquanto você trabalha, e o *próximo* start já abre na versão nova — anunciada uma única vez na tela de boas-vindas:
+
+```text
+  Versão: 1.169.5 (commit: 52441581)
+  ✓ Atualizado automaticamente para v1.169.5
+```
+
+No modo `notify` (o default), a tela de boas-vindas mostra o convite:
+
+```text
+  ⬆ v1.169.5 disponível — rode /update para atualizar
+```
+
+<Note>
+**O Homebrew fica deliberadamente fora do update silencioso em background.** O `brew upgrade` pega o lock global do Homebrew e pode disparar um `brew update` completo; o ChatCLI só o executa quando você roda `/update` explicitamente. Processos ChatCLI concorrentes se coordenam por lock file — só um faz o update em background.
+</Note>
+
+---
+
+## Configuração
+
+```bash
+/config update
+```
+
+```text
+🔄 Auto-update
+   Modo                            notify
+   Método de instalação            Homebrew
+   Versão atual                    1.169.5
+   Última release                  1.169.5
+
+   Ambiente
+   CHATCLI_AUTO_UPDATE             (default) notify
+   CHATCLI_DISABLE_VERSION_CHECK   desabilitado (default)
+   CHATCLI_LATEST_VERSION_URL      (não definida)
+```
+
+| Variável | Descrição | Default |
+|---|---|---|
+| `CHATCLI_AUTO_UPDATE` | Política de update: `auto`, `notify` ou `off` | `notify` |
+| `CHATCLI_DISABLE_VERSION_CHECK` | Desliga a checagem de release inteira (implica `off`) | `false` |
+| `CHATCLI_LATEST_VERSION_URL` | Endpoint customizado para a checagem (mirrors air-gapped) | GitHub API |
+
+---
+
+## Troubleshooting
+
+| Sintoma | Causa | Correção |
+|---|---|---|
+| `brew não encontrado no PATH` | Instalação Homebrew atualizada de um shell sem brew | Rode `brew upgrade diillson/chatcli/chatcli` num shell normal |
+| `go não encontrado no PATH` | Canal go install sem toolchain Go disponível | Instale o Go, ou baixe o binário da release diretamente |
+| `Sem binário pré-compilado para <os>/<arch>` | Plataforma sem asset publicado na release | Atualize pelo canal com que instalou (ex.: `go install`) |
+| Update aplicado mas a versão antiga continua rodando | O binário staged pousa no disco; o processo vivo continua | Reinicie o chatcli — o próximo start abre na versão nova |
+| `release não publica checksums.txt` | Release alvo é anterior à publicação de checksums | Baixe manualmente na página de releases |

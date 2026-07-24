@@ -1,0 +1,149 @@
+---
+title: "Auto-Update"
+sidebarTitle: "Auto-Update"
+description: "ChatCLI detects how it was installed and updates itself through that same channel — Homebrew, go install, or verified binary self-replace"
+icon: "arrows-rotate"
+---
+
+ChatCLI keeps itself current. It detects **which channel the running binary was installed through** and applies updates **through that exact channel** — it never crosses channels, never fights your package manager, and never touches a build it didn't produce.
+
+```bash
+/update          # check + apply through the detected channel
+/update check    # only check — never applies
+```
+
+---
+
+## Install-Channel Detection
+
+Detection runs locally (no network) by combining the binary's real path, the Go build metadata and the version stamp injected by the release CI:
+
+| Channel | How it is recognized | Update strategy |
+|---|---|---|
+| **Homebrew** | Real path lives under `Cellar/chatcli` (any prefix: `/opt/homebrew`, `/usr/local`, Linuxbrew) | Runs `brew upgrade diillson/chatcli/chatcli` with streamed output |
+| **go install** | No CI version stamp, but the Go module version is embedded in the binary | Runs `go install github.com/diillson/chatcli@latest` |
+| **Release binary** | Version stamped via ldflags by the release workflow | Verified in-place **self-replace** |
+| **Docker** | Container markers (`/.dockerenv`, `/run/.containerenv`) | Instructions only — pull the new image |
+| **Source build** | Build metadata reports a local `go build` | **Never touched** — instructions only |
+
+<Note>
+The Homebrew check runs first on purpose: the bottle installed by the tap is the *same* stamped asset published on the GitHub release, so only the `Cellar` path distinguishes the two channels.
+</Note>
+
+### Why source builds are never auto-updated
+
+A locally compiled binary may carry uncommitted patches. Replacing it with a release artifact would silently destroy that work, so ChatCLI only prints the way forward:
+
+```text
+This is a local source build, so it won't be touched.
+Update your checkout: git pull && go build ./...
+```
+
+---
+
+## The /update Command
+
+Bare `/update` is an explicit request: when a newer release exists on an automatable channel, it applies immediately — the same semantics as `brew upgrade`.
+
+```text
+> /update
+  Checking for updates...
+  Install method: official release binary
+  Current: v1.169.0 · Latest: v1.169.5
+  Downloading v1.169.5 (chatcli-darwin-arm64)...
+  ✅ Updated to v1.169.5 — restart chatcli to use the new version.
+```
+
+`/update check` reports the same status but never applies anything.
+
+The command is also available from the interactive command palette and the tab completer, and `/config update` shows the resolved policy at any time.
+
+---
+
+## Verified Self-Replace
+
+When the binary came straight from a GitHub release, ChatCLI updates it in place with a hardened pipeline:
+
+1. Downloads `checksums.txt` from the target release.
+2. Streams the platform asset to a staging file **in the same directory** as the binary (guaranteeing an atomic rename on the same filesystem) while computing its SHA-256.
+3. Refuses the install on any checksum mismatch — the download is discarded and the current binary is never touched.
+4. Swaps atomically: a plain rename on macOS/Linux (the running process keeps its old inode), or the rename-to-`.old` dance on Windows with automatic rollback if activation fails. Leftover artifacts are cleaned on the next boot.
+
+<Warning>
+Releases published before `checksums.txt` existed cannot be verified, and ChatCLI **refuses unverified installs** — you'll get a manual-download instruction instead. This only affects updating *to* very old releases.
+</Warning>
+
+If the install directory isn't writable (say, `/usr/local/bin` owned by root), the updater degrades to a copy-paste command:
+
+```text
+❌ No write permission on /usr/local/bin. Update manually:
+sudo curl -fsSL -o /usr/local/bin/chatcli https://github.com/diillson/chatcli/releases/download/v1.169.5/chatcli-darwin-arm64 && sudo chmod +x /usr/local/bin/chatcli
+```
+
+---
+
+## Background Auto-Update (Staging)
+
+Set `CHATCLI_AUTO_UPDATE` to control the boot-time behavior:
+
+| Value | Behavior |
+|---|---|
+| `notify` *(default)* | Checks in the background and shows an update hint on the welcome screen; updating stays a manual `/update` |
+| `auto` | Additionally applies the update **silently in the background** on eligible channels (go install and release binary) |
+| `off` | No checks, no notifications |
+
+Auto mode uses **staging**, the same model as Claude Code: the running process is never restarted or interrupted. The new binary lands on disk while you work, and the *next* start opens on the new version — announced once on the welcome screen:
+
+```text
+  Version: 1.169.5 (commit: 52441581)
+  ✓ Auto-updated to v1.169.5
+```
+
+In `notify` mode (the default) the welcome screen shows the invitation instead:
+
+```text
+  ⬆ v1.169.5 available — run /update to upgrade
+```
+
+<Note>
+**Homebrew is deliberately excluded from silent background updates.** `brew upgrade` takes Homebrew's global lock and can trigger a full `brew update`; ChatCLI only drives it when you explicitly run `/update`. Concurrent ChatCLI processes coordinate through a lock file, so only one performs the background update.
+</Note>
+
+---
+
+## Configuration
+
+```bash
+/config update
+```
+
+```text
+🔄 Auto-update
+   Mode                            notify
+   Install method                  Homebrew
+   Current version                 1.169.5
+   Latest release                  1.169.5
+
+   Environment
+   CHATCLI_AUTO_UPDATE             (default) notify
+   CHATCLI_DISABLE_VERSION_CHECK   disabled (default)
+   CHATCLI_LATEST_VERSION_URL      (not set)
+```
+
+| Variable | Description | Default |
+|---|---|---|
+| `CHATCLI_AUTO_UPDATE` | Update policy: `auto`, `notify` or `off` | `notify` |
+| `CHATCLI_DISABLE_VERSION_CHECK` | Disables the release check entirely (implies `off`) | `false` |
+| `CHATCLI_LATEST_VERSION_URL` | Custom endpoint for the release check (air-gapped mirrors) | GitHub API |
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `brew not found in PATH` | Homebrew install being updated from a shell without brew | Run `brew upgrade diillson/chatcli/chatcli` from a normal shell |
+| `go not found in PATH` | go install channel without a Go toolchain available | Install Go, or download the release binary directly |
+| `No prebuilt binary for <os>/<arch>` | Platform without a published release asset | Update through the channel you installed with (e.g. `go install`) |
+| Update applied but old version still runs | The staged binary lands on disk; the live process keeps running | Restart chatcli — the next start opens on the new version |
+| `release does not publish checksums.txt` | Target release predates checksum publishing | Download manually from the releases page |
