@@ -1,0 +1,134 @@
+---
+title: "Agent Squad"
+sidebarTitle: "Agent Squad"
+description: "A coordinated team of agents: live observability of every run, a shared kanban work board, agent-to-agent mail, and an orchestrator playbook that drives a single prompt to a validated delivery — autonomously."
+icon: "people-group"
+---
+
+The **Agent Squad** layer turns [Multi-Agent Orchestration](/features/multi-agent-orchestration) into a real team. You give one prompt; the orchestrator plans the work into cards, dispatches specialist workers, watches where each one is, routes review feedback back to the coder, schedules follow-ups, and only delivers after validation — without you babysitting anything.
+
+It is built from four pieces, each usable on its own:
+
+| Piece | Human surface | AI surface |
+|---|---|---|
+| Live run registry | `/agents` | `@agents` |
+| Work board (kanban) | `/board` | `@board` |
+| Squad mail | `/mail` | `@mail` + worker `send_mail` |
+| Delivery playbook | — | orchestrator system prompt |
+
+---
+
+## Live run registry — where is each agent?
+
+Every agent execution registers itself in a process-wide registry: the orchestrator loop, each dispatched worker, delegate subagents, Mixture-of-Agents panel members and scheduler headless runs. Runs form a parent → child tree, and each one reports its current ReAct turn and the action in flight.
+
+The live dispatch panel uses it to show real progress per agent:
+
+```text
+⠋ [gpt-5.6-sol] [1m02s] [████████░░░░░░░░░░░░] 2/4 agents (50%)
+  ✓ [file] Read engine files ─ concluido (12.4s)
+  ⠋ [coder] Implement /foo command ─ turno 7/30 · patch cli/foo.go
+      ↳ [subagent] analyze metrics endpoint — turno 3/15 · read
+  ⠋ [reviewer] Review the diff ─ turno 2/30 · git-diff
+  ○ [tester] Run the test suite ─ pendente
+```
+
+### `/agents`
+
+```bash
+/agents              # tree of live runs + recent history
+/agents show run-3   # one run in full: turn, action, tool calls, children
+/agents cancel run-3 # cancel a stuck run (propagates to its subagents)
+```
+
+### `@agents` (for the AI)
+
+The orchestrator uses the same registry through the `@agents` tool (`list`, `show`, `cancel`) — so it can check what is already running before dispatching duplicate work, and kill a worker that is looping without progress.
+
+Cancellation is per-run: it cancels that run's context and everything it spawned, never the whole batch.
+
+---
+
+## Work board — the squad's kanban
+
+The board is the shared unit of work: cards flowing across **backlog → doing → review → blocked → done**. A card carries an assignee (worker agent type), timestamped notes (review verdicts, delivery summaries), linked agent run IDs and scheduler job IDs, and its full transition history.
+
+```bash
+/board                       # kanban grouped by column
+/board show card-3           # description, notes, history, linked runs/jobs
+/board create Fix login bug  # you can add work too
+/board move card-3 review
+/board assign card-3 reviewer
+/board note card-3 needs tests for the OAuth path
+/board archive 24h           # clean old done cards
+```
+
+The AI manages the same board via `@board` (`create`, `list`, `show`, `move`, `assign`, `note`, `link`, `archive`). Agent results include their `run_id`, so the orchestrator links every execution to its card for traceability.
+
+Persistence is a single JSON document written atomically under `~/.chatcli/board.json` (override with `CHATCLI_BOARD_PATH`). A corrupt file surfaces an error — it is never silently wiped.
+
+---
+
+## Squad mail — agents talking to each other
+
+Squad mail is a directed message bus between agents. Messages are injected into the recipient's context at its **next turn boundary** — the only point that cannot split a native tool call and its result.
+
+- **Workers** get a universal native `send_mail` tool (regardless of their command allowlist): a reviewer can hand its verdict straight to the coder mid-flight.
+- **The orchestrator** drains its own inbox every turn (delivered as `[SQUAD MAIL]` blocks) and uses `@mail` (`send`, `inbox`, `history`).
+- **You** can redirect any agent without interrupting it:
+
+```bash
+/mail send coder prioritize the login fix over the refactor
+/mail list      # recent traffic (who told what to whom)
+/mail pending   # queued messages per recipient
+```
+
+### Durable and cross-process
+
+Squad mail is persisted through the [Conversation Hub](/features/conversation-hub) SQLite store (WAL mode): messages survive restarts and flow between processes. A directive typed in your REPL reaches agents running inside the [Chat Gateway](/features/chat-gateway) daemon, and vice versa. Delivery acks stop other processes (and post-restart hydration) from redelivering consumed messages.
+
+---
+
+## The delivery playbook
+
+With observability, a board and messaging in place, the orchestrator system prompt teaches the full autonomous cycle:
+
+1. **Plan** — break the goal into cards (`@board create`, one per deliverable, assignee = agent type).
+2. **Develop** — move the card to `doing`, dispatch the assigned workers, link the `run_id`.
+3. **Review** — move to `review`, dispatch reviewer/tester, record the verdict as a card note. Failed review → findings go back to the coder (new dispatch or `@mail send coder`), card returns to `doing`.
+4. **Deliver** — validate for real (build + tests, red → green), then move to `done` with a delivery note.
+5. **Loop** — repeat until no card sits outside `done`. Continuous or deferred work is scheduled via [`@scheduler`](/features/scheduler) with the job linked to its card.
+
+The orchestrator is instructed to never end a run with unfinished cards unless they are in `blocked` with a note explaining the blocker.
+
+---
+
+## Structured gateway telemetry
+
+When the squad runs inside the [Chat Gateway](/features/chat-gateway) (Telegram, Slack, …), progress is emitted from **typed agent events** instead of scraping the rendered terminal output: reasoning lines, tool start/end with duration, plan counters, and one line per worker state change (current turn and action, then terminal status).
+
+```text
+🧠 Reading the config to understand defaults
+▸ Reading: cli/foo.go
+✓ Reading: cli/foo.go (120ms)
+🤖 [reviewer] turn 4/30 · git-diff
+✓ [reviewer] completed (41s)
+📋 2/5 · apply patch
+```
+
+The legacy stdout-scraping path remains available with `CHATCLI_GATEWAY_STRUCTURED_PROGRESS=false`.
+
+---
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CHATCLI_AGENT_RUNS_HISTORY` | `200` | Finished runs retained for `/agents` and `@agents` |
+| `CHATCLI_BOARD_PATH` | `~/.chatcli/board.json` | Board file location |
+| `CHATCLI_GATEWAY_STRUCTURED_PROGRESS` | `true` | Structured gateway telemetry (set `false` for legacy scraping) |
+| `CHATCLI_HUB_POLL_MS` | `1000` | Cross-process mail poll cadence (shared with hub sync) |
+
+All are surfaced in `/config agent` and `/config gateway`.
+
+<Info>The squad tools are exposed to the LLM both in the prompt tool catalog and as native function-calling definitions (`agents_runs`, `board_cards`, `squad_mail`), so orchestration works on every provider.</Info>
