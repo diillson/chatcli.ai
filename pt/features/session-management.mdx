@@ -44,6 +44,34 @@ Todos os comandos de gerenciamento de sessão começam com `/session`.
     ```text
     Sessão 'documentação-site' carregada. A conversa anterior foi restaurada.
     ```
+
+    <Note>Carregar também rotaciona a thread compartilhada do [Conversation Hub](/pt/features/conversation-hub), para que o backlog cross-channel antigo não seja emendado por cima da sessão carregada.</Note>
+  </Step>
+
+  <Step title="/session attach <nome>">
+    Vincula a conversa a uma sessão nomeada — carrega quando ela existe, **cria quando não existe**. Enquanto vinculada, cada turno é gravado (write-through) no arquivo da sessão e escritas feitas por outras superfícies são adotadas antes de cada turno — veja [Continuidade cross-surface](#continuidade-cross-surface).
+
+    ```bash
+    /session attach projeto-x
+    ```
+
+    <Tip>`/session save` e `/session load` também vinculam: depois de qualquer um deles, a conversa fica atrelada àquele nome. `attach` é o alias que funciona com a sessão existindo ou não.</Tip>
+  </Step>
+
+  <Step title="/session detach">
+    Mantém a conversa atual em memória mas **remove o vínculo**: os turnos deixam de ser gravados no arquivo da sessão nomeada.
+
+    ```bash
+    /session detach
+    ```
+  </Step>
+
+  <Step title="/session status">
+    Mostra se a conversa está vinculada a uma sessão nomeada, e a qual.
+
+    ```bash
+    /session status
+    ```
   </Step>
 
   <Step title="/session list">
@@ -77,7 +105,7 @@ Todos os comandos de gerenciamento de sessão começam com `/session`.
   </Step>
 
   <Step title="/session new (ou /newsession)">
-    Limpa o histórico atual e inicia uma conversa completamente nova. É perfeito para começar uma tarefa do zero sem estar atrelado a nenhuma sessão nomeada.
+    Limpa o histórico atual e inicia uma conversa completamente nova. É perfeito para começar uma tarefa do zero sem estar atrelado a nenhuma sessão nomeada. Mesma semântica do `/newsession`: também remove qualquer vínculo de sessão e rotaciona a thread compartilhada do hub, para que nenhum backlog da conversa antiga vaze para a nova.
 
     ```bash
     /session new
@@ -120,20 +148,61 @@ Você não precisa lembrar do `/session save`: quando o REPL interativo encerra,
 
 ---
 
+## Continuidade cross-surface
+
+Uma sessão nomeada é a **camada durável de continuidade entre superfícies** do ChatCLI: o REPL interativo, o servidor MCP (`chatcli mcp-server`), o servidor ACP (`chatcli acp`) e o [Chat Gateway](/pt/features/chat-gateway) leem e escrevem o mesmo arquivo de sessão. Comece no terminal, continue na IDE, termine no WhatsApp — a mesma conversa.
+
+Enquanto uma sessão nomeada está ativa (após `/session save`, `/session load` ou `/session attach`), o vínculo (binding) funciona nas duas direções a cada turno:
+
+- **Write-through** — cada turno concluído é gravado imediatamente no arquivo da sessão (escrita atômica: arquivo temporário + rename, nunca há arquivos corrompidos pela metade).
+- **Adoção** — antes de cada turno, escritas feitas por outras superfícies (servidor MCP/ACP, daemon do gateway, outro terminal) desde a última sincronização são adotadas: quando o arquivo está mais novo, ele substitui o histórico em memória por inteiro (**last-writer-wins**).
+
+```bash
+# Terminal
+/session attach projeto-x        # vincula (cria a sessão se ainda não existir)
+
+# IDE (prompt box do ACP)
+/session attach projeto-x        # mesmo arquivo, mesma conversa
+
+# WhatsApp / Telegram / Slack (gateway)
+/session attach projeto-x        # o canal entra na mesma sessão
+```
+
+Cada superfície tem sua porta de entrada:
+
+| Superfície | Como vincular |
+|------------|---------------|
+| REPL interativo | `/session attach <nome>` (`save` / `load` também vinculam) |
+| ACP (prompt box da IDE) | `/session attach <nome>` — por sessão da IDE; veja [ACP](/pt/features/acp) |
+| Servidor MCP | actions `attach` / `detach` / `status` do `manage_session` (`save` / `load` também vinculam); veja [MCP Server](/pt/features/mcp-server) |
+| Chat Gateway | envie `/session attach <nome>` no canal — binding por remetente (principal), persistido; veja [Chat Gateway](/pt/features/chat-gateway) |
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `CHATCLI_SESSION_WRITETHROUGH` | Write-through ao vivo + adoção de escritas externas para a sessão nomeada ativa (desligado desativa as duas direções) | `true` |
+
+<Note>
+Sessões criadas por máquina (prefixos `autosave-`, `mcp-`) são espelhos rolling dos caminhos de autosave — elas nunca viram bindings vivos.
+</Note>
+
+<Info>
+Last-writer-wins converge enquanto as superfícies **alternam** turnos. Duas superfícies respondendo o *mesmo* turno simultaneamente em tempo real continua sendo papel do [Conversation Hub](/pt/features/conversation-hub) (efêmero, cross-channel); a sessão nomeada é o registro durável.
+</Info>
+
+---
+
 ## Onde as Sessões são Armazenadas
 
-As sessões são salvas como **arquivos JSON** no diretório de trabalho atual (CWD) — ou seja, o diretório de onde você iniciou o ChatCLI.
-
-O padrão de nomenclatura dos arquivos é:
+As sessões são salvas como **arquivos JSON** em um store por usuário — o mesmo store que todas as superfícies (REPL, servidor MCP/ACP, daemon do gateway) leem e escrevem:
 
 ```text
-.chatcli_session_<nome>.json
+~/.chatcli/sessions/<nome>.json
 ```
 
 Por exemplo, ao executar `/session save debug-api`, o arquivo criado será:
 
 ```text
-.chatcli_session_debug-api.json
+~/.chatcli/sessions/debug-api.json
 ```
 
 <Info>
@@ -142,9 +211,9 @@ O `SessionManager` é o componente interno responsável por toda a E/S de arquiv
 
 Os arquivos de sessão contêm o **histórico completo da conversa** no momento do salvamento — incluindo mensagens do usuário, respostas da IA, resultados de tool calls e resumos gerados por `/compact`.
 
-<Warning>
-Como os arquivos ficam no CWD, se você iniciar o ChatCLI de diretórios diferentes, verá sessões diferentes. Use `/session list` para verificar quais sessões estão disponíveis no diretório atual.
-</Warning>
+<Info>
+Como o store é por usuário (diretório home), as mesmas sessões ficam visíveis não importa de qual diretório você inicie o ChatCLI — e todas as superfícies (terminal, IDE, cliente MCP, canal do gateway) veem a mesma lista. Use `/session list` para vê-las todas.
+</Info>
 
 ---
 
@@ -262,11 +331,12 @@ Contextos anexados via `/context attach` **não são salvos** no arquivo de sess
 
 ## Auto-Save e Persistência
 
-<Warning>
-Sessões **não são salvas automaticamente**. Você deve chamar `/session save` explicitamente para persistir a conversa no disco.
-</Warning>
+Além do `/session save` explícito, a persistência tem duas camadas automáticas:
 
-Se você fechar o ChatCLI sem salvar, o histórico da conversa será **perdido permanentemente**. Não há mecanismo de recuperação automática.
+- **Sessão nomeada vinculada** — após `/session save`, `/session load` ou `/session attach`, **cada turno** é gravado (write-through) no arquivo da sessão (veja [Continuidade cross-surface](#continuidade-cross-surface); gate `CHATCLI_SESSION_WRITETHROUGH`, on por padrão).
+- **Autosave no exit** — uma conversa sem vínculo ainda é salva como `autosave-YYYYMMDD-HHMMSS` quando o REPL interativo encerra (veja **Salvamento automático no exit** acima; gate `CHATCLI_SESSION_AUTOSAVE`, on por padrão).
+
+Salve com um nome escolhido por você sempre que a conversa importar: sessões nomeadas pelo usuário nunca expiram, enquanto autosaves ficam sujeitos à **Limpeza Automática** abaixo.
 
 ### Arquivo `.chatcli_history` (não confundir)
 
@@ -274,12 +344,12 @@ O ChatCLI mantém um arquivo separado chamado `.chatcli_history` que armazena o 
 
 - Contém apenas os textos que você digitou no prompt, **não** as respostas da IA
 - É controlado pelas variáveis de ambiente `HISTORY_FILE` e `HISTORY_MAX_SIZE`
-- **Não tem relação** com os arquivos de sessão (`.chatcli_session_*.json`)
+- **Não tem relação** com os arquivos de sessão (`~/.chatcli/sessions/*.json`)
 
-| Aspecto | Sessões (`.chatcli_session_*.json`) | Histórico de comandos (`.chatcli_history`) |
+| Aspecto | Sessões (`~/.chatcli/sessions/*.json`) | Histórico de comandos (`.chatcli_history`) |
 |---|---|---|
 | Conteúdo | Conversa completa (user + assistant + tool) | Apenas o que você digitou |
-| Salvamento | Manual (`/session save`) | Automático |
+| Salvamento | `/session save`, ou automático a cada turno enquanto vinculada (write-through) | Automático |
 | Formato | JSON estruturado (v2) | Texto simples, uma linha por comando |
 | Controle | Comandos `/session` | Variáveis `HISTORY_FILE`, `HISTORY_MAX_SIZE` |
 
@@ -404,7 +474,7 @@ Nomes inválidos são rejeitados com uma mensagem de erro clara indicando os car
 
 <AccordionGroup>
   <Accordion title="As sessões são compartilhadas entre máquinas?">
-    **Não.** Os arquivos de sessão são armazenados localmente no diretório de trabalho atual. Para transferir uma sessão entre máquinas, você precisaria copiar manualmente o arquivo `.chatcli_session_<nome>.json` para o mesmo diretório na outra máquina.
+    **Não.** Os arquivos de sessão são armazenados localmente em `~/.chatcli/sessions`. Para transferir uma sessão entre máquinas, copie o arquivo `~/.chatcli/sessions/<nome>.json` para o mesmo local na outra máquina.
   </Accordion>
 
   <Accordion title="Existe limite de tamanho para as sessões?">
@@ -420,7 +490,7 @@ Nomes inválidos são rejeitados com uma mensagem de erro clara indicando os car
   </Accordion>
 
   <Accordion title="Posso ter sessões com o mesmo nome em diretórios diferentes?">
-    **Sim.** Como os arquivos são salvos no CWD, cada diretório tem seu próprio namespace de sessões. Uma sessão chamada `debug` em `/projeto-a` é completamente independente de uma sessão `debug` em `/projeto-b`.
+    **Não — o store é por usuário.** As sessões vivem em `~/.chatcli/sessions`, então os mesmos nomes ficam visíveis de qualquer diretório e de qualquer superfície (REPL, servidor MCP/ACP, gateway). Esse namespace compartilhado é exatamente o que faz a continuidade cross-surface funcionar; use nomes específicos da tarefa (`projeto-a-debug`, `projeto-b-debug`) para separar projetos.
   </Accordion>
 </AccordionGroup>
 
