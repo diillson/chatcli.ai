@@ -52,7 +52,7 @@ Anthropic caching (and OpenAI/xAI prefix auto-caching) works **by prefix**: a br
 **Why ordering matters (a fixed defect):** previously the workspace+memory block carried `cache_control` but held the **wall-clock timestamp to the second** plus hint-driven retrieval — both volatile — near the top of the prompt. That guaranteed a *cache miss* on that block every turn **and poisoned every cached block below it** (`/context` attachments, pinned skills, MCP catalog): you paid *cache creation* (1.25×) each time and never earned a *read*. The timestamp now lives in its own trailing block, and the volatile memory left the prefix. The genuinely stable blocks form a contiguous, cacheable prefix.
 </Warning>
 
-Each stable block carries `cache_control: ephemeral` for Anthropic-family providers (respecting the 4-breakpoint cap, with automatic coalescing). For providers with prefix auto-caching (OpenAI, xAI), the stable ordering ensures cache hits naturally. **Chat** follows the same ordering; being tool-less, it does not pull memory on demand (see section 7).
+Each stable block carries `cache_control: ephemeral` for Anthropic-family providers (respecting the 4-breakpoint cap, with automatic coalescing). For providers with prefix auto-caching (OpenAI, xAI), the stable ordering ensures cache hits naturally. **Chat** follows the same ordering — and since the chat memory tool exception carries the pull path, chat honors `index` mode exactly like agent/coder (see section 7).
 
 ### Cache on tool definitions
 
@@ -183,6 +183,8 @@ Because these prompts live in the **core** cache block, cache-enabled providers 
 
 Old tool results (file reads, search, git-diff, etc.) are progressively compressed in the history to keep the payload lean. See [Tool Result Management](/features/tool-result-management) for the full pipeline.
 
+**Honest budget accounting**: the compaction trigger now weighs the *whole* request payload, not just message text — native tool-call **arguments**, **image** payloads (via the token estimator) and any system-part excess all count toward the budget. Tool-heavy or vision-heavy histories therefore trigger compaction *before* blowing a proxy payload cap, instead of sailing past an undercounted budget. In agent/coder there is also a **skill lifecycle** on the same boundary: mid-loop skill blocks age out to compact stubs after `CHATCLI_SKILL_AGE_TURNS` turns (recoverable via `@recall`, re-triggerable after a cooldown) — see [Skill Registry › Skill lifecycle](/features/skill-registry#skill-injection-budget).
+
 Defaults are **conservative** to protect multi-turn workflows with cross-references (large refactors, review sessions). Users who want to squeeze harder can tune:
 
 | Variable | Default | Description |
@@ -215,13 +217,13 @@ Controlled by `CHATCLI_MEMORY_MODE`:
 
 | Mode | Behavior | When to use |
 |:-----|:---------|:------------|
-| `index` (**default**) | Injects a **compact, stable index** (profile summary + top topic/project names + fact tally by category) and a directive for the agent to call `@memory recall` when it needs detail. | Default. Per-turn cost stays **bounded** as memory grows. |
+| `index` (**default**) | Injects a **compact, stable index** (profile summary + top topic/project names + fact tally by category) and a directive to call the memory recall tool when detail is needed — in agent/coder via `@memory`, in chat via the sanctioned memory tool exception. | Default. Per-turn cost stays **bounded** as memory grows. |
 | `full` | Injects the full hint-driven retrieval every turn (previous behavior). | When you want the agent to always see relevant memory without relying on it pulling. |
 | `off` | Injects no memory (bootstrap still applies). | Sessions where long-term memory only gets in the way. |
 
 The `index` is **stable** (turn-independent, no timestamp), so it lives in the cached prefix (section 1) and is size-capped regardless of store size. `@memory recall` uses the full retrieval stack (HyDE + vector cosine search + keyword extraction), so pulled detail matches the quality of the old push.
 
-**Proactive auto-recall** (`CHATCLI_MEMORY_AUTORECALL`, on by default) adds a tiny hint-driven top-3-facts block per turn — but it rides in the *uncached trailing* region next to the wall-clock context, never in the stable digest, so the cached prefix stays byte-identical and none of the savings above are given back. See [Bootstrap and Memory](/features/bootstrap-memory) for details.
+**Proactive auto-recall** (`CHATCLI_MEMORY_AUTORECALL`, on by default) adds a tiny hint-driven top-3-facts block per turn, plus a one-line `Related (graph):` pointer naming the knowledge-graph neighbors of those facts — but it rides in the *uncached trailing* region next to the wall-clock context, never in the stable digest, so the cached prefix stays byte-identical and none of the savings above are given back. See [Bootstrap and Memory](/features/bootstrap-memory) for details.
 
 ### Measured impact
 
@@ -235,11 +237,11 @@ Measured against a real store of **500 facts** (MEMORY.md ~32KB, fact index ~270
 **−87.7% on the per-turn memory block** — and unlike `full` (capped by `CHATCLI_MEMORY_RETRIEVAL_BUDGET`), the index **does not grow** as memory grows.
 
 <Note>
-**Chat is tool-less by design** and cannot pull on demand: there `index` automatically degrades to `full`, and only `off` suppresses memory. The active mode is shown in `/config memory`.
+**Chat honors `index` too**: the chat memory tool exception (`CHATCLI_CHAT_MEMORY`, on by default) is its pull path, so chat gets the same digest + recall economics as agent/coder. Only with that exception disabled does chat fall back to `full`; `off` suppresses memory everywhere. The active mode is shown in `/config memory`.
 </Note>
 
 <Warning>
-In `index` mode the agent/coder **no longer sees the whole memory automatically** — it must call `@memory recall`. The index gives it the "map" (what exists) so it knows what to pull. If you notice the agent missing context it should recall, switch back to `CHATCLI_MEMORY_MODE=full` (the section 1 cache savings still apply).
+In `index` mode the agent/coder **no longer sees the whole memory automatically** — it must call `@memory recall`. The index gives it the "map" (what exists) so it knows what to pull. The proactive auto-recall block (with its `Related (graph):` line) and the graph expansion in every `@memory recall` pull soften exactly this risk. If you still notice missing context, switch back to `CHATCLI_MEMORY_MODE=full` (the section 1 cache savings still apply).
 </Warning>
 
 ---
@@ -276,6 +278,10 @@ Every variable on this page in one place:
 | Variable | Default | Disable with |
 |:---------|:--------|:-------------|
 | `CHATCLI_MEMORY_MODE` | `index` | `full` (push) / `off` |
+| `CHATCLI_MEMORY_GRAPH` | `1` (on) | `0` / `false` / `off` / `no` |
+| `CHATCLI_SKILL_INJECT_BUDGET` | `24000` | `0` (unlimited; run cap = 2× this) |
+| `CHATCLI_SKILL_AGE_TURNS` | `6` | high value (e.g., `100`) |
+| `CHATCLI_ATTACH_AUTO_RAG` | `1` (on) | `0` / `false` / `off` / `no` |
 | `CHATCLI_AGENT_EARLY_EXIT` | `1` (on) | `0` / `false` / `off` / `no` |
 | `CHATCLI_AGENT_EARLY_EXIT_TURNS` | `3` | — (clamped to [2, 10]) |
 | `CHATCLI_AGENT_SMART_ROUTE` | `hint` | `off` / `0` / `false` / `no` |

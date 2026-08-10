@@ -259,6 +259,8 @@ All memory lives in `~/.chatcli/memory/`:
 |-- user_profile.json      # User profile (name, role, expertise)
 |-- topics.json            # Recurring topics with frequency
 |-- projects.json          # Active projects with context
+|-- episodes.json          # Episodic timeline (dated work entries)
+|-- graph.json             # Persisted knowledge-graph cache (see below)
 |-- usage_stats.json       # Usage patterns and statistics
 |-- memory_archive.json    # Archived facts (low score)
 |-- weekly/                # Weekly digests (consolidated from daily notes)
@@ -334,7 +336,9 @@ Instead of dumping all memory into the system prompt, ChatCLI uses **intelligent
 1. Extracts keywords from the last few conversation messages
 2. Searches relevant facts in FactIndex by keyword match + temporal score
 3. Respects a configurable budget (default: 4000 characters)
-4. Prioritizes: Profile > Projects > Topics > Relevant facts > Recent notes > Trajectory (digests) > Usage patterns
+4. Prioritizes: Profile > Projects > Topics > Relevant facts > Recent notes > Episodes > **Related (graph)** > Trajectory (digests) > Usage patterns
+
+The **`## Related (graph)`** section is the knowledge graph participating in recall: the top-ranked facts are expanded one hop through the graph, surfacing structurally adjacent memories (a neighboring fact, the episode from the day it was learned, a connected topic or session) that keyword and vector ranking missed. It is purely additive — it never displaces a ranked fact, only spends leftover budget — and it appears both in `full`-mode injection and in every `@memory recall` pull.
 
 <Info>
 Facts accessed by the retriever automatically get their scores bumped, creating a virtuous cycle: the more useful a fact is, the more it appears.
@@ -342,17 +346,17 @@ Facts accessed by the retriever automatically get their scores bumped, creating 
 
 ### Injection mode: push vs pull
 
-How memory reaches the model in `/agent` and `/coder` is controlled by `CHATCLI_MEMORY_MODE`:
+How memory reaches the model — in **every mode**: chat, `/agent` and `/coder` — is controlled by `CHATCLI_MEMORY_MODE`:
 
 | Mode | Behavior |
 |------|----------|
-| `index` (**default**) | Injects only a **compact, stable index** (profile summary + top topic/project names + fact tally by category + episode count) and lets the agent pull detail on demand via `@memory recall`. Bounded, cacheable per-turn cost. |
+| `index` (**default**) | Injects only a **compact, stable index** (profile summary + top topic/project names + fact tally by category + episode count) and lets the model pull detail on demand via the memory recall tool. Bounded, cacheable per-turn cost. |
 | `full` | Injects the full Smart Retrieval (above) every turn — the classic "push" behavior. |
 | `off` | Injects no memory; bootstrap files still apply. |
 
-**Proactive auto-recall** closes the pull model's gap: models sometimes skip the `@memory recall` call even when a stored gotcha is exactly what they need. In `index` mode, each agent/coder turn also ranks the fact index against keywords from the recent messages and rides the **top 3 matches** into the prompt as a tiny `[MEMORY AUTO-RECALL]` block (700-byte cap). The block lives in the *uncached* trailing region next to the wall-clock context, so the stable digest stays byte-identical and prompt caching is unaffected. Gated by `CHATCLI_MEMORY_AUTORECALL` (**on** by default).
+**Proactive auto-recall** closes the pull model's gap: models sometimes skip the recall call even when a stored gotcha is exactly what they need. In `index` mode, each turn also ranks the fact index against keywords from the recent messages and rides the **top 3 matches** into the prompt as a tiny `[MEMORY AUTO-RECALL]` block (700-byte cap), followed by a one-line **`Related (graph):`** pointer naming what sits next to those facts in the [knowledge graph](#knowledge-graph-memory-neighbors--map) — so the model knows there is more to pull before it claims ignorance. The block lives in the *uncached* trailing region next to the wall-clock context, so the stable digest stays byte-identical and prompt caching is unaffected. Gated by `CHATCLI_MEMORY_AUTORECALL` (**on** by default).
 
-The pull mode (`index`) shrinks the per-turn memory block by ~88% on a 500-fact store without losing access to detail — see [Token Efficiency › Pull-first memory](/features/token-efficiency) for the full measurement. **Chat** is tool-less and cannot pull on demand: there `index` degrades to `full`. The `@memory recall` tool uses HyDE + vector search, so pulled detail matches push quality. Check the active mode with `/config memory`.
+The pull mode (`index`) shrinks the per-turn memory block by ~88% on a 500-fact store without losing access to detail — see [Token Efficiency › Pull-first memory](/features/token-efficiency) for the full measurement. **Chat honors `index` too**: the sanctioned chat memory tool exception (`CHATCLI_CHAT_MEMORY`, on by default) gives chat the same pull path, so it receives the compact digest plus a recall hint instead of the full retrieval. Only when that exception is disabled does chat fall back to `full` — chat without a pull path must never be starved of memory. Chat also receives the proactive `[MEMORY AUTO-RECALL]` and `[SESSION RECALL]` blocks and the knowledge-graph card, previously agent/coder-only (the session-recall wording in chat suggests `/session attach`, since chat has no session tool). The recall tool uses HyDE + vector search, so pulled detail matches push quality. Check the active mode with `/config memory`.
 
 ### Memory Configuration
 
@@ -360,8 +364,11 @@ The memory system has tunable parameters via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHATCLI_MEMORY_MODE` | `index` | Injection mode in agent/coder: `index` (pull), `full` (push) or `off` |
-| `CHATCLI_MEMORY_AUTORECALL` | `true` | Proactive top-3 fact injection in `index` mode (see above) |
+| `CHATCLI_MEMORY_MODE` | `index` | Injection mode in every mode (chat, agent, coder): `index` (pull), `full` (push) or `off` |
+| `CHATCLI_MEMORY_AUTORECALL` | `true` | Proactive top-3 fact injection + `Related (graph):` line in `index` mode (see above) |
+| `CHATCLI_MEMORY_GRAPH` | `true` | Persisted knowledge-graph cache (`graph.json`) + recall neighborhood expansion; `off` restores derive-per-call with no expansion |
+| `CHATCLI_GRAPH_INDEX` | `true` | Per-turn injection of the graph map-of-content card (`@memory map`/`neighbors` pull is always available regardless) |
+| `CHATCLI_CHAT_MEMORY` | `true` | Chat memory tool exception — the pull path that lets chat honor `index` mode |
 | `CHATCLI_MEMORY_MAX_SIZE` | `32768` (32KB) | Max size of rendered MEMORY.md |
 | `CHATCLI_MEMORY_RETENTION_DAYS` | `30` | Daily note retention before cleanup |
 | `CHATCLI_MEMORY_MAX_FACTS` | `500` | Max facts in the FactIndex |
@@ -501,7 +508,7 @@ Inside `/agent` and `/coder`, the model can persist and explore memory on its ow
 
 So when you tell the agent something new (e.g. a fresh certification), it records it into your profile/long-term facts without you running `/memory` manually. The `profile` subcommand accepts every lifecycle operation (`goals_done`, `goals_replace`, `stance`, `milestone`, `env_*`, `sensitive_mark`, ...).
 
-**In chat too**: memory/profile updates are the **fourth sanctioned exception** of tool-less chat (alongside `ask_user`, read-only knowledge and `@graphview`). When you reveal or correct a durable fact about yourself, the model persists it **in the same turn** — no more "I'll keep that in mind" without writing anything. Gated by `CHATCLI_CHAT_MEMORY` (**on by default**), flippable with `/config chat memory on|off`.
+**In chat too**: memory/profile updates are the **fourth sanctioned exception** of tool-less chat (alongside `ask_user`, read-only knowledge and `@graphview`). When you reveal or correct a durable fact about yourself, the model persists it **in the same turn** — no more "I'll keep that in mind" without writing anything. The exception also carries the **read side**: it is the pull path that lets chat honor `index` memory mode (compact digest + on-demand recall) and receive the proactive auto-recall, session-recall and graph-card blocks. Gated by `CHATCLI_CHAT_MEMORY` (**on by default**), flippable with `/config chat memory on|off` — disabling it reverts chat to the full-push memory model.
 
 ### Episodic memory: the work timeline
 
@@ -520,13 +527,15 @@ Facts capture what is **true**; episodes capture what **happened**. An episode i
 
 #### Knowledge graph (`@memory neighbors` / `map`)
 
-What ChatCLI knows about you is not a flat list: facts, topics, projects, skills and tags form an **on-demand graph** (Obsidian-style, in the core) derived from the relationships the stores already record (topic↔fact, fact→project, tags, skill triggers) plus `[[wikilinks]]` in note text. Access is through `@memory` itself:
+What ChatCLI knows about you is not a flat list: facts, topics, projects, skills, tags — and, since the persisted graph landed, **episodes, saved sessions and knowledge bases** — form a graph (Obsidian-style, in the core) derived from the relationships the stores already record (topic↔fact, fact→project, episode↔project, episode↔same-day facts, session↔project, session↔episode, KB↔tags, skill triggers) plus `[[wikilinks]]` in note text. Access is through `@memory` itself:
 
-- `recall` → search by **content** ("which facts match these words?").
+- `recall` → search by **content** ("which facts match these words?") — the output now ends with a `## Related (graph)` section of one-hop neighbors.
 - `neighbors <subject>` → **local graph**: backlinks + related notes for a subject ("what connects to this?").
 - `map` → overview (counts by kind + hubs).
 
-Context discipline: only a tiny, deterministic index card rides each turn (cache-friendly); depth is pulled on demand. To visualize, use [`/graph`](#) (renders the graph to an image via embedded go-graphviz).
+**The graph is a persisted cache**, not a per-call derivation: it lives at `~/.chatcli/memory/graph.json` and rebuilds only when a source actually changes (a fact is learned or forgotten, a session is saved, a skill is installed, a context is created — whether by you or by the model through its tools). On the next boot the cache is adopted instantly, so `@memory map` and the per-turn card cost nothing. The file is self-healing: a corrupt or stale copy is simply discarded and re-derived. Gate: `CHATCLI_MEMORY_GRAPH` (**on** by default; `off` restores the old derive-per-call behavior with no recall expansion). Node/edge counts are visible in `/config memory`.
+
+Context discipline: only a tiny, deterministic index card rides each turn (cache-friendly); depth is pulled on demand. To visualize, use `/graph` (renders the graph to an image via embedded go-graphviz).
 
 #### Fact quality (confidence, provenance, reconciliation)
 

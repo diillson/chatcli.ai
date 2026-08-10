@@ -259,6 +259,8 @@ Toda a memória fica em `~/.chatcli/memory/`:
 |-- user_profile.json      # Perfil do usuário (nome, role, expertise)
 |-- topics.json            # Topicos recorrentes com frequência
 |-- projects.json          # Projetos ativos com contexto
+|-- episodes.json          # Linha do tempo episódica (entradas datadas de trabalho)
+|-- graph.json             # Cache persistido do grafo de conhecimento (veja abaixo)
 |-- usage_stats.json       # Padroes de uso e estatisticas
 |-- memory_archive.json    # Fatos arquivados (baixo score)
 |-- weekly/                # Digests semanais (consolidados de notas diarias)
@@ -334,7 +336,9 @@ Em vez de injetar toda a memória no system prompt, o ChatCLI usa **retrieval in
 1. Extrai keywords das ultimas mensagens da conversa
 2. Busca fatos relevantes no FactIndex por keyword match + score temporal
 3. Respeita um budget configurável (padrão: 4000 caracteres)
-4. Prioriza: Perfil > Projetos > Topicos > Fatos relevantes > Notas recentes > Trajetória (digests) > Padrões de uso
+4. Prioriza: Perfil > Projetos > Topicos > Fatos relevantes > Notas recentes > Episódios > **Related (graph)** > Trajetória (digests) > Padrões de uso
+
+A seção **`## Related (graph)`** é o grafo de conhecimento participando do recall: os fatos mais bem ranqueados são expandidos um hop pelo grafo, trazendo memórias estruturalmente adjacentes (um fato vizinho, o episódio do dia em que foi aprendido, um tópico ou sessão conectados) que o ranking por keyword e vetor perdeu. É puramente aditiva — nunca desloca um fato ranqueado, só gasta budget sobrando — e aparece tanto na injeção do modo `full` quanto em todo pull de `@memory recall`.
 
 <Info>
 Fatos acessados pelo retriever tem seu score incrementado automaticamente, criando um ciclo virtuoso: quanto mais um fato e util, mais ele aparece.
@@ -342,17 +346,17 @@ Fatos acessados pelo retriever tem seu score incrementado automaticamente, crian
 
 ### Modo de injeção: push vs pull
 
-Como a memória chega ao modelo nos modos `/agent` e `/coder` é controlado por `CHATCLI_MEMORY_MODE`:
+Como a memória chega ao modelo — em **todos os modos**: chat, `/agent` e `/coder` — é controlado por `CHATCLI_MEMORY_MODE`:
 
 | Modo | Comportamento |
 |------|---------------|
-| `index` (**default**) | Injeta apenas um **índice compacto e estável** (perfil resumido + nomes dos top topics/projects + contagem de fatos por categoria + contagem de episódios) e deixa o agente puxar o detalhe sob demanda via `@memory recall`. Custo por turno limitado e cacheável. |
+| `index` (**default**) | Injeta apenas um **índice compacto e estável** (perfil resumido + nomes dos top topics/projects + contagem de fatos por categoria + contagem de episódios) e deixa o modelo puxar o detalhe sob demanda via a ferramenta de recall de memória. Custo por turno limitado e cacheável. |
 | `full` | Injeta o Smart Retrieval completo (acima) a cada turno — o comportamento clássico de "push". |
 | `off` | Não injeta memória; os arquivos bootstrap continuam valendo. |
 
-O **auto-recall proativo** fecha a lacuna do modelo pull: modelos às vezes pulam a chamada de `@memory recall` mesmo quando um gotcha armazenado é exatamente o que precisam. No modo `index`, cada turno de agent/coder também ranqueia o índice de fatos contra palavras-chave das mensagens recentes e leva os **3 melhores matches** para o prompt num bloco minúsculo `[MEMORY AUTO-RECALL]` (cap de 700 bytes). O bloco vive na região final *não-cacheada* junto do contexto de relógio, então o digest estável permanece byte-idêntico e o cache de prompt não é afetado. Gate `CHATCLI_MEMORY_AUTORECALL` (**on** por padrão).
+O **auto-recall proativo** fecha a lacuna do modelo pull: modelos às vezes pulam a chamada de `@memory recall` mesmo quando um gotcha armazenado é exatamente o que precisam. No modo `index`, cada turno também ranqueia o índice de fatos contra palavras-chave das mensagens recentes e leva os **3 melhores matches** para o prompt num bloco minúsculo `[MEMORY AUTO-RECALL]` (cap de 700 bytes), seguido de uma linha **`Related (graph):`** apontando o que fica ao lado desses fatos no [grafo de conhecimento](#grafo-de-conhecimento-memory-neighbors--map) — assim o modelo sabe que há mais para puxar antes de alegar ignorância. O bloco vive na região final *não-cacheada* junto do contexto de relógio, então o digest estável permanece byte-idêntico e o cache de prompt não é afetado. Gate `CHATCLI_MEMORY_AUTORECALL` (**on** por padrão).
 
-O modo `pull` (`index`) reduz o bloco de memória por turno em ~88% num store de 500 fatos sem perder acesso ao detalhe — veja [Eficiência de Tokens › Memória pull-first](/pt/features/token-efficiency) para a medição completa. O **chat** é tool-less e não puxa sob demanda: lá `index` cai em `full`. A ferramenta `@memory recall` usa HyDE + busca vetorial, então o detalhe puxado tem a mesma qualidade do push. Veja o estado atual em `/config memory`.
+O modo `pull` (`index`) reduz o bloco de memória por turno em ~88% num store de 500 fatos sem perder acesso ao detalhe — veja [Eficiência de Tokens › Memória pull-first](/pt/features/token-efficiency) para a medição completa. O **chat também honra `index`**: a exceção sancionada da ferramenta de memória do chat (`CHATCLI_CHAT_MEMORY`, on por padrão) dá ao chat o mesmo caminho de pull, então ele recebe o digest compacto mais um hint de recall em vez do retrieval completo. Só quando essa exceção está desabilitada o chat cai em `full` — chat sem caminho de pull nunca pode ficar sem memória. O chat também recebe os blocos proativos `[MEMORY AUTO-RECALL]` e `[SESSION RECALL]` e o card do grafo de conhecimento, antes exclusivos de agent/coder (o wording do session recall no chat sugere `/session attach`, já que o chat não tem ferramenta de sessão). A ferramenta de recall usa HyDE + busca vetorial, então o detalhe puxado tem a mesma qualidade do push. Veja o estado atual em `/config memory`.
 
 ### Configuração da Memória
 
@@ -360,8 +364,11 @@ O sistema de memória possui parâmetros configuraveis via variáveis de ambient
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
-| `CHATCLI_MEMORY_MODE` | `index` | Modo de injeção em agent/coder: `index` (pull), `full` (push) ou `off` |
-| `CHATCLI_MEMORY_AUTORECALL` | `true` | Injeção proativa dos top-3 fatos no modo `index` (veja acima) |
+| `CHATCLI_MEMORY_MODE` | `index` | Modo de injeção em todos os modos (chat, agent, coder): `index` (pull), `full` (push) ou `off` |
+| `CHATCLI_MEMORY_AUTORECALL` | `true` | Injeção proativa dos top-3 fatos + linha `Related (graph):` no modo `index` (veja acima) |
+| `CHATCLI_MEMORY_GRAPH` | `true` | Cache persistido do grafo de conhecimento (`graph.json`) + expansão de vizinhança no recall; `off` restaura a derivação por chamada, sem expansão |
+| `CHATCLI_GRAPH_INDEX` | `true` | Injeção por turno do card map-of-content do grafo (o pull via `@memory map`/`neighbors` fica sempre disponível) |
+| `CHATCLI_CHAT_MEMORY` | `true` | Exceção da ferramenta de memória no chat — o caminho de pull que permite ao chat honrar o modo `index` |
 | `CHATCLI_MEMORY_MAX_SIZE` | `32768` (32KB) | Tamanho máximo do MEMORY.md renderizado |
 | `CHATCLI_MEMORY_RETENTION_DAYS` | `30` | Dias de retencao de notas diarias antes da limpeza |
 | `CHATCLI_MEMORY_MAX_FACTS` | `500` | Número máximo de fatos no FactIndex |
@@ -501,7 +508,7 @@ Dentro do `/agent` e `/coder`, o modelo pode persistir e explorar memória sozin
 
 Assim, quando você conta uma novidade ao agente (ex.: uma certificação nova), ele a grava no seu perfil/fatos de longo prazo sem você precisar rodar `/memory` manualmente. O subcomando `profile` aceita todas as operações de ciclo de vida (`goals_done`, `goals_replace`, `stance`, `milestone`, `env_*`, `sensitive_mark`, ...).
 
-**No chat também**: atualização de memória/perfil é a **quarta exceção sancionada** do chat tool-less (junto de `ask_user`, knowledge read-only e `@graphview`). Quando você revela ou corrige um fato durável sobre si, o modelo persiste **no mesmo turno** — nada de "vou considerar daqui pra frente" sem gravar. Controlada por `CHATCLI_CHAT_MEMORY` (**ligada por padrão**) e alternável com `/config chat memory on|off`.
+**No chat também**: atualização de memória/perfil é a **quarta exceção sancionada** do chat tool-less (junto de `ask_user`, knowledge read-only e `@graphview`). Quando você revela ou corrige um fato durável sobre si, o modelo persiste **no mesmo turno** — nada de "vou considerar daqui pra frente" sem gravar. A exceção também carrega o **lado de leitura**: é o caminho de pull que permite ao chat honrar o modo de memória `index` (digest compacto + recall sob demanda) e receber os blocos proativos de auto-recall, session recall e o card do grafo. Controlada por `CHATCLI_CHAT_MEMORY` (**ligada por padrão**) e alternável com `/config chat memory on|off` — desabilitar reverte o chat ao modelo full-push de memória.
 
 ### Memória episódica: a linha do tempo de trabalho
 
@@ -520,13 +527,15 @@ Fatos capturam o que é **verdade**; episódios capturam o que **aconteceu**. Um
 
 #### Grafo de conhecimento (`@memory neighbors` / `map`)
 
-O que o ChatCLI sabe sobre você não é uma lista plana: facts, tópicos, projetos, skills e tags formam um **grafo derivado on-demand** (estilo Obsidian, no core) a partir das relações que os stores já guardam (tópico↔fato, fato→projeto, tags, triggers de skill) mais `[[wikilinks]]` no texto. Acesso pelo próprio `@memory`:
+O que o ChatCLI sabe sobre você não é uma lista plana: facts, tópicos, projetos, skills, tags — e, desde o grafo persistido, **episódios, sessões salvas e knowledge bases** — formam um grafo (estilo Obsidian, no core) a partir das relações que os stores já guardam (tópico↔fato, fato→projeto, episódio↔projeto, episódio↔fatos do mesmo dia, sessão↔projeto, sessão↔episódio, KB↔tags, triggers de skill) mais `[[wikilinks]]` no texto. Acesso pelo próprio `@memory`:
 
-- `recall` → busca por **conteúdo** ("quais fatos casam com estas palavras?").
+- `recall` → busca por **conteúdo** ("quais fatos casam com estas palavras?") — a saída agora termina com uma seção `## Related (graph)` de vizinhos a um hop.
 - `neighbors <assunto>` → **grafo local**: backlinks + notas conectadas de um assunto ("o que está ligado a isto?").
+
+**O grafo é um cache persistido**, não uma derivação por chamada: vive em `~/.chatcli/memory/graph.json` e só reconstrói quando uma fonte realmente muda (um fato aprendido ou esquecido, uma sessão salva, uma skill instalada, um contexto criado — por você ou pelo modelo via tools). No próximo boot o cache é adotado instantaneamente, então `@memory map` e o card por turno custam nada. O arquivo é auto-curável: cópia corrompida ou stale é descartada e re-derivada. Gate: `CHATCLI_MEMORY_GRAPH` (**on** por padrão; `off` restaura o comportamento antigo de derivar por chamada, sem expansão no recall). Contagem de nós/arestas visível em `/config memory`.
 - `map` → visão geral (contagens por tipo + hubs).
 
-Disciplina de contexto: por turno entra só um *index card* minúsculo e determinístico (cache-friendly); a profundidade é puxada sob demanda. Para visualizar, use [`/graph`](#) (renderiza o grafo em imagem via go-graphviz embarcado).
+Disciplina de contexto: por turno entra só um *index card* minúsculo e determinístico (cache-friendly); a profundidade é puxada sob demanda. Para visualizar, use `/graph` (renderiza o grafo em imagem via go-graphviz embarcado).
 
 #### Qualidade dos fatos (confiança, proveniência, reconciliação)
 
