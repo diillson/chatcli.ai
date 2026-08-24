@@ -1,303 +1,246 @@
 ---
 title: "Cost Tracking"
 sidebarTitle: "Cost Tracking"
-description: "Track token costs and price estimates per session across all modes, with real API data and configurable budgets"
+description: "Track token costs and price estimates per session across all modes, with real API data, budgets, persistence and /cost subcommands"
 icon: "money-bill-trend-up"
 ---
 
-ChatCLI's **Cost Tracking** monitors token consumption and estimates costs in real time during your sessions, with real API usage data when available. You can track how much each conversation is costing, view costs by model/provider, and configure spending limits.
+ChatCLI's **Cost Tracking** monitors token consumption and estimates costs in real time during your sessions, using real API usage data from every provider that reports it. You can inspect the live session with `/cost`, close and restart the accounting period with `/cost reset`, review past sessions with `/cost last` and `/cost sessions`, export machine-readable snapshots with `/cost export`, and configure spending limits — including an optional hard stop.
 
 ---
 
 ## The /cost Command
 
-The `/cost` command displays a comprehensive summary of token consumption and estimated costs for the current session:
+`/cost` renders the live session summary; four subcommands manage the accounting period:
 
-```bash
-/cost
-```
+| Command | What it does |
+|:--------|:-------------|
+| `/cost` | Live session summary: tokens, cache, per-model costs, budget |
+| `/cost reset` | Close and persist the current period, start a fresh one at zero |
+| `/cost last` | Show the previous persisted snapshot (also accepted: `--last`, `-l`) |
+| `/cost sessions` | List recent persisted snapshots, most recent first |
+| `/cost export [path]` | Write the current snapshot as JSON (defaults into the cost store) |
+
+The summary is rendered as a boxed panel (values below are self-consistent for `claude-sonnet-5`):
 
 ```text
-Session Cost Summary
-====================
-
-Tokens Used:
-  Input:    45.2K tokens
-  Output:   12.8K tokens
-  Cache:    38.1K tokens (cached)
-  Total:    58.0K tokens
-
-Estimated Cost:
-  Input:    $0.1356
-  Output:   $0.1920
-  Cache:    -$0.0914 (savings)
-  ─────────────────────
-  Total:    $0.2362
-
-Model: claude-sonnet-4-6 (Anthropic)
-Requests: 14
-Duration: 23m 15s
+╭─ $ Session cost ─────────────────────────────────────
+│  Provider:  CLAUDEAI
+│  Model:     claude-sonnet-5
+│  Duration:  23m15s
+│  Requests:  14
+│  Source:    API usage data
+│
+│  Tokens:
+│    Input:    45.2K   ████████████████████
+│    Output:   12.8K   █████
+│    Total:    58.0K
+│
+│  Cache Tokens:
+│    Created:  2.1K
+│    Read:     38.1K   (~ $0.1029 saved vs uncached)
+│
+│  Cost:
+│    claudeai/claude-sonnet-5: (API)
+│      Input:   $0.1356
+│      Output:  $0.1920
+│      Cache:   $0.0193
+│
+│    Total:   $0.3469
+╰──────────────────────────────────────────────────────
 ```
 
 <Info>
-When the provider returns real token usage data (`Usage.IsReal = true`), costs are calculated with precision. For providers that do not return real usage, ChatCLI estimates tokens from text size.
+The **Source** row reports whether the session has real API usage; each model line in the cost breakdown additionally carries its own tag — `(API)` for provider-reported counts, `(estimate)` for character-based estimation — because one session can mix both. Reasoning tokens (o-series / GPT-5 / Gemini thinking) get their own informational line when present; they are already billed inside Output.
 </Info>
+
+Models that matched **no pricing table entry** are not silently dropped: `/cost` lists them explicitly (`No pricing table for: provider/model — this spend is NOT in the total.`), so an under-reported total is always visible as such.
 
 ---
 
-## Token Tracking by Mode
+## Real API Data — Provider Coverage
 
-ChatCLI tracks tokens across all interaction modes:
+The tracker prefers real usage from the provider's response and falls back to a character estimate (`chars/4`, marked `IsReal=false`) only when the provider reports nothing:
 
-<Tabs>
-  <Tab title="Chat Mode">
-    In chat mode, tracking counts:
-    - System prompt tokens (bootstrap + memory + contexts)
-    - Tokens for each user message
-    - Tokens for each assistant response
-    - Cache savings (when applicable)
+| Provider | Real usage | Notes |
+|:---------|:-----------|:------|
+| OpenAI (Chat Completions, streaming, Responses API, Assistants) | ✅ | `stream_options: {include_usage: true}` on streams; `response.completed` on Responses; cached + reasoning details |
+| Anthropic (API key and OAuth, buffered, stream and tool paths) | ✅ | Cache creation/read tokens; per-client state, no cross-attribution between parallel clients |
+| AWS Bedrock (InvokeModel, Converse, OpenAI-compatible family, Mantle endpoint) | ✅ | Converse reports typed `TokenUsage` including cache read/write |
+| Google Gemini | ✅ | Also captures `cachedContentTokenCount` (cache) and `thoughtsTokenCount` (reasoning) |
+| xAI, Z.AI, MiniMax, Moonshot, Copilot, GitHub Models | ✅ | Buffered and native tool paths |
+| OpenRouter | ✅ | Also records `usage.cost` — the **actually billed amount**, authoritative over local tables |
+| Ollama, StackSpot | ✅ (tokens) | Real token counts, cost $0 by design (unmetered backends) |
+| Devin CLI | — | The binary reports no usage; tokens are estimated, cost is $0 (spend lives in the Cognition subscription) |
+| Fallback chain | ✅ | Usage is forwarded from — and attributed to — the entry that actually served the request |
 
-    ```text
-    [chat] claude-sonnet-4-6> /cost
-    Chat mode: 12 messages, 23.4K tokens, ~$0.08
-    ```
-  </Tab>
-  <Tab title="Agent Mode">
-    In agent mode, tracking additionally includes:
-    - Tokens for each tool call (request + response)
-    - ReAct loop tokens (reasoning + action + observation)
-    - Dispatched worker tokens (multi-agent)
-    - Web tool tokens (webfetch/websearch)
+### Modes covered
 
-    ```text
-    [agent] claude-sonnet-4-6> /cost
-    Agent mode: 8 turns, 45.2K tokens, ~$0.24
-      Tool calls: 23 (read: 12, exec: 5, write: 4, search: 2)
-    ```
-  </Tab>
-  <Tab title="Coder Mode">
-    In coder mode, tracking is similar to agent with additional details:
-    - Tokens per edited file
-    - Tokens for applied patches
-    - Tokens for test execution
+Every LLM call a session makes is accounted for and attributed to the model that actually served it (skill hints and `@model` route overrides included):
 
-    ```text
-    [coder] claude-sonnet-4-6> /cost
-    Coder mode: 5 turns, 67.8K tokens, ~$0.35
-      Files modified: 8
-      Tests executed: 3
-    ```
-  </Tab>
-</Tabs>
+- **Chat** — streaming, buffered, and the `/ask` tool-exception path
+- **Agent / Coder** — every ReAct turn, plus **dispatched workers/subagents** (each worker's client is decorated with a usage tally; the sum is recorded under the worker's own provider+model)
+- **MoA panels** — native-tools, XML and plain paths, attributed per participant
+- **One-shot (`-p`)**, **RPC/Gateway/ACP** turns and **scheduled runs** (the scheduler receives real token and cost figures back)
 
 ---
 
 ## Pricing Tables
 
-ChatCLI knows the prices of the most common models for calculating estimates:
+Prices in USD per 1M tokens, matching `cli/cost_tracker.go` (pinned by `cost_tracker_pricing_test.go`). Matching is by model-id substring, most specific first.
 
-### Anthropic
+### Anthropic (cache write = 1.25× input, cache read = 10% of input)
 
-| Model | Input (per 1M tokens) | Output (per 1M tokens) | Cache Read |
-|:------|:---------------------|:----------------------|:-----------|
-| claude-fable-5 | $10.00 | $50.00 | $1.00 |
-| claude-sonnet-5 | $3.00 | $15.00 | $0.30 |
-| claude-opus-4-8 | $5.00 | $25.00 | $0.50 |
-| claude-opus-4-8 (`ANTHROPIC_SPEED=fast`) | $10.00 | $50.00 | $1.00 |
-| claude-opus-4-7 | $5.00 | $25.00 | $0.50 |
-| claude-sonnet-4-6 | $3.00 | $15.00 | $0.30 |
-| claude-opus-4 | $15.00 | $75.00 | $1.50 |
-| claude-haiku-3.5 | $0.80 | $4.00 | $0.08 |
+| Model | Input | Output |
+|:------|:------|:-------|
+| claude-fable-5 | $10.00 | $50.00 |
+| claude-opus-5 | $5.00 | $25.00 |
+| claude-opus-4-5 / 4-6 / 4-7 / 4-8 | $5.00 | $25.00 |
+| claude-opus (3 / 4.0 / 4.1 legacy) | $15.00 | $75.00 |
+| claude-sonnet (all) | $3.00 | $15.00 |
+| claude-haiku-4-5 | $1.00 | $5.00 |
+| claude-haiku (legacy) | $0.25 | $1.25 |
 
-### OpenAI
+### OpenAI (cache read = 50% of input, no write surcharge)
 
-| Model | Input (per 1M tokens) | Output (per 1M tokens) | Cache Read |
-|:------|:---------------------|:----------------------|:-----------|
-| gpt-4o | $2.50 | $10.00 | $1.25 |
-| gpt-4o-mini | $0.15 | $0.60 | $0.075 |
-| o3-mini | $1.10 | $4.40 | $0.55 |
+| Model | Input | Output |
+|:------|:------|:-------|
+| gpt-5.6 (Sol / family alias) | $5.00 | $30.00 |
+| gpt-5.6-terra | $2.00 | $12.00 |
+| gpt-5.6-luna | $0.20 | $1.20 |
+| gpt-4.1 | $2.00 | $8.00 |
+| gpt-4o | $2.50 | $10.00 |
+| gpt-4o-mini | $0.15 | $0.60 |
+| gpt-4-turbo | $10.00 | $30.00 |
+| gpt-4 | $30.00 | $60.00 |
+| gpt-3.5 | $0.50 | $1.50 |
+| o3-mini / o4-mini | $1.10 | $4.40 |
+| o3 | $10.00 | $40.00 |
+| o1-mini | $3.00 | $12.00 |
+| o1 | $15.00 | $60.00 |
 
-<Note>
-**GPT models surface usage in the chat envelope too**, with the same `N↑ M↓` arrows the Claude flow has used since launch. ChatCLI sends `stream_options: {include_usage: true}` on streaming Chat Completions and parses `response.completed` on the Responses API, so input/output (and cache-hit) counts appear on the envelope regardless of provider. Cached prompt tokens reported under `prompt_tokens_details.cached_tokens` (Chat Completions) / `input_tokens_details.cached_tokens` (Responses) map to `CacheReadInputTokens`, the same field Anthropic prompt caching feeds. Reasoning tokens (o-series / GPT-5) are surfaced under a separate `ReasoningTokens` informational field — they're already counted in `CompletionTokens` and billed as output.
-</Note>
+### Google (cache read = 25% of input)
 
-### Google
-
-| Model | Input (per 1M tokens) | Output (per 1M tokens) |
-|:------|:---------------------|:----------------------|
-| gemini-2.0-flash | $0.10 | $0.40 |
+| Model | Input | Output |
+|:------|:------|:-------|
+| gemini-3.7-flash / 3.6-flash (intro pricing through Dec 2026) | $0.75 | $3.75 |
+| gemini-3.5-flash | $1.50 | $9.00 |
+| gemini-3.5-flash-lite | $0.30 | $2.50 |
+| gemini-3.1-pro / gemini-3 | $2.00 | $12.00 |
+| gemini-3.1-flash-lite | $0.25 | $1.50 |
+| gemini-3-flash | $0.50 | $3.00 |
 | gemini-2.5-pro | $1.25 | $10.00 |
+| gemini-2.5-flash | $0.30 | $2.50 |
+| gemini-2.5-flash-lite | $0.10 | $0.40 |
+| gemini-2.0 | $0.075 | $0.30 |
+| gemini-1.5-pro | $1.25 | $5.00 |
+| gemini-1.5-flash | $0.075 | $0.30 |
 
-### ZAI (Zhipu AI)
+### xAI (Grok)
 
-| Model | Input (per 1M tokens) | Output (per 1M tokens) |
-|:------|:---------------------|:----------------------|
-| glm-5.2 | $1.40 | $4.40 |
+| Model | Input | Output |
+|:------|:------|:-------|
+| grok-4.6 / grok-4.5 | $2.00 | $6.00 |
+| grok-4.3 / grok-4.20 | $1.25 | $2.50 |
+| grok-build | $1.00 | $2.00 |
+| grok-3 | $3.00 | $15.00 |
+| grok-2 | $2.00 | $10.00 |
+| grok (generic) | $5.00 | $15.00 |
+
+### Z.AI (GLM)
+
+| Model | Input | Output |
+|:------|:------|:-------|
+| glm-5.2 / glm-5.1 | $1.40 | $4.40 |
+| glm-5-turbo / glm-5v-turbo | $1.20 | $4.00 |
 | glm-5 | $1.00 | $3.20 |
-| glm-4.x (ZAI fallback) | $0.50 | $0.50 |
+| glm-4.x and other Z.AI ids | $0.50 | $0.50 |
 
-### MiniMax
+### DeepSeek (peak price; cache read = 25% of input)
 
-| Model | Input (per 1M tokens) | Output (per 1M tokens) |
-|:------|:---------------------|:----------------------|
-| MiniMax-M2.7 | $0.30 | $1.20 |
-| MiniMax-M2.5 | $0.30 | $1.20 |
-| MiniMax-Text-01 | $0.30 | $1.20 |
+| Model | Input | Output |
+|:------|:------|:-------|
+| deepseek-v4-pro | $1.32 | $3.96 |
+| deepseek-v4 | $0.44 | $1.32 |
+| deepseek-r1 / deepseek-reasoner | $0.55 | $2.19 |
+| deepseek (generic) | $0.27 | $1.10 |
 
-### Moonshot (Kimi)
+### Moonshot (Kimi) — cache-miss price, cache read = 17% of input
 
-| Model | Input (per 1M tokens) | Output (per 1M tokens) | Cache Read |
-|:------|:---------------------|:----------------------|:-----------|
-| kimi-k2.6 | $0.95 | $4.00 | $0.16 |
-| kimi-k2.5 | $0.95 | $4.00 | $0.16 |
-| moonshot-v1-* | $0.95 | $4.00 | $0.16 |
+| Model | Input | Output |
+|:------|:------|:-------|
+| kimi-k3 | $3.00 | $15.00 |
+| kimi-k2.7-code-highspeed | $1.90 | $8.00 |
+| kimi / moonshot (generic, incl. k2.7-code, k2.6) | $0.95 | $4.00 |
 
-<Note>
-The ChatCLI cost tracker bills the **cache-miss price** ($0.95/M input) to stay conservative. The cache hit ($0.16/M) is an automatic API saving when the same prefix is reused within the provider's window — not tracked at runtime.
-</Note>
+### Others
 
-### DeepSeek
-
-| Model | Input (per 1M tokens) | Output (per 1M tokens) | Cache Read |
-|:------|:---------------------|:----------------------|:-----------|
-| deepseek-chat | $0.27 | $1.10 | $0.07 |
-| deepseek-reasoner | $0.55 | $2.19 | $0.14 |
-
-### OpenRouter
-
-| Model | Input (per 1M tokens) | Output (per 1M tokens) |
-|:------|:---------------------|:----------------------|
-| openai/gpt-4o | $2.50 | $10.00 |
-| openai/gpt-4o-mini | $0.15 | $0.60 |
-| anthropic/claude-sonnet-4 | $3.00 | $15.00 |
-| google/gemini-2.5-flash | $0.15 | $0.60 |
-| deepseek/deepseek-r1 | $0.55 | $2.19 |
+| Provider | Pricing |
+|:---------|:--------|
+| MiniMax | $0.20 input / $1.10 output (flat) |
+| GitHub Copilot | $2.50 / $10.00 (flat, model-independent) |
+| OpenRouter | Re-dispatched to the underlying family (claude/gpt/gemini/deepseek), plus flat rates for llama ($0.20/$0.20), mistral ($0.20/$0.60), qwen ($0.15/$0.15) — and **overridden by the billed `usage.cost`** whenever the response carries it |
+| Ollama, StackSpot, Devin | $0 — unmetered from ChatCLI's viewpoint |
 
 <Tip>
-Prices are updated periodically in ChatCLI releases. For unlisted models or custom providers (via OpenAI-compatible), the cost shows as "N/A". OpenRouter provides prices via API -- ChatCLI uses its pricing ConfigMap to estimate costs for the most popular models.
+Prices are updated in ChatCLI releases and pinned by tests. An unlisted model is reported as **unpriced** in `/cost` (never silently zero), and OpenRouter's billed cost covers its long tail regardless of the local tables.
 </Tip>
 
 ---
 
-## Visual Display
+## Cache Accounting
 
-ChatCLI uses visual indicators for easy tracking:
+Cache tokens are priced per family — and, crucially, with the correct **semantics** per provider:
 
-### Token Format
+- **Anthropic / Bedrock Anthropic** report cache tokens *alongside* `input_tokens` (additive): write is billed at 1.25× input, read at 10%.
+- **OpenAI, Gemini, DeepSeek, Moonshot** report cache reads as a *subset* of the prompt count: the cached slice is carved out of the input and billed once at the discounted rate — never full price plus discount.
 
-Tokens are displayed with K/M suffixes for readability:
-
-| Value | Display |
-|:------|:--------|
-| 1,234 | `1.2K` |
-| 45,678 | `45.7K` |
-| 1,234,567 | `1.2M` |
-
-### Context Progress Bar
-
-When context approaches the model limit, a progress bar indicates utilization:
-
-```text
-Context: ████████░░░░░░░░ 52% (104K / 200K tokens)
-```
-
-<Warning>
-When context usage exceeds 80%, ChatCLI automatically suggests running `/compact` to free up space and reduce costs.
-</Warning>
-
----
-
-## Cache Savings
-
-ChatCLI optimizes costs using prompt caching when the provider supports it:
-
-```text
-Cache Savings:
-  System prompt cached: 38.1K tokens
-  Savings this session: $0.09 (38% reduction)
-  Cache hit rate: 92%
-```
-
-### Cache Tokens (Anthropic)
-
-ChatCLI tracks Anthropic-specific cache tokens:
-
-| Metric | Description |
-|:-------|:-----------|
-| `CacheCreationTokens` | Tokens used to create cache entries |
-| `CacheReadTokens` | Tokens read from cache (reduced cost) |
-
-The cache read cost is typically 10% of the normal input cost, resulting in significant savings in long conversations with large system prompts.
-
-<Info>
-Cache savings are calculated based on the difference between the normal input price and the cache read price. See [Bootstrap and Memory](/features/bootstrap-memory) for details on context optimization.
-</Info>
-
----
-
-## Real API Data
-
-The CostTracker supports two data sources:
-
-| Source | Precision | When Used |
-|:-------|:---------|:----------|
-| **Real API data** | High | Provider returns `Usage` in response |
-| **Character-based estimate** | Approximate | Provider does not return usage data |
-
-When the provider returns real data (`HasRealData = true`), tracking uses exact token counts. This is supported by 13+ providers including Anthropic, OpenAI, ZAI, MiniMax, DeepSeek, and OpenRouter.
-
-### Per-Model Cost
-
-In sessions with multiple models (e.g., fallback chain), `/cost` shows a breakdown by model:
-
-```text
-Per-Model Breakdown:
-  anthropic:claude-sonnet-4-6    32 reqs   $0.1845  (real data)
-  openai:gpt-4o-mini              5 reqs   $0.0023  (real data)
-```
+The `Cache Tokens` block shows the real dollar savings of the session (`~ $X saved vs uncached`), computed from each model's actual cache-read discount — not a fixed percentage.
 
 ---
 
 ## Session Persistence
 
-Cost data is persisted to disk so it can be consulted after the session ends:
+Cost data is written through to disk as the session runs (throttled, atomic writes):
 
 ```text
-~/.chatcli/sessions/<session_id>/cost.json
+~/.chatcli/costs/<start-timestamp>-<pid>.json
 ```
 
-The file contains the complete snapshot (`SessionCostData`) with per-model usage, costs, and timestamps.
+The snapshot (`SessionCostData`) carries per-model usage records, totals, timestamps and the bound session name when one is set. Snapshots are also saved on shutdown and on `/cost reset`, and pruned after **90 days**.
+
+- `/cost last` — the previous session's (or period's) spend
+- `/cost sessions` — the 10 most recent snapshots with date, requests, tokens and total
+- `/cost export [path]` — current snapshot as JSON, for pipelines and audits
 
 ---
 
 ## Session Budget
 
-Configure a spending limit per session to avoid unexpected costs:
-
 | Environment Variable | Description | Default |
 |:--------------------|:-----------|:--------|
 | `CHATCLI_SESSION_BUDGET_USD` | Maximum spending limit per session in USD | 0 (no limit) |
-| `CHATCLI_BUDGET_WARNING_PCT` | Percentage threshold for budget proximity warning | 0.80 (80%) |
+| `CHATCLI_BUDGET_WARNING_PCT` | Fraction of the limit at which the warning fires | 0.80 (80%) |
+| `CHATCLI_BUDGET_HARD_STOP` | Refuse new LLM turns once the limit is exhausted | false |
+
+All three are re-read on `/reload` — no restart needed to change a budget mid-session.
 
 ### Budget Levels
 
 | Level | Condition | Behavior |
 |:------|:---------|:---------|
-| `BudgetOK` | Spending below 80% of the limit | Normal |
-| `BudgetWarning` | Spending between 80-100% of the limit | Warning displayed |
-| `BudgetExceeded` | Spending above the limit | Session may be limited |
+| `BudgetOK` | Below the warning threshold | Normal |
+| `BudgetWarning` | Between warning threshold and the limit | One-shot notice printed the turn the threshold is crossed |
+| `BudgetExceeded` | At or above the limit | One-shot notice; with hard stop armed, new turns are refused |
+
+The notice is **proactive**: chat, agent and coder print it on the turn the session crosses a level — you don't have to remember to run `/cost`. Without `CHATCLI_BUDGET_HARD_STOP`, exceeding the budget never interrupts the session; with it, new turns (chat, agent loop, RPC/gateway) are blocked until the limit is raised or `/cost reset` starts a new period.
 
 ```bash
-# Example: limit session to $5.00
+# Limit the session to $5.00, warn at 70%, block once exhausted
 export CHATCLI_SESSION_BUDGET_USD=5.00
-
-# Warn when reaching 70% of the limit
 export CHATCLI_BUDGET_WARNING_PCT=0.70
+export CHATCLI_BUDGET_HARD_STOP=true
 ```
-
-<Warning>
-When the budget is exceeded, ChatCLI displays a warning but **does not automatically terminate the session**. The user can decide to continue or end it.
-</Warning>
 
 ---
 
@@ -310,10 +253,10 @@ When the budget is exceeded, ChatCLI displays a warning but **does not automatic
   <Card title="One-Shot Mode" icon="terminal" href="/features/non-interactive-mode">
     Monitor costs in automated pipelines.
   </Card>
-  <Card title="Tool Results" icon="database" href="/features/tool-result-management">
-    Tool result budgets that impact token usage.
+  <Card title="Token Efficiency" icon="gauge-high" href="/features/token-efficiency">
+    The optimizations /cost lets you verify.
   </Card>
-  <Card title="Context Recovery" icon="life-ring" href="/features/context-recovery">
-    Automatic strategies when context overflows.
+  <Card title="Model Routing" icon="route" href="/features/model-routing">
+    Per-model attribution of every routed turn.
   </Card>
 </CardGroup>
