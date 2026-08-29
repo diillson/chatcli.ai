@@ -1,0 +1,132 @@
+---
+title: "Task Graph"
+sidebarTitle: "Task Graph"
+description: "Execute um plano multi-task aprovado como um DAG verificado: squad workers paralelos por task, gates de validação executados pelo próprio engine e o veredito de um reviewer independente antes de qualquer coisa contar como done — com dashboard live no browser."
+icon: "diagram-project"
+---
+
+O **Task Graph** transforma um plano aprovado em um DAG persistido executado por [squad workers](/pt/features/agent-squad) paralelos — com uma regra inegociável: **done nunca é a autodeclaração do executor**.
+
+```text
+plano → task graph → execução paralela → gate do engine → review independente → done | retry
+```
+
+Com vários agentes em paralelo, uma task erroneamente autodeclarada como concluída libera as dependentes sobre uma premissa falsa. O task graph torna a verificação estrutural em vez de narrativa: o orquestrador é código Go determinístico (não um LLM), os comandos de validação são executados pelo próprio engine, e o veredito vem de um **reviewer worker de contexto limpo** que nunca compartilha contexto com o executor.
+
+---
+
+## Quando usar
+
+| Situação | Ferramenta certa |
+|---|---|
+| 1–4 tasks, ou trabalho estritamente serial | Workers via `agent_call` direto ou o [playbook do squad](/pt/features/agent-squad) |
+| **5+ tasks com independência real**, plano aprovado, entregável verificável | **`@taskgraph`** — o paralelismo paga o overhead de orquestração |
+
+A [skill](/pt/features/builtin-skills) embutida `task-graph` ensina ao modelo essa régua, o schema do plano e a disciplina ("você nunca declara done").
+
+---
+
+## O schema do plano
+
+Um único objeto JSON descreve a entrega inteira:
+
+```json
+{
+  "name": "feature-x",
+  "require_review": true,
+  "phases": [{"id": "F1", "title": "Server"}, {"id": "F2", "title": "Client"}],
+  "tasks": [
+    {"id": "T1", "phase": "F1", "title": "Add /foo endpoint", "agent": "coder",
+     "prompt": "Implement GET /foo in server/handler.go returning ...",
+     "validation": [{"run": "go test ./server/...", "expect": "all green, includes a /foo case"}]},
+    {"id": "T2", "phase": "F2", "title": "CLI client", "deps": ["T1"],
+     "prompt": "Add the /foo client call. Server contract: #T1",
+     "validation": [{"run": "go build ./...", "expect": "builds clean"}]}
+  ]
+}
+```
+
+- `deps` só pode referenciar tasks declaradas **antes** (o que também elimina ciclos).
+- `prompt` precisa ser autocontido — workers não veem a conversa. `#<depID>` é substituído pelo output daquela dependência.
+- Os comandos de `validation[].run` são executados pelo **engine** (herdando o [sandbox do coder](/pt/features/coder-security) e a denylist de comandos perigosos) — nunca pelo executor. `expect` é prosa para o reviewer. Uma string simples vale como contrato só-prosa (o reviewer verifica por inspeção).
+- `agent` tem default `coder` (qualquer worker type do squad funciona); `max_attempts` default 3; `require_review` default **true**, por grafo ou por task.
+
+---
+
+## Execução: ready-set scheduling
+
+Tasks disparam no instante em que suas dependências concluem — sem barreiras de nível, sem wall-clock desperdiçado. A concorrência é limitada pela env já existente do squad, `CHATCLI_AGENT_MAX_WORKERS` (o `max_parallel` do próprio grafo pode reduzi-la); **nenhuma variável de ambiente nova** foi adicionada para essa feature.
+
+Cada task passa por um loop de tentativas:
+
+1. **Checkpoint** — um [snapshot shadow-git](/pt/features/coder-plugin#checkpoints) do workspace, best-effort, antes do executor começar.
+2. **Executor** — um worker fresco recebe o prompt (mais o feedback do reviewer nos retries).
+3. **Gate** — o engine executa ele mesmo cada comando de `validation[].run` e grava a saída; exit diferente de zero falha a tentativa sem gastar reviewer.
+4. **Review** — um `reviewer` worker fresco (ferramentas read-only) recebe o contrato, as saídas do gate e o relato do executor, e precisa terminar com `VERDICT: PASS — evidência` ou `VERDICT: FAIL — o que falta`.
+5. **Promoção ou retry** — gate verde + PASS promove a `done` com a evidência gravada; FAIL repete com o feedback injetado, até `max_attempts`, quando a task falha e suas sucessoras ficam `blocked`.
+
+O engine **recusa**: ciclos de dependência, iniciar task com deps não satisfeitas, promover sem gate + veredito quando o review é exigido, e reviewer = executor (cada um é um dispatch distinto — os dois run IDs ficam gravados na tentativa como prova).
+
+Estados: `pending → running → reviewing → done | failed | blocked`.
+
+Cada tentativa também carrega seu **custo real**: cada chamada LLM de worker é atribuída ao nó do grafo que a originou, com a mesma contabilidade por chamada do [cost tracking](/pt/features/cost-tracking).
+
+---
+
+## Superfícies
+
+### `@taskgraph` (para a IA)
+
+```json
+{"cmd":"run","args":{"graph":{...}}}   // planeja + executa em uma chamada (streama progresso)
+{"cmd":"run","args":{"id":"tg-..."}}   // executa/retoma um plano persistido
+{"cmd":"plan","args":{"graph":{...}}}  // valida + persiste apenas
+{"cmd":"status"}                       // status por task, tentativas, vereditos, custo
+{"cmd":"show","args":{"task":"T3"}}    // uma task completa: saídas do gate, evidência, run ids
+{"cmd":"retry","args":{"task":"T3"}}   // reabre uma task falha (+1 tentativa) e retoma
+{"cmd":"cancel"}                       // para a run ativa
+{"cmd":"list"}                         // runs persistidas
+{"cmd":"dash"}                         // serve a dashboard live, retorna a URL
+```
+
+`run` executa o grafo inteiro em uma única tool call, streamando eventos conforme acontecem. Resume é inerente: tasks concluídas ficam done, então re-executar um grafo que falhou continua de onde parou.
+
+### `/taskgraph` (para humanos)
+
+```bash
+/taskgraph status [id]     # status por task, vereditos, custo
+/taskgraph show T3 [id]    # uma task: tentativas, saídas do gate, evidência
+/taskgraph list            # runs persistidas
+/taskgraph dash [id]       # abre a dashboard live no browser
+/taskgraph cancel          # para a run ativa
+```
+
+`/taskgraph` é permitido como **side command mid-run** — digite enquanto o grafo executa para inspecionar o progresso sem tocar no loop do orquestrador.
+
+---
+
+## A dashboard live
+
+`/taskgraph dash` (ou `{"cmd":"dash"}`) serve uma dashboard no browser a partir de uma porta efêmera em `127.0.0.1` — um único arquivo embarcado, zero CDN, zero configuração:
+
+- **Canvas de DAG animado** — swimlanes por fase, béziers de dependência com traços animados nas tasks em execução, cards coloridos por status com contagem de tentativas e custo por task; arraste para pan, ctrl/⌘+scroll para zoom, `0` para ajustar, highlight de linhagem no hover.
+- **Popovers de evidência** — clique numa task para ver prompt, contrato de validação, saídas do gate, veredito + evidência do reviewer e os run IDs de executor e reviewer.
+- **Aba Results** — critical path, wall-clock vs tempo de agente, fator de paralelismo e o custo real por task.
+- **Live** — a página consulta o estado persistido a cada segundo e acompanha o feed de eventos.
+
+O servidor é **estritamente read-only**: lê `state.json` e `events.ndjson` do disco a cada request. Fechar a dashboard nunca afeta uma run, e runs finalizadas renderizam igualmente bem.
+
+---
+
+## Persistência
+
+Cada run possui `~/.chatcli/taskgraph/<runID>/`:
+
+| Arquivo | Papel |
+|---|---|
+| `state.json` | O grafo completo, escrito atomicamente a cada transição (arquivos corrompidos são quarentenados, nunca sobrescritos) |
+| `events.ndjson` | Trilha de auditoria append-only — também o feed da dashboard |
+
+As runs aparecem em `/agents` (e no [Conversation Hub](/pt/features/conversation-hub)) como uma run-mãe com cada executor e reviewer registrados como filhos — o cancelamento propaga pela árvore.
+
+<Tip>O task graph foi inspirado na disciplina executor ≠ reviewer das skills de orquestração em grafo: autodeclaração não é veredito. No ChatCLI o orquestrador é código determinístico nativo, então o grafo, os gates e a promoção a done ficam estruturalmente fora do alcance de alucinação do modelo.</Tip>

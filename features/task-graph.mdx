@@ -1,0 +1,132 @@
+---
+title: "Task Graph"
+sidebarTitle: "Task Graph"
+description: "Execute an approved multi-task plan as a verified DAG: parallel squad workers per task, validation gates the engine runs itself, and an independent reviewer verdict before anything counts as done — with a live browser dashboard."
+icon: "diagram-project"
+---
+
+The **Task Graph** turns an approved plan into a persisted DAG executed by parallel [squad workers](/features/agent-squad) — with one non-negotiable rule: **done is never the executor's self-report**.
+
+```text
+plan → task graph → parallel execution → engine-run gate → independent review → done | retry
+```
+
+With several agents working in parallel, a task wrongly self-declared as complete unblocks its dependents on a false premise. The task graph makes verification structural instead of narrative: the orchestrator is deterministic Go code (not an LLM), the validation commands are executed by the engine itself, and the verdict comes from a **fresh reviewer worker** that never shares context with the executor.
+
+---
+
+## When to use it
+
+| Situation | Right tool |
+|---|---|
+| 1–4 tasks, or strictly serial work | Direct `agent_call` workers or the [squad playbook](/features/agent-squad) |
+| **5+ tasks with real independence**, an approved plan, a verifiable deliverable | **`@taskgraph`** — the parallelism pays for the orchestration overhead |
+
+The embedded `task-graph` [skill](/features/builtin-skills) teaches the model this ruler, the plan schema and the discipline ("you never declare done").
+
+---
+
+## The plan schema
+
+One JSON object describes the whole delivery:
+
+```json
+{
+  "name": "feature-x",
+  "require_review": true,
+  "phases": [{"id": "F1", "title": "Server"}, {"id": "F2", "title": "Client"}],
+  "tasks": [
+    {"id": "T1", "phase": "F1", "title": "Add /foo endpoint", "agent": "coder",
+     "prompt": "Implement GET /foo in server/handler.go returning ...",
+     "validation": [{"run": "go test ./server/...", "expect": "all green, includes a /foo case"}]},
+    {"id": "T2", "phase": "F2", "title": "CLI client", "deps": ["T1"],
+     "prompt": "Add the /foo client call. Server contract: #T1",
+     "validation": [{"run": "go build ./...", "expect": "builds clean"}]}
+  ]
+}
+```
+
+- `deps` may only reference tasks declared **earlier** (which also rules out cycles).
+- `prompt` must be self-contained — workers do not see the conversation. `#<depID>` is replaced with that dependency's output.
+- `validation[].run` commands are executed by the **engine** (inheriting the [coder sandbox](/features/coder-security) and the unsafe-command denylist) — never by the executor. `expect` is prose for the reviewer. A bare string is a prose-only contract (reviewer verifies by inspection).
+- `agent` defaults to `coder` (any squad worker type works); `max_attempts` defaults to 3; `require_review` defaults to **true**, per graph or per task.
+
+---
+
+## Execution: ready-set scheduling
+
+Tasks fire the moment their dependencies complete — no level barriers, no wasted wall-clock. Concurrency is capped by the squad's existing `CHATCLI_AGENT_MAX_WORKERS` knob (the graph's own `max_parallel` can lower it); **no new environment variables** were added for this feature.
+
+Each task runs through an attempt loop:
+
+1. **Checkpoint** — a [shadow-git snapshot](/features/coder-plugin#checkpoints) of the workspace, best-effort, before the executor starts.
+2. **Executor** — a fresh worker receives the prompt (plus reviewer feedback on retries).
+3. **Gate** — the engine runs every `validation[].run` command itself and records output; a non-zero exit fails the attempt without spending a reviewer.
+4. **Review** — a fresh `reviewer` worker (read-only tools) receives the contract, the gate outputs and the executor's report, and must end with `VERDICT: PASS — evidence` or `VERDICT: FAIL — what is missing`.
+5. **Promote or retry** — gate green + PASS promotes to `done` with the evidence recorded; FAIL retries with the feedback injected, up to `max_attempts`, then the task fails and its successors become `blocked`.
+
+The engine **refuses**: dependency cycles, starting a task with unmet deps, promoting without gate + verdict when review is required, and reviewer = executor (each is a distinct dispatch — both run IDs are recorded on the attempt as proof).
+
+States: `pending → running → reviewing → done | failed | blocked`.
+
+Every attempt also carries its **real cost**: each worker LLM call is attributed to the graph node that spawned it, using the same per-call accounting as [cost tracking](/features/cost-tracking).
+
+---
+
+## Surfaces
+
+### `@taskgraph` (for the AI)
+
+```json
+{"cmd":"run","args":{"graph":{...}}}   // plan + execute in one call (streams progress)
+{"cmd":"run","args":{"id":"tg-..."}}   // run/resume a persisted plan
+{"cmd":"plan","args":{"graph":{...}}}  // validate + persist only
+{"cmd":"status"}                       // per-task status, attempts, verdicts, cost
+{"cmd":"show","args":{"task":"T3"}}    // one task in full: gate outputs, evidence, run ids
+{"cmd":"retry","args":{"task":"T3"}}   // re-open a failed task (+1 attempt) and resume
+{"cmd":"cancel"}                       // stop the active run
+{"cmd":"list"}                         // persisted runs
+{"cmd":"dash"}                         // serve the live dashboard, returns its URL
+```
+
+`run` executes the whole graph in a single tool call, streaming events as they happen. Resume is inherent: completed tasks stay done, so re-running a failed graph continues where it stopped.
+
+### `/taskgraph` (for humans)
+
+```bash
+/taskgraph status [id]     # per-task status, verdicts, cost
+/taskgraph show T3 [id]    # one task: attempts, gate outputs, evidence
+/taskgraph list            # persisted runs
+/taskgraph dash [id]       # open the live browser dashboard
+/taskgraph cancel          # stop the active run
+```
+
+`/taskgraph` is allowlisted as a **mid-run side command** — type it while the graph executes to inspect progress without touching the orchestrator loop.
+
+---
+
+## The live dashboard
+
+`/taskgraph dash` (or `{"cmd":"dash"}`) serves a browser dashboard from an ephemeral `127.0.0.1` port — a single embedded file, zero CDN, zero configuration:
+
+- **Animated DAG canvas** — phase swimlanes, dependency béziers with animated dashes into running tasks, status-colored cards with attempt count and per-task cost; drag to pan, ctrl/⌘+wheel to zoom, `0` to fit, lineage highlight on hover.
+- **Evidence popovers** — click a task for its prompt, validation contract, gate outputs, reviewer verdict + evidence and the executor/reviewer run IDs.
+- **Results tab** — critical path, wall-clock vs agent time, parallelism factor and the real cost per task.
+- **Live** — the page polls the persisted state every second and tails the event feed.
+
+The server is **strictly read-only**: it reads `state.json` and `events.ndjson` from disk on every request. Closing the dashboard never affects a run, and finished runs render just as well.
+
+---
+
+## Persistence
+
+Each run owns `~/.chatcli/taskgraph/<runID>/`:
+
+| File | Role |
+|---|---|
+| `state.json` | The full graph, written atomically on every transition (corrupt files are quarantined, never overwritten) |
+| `events.ndjson` | Append-only audit trail — also the dashboard's feed |
+
+Runs appear in `/agents` (and the [Conversation Hub](/features/conversation-hub)) as a parent run with each executor and reviewer registered as children — cancellation propagates down the tree.
+
+<Tip>The task graph was inspired by the executor ≠ reviewer discipline of graph-style orchestration skills: self-declaration is not a verdict. In ChatCLI the orchestrator is native deterministic code, so the graph, the gates and the promotion to done are structurally out of reach of model hallucination.</Tip>
