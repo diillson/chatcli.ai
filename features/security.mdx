@@ -149,13 +149,23 @@ All OAuth credentials are encrypted at rest using **AES-256-GCM** in `~/.chatcli
 | `~/.chatcli/.auth-key` | `0600` | AES-256-GCM encryption key |
 | `~/.chatcli/coder_policy.json` | `0600` | Coder policy rules |
 
-### Session Encryption
+### Encryption at Rest (sessions, autosaves, park snapshots)
 
-Session data can be encrypted at rest when a custom encryption key is provided:
+Encryption at rest is an **explicit opt-in**: it is active while `CHATCLI_ENCRYPTION_KEY` is set in the process environment. When it is, every store that embeds conversation content is sealed before it touches disk and opened transparently on read:
+
+- saved sessions (`/session save`, `/session attach` write-through)
+- exit autosaves and MCP/ACP session mirrors (`autosave-*`, `mcp-*`)
+- agent park snapshots (`/park`, `/resume`)
 
 ```bash
-export CHATCLI_ENCRYPTION_KEY="your-32-byte-hex-key"
+export CHATCLI_ENCRYPTION_KEY="a-long-random-secret"
 ```
+
+Format: `CHATCLI_ENC_v1` header + 12-byte nonce + AES-256-GCM ciphertext. The key is derived with HKDF-SHA256 from `SHA-256(CHATCLI_ENCRYPTION_KEY)`; the secret itself is never written anywhere.
+
+<Note>
+**Transparent migration.** Plaintext files written before the key existed keep loading and are re-written encrypted on their next save. An encrypted file opened without the key fails with a clear error naming `CHATCLI_ENCRYPTION_KEY` — it is never silently treated as empty or corrupt. Long-term memory (`~/.chatcli/memory/`), knowledge contexts and the conversation hub database are not covered yet.
+</Note>
 
 ### TLS 1.3 Transport Security
 
@@ -183,17 +193,23 @@ export CHATCLI_ENCRYPTION_KEY="your-32-byte-hex-key"
 
 <Info>If TLS certificate loading fails, the error is written to both **stderr** and the structured log, including the cert and key paths. In containers, this ensures the error is visible via `kubectl logs` even if the structured logger cannot flush before the crash.</Info>
 
-### Environment Variable Redaction
+### Secret Redaction on the LLM Path
 
-Sensitive environment variables are automatically redacted in logs and error messages. You can control the redaction behavior:
+Content the model receives without the user retyping it passes through one redaction chokepoint before it leaves the process: tool outputs in agent/coder mode (file reads, exec, plugins, MCP), squad worker tool outputs, the `@file`/`@git`/`@env` context assembled in chat, and the conversation segment handed to the memory extractor — so a secret pasted into a conversation is neither sent out again nor distilled into a persisted fact.
+
+Two layers compose. `KEY=VALUE` lines (env dumps, `.env` files, compose/CI logs) are judged by **name** — `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, anything ending in `_TOKEN`, `_PASSWORD`, `_KEY` — plus value heuristics (known prefixes, long hex). Free text is scanned for the value shapes providers hand out (`sk-…`, `ghp_…`, `AKIA…`, JWTs, bearer headers, credential fields in JSON).
 
 ```bash
-# Redaction mode: "full" (default), "partial" (show first/last 4 chars), "none"
-export CHATCLI_ENV_REDACT_MODE=full
+# permissive (default): name denylist + value shapes
+# strict: additionally redacts every KEY=VALUE line whose name is not on the known-safe allowlist (HOME, PATH, GOPATH, …)
+# off: disables this chokepoint (the regex pass on exec output stays)
+export CHATCLI_ENV_REDACT_MODE=permissive
 
-# Custom redaction patterns (regex, semicolon-separated)
-export CHATCLI_REDACT_PATTERNS="INTERNAL_SECRET_.*;MY_TOKEN_.*"
+# Extra name fragments to treat as sensitive (comma-separated, case-insensitive substring match)
+export CHATCLI_REDACT_PATTERNS="INTERNAL_SECRET,MY_TOKEN"
 ```
+
+Humans still see the full output in the terminal and `PostToolUse` hooks still receive it; only the model's copy is redacted.
 
 ### OS Keychain Integration
 
@@ -902,11 +918,11 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_ALLOW_INSECURE` | Allow insecure (non-TLS) connections | `false` |
 | `CHATCLI_TLS_CLIENT_CERT` | Client TLS certificate for mTLS | `""` |
 | `CHATCLI_TLS_CLIENT_KEY` | Client TLS key for mTLS | `""` |
-| `CHATCLI_ENCRYPTION_KEY` | Custom encryption key for session data | Auto-generated |
+| `CHATCLI_ENCRYPTION_KEY` | Opt-in encryption at rest for sessions, autosaves, MCP mirrors and park snapshots (AES-256-GCM, HKDF-derived) | `""` (off) |
 | `CHATCLI_KEYCHAIN_BACKEND` | Keychain backend: `auto`, `file`, `keychain` | `auto` |
 | `CHATCLI_DISABLE_HISTORY` | Disable conversation history recording | `false` |
 | `CHATCLI_SESSION_TTL` | Machine-session time-to-live, in days (`0` disables; user-named sessions never expire) | `90d` |
-| `CHATCLI_ENV_REDACT_MODE` | Env redaction: `full`, `partial`, `none` | `full` |
+| `CHATCLI_ENV_REDACT_MODE` | Secret redaction on the LLM path: `permissive`, `strict`, `off` | `permissive` |
 | `CHATCLI_REDACT_PATTERNS` | Custom redaction patterns (semicolon-separated regex) | `""` |
 
 ### Operator Security
@@ -991,7 +1007,7 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
   </Step>
   <Step title="Enable environment variable redaction">
     ```bash
-    export CHATCLI_ENV_REDACT_MODE=full
+    export CHATCLI_ENV_REDACT_MODE=strict
     ```
   </Step>
   <Step title="Use OS keychain for key storage">

@@ -22,7 +22,7 @@ O ChatCLI implementa uma arquitetura de **segurança em profundidade** (defense-
 | 5 | **OAuth** | PKCE + Device Flow para provedores externos | <Icon icon="check" /> Ativo |
 | 6 | **Criptografia** | AES-256-GCM para credenciais em repouso | <Icon icon="check" /> Ativo |
 | 7 | **TLS** | TLS 1.3 obrigatório para gRPC em produção | <Icon icon="check" /> Ativo |
-| 8 | **Sessões** | Criptografia de sessão em repouso com HKDF key derivation | <Icon icon="check" /> Ativo |
+| 8 | **Sessões** | Criptografia em repouso (sessões, autosaves, park) com derivação HKDF — opt-in via `CHATCLI_ENCRYPTION_KEY` | <Icon icon="check" /> Ativo |
 | 9 | **Sessões TTL** | Expiração automática de sessões inativas | <Icon icon="check" /> Ativo |
 | 10 | **Keychain** | Integração com OS keychain (macOS Keychain, Linux secret-tool) | <Icon icon="check" /> Ativo |
 | 11 | **Env Vars** | Redação automática de variáveis sensíveis (strict/permissive) | <Icon icon="check" /> Ativo |
@@ -172,22 +172,23 @@ io.ReadFull(crypto.Reader, nonce)
 ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
 ```
 
-### Criptografia de Sessão em Repouso
+### Criptografia em Repouso (sessões, autosaves, park snapshots)
 
-Os dados de sessão são criptografados antes de gravar em disco usando uma chave derivada via **HKDF** (HMAC-based Key Derivation Function) a partir da chave mestre.
+A criptografia em repouso é um **opt-in explícito**: fica ativa enquanto `CHATCLI_ENCRYPTION_KEY` estiver definida no ambiente do processo. Com ela definida, todo store que embute conteúdo de conversa é selado antes de tocar o disco e aberto de forma transparente na leitura:
 
+- sessões salvas (`/session save`, write-through de `/session attach`)
+- autosaves de saída e espelhos de sessão MCP/ACP (`autosave-*`, `mcp-*`)
+- snapshots de park do agente (`/park`, `/resume`)
+
+```bash
+export CHATCLI_ENCRYPTION_KEY="um-segredo-longo-e-aleatorio"
 ```
-Chave mestre (.auth-key)
-    │
-    ▼
-  HKDF (SHA-256, salt=session-id, info="chatcli-session")
-    │
-    ▼
-  Chave de sessão (256 bits, única por sessão)
-    │
-    ▼
-  AES-256-GCM (criptografia dos dados de sessão)
-```
+
+Formato: cabeçalho `CHATCLI_ENC_v1` + nonce de 12 bytes + ciphertext AES-256-GCM. A chave é derivada por HKDF-SHA256 a partir de `SHA-256(CHATCLI_ENCRYPTION_KEY)`; o segredo em si nunca é gravado.
+
+<Note>
+**Migração transparente.** Arquivos em texto claro gravados antes da chave existir continuam carregando e são regravados criptografados no próximo save. Um arquivo criptografado aberto sem a chave falha com erro claro citando `CHATCLI_ENCRYPTION_KEY` — nunca é tratado silenciosamente como vazio ou corrompido. Memória de longo prazo (`~/.chatcli/memory/`), contextos de conhecimento e o banco do hub ainda não são cobertos.
+</Note>
 
 ### TLS 1.3 para gRPC
 
@@ -207,35 +208,47 @@ chatcli server --tls-cert cert.pem --tls-key key.pem
 
 <Note>Quando TLS não está configurado, o servidor emite um log de warning a cada startup. O comportamento funcional não muda, mas a comunicação trafega em texto plano.</Note>
 
-### Redação de Variáveis de Ambiente
+### Redação de Segredos no Caminho ao LLM
 
-O ChatCLI detecta e redacta automaticamente variáveis de ambiente sensíveis antes de exibir ou enviar ao LLM.
+Todo conteúdo que o modelo recebe sem o usuário redigitar passa por um único chokepoint de redação antes de sair do processo: saídas de tools em modo agent/coder (leituras de arquivo, exec, plugins, MCP), saídas de tools dos workers do squad, o contexto `@file`/`@git`/`@env` montado no chat e o segmento de conversa entregue ao extrator de memória — assim um segredo colado na conversa não é reenviado nem destilado em um fato persistido.
+
+Duas camadas se compõem. Linhas `KEY=VALUE` (dumps de env, arquivos `.env`, logs de compose/CI) são julgadas pelo **nome** — `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, qualquer nome terminado em `_TOKEN`, `_PASSWORD`, `_KEY` — mais heurísticas de valor (prefixos conhecidos, hex longo). Texto livre é varrido pelos formatos de valor que os provedores entregam (`sk-…`, `ghp_…`, `AKIA…`, JWTs, cabeçalhos bearer, campos de credencial em JSON).
 
 <Tabs>
-  <Tab title="Modo Strict">
+  <Tab title="Modo Permissive (padrão)">
     ```bash
-    export CHATCLI_ENV_REDACTION=strict
-    # Redacta QUALQUER variável que contenha:
-    # KEY, SECRET, TOKEN, PASSWORD, CREDENTIAL, AUTH,
-    # API_KEY, PRIVATE, CERTIFICATE, e mais
+    export CHATCLI_ENV_REDACT_MODE=permissive
+    # denylist por nome + formatos de valor
     ```
 
-    Exemplo de saída:
+    Exemplo de saída para o modelo:
     ```
-    AWS_ACCESS_KEY_ID=****REDACTED****
-    DATABASE_URL=****REDACTED****
-    OPENAI_API_KEY=****REDACTED****
+    AWS_SECRET_ACCESS_KEY=[REDACTED]
+    DATABASE_URL=[REDACTED]
+    HOME=/Users/dev
     ```
   </Tab>
-  <Tab title="Modo Permissive">
+  <Tab title="Modo Strict">
     ```bash
-    export CHATCLI_ENV_REDACTION=permissive
-    # Redacta apenas variáveis em uma lista fixa:
-    # *_KEY, *_SECRET, *_TOKEN, *_PASSWORD
-    # Variáveis como PATH, HOME, SHELL são preservadas
+    export CHATCLI_ENV_REDACT_MODE=strict
+    # além do permissive, redacta TODA linha KEY=VALUE cujo nome
+    # não esteja na allowlist conhecida (HOME, PATH, GOPATH, ...)
+    ```
+  </Tab>
+  <Tab title="Off">
+    ```bash
+    export CHATCLI_ENV_REDACT_MODE=off
+    # desliga este chokepoint (a varredura regex da saída de exec permanece)
     ```
   </Tab>
 </Tabs>
+
+```bash
+# Fragmentos extras de nome tratados como sensíveis (separados por vírgula, substring sem distinção de caixa)
+export CHATCLI_REDACT_PATTERNS="INTERNAL_SECRET,MY_TOKEN"
+```
+
+O humano continua vendo a saída completa no terminal e hooks `PostToolUse` continuam recebendo-a; só a cópia do modelo é redigida.
 
 ### Redação do Histórico de Conversas
 
@@ -870,17 +883,16 @@ Tabela completa de todas as variáveis de ambiente relacionadas à segurança do
 | `CHATCLI_SERVER_TLS_CERT` | Caminho do certificado TLS do servidor | `""` |
 | `CHATCLI_SERVER_TLS_KEY` | Caminho da chave TLS do servidor | `""` |
 | `CHATCLI_TLS_MIN_VERSION` | Versão mínima de TLS aceita | `1.3` |
-| `CHATCLI_ENCRYPTION_KEY` | Chave de criptografia customizada (override .auth-key) | `""` |
+| `CHATCLI_ENCRYPTION_KEY` | Criptografia em repouso opt-in para sessões, autosaves, espelhos MCP e park snapshots (AES-256-GCM, chave derivada por HKDF) | `""` (desligada) |
 | `CHATCLI_DISABLE_KEYCHAIN` | Desabilita integração com OS keychain | `false` |
-| `CHATCLI_SESSION_ENCRYPTION` | Habilita/desabilita criptografia de sessão | `true` |
 | `CHATCLI_SESSION_TTL` | Tempo de vida das sessões de máquina, em dias (`0` desabilita; sessões nomeadas nunca expiram) | `90d` |
 
 ### Redação e Proteção de Dados
 
 | Variável | Descrição | Padrão |
 |----------|-----------|--------|
-| `CHATCLI_ENV_REDACTION` | Modo de redação de env vars (`strict`/`permissive`/`off`) | `strict` |
-| `CHATCLI_HISTORY_REDACTION` | Habilita redação do histórico de conversas | `true` |
+| `CHATCLI_ENV_REDACT_MODE` | Redação de segredos no caminho ao LLM: `permissive`, `strict`, `off` | `permissive` |
+| `CHATCLI_REDACT_PATTERNS` | Fragmentos extras de nome tratados como sensíveis (separados por vírgula) | `""` |
 | `CHATCLI_LOG_SCRUB_PATTERNS` | Padrões regex adicionais para log scrubbing (`;` separados) | `""` |
 | `CHATCLI_AUDIT_LOG` | Caminho do arquivo de audit log | `""` (stdout) |
 | `CHATCLI_AUDIT_LOG_MAX_SIZE` | Tamanho máximo do arquivo de audit log | `100M` |
@@ -981,8 +993,7 @@ Tabela completa de todas as variáveis de ambiente relacionadas à segurança do
   </Step>
   <Step title="Habilite redação em modo strict">
     ```bash
-    export CHATCLI_ENV_REDACTION=strict
-    export CHATCLI_HISTORY_REDACTION=true
+    export CHATCLI_ENV_REDACT_MODE=strict
     export CHATCLI_OPERATOR_LOG_SCRUB=true
     ```
   </Step>
