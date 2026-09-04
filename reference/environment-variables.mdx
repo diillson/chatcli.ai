@@ -240,7 +240,7 @@ StackSpot's agent API decides the output limit **server-side** (it ignores `max_
 | `CHATCLI_AGENT_PARALLEL_MODE` | Enable parallel multi-agent orchestration | `true` |
 | `CHATCLI_AGENT_MAX_WORKERS` | Maximum simultaneous workers (goroutines) | `4` |
 | `CHATCLI_AGENT_WORKER_MAX_TURNS` | Maximum turns per worker | `30` |
-| `CHATCLI_AGENT_WORKER_TIMEOUT` | Timeout per individual worker | `5m` |
+| `CHATCLI_AGENT_WORKER_TIMEOUT` | Timeout per individual worker | `10m` |
 | `CHATCLI_AGENT_PARALLEL_TOOLS` | Enables parallel execution of concurrency-safe tools **inside a single agent** (read-only operations such as `@websearch`, `@webfetch`, `@coder read/search/tree` in the same turn). Distinct from `CHATCLI_AGENT_PARALLEL_MODE`, which controls multiple agents running in parallel. Off by default while the feature is in rollout. | `false` |
 | `CHATCLI_AGENT_MAX_TOOL_CONCURRENCY` | Fan-out cap for the parallel tool batch within an agent. Operators processing many `@webfetch` in parallel can raise it; conservatives can lower it. | `10` |
 
@@ -444,6 +444,7 @@ When enabled, reflexion triggers flow through a persistent queue — lessons sur
 
 | Variable | Description | Default |
 | --- | --- | --- |
+| `OLLAMA_HOST` | Local Ollama server used for keyless embeddings (`CHATCLI_EMBED_PROVIDER=ollama`) | `http://localhost:11434` |
 | `CHATCLI_EMBED_PROVIDER` | `voyage` / `openai` / `google` / `bedrock` / `ollama` (local, keyless; `OLLAMA_HOST`) / `null` | `null` |
 | `CHATCLI_EMBED_MODEL` | Embedding model. Provider defaults: Voyage `voyage-4`; OpenAI `text-embedding-3-small`; Google `gemini-embedding-2`; Bedrock `amazon.titan-embed-text-v2:0`. | provider default |
 | `CHATCLI_EMBED_DIMENSIONS` | OpenAI: truncate via Matryoshka. Google: 128–3072 via Matryoshka (default 3072). Bedrock Titan v2: accepts 256 / 512 / 1024; Nova MME: 256 / 384 / 1024 / 3072 (others rejected). Bedrock Titan v1 / Cohere v3: fixed dim, ignored. Cohere v4: 1536 default. | model native |
@@ -475,6 +476,49 @@ When enabled, reflexion triggers flow through a persistent queue — lessons sur
 <Tip>Recommended presets (cheap dev, rigorous review, docs, incident, autopilot) in [Pipeline Configuration](/features/quality/configuration#recommended-presets).</Tip>
 
 ---
+
+## Typewriter Effect (Adaptive Pacing)
+
+The model's final answer is painted with a "typewriter" effect — rune by rune, with a small delay between characters — so a reply reads like a live conversation rather than a single paste. Since v1.120 ChatCLI uses **adaptive pacing**: short answers keep the original cadence, long answers get their per-rune delay scaled down automatically to fit a total budget (~800 ms by default), and very long answers (over 8,000 visible runes, e.g. giant code blocks) skip the animation entirely. The behaviour is the same in `/chat`, `/coder` and `/agent` — every surface that types model output goes through the same internal helper (`agent.PaceText`).
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `CHATCLI_NO_TYPEWRITER` | Turns the typewriter effect off **entirely**: the answer is painted at once. Accepts `1`, `true`, `yes`, `on` (case-insensitive). Useful on slow terminals, mirrored `tmux` sessions, or when you simply want the answer on screen immediately. | — (effect on) |
+| `CHATCLI_TYPEWRITER_BUDGET_MS` | Total animation budget in milliseconds. For long answers the per-rune delay is divided by the number of visible runes so the whole effect completes within this budget. `0` disables the budget (each rune uses the requested delay in full — the pre-v1.120 behaviour where long answers took several seconds). Typical values: `400` (fast), `800` (default), `1500` (more noticeable). | `800` |
+| `CHATCLI_TYPEWRITER_DELAY_MS` | Per-rune delay in milliseconds, overriding what the internal call site asked for. `0` forces the minimum (~200 µs per rune — barely perceptible but present), `5` or `10` gives a more "typed" cadence. It takes precedence over the programmatic delay but still goes through the budget, so long answers keep respecting the ceiling. | `2` |
+
+<Info>
+**How the three variables interact:**
+
+1. If `CHATCLI_NO_TYPEWRITER` is on, **nothing else matters** — the answer is instant.
+2. Otherwise ChatCLI reads the requested delay (from the call site) or `CHATCLI_TYPEWRITER_DELAY_MS` when set.
+3. It counts the visible runes (ANSI colour sequences do not count — they are emitted instantly so colour transitions never pause the eye).
+4. If visible runes ≥ 8,000, the animation is skipped (a built-in "hardSkip" so a code dump never freezes the terminal for 16+ seconds).
+5. Otherwise `effective_delay = min(requested_delay, CHATCLI_TYPEWRITER_BUDGET_MS / visible_runes)`, with a 200 µs floor.
+
+In short: the budget pulls the delay **down** for long answers and never raises it; short answers keep the requested delay.
+</Info>
+
+<Warning>
+**System granularity:** `time.Sleep` on Linux/macOS has a minimum granularity of about 1 ms, so very small `CHATCLI_TYPEWRITER_DELAY_MS` values (e.g. `0`) effectively run at ~200 µs–1 ms. It is not microcontroller precision — it is "fast enough to feel instant in a human shell".
+</Warning>
+
+**Practical examples:**
+
+```bash
+# Disable the effect entirely (single paste)
+export CHATCLI_NO_TYPEWRITER=1
+
+# Faster animation: 300 ms budget, any answer completes in ≤ 300 ms
+export CHATCLI_TYPEWRITER_BUDGET_MS=300
+
+# Slower typing (4 ms per rune) BUT still within the budget
+export CHATCLI_TYPEWRITER_DELAY_MS=4
+
+# Back to the pre-v1.120 behaviour (no budget, always 2 ms per rune)
+export CHATCLI_TYPEWRITER_BUDGET_MS=0
+export CHATCLI_TYPEWRITER_DELAY_MS=2
+```
 
 ## Session Workspace and Subagent
 
@@ -760,13 +804,13 @@ Sanitizes **injected** prompt content — contexts attached via `/context attach
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `CHATCLI_AGENT_SECURITY_MODE` | Security mode: `strict` (allowlist) or `permissive` (denylist) | `permissive` |
+| `CHATCLI_AGENT_SECURITY_MODE` | Security mode: `strict` (allowlist) or `permissive` (denylist) | `strict` |
 | `CHATCLI_AGENT_ALLOWLIST` | Extra allowed commands in strict mode (semicolon-separated) | `""` |
-| `CHATCLI_AGENT_WORKSPACE_STRICT` | Restrict file access to workspace directory only | `false` |
+| `CHATCLI_AGENT_WORKSPACE_STRICT` | Restrict file access to workspace directory only | `true` |
 | `CHATCLI_AGENT_ALLOW_KUBECONFIG` | Allow agent commands to access kubeconfig | `false` |
 | `CHATCLI_AGENT_EXTRA_READ_PATHS` | Additional allowed read paths (semicolon-separated) | `""` |
 | `CHATCLI_AGENT_SOURCE_SHELL_CONFIG` | Source shell config (`~/.bashrc`, etc.) in agent commands | `false` |
-| `CHATCLI_MAX_COMMAND_OUTPUT` | Maximum command output size (bytes) | `65536` |
+| `CHATCLI_MAX_COMMAND_OUTPUT` | Maximum command output size (bytes) | `102400` |
 
 ### Coder Execution (auto-diagnostics, checkpoints, sandbox)
 
