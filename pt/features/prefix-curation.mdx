@@ -1,0 +1,118 @@
+---
+title: "Curadoria do Prefixo do Chat"
+sidebarTitle: "Curadoria de Prefixo"
+description: "O que o prompt do chat cacheia, o que ele adia e como o modelo recupera qualquer coisa que saiu do prompt."
+icon: "scissors"
+---
+
+Um turno de chat reenvia o prefixo inteiro a cada requisição. Medido numa sessão real de 10 turnos, esse prefixo carregou **37.823 caracteres** de contexto injetado — e a maior parte era paga repetidamente sem mudar:
+
+| Bloco | Fatia do contexto injetado |
+|---|---|
+| Corpo de skills auto-ativadas | 32% |
+| Índice de memória | 22% |
+| Recall proativo de memória | 18% |
+| Card do grafo de conhecimento | 13% |
+| Session recall | 12% |
+
+Há dois problemas diferentes nessa tabela. O índice de memória e o card do grafo **não mudam durante a sessão** — eram reenviados a cada turno e nunca cacheados. Os corpos de skill **já estavam na conversa** — as mesmas skills casavam de novo e de novo, mandando o texto completo toda vez.
+
+A curadoria resolve os dois sob uma regra única:
+
+<Warning>
+Material sai do prompt **apenas enquanto continua alcançável**. Um resumo que o modelo não consegue expandir é perda de capacidade, não economia — então toda troca desta página se desarma sozinha quando o caminho de recuperação está desligado, restaurando o prompt anterior byte a byte.
+</Warning>
+
+---
+
+## O que o modelo continua recebendo
+
+Nada sai do alcance do modelo. O que muda é **onde** cada bloco fica e **quando** ele é pago.
+
+<Tabs>
+  <Tab title="Prefixo cacheado">
+    Estável pela conversa inteira, então o provider serve como leitura quente de cache (~0,1x input) em vez de preço cheio a cada turno:
+
+    - banner de modo e diretiva de idioma
+    - **a metade do workspace que não depende da pergunta** — arquivos de bootstrap (`SOUL.md`, `USER.md`, `AGENTS.md`…), índice de memória, card do grafo de conhecimento
+    - anexos de `/context`, skills fixadas
+    - catálogo de tools MCP, listado por nome
+  </Tab>
+  <Tab title="Sufixo por turno">
+    Varia de verdade com a pergunta, então não carrega hint de cache e nunca invalida o prefixo acima:
+
+    - rules casadas por path a partir dos hints do turno
+    - no modo de memória `full`, o retrieval dirigido pela query
+    - auto-recall proativo de memória e session recall
+    - skills auto-ativadas (corpo, ou o aviso de que o corpo já está acima)
+    - pushes de canal MCP, contexto do watcher, a data
+  </Tab>
+  <Tab title="A um pull de distância">
+    Alcançável via `context_pull` sempre que o modelo decidir que precisa:
+
+    - as instruções completas de qualquer skill instalada
+    - o catálogo de todas as skills instaladas com descrição
+    - o catálogo MCP completo com descrições
+  </Tab>
+</Tabs>
+
+---
+
+## Como o modelo sabe quando puxar
+
+Ele nunca fica adivinhando. Todo adiamento no prompt **cita a chamada exata que o recupera**:
+
+- um corpo de skill que já está antes na conversa vira *"Body already provided earlier in this conversation — follow that copy; it has not changed. If it is no longer visible above, call context_pull with kind=skill and this skill's name."*
+- um corpo deixado de fora pelo orçamento de injeção vira *"Before applying this skill, call context_pull with kind=skill…"*
+- o bloco MCP diz quantas tools existem e que `context_pull` com `kind=mcp_tools` lê o que cada uma faz
+
+Ou seja: o gatilho é o próprio prompt, não uma heurística. A descrição da tool afirma o mesmo contrato, e o modelo pode encadear até **3 recuperações por turno** antes de ter que responder.
+
+---
+
+## `context_pull` — a terceira exceção sancionada do chat
+
+O chat é tool-less por design. `context_pull` entra junto de [`ask_user`](/pt/features/interactive-ask), [knowledge](/pt/features/knowledge-base), [`@graphview`](/pt/features/graphview) e [memória](/pt/features/bootstrap-memory) como exceção sancionada — e é a mais estreita delas: não executa nada, não escreve nada e não alcança nada fora do processo. Ela relê material que o próprio ChatCLI curou para fora do turno atual.
+
+```json
+{"kind": "skill", "name": "chatcli-coder-patch-flow"}
+{"kind": "skills"}
+{"kind": "mcp_tools"}
+```
+
+Providers com tool use nativo recebem a definição da tool; os demais recebem o transporte XML que as outras exceções já usam, então **todos os providers estão cobertos**. O parsing dos argumentos é tolerante de propósito — `{"cmd":"skill","skill":"x"}` e `{"kind":"skill","args":{"name":"x"}}` funcionam igual, porque parsing estrito só ensina o modelo a repetir a chamada ao custo de um round trip.
+
+```bash
+/config chat pull status      # a recuperação está ativa nesta sessão?
+/config chat pull off         # desliga — a curadoria se desarma junto
+```
+
+Persista com `CHATCLI_CHAT_CONTEXT_PULL=false`.
+
+---
+
+## A de-duplicação de skills é verificada contra o histórico vivo
+
+Um corpo de skill vira *"você já tem isso"* apenas enquanto a cópia anterior está genuinamente na conversa. Isso é verificado contra o **histórico vivo** a cada turno, e não rastreado pelos lugares que podem descartar uma mensagem — então [compactação](/pt/features/context-compression), `/clear`, `/rewind`, restauração de checkpoint e carga de sessão fazem o corpo voltar a ser embutido automaticamente. Os corpos têm fingerprint, então editar a skill em disco também força o re-embutido.
+
+---
+
+## O TTL do prompt cache é escolhido por evidência
+
+A entrada de cache de 1 hora da Anthropic custa **2x** a escrita, em vez de 1,25x. Escolher isso de antemão é uma aposta: perda pura numa sessão que nunca pausa, ganho grande numa que pausa.
+
+O ChatCLI agora espera pela resposta. Quando a sessão vê o próprio prefixo expirar numa pausa que a hora teria coberto, ele pede a hora — **uma vez**, sem volta, nunca por cima de um `CHATCLI_PROMPT_CACHE_TTL` explícito e nunca num modelo que não suporta. Uma execução one-shot jamais chega à segunda observação, então permanece no TTL curto.
+
+O `/cost` mostra o TTL em vigor na linha de cache.
+
+---
+
+## Como enxergar
+
+O `/context status` quebra o prompt atual seção por seção, marca quais seções ficam no prefixo cacheado e mostra **o que o provider realmente contou** na última chamada ao lado da projeção local — dá para ver a estimativa derivando, em vez de descobrir quando a compactação dispara cedo demais.
+
+---
+
+## Escopo
+
+Agent e coder mantêm o bloco único de workspace: eles carregam o system prompt dentro do histórico e cacheiam de outro jeito, e já têm cota de skill por run mais tools de arquivo reais para recuperar um corpo adiado.

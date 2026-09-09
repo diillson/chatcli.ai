@@ -1,0 +1,118 @@
+---
+title: "Chat Prefix Curation"
+sidebarTitle: "Prefix Curation"
+description: "What the chat prompt caches, what it defers, and how the model gets back anything that was curated out."
+icon: "scissors"
+---
+
+A chat turn re-sends its whole prefix on every request. Measured on a real 10-turn session, that prefix carried **37.823 characters** of injected context, and most of it was paid for repeatedly without changing:
+
+| Block | Share of the injected context |
+|---|---|
+| Auto-activated skill bodies | 32% |
+| Memory index | 22% |
+| Proactive memory recall | 18% |
+| Knowledge-graph card | 13% |
+| Session recall | 12% |
+
+Two different problems hide in that table. The memory index and the graph card **never change during a session** — they were re-sent every turn and never cached. The skill bodies **were already in the conversation** — the same skills matched again and again, shipping their full text each time.
+
+Curation fixes both under one rule:
+
+<Warning>
+Material leaves the prompt **only while it stays reachable**. A summary the model cannot expand is a capability loss, not a saving — so every trade on this page disarms itself when the recovery path is off, restoring the previous prompt byte for byte.
+</Warning>
+
+---
+
+## What the model still receives
+
+Nothing is removed from the model's reach. What changes is **where** each block lives and **when** it is paid for.
+
+<Tabs>
+  <Tab title="Cached prefix">
+    Stable for the whole conversation, so the provider serves it as a warm-cache read (~0.1x input) instead of full price on every turn:
+
+    - the mode banner and language directive
+    - **the workspace half that does not depend on the question** — bootstrap files (`SOUL.md`, `USER.md`, `AGENTS.md`…), the memory index, the knowledge-graph card
+    - `/context` attachments, pinned skills
+    - the MCP tool catalog, listed by name
+  </Tab>
+  <Tab title="Per-turn suffix">
+    Genuinely varies with the question, so it carries no cache hint and never invalidates the prefix above it:
+
+    - path-matched rules for this turn's file hints
+    - in `full` memory mode, the query-driven retrieval
+    - proactive memory auto-recall and session recall
+    - auto-activated skills (bodies, or a note that the body is already above)
+    - MCP channel pushes, watcher context, the date
+  </Tab>
+  <Tab title="One pull away">
+    Reachable through `context_pull` whenever the model decides it needs it:
+
+    - the full instructions of any installed skill
+    - the catalog of every installed skill with descriptions
+    - the full MCP tool catalog with descriptions
+  </Tab>
+</Tabs>
+
+---
+
+## How the model knows when to pull
+
+It is never left guessing. Every deferral in the prompt **names the exact call that recovers it**:
+
+- a skill body that is already earlier in the conversation renders as *"Body already provided earlier in this conversation — follow that copy; it has not changed. If it is no longer visible above, call context_pull with kind=skill and this skill's name."*
+- a skill body left out by the injection budget renders as *"Before applying this skill, call context_pull with kind=skill…"*
+- the MCP block says how many tools exist and that `context_pull` with `kind=mcp_tools` reads what any of them does
+
+So the trigger is the prompt itself, not a heuristic. The tool description states the same contract, and the model may chain up to **3 recoveries per turn** before it has to answer.
+
+---
+
+## `context_pull` — the third sanctioned chat exception
+
+Chat is tool-less by design. `context_pull` joins [`ask_user`](/features/interactive-ask), [knowledge](/features/knowledge-base), [`@graphview`](/features/graphview) and [memory](/features/bootstrap-memory) as a sanctioned exception, and it is the narrowest of them: it executes nothing, writes nothing and reaches nothing outside the process. It re-reads material ChatCLI itself curated out of the current turn.
+
+```json
+{"kind": "skill", "name": "chatcli-coder-patch-flow"}
+{"kind": "skills"}
+{"kind": "mcp_tools"}
+```
+
+Providers with native tool use get a tool definition; the rest get the XML transport the other exceptions already use, so **every provider is covered**. Argument parsing is deliberately lenient — `{"cmd":"skill","skill":"x"}` and `{"kind":"skill","args":{"name":"x"}}` both work, because strict parsing only teaches the model to retry at the cost of a round trip.
+
+```bash
+/config chat pull status      # is recovery active for this session
+/config chat pull off         # disable it — curation disarms with it
+```
+
+Persist with `CHATCLI_CHAT_CONTEXT_PULL=false`.
+
+---
+
+## Skill de-duplication is checked against the live history
+
+A skill body is reduced to *"you already have this"* only while the earlier copy is genuinely still in the conversation. That is verified against the **live history** on every turn, not tracked through the places that can drop a message — so [compaction](/features/context-compression), `/clear`, `/rewind`, a checkpoint restore and a session load all make the body re-inline automatically. Bodies are fingerprinted, so editing a skill on disk re-inlines it too.
+
+---
+
+## The prompt-cache lifetime is chosen from evidence
+
+Anthropic's hour-long cache entry costs **2x** the write instead of 1.25x. Choosing it up front is a bet: pure loss on a session that never pauses, a large win on one that does.
+
+ChatCLI now waits for the answer. When a session watches its own prefix expire during a gap that an hour would have covered, it asks for the hour — **once**, one-way, never over an explicit `CHATCLI_PROMPT_CACHE_TTL`, and never on a model that cannot carry it. A one-shot run can never reach that second observation, so it stays on the short lifetime.
+
+`/cost` shows the lifetime in effect on the cache line.
+
+---
+
+## Seeing it
+
+`/context status` breaks the current prompt down section by section, marks which sections sit in the cached prefix, and shows **what the provider actually counted** for the last call next to the local projection — so the estimate can be seen drifting instead of discovered when compaction fires early.
+
+---
+
+## Scope
+
+Agent and coder keep their single workspace block: they carry the system prompt inside the history and cache it differently, and they already have a per-run skill quota plus real file tools to recover a deferred body with.
