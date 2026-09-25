@@ -376,6 +376,7 @@ The server implements a gRPC service with the following RPCs:
 | `ExecuteRemotePlugin` | Executes a plugin on the server and returns the result |
 | `DownloadPlugin` | Streaming download of a plugin binary |
 | `GetAlerts` | Returns active alerts from the K8s Watcher (used by the Operator) |
+| `StreamAlerts` | Pushes K8s Watcher alerts as they are raised, with heartbeats (server streaming; used by the Operator) |
 | `AnalyzeIssue` | Sends Issue context to the LLM and returns analysis + suggested actions |
 | `AgenticStep` | Runs one turn of the AI-driven remediation loop (used by the Operator) |
 | `ResolveActiveConversation` | Returns the principal's current conversation, creating one on first contact (conversation hub) |
@@ -471,7 +472,7 @@ The `ListRemotePlugins`, `ListRemoteAgents`, `ListRemoteSkills`, `GetAgentDefini
 
 ### AIOps Platform RPCs
 
-The `GetAlerts`, `AnalyzeIssue` and `AgenticStep` RPCs are used by the [AIOps Operator](/features/k8s-operator) to feed the autonomous remediation pipeline. `AnalyzeIssue` and `AgenticStep` responses also carry the `usage`, `provider` and `model` fields described above.
+The `GetAlerts`, `StreamAlerts`, `AnalyzeIssue` and `AgenticStep` RPCs are used by the [AIOps Operator](/features/k8s-operator) to feed the autonomous remediation pipeline. `AnalyzeIssue` and `AgenticStep` responses also carry the `usage`, `provider` and `model` fields described above.
 
 #### GetAlerts
 
@@ -494,6 +495,29 @@ message AlertInfo {
   int64 timestamp = 6;
 }
 ```
+
+#### StreamAlerts
+
+Pushes alerts the moment the watcher raises them, so the operator no longer has to poll. The stream is server-side streaming over the same authenticated connection:
+
+```protobuf
+rpc StreamAlerts(StreamAlertsRequest) returns (stream StreamAlertsResponse);
+
+message StreamAlertsRequest {
+  string namespace = 1;     // Filter by namespace (empty = all)
+  string deployment = 2;    // Filter by deployment (empty = all)
+  bool include_current = 3; // Open with the alerts active right now
+}
+
+message StreamAlertsResponse {
+  WatcherAlert alert = 1;   // Unset on a heartbeat
+  bool heartbeat = 2;       // Liveness tick every 15s while the watcher is quiet
+}
+```
+
+- With `include_current` the stream opens with the alerts `GetAlerts` would return, then only new ones follow. The watcher's own dedup (same type and object within the window) means each alert is pushed once.
+- Heartbeats every 15 seconds let a client tell a quiet watcher from a dead connection. Without a watcher configured the stream carries heartbeats only, matching `GetAlerts` returning an empty list.
+- Every subscriber owns a bounded buffer. A subscriber that falls behind is dropped with `ABORTED`: reopen the stream with `include_current` to resync. `GetAlerts` stays available for one-shot reads and for clients that prefer polling.
 
 #### AnalyzeIssue
 

@@ -138,13 +138,13 @@ The **operator** chart (`chatcli-operator`) is separate from the **server** char
 ```mermaid
 graph TD
     subgraph "ChatCLI Server"
-        W[K8s Watcher<br/>collectors] --> GA[GetAlerts RPC]
+        W[K8s Watcher<br/>collectors] --> GA[StreamAlerts RPC<br/>GetAlerts fallback]
         AI_RPC[AnalyzeIssue RPC<br/>LLM call]
         AG_RPC[AgenticStep RPC<br/>observe-decide-act]
     end
 
     subgraph "Operator"
-        WB[WatcherBridge<br/>polls every 30s] -->|gRPC| GA
+        WB[WatcherBridge<br/>open stream] -->|gRPC| GA
         WB -->|creates| ANOM[Anomaly CR]
         ANOM -->|AnomalyReconciler<br/>correlation| ISS[Issue CR]
         ISS -->|IssueReconciler<br/>creates| INSIGHT[AIInsight CR]
@@ -172,7 +172,7 @@ graph TD
 
 | Phase | Component | What It Does |
 |-------|-----------|--------------|
-| **1. Detection** | WatcherBridge | Queries `GetAlerts` from the server every 30s. Creates Anomaly CRs (dedup SHA256). Invalidates dedup when Issue reaches terminal state. |
+| **1. Detection** | WatcherBridge | Receives alerts over the server's `StreamAlerts` stream (polls `GetAlerts` every 30s only for a server without it). Creates Anomaly CRs (dedup SHA256). Invalidates dedup when Issue reaches terminal state. |
 | **2. Correlation** | AnomalyReconciler + CorrelationEngine | Groups anomalies by resource + time window. Calculates risk score and severity. Creates/updates Issue CRs with `signalType`. |
 | **3. Analysis** | AIInsightReconciler + 6 enrichers | Collects K8s context (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, HPAs), **advanced log analysis** (stack traces Java/Go/Python/Node.js, 24+ error patterns), **Prometheus metrics** (CPU/mem/latency trends), **GitOps** (Helm/ArgoCD/Flux status), **source code** (commit↔incident correlation), **cascade analysis** (cross-service). |
 | **4. Remediation** | IssueReconciler | AI-validated runbook selection: **(a)** finds ALL candidate runbooks (multi-runbook per trigger), **(b)** AI validates each against root cause (`RUNBOOK_APPROVED: name` or `RUNBOOK_REJECTED`), **(c)** if rejected or no candidates, generates new runbook from AI suggestions (with unique hash per root cause), or **(d)** agentic remediation (AI acts step-by-step). |
@@ -1815,7 +1815,10 @@ The risk score is the sum of correlated anomaly weights (maximum 100).
 
 The `WatcherBridge` is the component that connects the ChatCLI server to the operator:
 
-- **Polling**: Queries `GetAlerts` from the server every 30 seconds
+- **Stream first**: Keeps the server's `StreamAlerts` stream open and turns each alert into an Anomaly the moment it arrives. The stream opens with the alerts active right now, so nothing raised while the bridge was away is lost
+- **Liveness**: The server heartbeats every 15 seconds; 60 seconds of silence reopens the stream. Reopens back off from 1s to 30s, and three silent attempts in a row drop the connection so the Instance is rediscovered (address or credentials may have changed)
+- **Polling fallback**: A server without `StreamAlerts` (older release) answers `UNIMPLEMENTED`; the bridge then polls `GetAlerts` every 30 seconds and probes the stream again after 10 minutes, so a server upgrade is picked up without an operator restart. `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll` (chart value `alertTransport`) forces polling
+- **Resync**: If the server drops the bridge for falling behind (`ABORTED`), the stream is reopened at once with the current snapshot; dedup absorbs the repeats
 - **Discovery**: Locates the server via Instance CRs (first Instance with a ready gRPC endpoint)
 - **Dedup**: SHA256 hash of type+deployment+namespace (no temporal component -- a continuous problem generates only one Anomaly). 2-hour TTL
 - **Dedup invalidation**: When an Issue reaches a terminal state (Resolved/Escalated), dedup entries for the resource are removed, allowing immediate recurrence detection
@@ -2143,7 +2146,7 @@ In `strict` mode, agent security blocks any cluster write operations not on the 
     Collection and budget details
   </Card>
   <Card title="Server Mode" icon="server" href="/features/server-mode">
-    GetAlerts and AnalyzeIssue RPCs
+    StreamAlerts, GetAlerts and AnalyzeIssue RPCs
   </Card>
   <Card title="K8s Monitoring" icon="book" href="/cookbook/k8s-monitoring">
     Recipe: K8s Monitoring with AI
