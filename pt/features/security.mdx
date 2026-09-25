@@ -30,7 +30,7 @@ O ChatCLI implementa uma arquitetura de **segurança em profundidade** (defense-
 | 11 | **Env Vars** | Redação automática de variáveis sensíveis (strict/permissive) | <Icon icon="check" /> Ativo |
 | 12 | **Histórico** | Redação de secrets no histórico de conversas | <Icon icon="check" /> Ativo |
 | 13 | **SSRF** | Bloqueio de IPs privados, link-local e cloud metadata | <Icon icon="check" /> Ativo |
-| 14 | **Rate Limiting** | Token bucket por cliente no servidor gRPC | <Icon icon="check" /> Ativo |
+| 14 | **Rate Limiting** | Token bucket por sujeito autenticado no servidor gRPC — `sub` do JWT ou principal do certificado; por endereço para chamadores anônimos | <Icon icon="check" /> Ativo |
 | 15 | **Plugins** | Assinatura Ed25519 com verificação obrigatória | <Icon icon="check" /> Ativo |
 | 16 | **Plugins** | Quarentena para plugins não assinados recém-vistos, via `CHATCLI_PLUGIN_QUARANTINE` | <Icon icon="gear" /> Opt-in |
 | 17 | **Comandos** | Allowlist com ~200 comandos, aplicada a **todo comando da linha**, não só ao primeiro | <Icon icon="check" /> Ativo |
@@ -44,14 +44,14 @@ O ChatCLI implementa uma arquitetura de **segurança em profundidade** (defense-
 | 25 | **Operator Auth** | Fail-closed — requisições sem auth são recusadas | <Icon icon="check" /> Ativo |
 | 26 | **RBAC K8s** | Least-privilege, namespace-scoped por padrão | <Icon icon="check" /> Ativo |
 | 27 | **gRPC Limits** | Limites de tamanho de mensagem e conexões concorrentes | <Icon icon="check" /> Ativo |
-| 28 | **Bind Address** | Bind em `localhost` por padrão (não expõe na rede) | <Icon icon="check" /> Ativo |
+| 28 | **Bind Address** | Bind em `localhost` por padrão (não expõe na rede); um bind alcançável recusa subir sem credencial (token, segredo HS256, chave pública RS256 ou CA de cliente) | <Icon icon="check" /> Ativo |
 | 29 | **JWT Clock Skew** | Tolerância configurável para diferença de relógio | <Icon icon="check" /> Ativo |
 | 30 | **NetworkPolicy** | Segmentação de rede no chart, com egress irrestrito ou restrito a DNS/HTTPS/API do K8s | <Icon icon="gear" /> Opt-in |
 | 31 | **Cosign** | Assinatura de imagens de container com Cosign | <Icon icon="check" /> Ativo |
 | 32 | **govulncheck** | Verificação de vulnerabilidades em dependências Go no CI | <Icon icon="check" /> Ativo |
 | 33 | **gosec** | Análise estática de segurança no CI | <Icon icon="check" /> Ativo |
 | 34 | **Dependabot** | Atualização automática de dependências | <Icon icon="check" /> Ativo |
-| 35 | **mTLS** | O servidor exige e verifica certificado de cliente, via `CHATCLI_SERVER_TLS_CLIENT_CA` | <Icon icon="gear" /> Opt-in |
+| 35 | **mTLS** | O servidor exige e verifica certificado de cliente, via `CHATCLI_SERVER_TLS_CLIENT_CA`, e identifica o chamador por ele (`CHATCLI_MTLS_ROLE`) | <Icon icon="gear" /> Opt-in |
 | 36 | **gRPC** | Validação de entrada em **todos** os RPCs, unários e de streaming | <Icon icon="check" /> Ativo |
 | 37 | **Audit** | Trilha JSON encadeada por hash que nomeia o chamador autenticado | <Icon icon="gear" /> Opt-in |
 | 38 | **Plugins** | Ferramental de assinatura: `chatcli plugin keygen`, `sign`, `verify`, `trust` | <Icon icon="check" /> Ativo |
@@ -264,6 +264,29 @@ chatcli server --tls-cert cert.pem --tls-key key.pem
 <Info>Se o carregamento do certificado TLS falhar, o erro é escrito em **stderr** e no log estruturado, incluindo os caminhos do certificado e da chave. Em containers, isso garante que o erro seja visível via `kubectl logs` mesmo que o logger estruturado não consiga fazer flush antes do crash.</Info>
 
 <Note>Quando TLS não está configurado, o servidor emite um log de warning a cada startup. O comportamento funcional não muda, mas a comunicação trafega em texto plano.</Note>
+
+### TLS mútuo (mTLS)
+
+O TLS mútuo tem duas metades, e as duas são necessárias. No servidor, um bundle de CA de cliente torna obrigatório um certificado de cliente verificado:
+
+```bash
+chatcli server \
+  --tls-cert server-cert.pem \
+  --tls-key server-key.pem \
+  --tls-client-ca ca.pem        # env: CHATCLI_SERVER_TLS_CLIENT_CA
+```
+
+No cliente, o certificado a apresentar:
+
+```bash
+export CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
+export CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
+chatcli connect servidor:50051 --tls --ca-cert ca.pem
+```
+
+<Warning>Uma CA de cliente que falha ao carregar é fatal: o servidor recusa subir em vez de aceitar chamadores anônimos num deployment configurado para o contrário. Uma CA de cliente sem `--tls-cert` e `--tls-key` também é fatal — não há handshake para carregar um certificado de cliente.</Warning>
+
+**Identidade pelo certificado.** Com `--tls-client-ca`, um chamador que não envia bearer token é identificado pelo certificado verificado: o principal é `mtls:<CN>`, ou o primeiro URI SAN (onde vivem os ids SPIFFE), depois o primeiro DNS SAN quando o CN está vazio. O papel é `CHATCLI_MTLS_ROLE` (`viewer`, `user` ou `admin`; padrão `user` — um certificado prova quem é o chamador, não que ele pode administrar o servidor; valor não reconhecido vira somente-leitura). Um bearer token, quando presente, continua prevalecendo: ele carrega o papel que o emissor escolheu. RBAC, trilha de auditoria e rate limiter passam a ver esse principal em vez de um chamador anônimo. O Helm chart expõe o papel como `security.mtlsRole`.
 
 ### Redação de Segredos no Caminho ao LLM
 
@@ -643,7 +666,7 @@ fe80::/10           — IPv6 link-local
 
 ### Rate Limiting por Cliente
 
-O servidor implementa rate limiting com **token bucket** por cliente, identificado pelo IP de origem.
+O servidor implementa rate limiting com **token bucket** por cliente. O limitador roda **depois** da autenticação e usa como chave o sujeito do chamador — o claim `sub` do JWT, ou o principal do certificado sob mTLS — em vez do endereço que ele divide com todo outro tenant atrás do mesmo NAT ou ingress. Chamadores anônimos (deployment com token compartilhado ou em loopback) caem para o endereço. Rajadas não autenticadas são contidas à parte pelo limitador de falhas de autenticação por endereço.
 
 | Parâmetro | Padrão | Variável |
 |-----------|--------|----------|
@@ -697,7 +720,7 @@ chatcli server --bind 0.0.0.0:50051 --tls-cert cert.pem --tls-key key.pem
 
 <Tip>Em Kubernetes, o bind address é automaticamente configurado para `0.0.0.0` — nenhuma configuração manual é necessária. O servidor detecta o ambiente via a variável `KUBERNETES_SERVICE_HOST`.</Tip>
 
-<Warning>Nunca exponha o servidor na rede (`0.0.0.0`) sem TLS e autenticação habilitados.</Warning>
+<Warning>Nunca exponha o servidor na rede (`0.0.0.0`) sem TLS e autenticação habilitados. Um bind alcançável é fail-closed: sem credencial configurada o servidor recusa subir em vez de admitir todo chamador como administrador. Qualquer uma destas satisfaz a guarda, espelhando o que o interceptor de auth e o listener TLS de fato aplicam: `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET` (HS256), `CHATCLI_JWT_PUBLIC_KEY` (RS256) ou `CHATCLI_SERVER_TLS_CLIENT_CA` (mTLS).</Warning>
 
 ### gRPC Reflection
 
@@ -1025,6 +1048,7 @@ Tabela completa de todas as variáveis de ambiente relacionadas à segurança do
 | `CHATCLI_SERVER_TLS_CERT` | Caminho do certificado TLS do servidor | `""` |
 | `CHATCLI_SERVER_TLS_KEY` | Caminho da chave TLS do servidor | `""` |
 | `CHATCLI_SERVER_TLS_CLIENT_CA` | Bundle de CA contra o qual certificados de cliente são verificados; habilita TLS mútuo. Exige cert e key. | `""` |
+| `CHATCLI_MTLS_ROLE` | Papel concedido a um chamador identificado só pelo certificado de cliente (sem bearer token): `viewer`, `user` ou `admin`. Valor não reconhecido vira somente-leitura. | `user` |
 | `CHATCLI_ENCRYPTION_KEY` | Criptografia em repouso opt-in para sessões, memória, contextos, transcrições, CCR e custos (AES-256-GCM, chave derivada por HKDF) | `""` (desligada) |
 | `CHATCLI_ENCRYPTION_KEY_PREVIOUS` | Chaves aposentadas ainda aceitas na leitura durante uma rotação (separadas por vírgula) | `""` |
 | `CHATCLI_KEYCHAIN_BACKEND` | Onde mora a chave de credenciais: `auto`, `file`, `keychain`. Um binário de teste Go nunca alcança o keychain do sistema em `auto` — só um `keychain` explícito — então rodar a suíte não pede permissão nem reescreve a chave do desenvolvedor | `auto` |
@@ -1130,6 +1154,12 @@ Tabela completa de todas as variáveis de ambiente relacionadas à segurança do
     chatcli server \
       --tls-cert /etc/chatcli/tls/cert.pem \
       --tls-key /etc/chatcli/tls/key.pem
+    ```
+  </Step>
+  <Step title="Exija certificados de cliente">
+    ```bash
+    export CHATCLI_MTLS_ROLE=user   # papel de quem se identifica só pelo certificado
+    chatcli server --tls-cert cert.pem --tls-key key.pem --tls-client-ca ca.pem
     ```
   </Step>
   <Step title="Use modo strict para o agente">

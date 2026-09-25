@@ -105,7 +105,8 @@ The **operator** chart (`chatcli-operator`) is separate from the **server** char
   | `image.tag` | `latest` | Image tag |
   | `replicaCount` | `1` | Replicas (leader election enabled by default) |
   | `api.port` | `8090` | Web dashboard and REST API port |
-  | `prometheusUrl` | `""` | Prometheus URL for incident metrics collection |
+  | `prometheusUrl` | `""` | Prometheus URL for incident metrics collection (set it here, not on the server chart, where it is deprecated) |
+  | `security.allowedDiagnosticCommands` | `""` | Extra read-only diagnostic commands for `ExecDiagnostic` (comma-separated, appended to the built-in allowlist); rendered as `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` on the operator pod |
   | `leaderElect` | `true` | Leader election for HA |
   | `serviceMonitor.enabled` | `false` | Create Prometheus ServiceMonitor |
 </Accordion>
@@ -345,9 +346,17 @@ spec:
 
   server:
     security:
-      jwtSecretRef:
+      jwtSecretRef:                 # HS256: the operator mints its own tokens from it
         name: chatcli-jwt
         key: secret
+      # jwtPublicKeyRef:            # RS256 instead: PEM public key the server verifies with
+      #   name: chatcli-jwt
+      #   key: public.pem
+      # jwtIssuer: "my-idp"         # required iss / aud claims, when your issuer sets them
+      # jwtAudience: "chatcli"
+      # operatorTokenRef:           # credential the operator presents (needed with RS256)
+      #   name: chatcli-operator-jwt
+      #   key: token
       rateLimitRps: 20
       # bindAddress: "0.0.0.0"  # Unset means every interface in Kubernetes — not loopback
 
@@ -360,8 +369,9 @@ spec:
 
 <Warning>
 **An Instance needs a credential.** The server an Instance provisions binds
-every interface inside a cluster, so a spec with no `server.token` and no
-`security.jwtSecretRef` would provision a server that refuses to start.
+every interface inside a cluster, so a spec with no `server.token`, no
+`security.jwtSecretRef` and no `security.jwtPublicKeyRef` would provision a
+server that refuses to start.
 The operator does not provision the Deployment in that case — it raises a
 condition on the Instance instead:
 
@@ -372,8 +382,49 @@ kubectl get instance my-instance \
 
 Bind loopback with `security.bindAddress: "127.0.0.1"` when the server is
 only reached from inside its own pod. A credential passed through
-`extraEnv` as `CHATCLI_SERVER_TOKEN` or `CHATCLI_JWT_SECRET` counts too.
+`extraEnv` as `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET`,
+`CHATCLI_JWT_PUBLIC_KEY` or `CHATCLI_SERVER_TLS_CLIENT_CA` counts too.
 </Warning>
+
+#### How the operator authenticates
+
+The AIOps pipeline (alerts, analysis, remediation steps) calls the same
+server, so the operator needs a credential of its own. It picks one in this
+order and reports the choice on the Instance:
+
+| Precedence | Field | What the operator sends |
+|---|---|---|
+| 1 | `spec.server.token` | the shared token, as before |
+| 2 | `spec.server.security.operatorTokenRef` | the referenced value verbatim: a JWT issued for `chatcli-operator` by your identity provider (RS256 servers), or a dedicated shared token |
+| 3 | `spec.server.security.jwtSecretRef` | short-lived HS256 tokens it mints itself (`sub: chatcli-operator`, `role: operator`, one hour, renewed at 45 minutes), stamped with `jwtIssuer` / `jwtAudience` when set |
+
+```bash
+kubectl get instance my-instance \
+  -o jsonpath='{.status.conditions[?(@.type=="OperatorCredentialConfigured")]}'
+```
+
+`OperatorCredentialConfigured=False` means the server is secured in a way
+the operator cannot satisfy (an RS256 public key with no
+`operatorTokenRef`, or a credential passed only through `extraEnv`): the
+Instance still provisions, but `AnalyzeIssue` and `AgenticStep` will be
+refused until one of the fields above is set. The minted token carries the
+`operator` role, which the AIOps RPCs need and nothing more.
+
+#### ServerSecuritySpec (`spec.server.security`)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `jwtSecretRef` | SecretKeyRef | No | HS256 signing secret (`CHATCLI_JWT_SECRET`); the operator also mints its own tokens from it |
+| `jwtPublicKeyRef` | SecretKeyRef | No | RSA public key (PEM) the server verifies RS256 tokens with (`CHATCLI_JWT_PUBLIC_KEY`). The operator cannot sign with it: set `operatorTokenRef` too |
+| `jwtIssuer` | string | No | Required `iss` claim (`CHATCLI_JWT_ISSUER`); stamped on the tokens the operator mints |
+| `jwtAudience` | string | No | Required `aud` claim (`CHATCLI_JWT_AUDIENCE`); stamped on the tokens the operator mints |
+| `operatorTokenRef` | SecretKeyRef | No | Credential the operator presents to this server: a JWT issued out of band, or the shared token |
+| `rateLimitRps` / `rateLimitBurst` | int32 | No | Per-client rate limit (`CHATCLI_RATE_LIMIT_RPS` / `CHATCLI_RATE_LIMIT_BURST`) |
+| `maxRecvMsgSize` / `maxSendMsgSize` / `maxConcurrentStreams` | int32 | No | gRPC message and stream limits |
+| `bindAddress` | string | No | Server bind address (unset = every interface in Kubernetes) |
+| `auditLogPath` | string | No | Audit log file path (`CHATCLI_AUDIT_LOG_PATH`) |
+| `debug` | bool | No | Debug logging |
+| `enableReflection` | bool | No | gRPC reflection (debugging only) |
 
 ### Spec Fields
 
@@ -1002,13 +1053,12 @@ flowchart TD
 | **wget fallback (Alpine)** | `wget -qO- http://localhost{,:8080}/{health,healthz,metrics}` |
 | **TCP reachability** | `nc -zv kubernetes.default.svc.cluster.local 443`, `nc -zv kube-dns.kube-system.svc.cluster.local 53` |
 
-Extend via the `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` env var (comma-separated, read once at startup):
+Extend via the `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` env var (comma-separated, read once at startup). The **operator** process reads it, not the server, so set it on the `chatcli-operator` chart with `security.allowedDiagnosticCommands` — an entry in an Instance's `spec.extraEnv` lands on the server pod and has no effect:
 
-```yaml
-spec:
-  extraEnv:
-    - name: CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS
-      value: "dig +short redis.default.svc.cluster.local, nc -zv redis.default.svc.cluster.local 6379"
+```bash
+helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
+  --namespace chatcli-system --reuse-values \
+  --set security.allowedDiagnosticCommands="dig +short redis.default.svc.cluster.local\, nc -zv redis.default.svc.cluster.local 6379"
 ```
 
 <Warning>

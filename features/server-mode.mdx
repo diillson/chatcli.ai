@@ -22,7 +22,7 @@ icon: "server"
     Clients can use their **own credentials** (API key or OAuth) if desired
   </Card>
   <Card title="Performance" icon="bolt">
-    Communication via gRPC with TLS support and progressive streaming
+    Communication via gRPC with TLS support and real provider streaming
   </Card>
 </CardGroup>
 
@@ -134,6 +134,8 @@ Per-model points carry the OpenTelemetry GenAI attribute names (`gen_ai.provider
 | `CHATCLI_GRPC_REFLECTION` | Enables gRPC reflection for debugging. Requires **BOTH** the `--grpc-reflection` flag **AND** this variable set to `true`. **Keep disabled in production.** Configurable via Helm with `server.grpcReflection`. | `false` |
 | `CHATCLI_DISABLE_VERSION_CHECK` | Disables automatic version check on startup. | `false` |
 | `CHATCLI_BIND_ADDRESS` | Server bind address. Defaults to `127.0.0.1` (local); in Kubernetes, auto-detects via `KUBERNETES_SERVICE_HOST` and defaults to `0.0.0.0`. Explicit value always takes precedence. | `127.0.0.1` / `0.0.0.0` (K8s) |
+| `CHATCLI_SERVER_TLS_CLIENT_CA` | CA bundle client certificates are verified against (`--tls-client-ca`); enables mutual TLS and identifies callers by certificate. Requires `--tls-cert`/`--tls-key`. | `""` |
+| `CHATCLI_MTLS_ROLE` | Role granted to a caller identified by its client certificate alone (no bearer token): `viewer`, `user` or `admin`. An unrecognized value resolves to read-only. | `user` |
 
 <Warning>
 gRPC reflection now requires **two conditions**: the `--grpc-reflection` flag **AND** the `CHATCLI_GRPC_REFLECTION=true` variable. This prevents accidental exposure in production. See the [security documentation](/features/security) for all hardening measures.
@@ -153,8 +155,12 @@ to start** and names what is missing.
 Provide one of:
 
 - `--token` / `CHATCLI_SERVER_TOKEN` — one shared credential;
-- `CHATCLI_JWT_SECRET` — per-user JWTs carrying identity and role. Tokens
-  must carry an `exp` claim; one without an expiry is rejected;
+- `CHATCLI_JWT_SECRET` (HS256) or `CHATCLI_JWT_PUBLIC_KEY` (RS256) —
+  per-user JWTs carrying identity and role. Tokens must carry an `exp`
+  claim; one without an expiry is rejected;
+- `--tls-client-ca` / `CHATCLI_SERVER_TLS_CLIENT_CA` — mutual TLS: every
+  caller presents a certificate the CA signed and is identified by it
+  (see the TLS tab below);
 - `CHATCLI_BIND_ADDRESS=127.0.0.1` — no credential, reachable only from
   the machine itself.
 
@@ -185,7 +191,7 @@ Use `--watch-config` to monitor **multiple deployments** simultaneously with Pro
 
 <Tabs>
   <Tab title="No Authentication">
-    By default, the server does not require authentication. Any client can connect:
+    On loopback, the server does not require authentication and any local client can connect (a reachable bind refuses to start without a credential — see the warning above):
 
     ```bash
     chatcli server  # no --token = open access
@@ -260,13 +266,19 @@ Use `--watch-config` to monitor **multiple deployments** simultaneously with Pro
     chatcli connect server:50051 --tls --ca-cert /path/to/ca.pem
     ```
 
-    **mTLS (Mutual TLS):** For mutual authentication, also configure the client certificate:
+    **mTLS (Mutual TLS):** For mutual authentication, the server verifies client certificates against a CA bundle and the client presents its certificate:
 
     ```bash
+    # Server: require a certificate signed by ca.pem (env: CHATCLI_SERVER_TLS_CLIENT_CA)
+    chatcli server --tls-cert cert.pem --tls-key key.pem --tls-client-ca ca.pem
+
+    # Client: present its certificate
     export CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
     export CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
-    chatcli server --tls-cert cert.pem --tls-key key.pem
+    chatcli connect server:50051 --tls --ca-cert ca.pem
     ```
+
+    With `--tls-client-ca`, a caller that sends no bearer token is identified by its verified certificate: the principal is `mtls:<CN>` (the first URI SAN, then the first DNS SAN, when the CN is empty) and its role comes from `CHATCLI_MTLS_ROLE` (`viewer`, `user` or `admin`; default `user`; an unrecognized value resolves to read-only). A bearer token, when present, still wins, since it carries the role its issuer chose. The Helm chart exposes this as `security.mtlsRole`.
 
     <Info>
     If TLS certificate loading fails, the error is written to both **stderr** and the structured log, including the cert and key paths for debugging. In Kubernetes, check `kubectl logs` to see the error.
@@ -352,6 +364,7 @@ The server implements a gRPC service with the following RPCs:
 | `ListSessions` | Lists sessions saved on the server |
 | `LoadSession` | Loads a saved session |
 | `SaveSession` | Saves the current session |
+| `DeleteSession` | Deletes a saved session |
 | `Health` | Server health check |
 | `GetServerInfo` | Server information (version, provider, model, watcher) |
 | `GetWatcherStatus` | K8s Watcher status (if active) |
@@ -364,6 +377,14 @@ The server implements a gRPC service with the following RPCs:
 | `DownloadPlugin` | Streaming download of a plugin binary |
 | `GetAlerts` | Returns active alerts from the K8s Watcher (used by the Operator) |
 | `AnalyzeIssue` | Sends Issue context to the LLM and returns analysis + suggested actions |
+| `AgenticStep` | Runs one turn of the AI-driven remediation loop (used by the Operator) |
+| `ResolveActiveConversation` | Returns the principal's current conversation, creating one on first contact (conversation hub) |
+| `NewConversation` | Rotates the principal's active conversation to a fresh thread; every channel follows |
+| `AppendEvent` | Appends one dialogue turn to a conversation's shared log |
+| `ReadConversation` | Returns the events after a given sequence number (hydration/resume) |
+| `SubscribeConversation` | Live-tails a conversation: backlog, then events as any channel appends them (server streaming) |
+| `SetBinding` | Maps a channel identity (platform, user id) to a principal |
+| `ListBindings` | Lists channel-to-principal bindings |
 
 ### gRPC with Multiple Replicas
 
@@ -379,9 +400,38 @@ gRPC uses persistent HTTP/2 connections that, by default, pin to a single pod vi
 For more details, see the [K8s Operator documentation](/features/k8s-operator) and [Helm deployment](/getting-started/docker-deployment).
 </Info>
 
-### Progressive Streaming
+### Streaming
 
-The `StreamPrompt` RPC splits the response into ~200 character chunks at natural boundaries (paragraphs, lines, sentences), providing a progressive response experience on the client.
+`StreamPrompt` streams the text as the provider produces it: every chunk is a fragment the provider emitted, not a slice of a finished reply. The final message (`done: true`) carries the `usage` the provider reported and the `stop_reason`. When the selected route cannot stream, the reply is completed in one call and delivered as a single chunk, so clients never need a second code path.
+
+### Reply Attribution and Token Usage
+
+`SendPrompt`, `AnalyzeIssue` and `AgenticStep` responses, and the final `StreamPrompt` message, carry a `TokenUsage` message and a `stop_reason`, and name the `provider` and `model` that actually answered (the fallback chain may answer with a different provider than the one configured):
+
+```protobuf
+message TokenUsage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 cache_read_tokens = 3;
+  int32 cache_write_tokens = 4;
+  int32 reasoning_tokens = 5;
+  bool estimated = 6;   // provider returned no usage; counts derive from character length
+}
+```
+
+`stop_reason` is what the provider reported (`end_turn`, `max_tokens`, `refusal`, ...). `chatcli connect` feeds this usage to its local cost tracker, so `/cost` over a remote connection prices the real tokens instead of a character estimate.
+
+### Request Routing
+
+Every prompt RPC (`SendPrompt`, `StreamPrompt`, `InteractiveSession`, `AnalyzeIssue`, `AgenticStep`) resolves its LLM client through the same rules:
+
+- A caller-forwarded credential (`--llm-key`, `--use-local-auth`, StackSpot fields) or an explicit provider/model override gets a dedicated client.
+- A request that names no provider or model and forwards no credential goes through the configured **fallback chain** (`CHATCLI_FALLBACK_*`) when there is one, otherwise the server's default client. The response names the chain entry that answered.
+- `max_tokens` is the request value when set, else the provider's `*_MAX_TOKENS` environment override (`OPENAI_MAX_TOKENS`, `ANTHROPIC_MAX_TOKENS`, `GOOGLEAI_MAX_TOKENS`, `BEDROCK_MAX_TOKENS`, ...), else the catalog ceiling for the model.
+- An expired **server** credential (provider 401/403) triggers one provider refresh and a retry. Refreshes are throttled to one per 30 seconds process-wide, so a burst of 401s under load rebuilds the providers once. Caller-forwarded credentials are never refreshed: the remote client owns them.
+- A reply stopped by a safety classifier (`stop_reason: refusal`) is resent once on the sibling model of the same provider, as the agent loop does. On a stream this only happens while no text has been shown yet.
+
+Requests are not serialized: every RPC keeps running concurrently on its own client instance.
 
 ### Resource Discovery RPCs
 
@@ -392,7 +442,7 @@ The `ListRemotePlugins`, `ListRemoteAgents`, `ListRemoteSkills`, `GetAgentDefini
 
 ### AIOps Platform RPCs
 
-The `GetAlerts` and `AnalyzeIssue` RPCs are used by the [AIOps Operator](/features/k8s-operator) to feed the autonomous remediation pipeline.
+The `GetAlerts`, `AnalyzeIssue` and `AgenticStep` RPCs are used by the [AIOps Operator](/features/k8s-operator) to feed the autonomous remediation pipeline. `AnalyzeIssue` and `AgenticStep` responses also carry the `usage`, `provider` and `model` fields described above.
 
 #### GetAlerts
 
@@ -450,6 +500,7 @@ message AnalyzeIssueResponse {
   string provider = 4;
   string model = 5;
   repeated SuggestedAction suggested_actions = 6;
+  TokenUsage usage = 7;
 }
 ```
 
@@ -515,7 +566,7 @@ K8s watcher active: 5 targets (interval: 30s)
 
 ## Rate Limiting
 
-The server implements per-client rate limiting using a token bucket to protect against abuse:
+The server implements per-client rate limiting using a token bucket to protect against abuse. The limiter runs **after** authentication and keys on the caller's subject — the JWT `sub` or the certificate principal — so tenants behind the same NAT or ingress do not share a bucket; anonymous callers are keyed by address. Unauthenticated floods are bounded separately by the per-address authentication failure limiter.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -623,7 +674,8 @@ CHATCLI_BIND_ADDRESS=127.0.0.1  # Auto-detected as 0.0.0.0 in Kubernetes
 # Security
 CHATCLI_GRPC_REFLECTION=false
 CHATCLI_DISABLE_VERSION_CHECK=false
-CHATCLI_JWT_SECRET=my-secret-key
+CHATCLI_JWT_SECRET=my-secret-key            # HS256, or:
+# CHATCLI_JWT_PUBLIC_KEY=/path/to/jwt-public.pem   # RS256
 CHATCLI_JWT_ISSUER=chatcli-server
 CHATCLI_JWT_AUDIENCE=chatcli-api
 
@@ -636,7 +688,11 @@ CHATCLI_MAX_RECV_MSG_SIZE=52428800
 CHATCLI_MAX_SEND_MSG_SIZE=52428800
 CHATCLI_MAX_CONCURRENT_STREAMS=100
 
-# mTLS
+# mTLS (server side)
+CHATCLI_SERVER_TLS_CLIENT_CA=/path/to/ca.pem
+CHATCLI_MTLS_ROLE=user   # role for callers identified by certificate alone
+
+# mTLS (client side, chatcli connect)
 CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
 CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
 

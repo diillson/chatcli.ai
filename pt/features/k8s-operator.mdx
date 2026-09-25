@@ -105,7 +105,8 @@ O chart do **operator** (`chatcli-operator`) é separado do chart do **server** 
   | `image.tag` | `latest` | Tag da imagem |
   | `replicaCount` | `1` | Réplicas (leader election ativo por padrão) |
   | `api.port` | `8090` | Porta do dashboard web e REST API |
-  | `prometheusUrl` | `""` | URL do Prometheus para coleta de métricas |
+  | `prometheusUrl` | `""` | URL do Prometheus para coleta de métricas (defina aqui, não no chart do servidor, onde está deprecado) |
+  | `security.allowedDiagnosticCommands` | `""` | Comandos de diagnóstico read-only extras para o `ExecDiagnostic` (separados por vírgula, somados à allowlist embutida); renderizado como `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` no pod do operator |
   | `leaderElect` | `true` | Leader election para HA |
   | `serviceMonitor.enabled` | `false` | Criar ServiceMonitor para Prometheus Operator |
 </Accordion>
@@ -357,9 +358,17 @@ spec:
 
   server:
     security:
-      jwtSecretRef:
+      jwtSecretRef:                 # HS256: o operator emite os próprios tokens a partir dele
         name: chatcli-jwt
         key: secret
+      # jwtPublicKeyRef:            # RS256 em vez disso: chave pública PEM com que o servidor verifica
+      #   name: chatcli-jwt
+      #   key: public.pem
+      # jwtIssuer: "meu-idp"        # claims iss / aud exigidos, quando seu emissor os define
+      # jwtAudience: "chatcli"
+      # operatorTokenRef:           # credencial que o operator apresenta (necessária com RS256)
+      #   name: chatcli-operator-jwt
+      #   key: token
       rateLimitRps: 20
       # bindAddress: "0.0.0.0"  # Em branco significa toda interface no Kubernetes — não loopback
 
@@ -373,8 +382,8 @@ spec:
 <Warning>
 **Uma Instance precisa de credencial.** O servidor que uma Instance
 provisiona escuta em toda interface dentro do cluster, então um spec sem
-`server.token` e sem `security.jwtSecretRef` provisionaria um servidor que
-recusa subir. O operator não cria o Deployment nesse caso — levanta uma
+`server.token`, sem `security.jwtSecretRef` e sem `security.jwtPublicKeyRef`
+provisionaria um servidor que recusa subir. O operator não cria o Deployment nesse caso — levanta uma
 condition na Instance:
 
 ```bash
@@ -384,9 +393,49 @@ kubectl get instance minha-instance \
 
 Use loopback com `security.bindAddress: "127.0.0.1"` quando o servidor só
 é alcançado de dentro do próprio pod. Uma credencial passada por
-`extraEnv` como `CHATCLI_SERVER_TOKEN` ou `CHATCLI_JWT_SECRET` também
-conta.
+`extraEnv` como `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET`,
+`CHATCLI_JWT_PUBLIC_KEY` ou `CHATCLI_SERVER_TLS_CLIENT_CA` também conta.
 </Warning>
+
+#### Como o operator se autentica
+
+O pipeline AIOps (alertas, análise, passos de remediação) chama o mesmo
+servidor, então o operator precisa de uma credencial própria. Ele escolhe
+uma nesta ordem e registra a escolha na Instance:
+
+| Precedência | Campo | O que o operator envia |
+|---|---|---|
+| 1 | `spec.server.token` | o token compartilhado, como antes |
+| 2 | `spec.server.security.operatorTokenRef` | o valor referenciado, sem alteração: um JWT emitido para `chatcli-operator` pelo seu identity provider (servidores RS256), ou um token compartilhado dedicado |
+| 3 | `spec.server.security.jwtSecretRef` | tokens HS256 de curta duração que ele mesmo emite (`sub: chatcli-operator`, `role: operator`, uma hora, renovados aos 45 minutos), carimbados com `jwtIssuer` / `jwtAudience` quando definidos |
+
+```bash
+kubectl get instance minha-instance \
+  -o jsonpath='{.status.conditions[?(@.type=="OperatorCredentialConfigured")]}'
+```
+
+`OperatorCredentialConfigured=False` significa que o servidor está protegido
+de um jeito que o operator não consegue satisfazer (uma chave pública RS256
+sem `operatorTokenRef`, ou uma credencial passada só por `extraEnv`): a
+Instance ainda é provisionada, mas `AnalyzeIssue` e `AgenticStep` serão
+recusados até que um dos campos acima seja definido. O token emitido carrega
+o papel `operator`, que é o que os RPCs de AIOps precisam e nada mais.
+
+#### ServerSecuritySpec (`spec.server.security`)
+
+| Campo | Tipo | Obrigatório | Descrição |
+|-------|------|-------------|-----------|
+| `jwtSecretRef` | SecretKeyRef | Não | Segredo de assinatura HS256 (`CHATCLI_JWT_SECRET`); o operator também emite os próprios tokens a partir dele |
+| `jwtPublicKeyRef` | SecretKeyRef | Não | Chave pública RSA (PEM) com que o servidor verifica tokens RS256 (`CHATCLI_JWT_PUBLIC_KEY`). O operator não consegue assinar com ela: defina `operatorTokenRef` também |
+| `jwtIssuer` | string | Não | Claim `iss` exigido (`CHATCLI_JWT_ISSUER`); carimbado nos tokens que o operator emite |
+| `jwtAudience` | string | Não | Claim `aud` exigido (`CHATCLI_JWT_AUDIENCE`); carimbado nos tokens que o operator emite |
+| `operatorTokenRef` | SecretKeyRef | Não | Credencial que o operator apresenta a este servidor: um JWT emitido fora de banda, ou o token compartilhado |
+| `rateLimitRps` / `rateLimitBurst` | int32 | Não | Rate limit por cliente (`CHATCLI_RATE_LIMIT_RPS` / `CHATCLI_RATE_LIMIT_BURST`) |
+| `maxRecvMsgSize` / `maxSendMsgSize` / `maxConcurrentStreams` | int32 | Não | Limites de mensagem e de streams gRPC |
+| `bindAddress` | string | Não | Endereço de bind do servidor (em branco = toda interface no Kubernetes) |
+| `auditLogPath` | string | Não | Caminho do arquivo de auditoria (`CHATCLI_AUDIT_LOG_PATH`) |
+| `debug` | bool | Não | Logging de debug |
+| `enableReflection` | bool | Não | gRPC reflection (só para debugging) |
 
 ### Campos do Spec
 
@@ -1015,13 +1064,12 @@ A ação `ExecDiagnostic` faz match exato de string contra um allowlist de coman
 | **wget fallback (Alpine)** | `wget -qO- http://localhost{,:8080}/{health,healthz,metrics}` |
 | **Reachability TCP** | `nc -zv kubernetes.default.svc.cluster.local 443`, `nc -zv kube-dns.kube-system.svc.cluster.local 53` |
 
-Extender via env var `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` (comma-separated, lido uma vez na inicialização):
+Extender via env var `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` (comma-separated, lido uma vez na inicialização). Quem lê essa variável é o processo do **operator**, não o servidor, então defina-a no chart `chatcli-operator` com `security.allowedDiagnosticCommands` — uma entrada no `spec.extraEnv` de uma Instance vai parar no pod do servidor e não tem efeito:
 
-```yaml
-spec:
-  extraEnv:
-    - name: CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS
-      value: "dig +short redis.default.svc.cluster.local, nc -zv redis.default.svc.cluster.local 6379"
+```bash
+helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
+  --namespace chatcli-system --reuse-values \
+  --set security.allowedDiagnosticCommands="dig +short redis.default.svc.cluster.local\, nc -zv redis.default.svc.cluster.local 6379"
 ```
 
 <Warning>

@@ -30,7 +30,7 @@ The table below summarizes all active protections across every layer of the stac
 | **Encryption** | Credential key in the OS keychain instead of a file | Opt-in |
 | **Encryption** | Encryption at rest for sessions, memory, contexts, transcripts, archives, costs | Opt-in |
 | **Transport** | TLS 1.3 for gRPC and REST endpoints | Opt-in |
-| **Transport** | Mutual TLS: the server requires and verifies a client certificate | Opt-in |
+| **Transport** | Mutual TLS: the server requires and verifies a client certificate, and identifies the caller by it (`CHATCLI_MTLS_ROLE`) | Opt-in |
 | **Keychain** | OS keychain integration (macOS Keychain, Linux secret-service, Windows Credential Manager) | Opt-in |
 | **Shell** | POSIX quoting to prevent shell injection in arguments | Active |
 | **Editors** | EDITOR validation against an allowlist of known editors | Active |
@@ -46,12 +46,12 @@ The table below summarizes all active protections across every layer of the stac
 | **Plugins** | Signing toolchain: `chatcli plugin keygen`, `sign`, `verify`, `trust` | Active |
 | **Plugins** | Quarantine window for newly seen unsigned plugins | Opt-in |
 | **gRPC** | SSRF prevention with private IP blocking on provider URLs | Active |
-| **gRPC** | Rate limiting (token bucket) per client IP | Active |
+| **gRPC** | Rate limiting (token bucket) per authenticated subject — JWT `sub` or certificate principal; per address for anonymous callers | Active |
 | **gRPC** | Maximum message size limits (send/receive) | Active |
 | **gRPC** | Maximum concurrent stream limits | Active |
 | **gRPC** | Input validation on every RPC, unary and streaming | Active |
 | **gRPC** | Reflection disabled by default (hides service schema) | Active |
-| **gRPC** | Fail-closed bind: refuses to serve an unauthenticated API on a reachable address | Active |
+| **gRPC** | Fail-closed bind: refuses to serve an unauthenticated API on a reachable address (a shared token, HS256 secret, RS256 public key or client CA satisfies it) | Active |
 | **Audit** | Structured JSON audit logging, unary and streaming, naming the authenticated caller | Opt-in |
 | **Audit** | Hash-chained, tamper-evident trail with `/config security verify-audit` | Opt-in |
 | **Binaries** | `stty` resolved via `exec.LookPath` (prevents PATH injection) | Active |
@@ -264,6 +264,8 @@ Every line of the audit trail (`CHATCLI_AUDIT_LOG_PATH`) carries `seq`, `prev_ha
     ```
 
     <Warning>A client CA that fails to load is fatal: the server refuses to start rather than come up accepting anonymous callers on a deployment configured for the opposite. A client CA without `--tls-cert` and `--tls-key` is also fatal — there is no handshake to carry a client certificate.</Warning>
+
+    **Certificate identity.** With `--tls-client-ca`, a caller that sends no bearer token is identified by its verified certificate: the principal is `mtls:<CN>`, or the first URI SAN (where SPIFFE ids live), then the first DNS SAN when the CN is empty. Its role is `CHATCLI_MTLS_ROLE` (`viewer`, `user` or `admin`; default `user` — a certificate proves who the caller is, not that it may administer the server; an unrecognized value resolves to read-only). A bearer token, when present, still wins: it carries the role its issuer chose. RBAC, the audit trail and the rate limiter all see this principal instead of an anonymous caller. The Helm chart exposes the role as `security.mtlsRole`.
   </Tab>
   <Tab title="Development (no TLS)">
     ```bash
@@ -655,6 +657,8 @@ export CHATCLI_RATE_LIMIT_RPS=10
 export CHATCLI_RATE_LIMIT_BURST=20
 ```
 
+The limiter runs **after** authentication and keys on the caller's subject — the JWT `sub` claim, or the certificate principal under mTLS — rather than on the address it shares with every other tenant behind the same NAT or ingress. Anonymous callers (a shared-token or loopback deployment) fall back to the address. Unauthenticated floods are bounded separately by the per-address authentication failure limiter.
+
 ### Message Size Limits
 
 Prevent memory exhaustion from oversized messages:
@@ -747,6 +751,8 @@ export CHATCLI_BIND_ADDRESS=0.0.0.0
 
 <Tip>In Kubernetes, the bind address is automatically set to `0.0.0.0` — no manual configuration required. The server detects the environment via the `KUBERNETES_SERVICE_HOST` variable.</Tip>
 
+<Warning>A reachable bind is fail-closed: with no credential configured the server refuses to start instead of admitting every caller as an administrator. Any one of these satisfies the guard, mirroring what the auth interceptor and the TLS listener actually enforce: `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET` (HS256), `CHATCLI_JWT_PUBLIC_KEY` (RS256) or `CHATCLI_SERVER_TLS_CLIENT_CA` (mTLS).</Warning>
+
 ### Interceptor Chain
 
 All requests pass through a chain of gRPC interceptors:
@@ -754,9 +760,6 @@ All requests pass through a chain of gRPC interceptors:
 <Steps>
   <Step title="Validation">
     Bounds every field of the request against the RPC's validator, before anything else touches it.
-  </Step>
-  <Step title="Rate Limiting">
-    Token-bucket rate limiter per client IP.
   </Step>
   <Step title="Audit">
     Wraps everything inward so it records refusals as well as successes, and names the caller authentication resolves further in.
@@ -768,7 +771,10 @@ All requests pass through a chain of gRPC interceptors:
     Records method, duration and status of each request.
   </Step>
   <Step title="Auth">
-    Validates the JWT or bearer token and attaches the caller's role.
+    Validates the JWT or bearer token — or names the caller after its verified client certificate under mTLS — and attaches the caller's role.
+  </Step>
+  <Step title="Rate Limiting">
+    Token-bucket rate limiter keyed on the authenticated subject (JWT `sub` or certificate principal), or on the address for anonymous callers. It runs after auth on purpose, so tenants behind one ingress do not share a bucket.
   </Step>
 </Steps>
 
@@ -1141,6 +1147,7 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_SERVER_TLS_CERT` | Server TLS certificate path | `""` |
 | `CHATCLI_SERVER_TLS_KEY` | Server TLS key path | `""` |
 | `CHATCLI_SERVER_TLS_CLIENT_CA` | CA bundle client certificates are verified against; enables mutual TLS. Requires cert and key. | `""` |
+| `CHATCLI_MTLS_ROLE` | Role granted to a caller identified by its client certificate alone (no bearer token): `viewer`, `user` or `admin`. An unrecognized value resolves to read-only. | `user` |
 
 ### Agent Security
 
@@ -1239,6 +1246,7 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
   </Step>
   <Step title="Require client certificates">
     ```bash
+    export CHATCLI_MTLS_ROLE=user   # role for callers identified by certificate alone
     chatcli server --tls-cert cert.pem --tls-key key.pem --tls-client-ca ca.pem
     ```
   </Step>
