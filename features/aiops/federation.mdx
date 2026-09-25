@@ -227,119 +227,58 @@ sequenceDiagram
 
 ## Cross-Cluster Correlation
 
-One of the most powerful federation features is the ability to correlate incidents across clusters.
+When an Issue is detected, the IssueReconciler asks the federation controller to look for the same problem elsewhere. Both checks below run only against ClusterRegistrations that are `connected` and whose kubeconfig client is cached; with no registrations they cost two cached lists and change nothing.
 
 ### Automatic Severity Elevation
 
-When the **same `signalType`** is detected in **3 or more clusters** within a time window, the platform automatically elevates severity to `critical`:
-
-```go
-func (ce *CrossClusterCorrelator) Evaluate(issues []FederatedIssue) []Correlation {
-    // Group by signalType
-    bySignal := make(map[string][]FederatedIssue)
-    for _, issue := range issues {
-        bySignal[issue.SignalType] = append(bySignal[issue.SignalType], issue)
-    }
-
-    var correlations []Correlation
-    for signalType, clusterIssues := range bySignal {
-        uniqueClusters := countUniqueClusters(clusterIssues)
-        if uniqueClusters >= 3 {
-            correlations = append(correlations, Correlation{
-                SignalType:       signalType,
-                AffectedClusters: uniqueClusters,
-                ElevateTo:        "critical",
-                CorrelationID:    generateCorrelationID(),
-            })
-        }
-    }
-    return correlations
-}
-```
-
-### CorrelationID Annotation
-
-When incidents are correlated across clusters, they all receive the same `correlationID` annotation for traceability:
+The controller lists the active (non-terminal) Issues with the **same `signalType`** on the local cluster and on every connected cluster. When they span **3 or more clusters** (the local one counts as one), every matching Issue, local and remote, is annotated and raised to `critical`:
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: Issue
 metadata:
-  name: issue-oom-api-server
+  name: api-gateway-error-rate-1790368432
   namespace: production
   annotations:
-    platform.chatcli.io/correlation-id: "cross-7f8a2b3c"
-    platform.chatcli.io/correlated-clusters: "prod-us-east-1,prod-eu-west-1,prod-ap-southeast-1"
-    platform.chatcli.io/elevated-severity: "true"
-    platform.chatcli.io/original-severity: "medium"
+    platform.chatcli.io/cross-cluster-correlation: "xcluster-7f8a2b3c"
+    platform.chatcli.io/affected-clusters: "3"
 spec:
-  severity: critical  # Elevated from medium to critical
-  signalType: OOMKilled
+  severity: critical   # raised from medium
+  signalType: error_rate
 ```
 
+The counter `chatcli_operator_federation_cross_cluster_issues_total` increments once per correlation. Remote Issues that changed underneath the update are skipped on a conflict and picked up on their own next reconcile.
+
 <Note>
-  The `correlationID` allows operators to run `kubectl` queries to find
-  all related incidents across all clusters:
+  The correlation id is an annotation, so find the related Issues with:
+
   ```bash
-  kubectl get issues -A -l platform.chatcli.io/correlation-id=cross-7f8a2b3c
+  kubectl get issues -A -o json \
+    | jq -r '.items[] | select(.metadata.annotations["platform.chatcli.io/cross-cluster-correlation"]=="xcluster-7f8a2b3c") | "\(.metadata.namespace)/\(.metadata.name)"'
   ```
 </Note>
 
-
-
 ## Cascade Detection
 
-Cascade detection identifies when a problem in a lower-tier environment (staging) may be about to affect a higher-tier environment (production).
+Cascade detection flags a production Issue whose resource already failed in staging: the same problem is rolling through the environments.
 
 ### Staging to Production
 
-```go
-func (cd *CascadeDetector) DetectStagingToProd(
-    stagingIssues []FederatedIssue,
-    prodIssues []FederatedIssue,
-) []CascadeAlert {
-    var alerts []CascadeAlert
-
-    for _, staging := range stagingIssues {
-        for _, prod := range prodIssues {
-            // Same signalType AND same resourceKind
-            if staging.SignalType == prod.SignalType &&
-               staging.ResourceKind == prod.ResourceKind {
-                // Staging occurred before production
-                if staging.DetectedAt.Before(prod.DetectedAt) {
-                    alerts = append(alerts, CascadeAlert{
-                        SourceCluster: staging.ClusterName,
-                        TargetCluster: prod.ClusterName,
-                        SignalType:    staging.SignalType,
-                        TimeDelta:     prod.DetectedAt.Sub(staging.DetectedAt),
-                    })
-                }
-            }
-        }
-    }
-    return alerts
-}
-```
-
-When a cascade is detected, the annotation `platform.chatcli.io/cascade-detected: true` is added to the production Issue:
+The check needs at least one connected registration with `environment: staging` and one with `environment: prod`. For the Issue being detected, the controller lists the Issues on every staging cluster and looks for one on a resource with the **same name** whose `detectedAt` is **earlier** than the local Issue's. The first match annotates the local Issue:
 
 ```yaml
 metadata:
   annotations:
     platform.chatcli.io/cascade-detected: "true"
-    platform.chatcli.io/cascade-source: "staging-us-east-1"
-    platform.chatcli.io/cascade-signal: "CrashLoopBackOff"
-    platform.chatcli.io/cascade-delta: "15m"
+    platform.chatcli.io/cascade-source-cluster: "staging-us-east-1"
+    platform.chatcli.io/cascade-source-issue: "checkout-crashloop-1790360001"
 ```
 
-<Warning>
-  Detected cascades automatically elevate the issue's priority and add
-  extra context to the LLM prompt, including the incident history from the source
-  cluster. This allows the AI to recommend preventive actions based on what
-  happened in staging.
-</Warning>
+and increments `chatcli_operator_federation_cascade_detected_total`.
 
-
+<Note>
+  The annotation is the whole effect: severity, notifications and the AI prompt are not changed by a cascade. Route on it from a NotificationPolicy or a dashboard filter if a cascade should page differently.
+</Note>
 
 ## Global Status Aggregation
 
@@ -407,7 +346,7 @@ status:
 
 ## Remediation Policy per Tier
 
-Each cluster has a remediation policy based on its `tier`, which controls the level of autonomy allowed by the Decision Engine.
+Each cluster has a remediation policy based on the `tier` of its ClusterRegistration, which controls how much autonomy the operator running **in that cluster** grants before the [Decision Engine](/features/aiops/decision-engine) evaluates confidence.
 
 ### Policy Definitions
 
@@ -417,64 +356,22 @@ Each cluster has a remediation policy based on its `tier`, which controls the le
 | **standard** | critical/high | Manual with approval | Conservatism for high severities |
 | **standard** | medium/low | Auto-remediation | Automation for lower-impact problems |
 | **non-critical** | Any | Auto-remediation | Maximum automation in dev/test environments |
+| unknown tier | Any | Manual with approval | Safe fallback |
 
-```go
-func (pm *PolicyManager) GetRemediationPolicy(
-    tier string,
-    severity string,
-) RemediationPolicy {
-    switch tier {
-    case "critical":
-        // Critical clusters: ALWAYS manual
-        return RemediationPolicy{
-            Mode:            "manual",
-            RequiresApproval: true,
-            RequiredRole:    "Admin",
-            Reason:          "Critical tier cluster: all remediations require approval",
-        }
+### Wiring
 
-    case "standard":
-        switch severity {
-        case "critical", "high":
-            return RemediationPolicy{
-                Mode:            "manual",
-                RequiresApproval: true,
-                RequiredRole:    "Operator",
-                Reason:          "High severity in standard cluster",
-            }
-        default: // medium, low
-            return RemediationPolicy{
-                Mode:            "auto",
-                RequiresApproval: false,
-                Reason:          "Medium/low severity in standard cluster",
-            }
-        }
+Tell the operator which registration is its own cluster:
 
-    case "non-critical":
-        // Dev/test: auto for everything
-        return RemediationPolicy{
-            Mode:            "auto",
-            RequiresApproval: false,
-            Reason:          "Non-critical cluster: auto-remediation for all severities",
-        }
-    }
-
-    // Safe fallback
-    return RemediationPolicy{
-        Mode:            "manual",
-        RequiresApproval: true,
-    }
-}
+```yaml
+# Helm values (chatcli-operator)
+clusterName: prod-us-east-1      # ClusterRegistration name or displayName
 ```
 
+or `CHATCLI_OPERATOR_CLUSTER_NAME` on the Deployment. Empty (the default) disables the tier gate. With it set, every plan that reaches `Pending` and was not parked by an ApprovalPolicy is checked against the table: when the tier says "manual", the plan waits in `WaitingApproval` under the synthetic policy `cluster-tier` (one approver, 30-minute timeout, decided like any ApprovalRequest) and its annotations carry `decision-mode: approval` and the reason, for example `Cluster prod-us-east-1 tier policy "manual" requires approval for high severity`.
+
 <Note>
-  The per-tier policy is evaluated **before** the Decision Engine calculates
-  confidence. If the tier requires manual approval, the confidence calculation
-  is still performed (for logging and auditing), but the result does not change
-  the decision.
+  The tier gate runs **before** the Decision Engine and independently of it: a plan the tier parks is not evaluated for confidence, and a plan the tier lets through is still subject to the engine when the engine is enabled.
 </Note>
-
-
 
 ## YAML Examples
 

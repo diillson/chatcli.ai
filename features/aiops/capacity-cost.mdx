@@ -1,11 +1,11 @@
 ---
 title: "Capacity Planning and Cost Attribution"
 sidebarTitle: "Capacity & Costs"
-description: "Capacity forecasting with linear regression, noise reduction, and cost tracking with ROI."
+description: "Capacity forecasting with linear regression, noise reduction, and LLM cost tracking per incident."
 icon: "chart-line"
 ---
 
-The ChatCLI AIOps platform includes three advanced subsystems that work together to optimize operations: **Capacity Planner** (resource exhaustion forecasting), **Noise Reducer** (intelligent alert suppression), and **Cost Tracker** (cost tracking and ROI calculation).
+The ChatCLI AIOps platform includes three advanced subsystems that work together to optimize operations: **Capacity Planner** (resource exhaustion forecasting), **Noise Reducer** (intelligent alert suppression), and **Cost Tracker** (LLM spend per incident, served over the REST API).
 
 
 
@@ -278,7 +278,7 @@ Where:
 
 ## Cost Tracker
 
-The Cost Tracker tracks operational costs (LLM + downtime) and calculates AIOps automation ROI.
+The Cost Tracker books the LLM spend of every incident from the usage the server reports, and serves the aggregate over the REST API.
 
 ### LLM Costs per Provider
 
@@ -316,121 +316,54 @@ data:
 
 ### IncidentCost
 
-Total cost of an incident, decomposed into components:
+One ledger entry per incident, written by the AIInsight and Remediation controllers on every LLM call:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `IncidentName` | `string` | Incident name |
-| `Namespace` | `string` | Namespace |
-| `LLMCost` | `CostBreakdown` | Cost of LLM calls |
-| `DowntimeCost` | `float64` | Downtime cost (minutes * cost/minute) |
-| `TotalCost` | `float64` | LLMCost.Total + DowntimeCost |
-| `Provider` | `string` | LLM provider used |
-| `Model` | `string` | LLM model used |
-| `Duration` | `time.Duration` | Total incident duration |
-| `AutoRemediated` | `bool` | Whether it was resolved automatically |
-
-**CostBreakdown:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `InputTokens` | `int64` | Total input tokens |
-| `OutputTokens` | `int64` | Total output tokens |
-| `InputCost` | `float64` | Input token cost |
-| `OutputCost` | `float64` | Output token cost |
-| `Total` | `float64` | InputCost + OutputCost |
-| `Calls` | `int` | Number of LLM calls |
+| `issueName` | `string` | Incident name |
+| `llmCosts.totalInputTokens` | `int64` | Input tokens across all calls |
+| `llmCosts.totalOutputTokens` | `int64` | Output tokens across all calls |
+| `llmCosts.analysisCalls` | `int32` | `AnalyzeIssue` calls |
+| `llmCosts.agenticSteps` | `int32` | `AgenticStep` calls |
+| `llmCosts.estimatedCostUSD` | `float64` | Spend priced by the pricing engine or the ConfigMap override |
+| `llmCosts.provider` / `llmCosts.model` | `string` | Provider and model that answered |
+| `engineerTimeSavedMinutes` | `float64` | Reserved for future estimation, `0` today |
+| `totalCostUSD` | `float64` | Equals `llmCosts.estimatedCostUSD` |
 
 **Calculation example:**
 
 ```text
 Incident: CrashLoopBackOff on api-server
-  - Provider: claude
+  - Provider: CLAUDEAI
   - LLM calls: 2 (AnalyzeIssue + 1 AgenticStep)
   - Input tokens: 8,500 | Output tokens: 2,200
-  - InputCost:  8,500 / 1,000,000 * $3.00  = $0.0255
-  - OutputCost: 2,200 / 1,000,000 * $15.00 = $0.0330
-  - Total LLMCost: $0.0585
-
-  - Downtime: 3 minutes
-  - DowntimeCost: 3 * $10.00 = $30.00
-
-  - TotalCost: $0.0585 + $30.00 = $30.06
+  - Input cost:  8,500 / 1,000,000 * $3.00  = $0.0255
+  - Output cost: 2,200 / 1,000,000 * $15.00 = $0.0330
+  - estimatedCostUSD: $0.0585
 ```
+
+The usage the server reports on each response (`usage` on `AnalyzeIssue` and `AgenticStep`) is what gets booked, so the ledger reflects real token counts, not estimates.
 
 ### CostSummary
 
-Cost aggregation for a period:
+Aggregation over a window, served by the REST API:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `Period` | `string` | Aggregation period (e.g., `30d`) |
-| `TotalLLMCost` | `float64` | Sum of all LLM costs |
-| `TotalDowntimeCost` | `float64` | Sum of all downtime costs |
-| `TotalCost` | `float64` | TotalLLMCost + TotalDowntimeCost |
-| `IncidentCount` | `int` | Total incidents in the period |
-| `AutoRemediatedCount` | `int` | Incidents resolved automatically |
-| `AvgCostPerIncident` | `float64` | TotalCost / IncidentCount |
-| `TopCostlyIncidents` | `[]IncidentCost` | Top 5 most expensive incidents |
-| `CostByProvider` | `map[string]float64` | Aggregated cost by LLM provider |
-| `CostByNamespace` | `map[string]float64` | Aggregated cost by namespace |
-| `ROI` | `ROICalculation` | Return on investment calculation |
+| `periodStart` / `periodEnd` | `time` | Window boundaries |
+| `totalLLMCost` | `float64` | Sum of every incident's `estimatedCostUSD` |
+| `incidentCount` | `int` | Incidents with a ledger entry |
+| `costPerIncident` | `float64` | `totalLLMCost / incidentCount` |
 
-### ROI Calculation
+```bash
+# last 30 days (default), all namespaces
+curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost"
 
-ROI is calculated by comparing automation cost with the estimated cost of manual resolution:
-
-```text
-Variables:
-  autoRemediated    = number of automatically resolved incidents
-  avgManualHours    = 2h (estimated manual resolution time per incident)
-  engineerRate      = $75/hour (configurable via ConfigMap)
-  downtimePrevented = autoRemediated * avgDowntimeMinutes
-  downtimeCostRate  = $10/minute (configurable via ConfigMap)
-
-Calculation:
-  engineerHoursSaved = autoRemediated * avgManualHours
-  laborSavings       = engineerHoursSaved * engineerRate
-  downtimeSavings    = downtimePrevented * downtimeCostRate
-  totalSavings       = laborSavings + downtimeSavings
-  totalLLMCost       = sum of all LLM costs in the period
-
-  ROI% = ((totalSavings - totalLLMCost) / totalLLMCost) * 100
+# one namespace, explicit window
+curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost?namespace=production&from=2026-09-01T00:00:00Z&to=2026-09-25T00:00:00Z"
 ```
 
-**ROICalculation struct:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `EngineerHoursSaved` | `float64` | Engineer hours saved |
-| `LaborSavings` | `float64` | Labor savings ($) |
-| `DowntimePrevented` | `float64` | Minutes of downtime prevented |
-| `DowntimeSavings` | `float64` | Downtime savings ($) |
-| `TotalSavings` | `float64` | Total savings ($) |
-| `TotalLLMCost` | `float64` | Total LLM cost ($) |
-| `ROIPercent` | `float64` | Return on investment (%) |
-
-**Monthly ROI example:**
-
-```text
-Monthly data:
-  - 312 automatically resolved incidents
-  - Total LLM cost: $18.72
-
-Calculation:
-  engineerHoursSaved = 312 * 2h = 624 hours
-  laborSavings       = 624 * $75 = $46,800
-  downtimePrevented  = 312 * 4.5min = 1,404 minutes
-  downtimeSavings    = 1,404 * $10 = $14,040
-  totalSavings       = $46,800 + $14,040 = $60,840
-  totalLLMCost       = $18.72
-
-  ROI% = ($60,840 - $18.72) / $18.72 * 100 = 324,935%
-```
-
-<Info>
-  ROI typically exceeds 100,000% because the cost of LLM calls ($0.03-0.10 per incident) is orders of magnitude lower than the cost of manual resolution (2h of engineer time + downtime).
-</Info>
+Downtime cost and return-on-investment figures are not computed: the platform has no trustworthy source for revenue per minute or engineer hourly rates, and numbers built on assumed constants would be misleading. Combine `totalLLMCost` with your own incident economics if you need them.
 
 
 
@@ -443,53 +376,45 @@ All Capacity Planner, Noise Reducer, and Cost Tracker data is persisted in Confi
 | `chatcli-capacity-history` | Historical CPU/memory usage per resource. Compact time series in JSON. | 7 days (rolling window) |
 | `chatcli-pattern-store` | Noise Reducer dedup hashes, suppression counters, flap flags. | 24 hours (automatic pruning) |
 | `chatcli-seasonal-patterns` | Learned seasonal patterns (SeasonalPattern structs in JSON). | Indefinite (patterns with Confidence &lt; 0.3 and LastSeen &gt; 30 days are removed) |
-| `chatcli-cost-ledger` | Cost records per incident (IncidentCost in JSON). Used for aggregation. | 90 days (rolling window) |
-| `chatcli-cost-config` | Per-provider pricing configuration, downtime cost, engineer rate. | Indefinite (user-managed) |
+| `chatcli-cost-ledger` | Cost records per incident (IncidentCost in JSON), one ConfigMap per namespace. | Indefinite (never pruned by the operator) |
+| `chatcli-cost-config` | Per-provider pricing override (`pricing` key). | Indefinite (user-managed) |
 
 <Warning>
-  ConfigMaps have a 1MB limit in Kubernetes. For clusters with high incident volume (&gt;1000/month), the Cost Tracker automatically compacts old records, keeping only daily aggregations for data older than 30 days.
+  ConfigMaps have a 1MB limit in Kubernetes, roughly 3,000 ledger entries. The operator does not compact the ledger: on a namespace with that volume, prune old keys periodically or the bookings start failing with a size error.
 </Warning>
 
 ### Storage Format
+
+One ConfigMap per namespace, `chatcli-cost-ledger`, one key per incident holding the `IncidentCost` JSON. The tracker creates it with the `app.kubernetes.io/managed-by: chatcli-operator` label, which is how the all-namespace summary finds every ledger:
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: chatcli-cost-ledger
-  namespace: chatcli-system
+  namespace: production
   labels:
-    app.kubernetes.io/component: cost-tracker
-    platform.chatcli.io/managed-by: operator
+    app.kubernetes.io/managed-by: chatcli-operator
 data:
-  ledger.json: |
+  api-gateway-oom-7f3a: |
     {
-      "version": 2,
-      "lastCompaction": "2026-03-19T00:00:00Z",
-      "entries": [
-        {
-          "incident": "issue-crashloop-api-server-production",
-          "namespace": "production",
-          "timestamp": "2026-03-19T14:13:00Z",
-          "llmCost": 0.0585,
-          "downtimeCost": 30.00,
-          "totalCost": 30.06,
-          "provider": "claude",
-          "autoRemediated": true,
-          "durationSeconds": 180
-        }
-      ],
-      "dailyAggregates": [
-        {
-          "date": "2026-03-18",
-          "totalLLMCost": 0.62,
-          "totalDowntimeCost": 350.00,
-          "incidentCount": 12,
-          "autoRemediatedCount": 11
-        }
-      ]
+      "issueName": "api-gateway-oom-7f3a",
+      "llmCosts": {
+        "totalInputTokens": 8500,
+        "totalOutputTokens": 2200,
+        "analysisCalls": 1,
+        "agenticSteps": 1,
+        "estimatedCostUSD": 0.0585,
+        "provider": "CLAUDEAI",
+        "model": "claude-sonnet-5"
+      },
+      "engineerTimeSavedMinutes": 0,
+      "totalCostUSD": 0.0585,
+      "recordedAt": "2026-09-25T14:13:00Z"
     }
 ```
+
+Entries are never compacted or expired by the operator: delete keys, or the ConfigMap, to reset a namespace's ledger.
 
 
 
@@ -497,13 +422,13 @@ data:
 
 <CardGroup cols={2}>
   <Card title="REST API" icon="code" href="/reference/api-reference">
-    Endpoints `/api/v1/analytics/remediation-stats` and `/api/v1/analytics/summary` expose cost and capacity data.
+    `/api/v1/analytics/cost` serves the ledger summary; `/api/v1/analytics/capacity` and `/api/v1/analytics/summary` expose capacity and incident data.
   </Card>
   <Card title="Web Dashboard" icon="chart-mixed" href="/features/aiops/web-dashboard">
-    The Overview view displays ROI metrics and capacity projections in real time.
+    The Overview view displays capacity warnings and remediation effectiveness in real time.
   </Card>
   <Card title="Grafana" icon="chart-area" href="/features/aiops/web-dashboard#grafana-dashboards">
-    The `remediation-stats.json` dashboard includes cost and ROI panels.
+    The `remediation-stats.json` dashboard covers remediation success by strategy.
   </Card>
   <Card title="AIOps Platform" icon="brain" href="/features/aiops-platform">
     Complete AIOps pipeline architecture and how these subsystems integrate.

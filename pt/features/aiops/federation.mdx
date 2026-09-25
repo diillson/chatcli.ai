@@ -227,119 +227,58 @@ sequenceDiagram
 
 ## Correlação Cross-Cluster
 
-Um dos recursos mais poderosos da federação é a capacidade de correlacionar incidentes entre clusters.
+Quando uma Issue é detectada, o IssueReconciler pede ao controller de federação que procure o mesmo problema em outros lugares. As duas verificações abaixo rodam só contra ClusterRegistrations `connected` cujo client do kubeconfig está em cache; sem registros elas custam duas listagens em cache e não mudam nada.
 
 ### Elevação Automática de Severidade
 
-Quando o **mesmo `signalType`** é detectado em **3 ou mais clusters** dentro de uma janela de tempo, a plataforma eleva automaticamente a severidade para `critical`:
-
-```go
-func (ce *CrossClusterCorrelator) Evaluate(issues []FederatedIssue) []Correlation {
-    // Agrupa por signalType
-    bySignal := make(map[string][]FederatedIssue)
-    for _, issue := range issues {
-        bySignal[issue.SignalType] = append(bySignal[issue.SignalType], issue)
-    }
-
-    var correlations []Correlation
-    for signalType, clusterIssues := range bySignal {
-        uniqueClusters := countUniqueClusters(clusterIssues)
-        if uniqueClusters >= 3 {
-            correlations = append(correlations, Correlation{
-                SignalType:       signalType,
-                AffectedClusters: uniqueClusters,
-                ElevateTo:        "critical",
-                CorrelationID:    generateCorrelationID(),
-            })
-        }
-    }
-    return correlations
-}
-```
-
-### CorrelationID Annotation
-
-Quando incidentes são correlacionados entre clusters, todos recebem a mesma annotation `correlationID` para rastreabilidade:
+O controller lista as Issues ativas (não terminais) com o **mesmo `signalType`** no cluster local e em cada cluster conectado. Quando elas abrangem **3 ou mais clusters** (o local conta como um), toda Issue correspondente, local e remota, é anotada e elevada a `critical`:
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: Issue
 metadata:
-  name: issue-oom-api-server
+  name: api-gateway-error-rate-1790368432
   namespace: production
   annotations:
-    platform.chatcli.io/correlation-id: "cross-7f8a2b3c"
-    platform.chatcli.io/correlated-clusters: "prod-us-east-1,prod-eu-west-1,prod-ap-southeast-1"
-    platform.chatcli.io/elevated-severity: "true"
-    platform.chatcli.io/original-severity: "medium"
+    platform.chatcli.io/cross-cluster-correlation: "xcluster-7f8a2b3c"
+    platform.chatcli.io/affected-clusters: "3"
 spec:
-  severity: critical  # Elevado de medium para critical
-  signalType: OOMKilled
+  severity: critical   # elevada de medium
+  signalType: error_rate
 ```
 
+O contador `chatcli_operator_federation_cross_cluster_issues_total` incrementa uma vez por correlação. Issues remotas que mudaram por baixo do update são puladas no conflito e apanhadas no próprio reconcile seguinte.
+
 <Note>
-  O `correlationID` permite que operadores façam `kubectl` queries para encontrar
-  todos os incidentes relacionados em todos os clusters:
+  O id de correlação é uma annotation, então encontre as Issues relacionadas com:
+
   ```bash
-  kubectl get issues -A -l platform.chatcli.io/correlation-id=cross-7f8a2b3c
+  kubectl get issues -A -o json \
+    | jq -r '.items[] | select(.metadata.annotations["platform.chatcli.io/cross-cluster-correlation"]=="xcluster-7f8a2b3c") | "\(.metadata.namespace)/\(.metadata.name)"'
   ```
 </Note>
 
-
-
 ## Detecção de Cascata
 
-A detecção de cascata identifica quando um problema em um ambiente de menor tier (staging) pode estar prestes a afetar um ambiente de maior tier (produção).
+A detecção de cascata marca uma Issue de produção cujo recurso já falhou em staging: o mesmo problema está rolando pelos ambientes.
 
 ### Staging para Produção
 
-```go
-func (cd *CascadeDetector) DetectStagingToProd(
-    stagingIssues []FederatedIssue,
-    prodIssues []FederatedIssue,
-) []CascadeAlert {
-    var alerts []CascadeAlert
-
-    for _, staging := range stagingIssues {
-        for _, prod := range prodIssues {
-            // Mesmo signalType E mesmo resourceKind
-            if staging.SignalType == prod.SignalType &&
-               staging.ResourceKind == prod.ResourceKind {
-                // Staging aconteceu antes de produção
-                if staging.DetectedAt.Before(prod.DetectedAt) {
-                    alerts = append(alerts, CascadeAlert{
-                        SourceCluster: staging.ClusterName,
-                        TargetCluster: prod.ClusterName,
-                        SignalType:    staging.SignalType,
-                        TimeDelta:     prod.DetectedAt.Sub(staging.DetectedAt),
-                    })
-                }
-            }
-        }
-    }
-    return alerts
-}
-```
-
-Quando uma cascata é detectada, a annotation `platform.chatcli.io/cascade-detected: true` é adicionada ao Issue em produção:
+A verificação precisa de pelo menos um registro conectado com `environment: staging` e um com `environment: prod`. Para a Issue sendo detectada, o controller lista as Issues de cada cluster de staging e procura uma num recurso com o **mesmo nome** cujo `detectedAt` seja **anterior** ao da Issue local. A primeira correspondência anota a Issue local:
 
 ```yaml
 metadata:
   annotations:
     platform.chatcli.io/cascade-detected: "true"
-    platform.chatcli.io/cascade-source: "staging-us-east-1"
-    platform.chatcli.io/cascade-signal: "CrashLoopBackOff"
-    platform.chatcli.io/cascade-delta: "15m"
+    platform.chatcli.io/cascade-source-cluster: "staging-us-east-1"
+    platform.chatcli.io/cascade-source-issue: "checkout-crashloop-1790360001"
 ```
 
-<Warning>
-  Cascatas detectadas elevam automaticamente a prioridade da issue e adicionam
-  contexto extra ao prompt do LLM, incluindo o histórico do incidente no cluster
-  de origem. Isso permite que a IA recomende ações preventivas baseadas no que
-  aconteceu no staging.
-</Warning>
+e incrementa `chatcli_operator_federation_cascade_detected_total`.
 
-
+<Note>
+  A annotation é todo o efeito: severidade, notificações e o prompt da IA não mudam por causa de uma cascata. Roteie a partir dela numa NotificationPolicy ou num filtro do dashboard se uma cascata deve acionar diferente.
+</Note>
 
 ## Agregação de Status Global
 
@@ -407,73 +346,32 @@ status:
 
 ## Política de Remediação por Tier
 
-Cada cluster tem uma política de remediação baseada no seu `tier`, que controla o nível de autonomia permitido pelo Motor de Decisão.
+Cada cluster tem uma política de remediação baseada no `tier` da sua ClusterRegistration, que controla quanta autonomia o operator rodando **naquele cluster** concede antes de o [Motor de Decisão](/pt/features/aiops/decision-engine) avaliar a confiança.
 
 ### Definição de Políticas
 
 | Tier | Severidade | Política | Justificativa |
-|------|-----------|----------|---------------|
+|------|------------|----------|---------------|
 | **critical** | Qualquer | Manual com aprovação | Zero risco de ação automática em infra crítica |
 | **standard** | critical/high | Manual com aprovação | Conservadorismo para severidades altas |
 | **standard** | medium/low | Auto-remediação | Automação para problemas de menor impacto |
-| **non-critical** | Qualquer | Auto-remediação | Máxima automação em ambientes de dev/test |
+| **non-critical** | Qualquer | Auto-remediação | Máxima automação em dev/test |
+| tier desconhecido | Qualquer | Manual com aprovação | Fallback seguro |
 
-```go
-func (pm *PolicyManager) GetRemediationPolicy(
-    tier string,
-    severity string,
-) RemediationPolicy {
-    switch tier {
-    case "critical":
-        // Clusters críticos: SEMPRE manual
-        return RemediationPolicy{
-            Mode:            "manual",
-            RequiresApproval: true,
-            RequiredRole:    "Admin",
-            Reason:          "Cluster tier critical: todas as remediações requerem aprovação",
-        }
+### Fiação
 
-    case "standard":
-        switch severity {
-        case "critical", "high":
-            return RemediationPolicy{
-                Mode:            "manual",
-                RequiresApproval: true,
-                RequiredRole:    "Operator",
-                Reason:          "Severidade alta em cluster standard",
-            }
-        default: // medium, low
-            return RemediationPolicy{
-                Mode:            "auto",
-                RequiresApproval: false,
-                Reason:          "Severidade média/baixa em cluster standard",
-            }
-        }
+Diga ao operator qual registro é o seu próprio cluster:
 
-    case "non-critical":
-        // Dev/test: auto para tudo
-        return RemediationPolicy{
-            Mode:            "auto",
-            RequiresApproval: false,
-            Reason:          "Cluster non-critical: auto-remediação para todas as severidades",
-        }
-    }
-
-    // Fallback seguro
-    return RemediationPolicy{
-        Mode:            "manual",
-        RequiresApproval: true,
-    }
-}
+```yaml
+# Helm values (chatcli-operator)
+clusterName: prod-us-east-1      # nome ou displayName da ClusterRegistration
 ```
 
+ou `CHATCLI_OPERATOR_CLUSTER_NAME` no Deployment. Vazio (o padrão) desliga a barreira por tier. Com ele definido, todo plano que chega a `Pending` e não foi segurado por uma ApprovalPolicy é comparado com a tabela: quando o tier diz "manual", o plano espera em `WaitingApproval` sob a política sintética `cluster-tier` (um aprovador, timeout de 30 minutos, decidido como qualquer ApprovalRequest) e suas annotations carregam `decision-mode: approval` e o motivo, por exemplo `Cluster prod-us-east-1 tier policy "manual" requires approval for high severity`.
+
 <Note>
-  A política por tier é avaliada **antes** do Motor de Decisão calcular
-  confiança. Se o tier exige aprovação manual, o cálculo de confiança ainda
-  é feito (para registro e auditoria), mas o resultado não altera a decisão.
+  A barreira por tier roda **antes** do Motor de Decisão e independe dele: um plano que o tier segura não é avaliado por confiança, e um plano que o tier libera ainda passa pelo motor quando ele está habilitado.
 </Note>
-
-
 
 ## Exemplos YAML
 

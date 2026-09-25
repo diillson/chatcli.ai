@@ -106,7 +106,12 @@ Os seguintes eventos são **registrados automaticamente** pelo operator:
 - `issue_escalated` — quando todas as tentativas de remediação falham
 - `remediation_started` — quando um RemediationPlan inicia execução
 - `remediation_completed` — quando a verificação de saúde confirma remediação bem-sucedida
-- `remediation_failed` — quando uma remediação falha
+- `remediation_failed` — quando um plano termina Failed ou RolledBack (registrado uma vez, na transição)
+- `approval_requested` — quando um plano fica em espera por um humano, por ApprovalPolicy, tier do cluster ou motor de decisão
+- `approval_approved`, `approval_rejected`, `approval_expired` — quando o plano em espera sai de WaitingApproval, uma vez por decisão
+- `notification_sent` — cada tentativa de entrega de uma NotificationPolicy ou canal de escalonamento, sucesso ou falha com o erro
+- `slo_violation` — quando uma janela de burn rate dispara num ServiceLevelObjective
+- `sla_breach` — quando um IncidentSLA registra uma violação de resposta ou resolução
 
 <Tabs>
   <Tab title="Detecção">
@@ -192,7 +197,7 @@ Exemplos:
 
 ### Annotation de Imutabilidade
 
-Todo AuditEvent é criado com a annotation `platform.chatcli.io/immutable: "true"`. Um admission webhook pode ser configurado para rejeitar updates/deletes em recursos com esta annotation.
+Todo AuditEvent é criado com a annotation `platform.chatcli.io/immutable: "true"`. O operator não traz admission webhook, então a annotation é um marcador: imponha-a com uma regra de policy engine (Kyverno, Gatekeeper) que rejeite updates e deletes em recursos que a carregam.
 
 
 
@@ -587,88 +592,32 @@ O RBAC Manager implementa controle de acesso granular com **4 roles** predefinid
   </Tab>
 </Tabs>
 
-### EnsureRoles
+### Papéis da plataforma
 
-O RBAC Manager garante que as ClusterRoles existem no cluster:
+As quatro ClusterRoles (`chatcli-role-viewer`, `chatcli-role-operator`, `chatcli-role-admin`, `chatcli-role-superadmin`) são **provisionadas pelo Helm chart ou pelo overlay kustomize**, nunca pelo operator em runtime (hardening H5: o operator não tem permissão para criar ClusterRoles). Elas dão acesso graduado aos CRDs da plataforma: viewers leem, operators também atualizam Issues, ApprovalRequests e PostMortems, admins gerenciam todos os recursos da plataforma.
 
-```go
-func (rm *RBACManager) EnsureRoles(ctx context.Context) error {
-    roles := []struct {
-        name  string
-        rules []rbacv1.PolicyRule
-    }{
-        {name: "chatcli-aiops-viewer", rules: viewerRules},
-        {name: "chatcli-aiops-operator", rules: operatorRules},
-        {name: "chatcli-aiops-admin", rules: adminRules},
-        {name: "chatcli-aiops-superadmin", rules: superAdminRules},
-    }
+Conceda um papel vinculando-o a um usuário ou grupo, como qualquer ClusterRole:
 
-    for _, role := range roles {
-        cr := &rbacv1.ClusterRole{
-            ObjectMeta: metav1.ObjectMeta{Name: role.name},
-            Rules:      role.rules,
-        }
-        _, err := controllerutil.CreateOrUpdate(ctx, rm.client, cr, func() error {
-            cr.Rules = role.rules
-            return nil
-        })
-        if err != nil {
-            return fmt.Errorf("falha ao criar/atualizar role %s: %w", role.name, err)
-        }
-    }
-    return nil
-}
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chatcli-role-operator-sre
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chatcli-role-operator
+subjects:
+  - kind: Group
+    name: sre-oncall
+    apiGroup: rbac.authorization.k8s.io
 ```
 
-### GrantRole e RevokeRole
+Revogar é apagar o binding. Mudanças de papel aparecem no audit log do Kubernetes; os AuditEvents do operator cobrem o que os controllers fazem, não quem recebeu qual papel.
 
-<CodeGroup>
-```go GrantRole
-func (rm *RBACManager) GrantRole(ctx context.Context, user string, role string) error {
-    binding := &rbacv1.ClusterRoleBinding{
-        ObjectMeta: metav1.ObjectMeta{
-            Name: fmt.Sprintf("chatcli-aiops-%s-%s", role, sanitize(user)),
-        },
-        RoleRef: rbacv1.RoleRef{
-            APIGroup: "rbac.authorization.k8s.io",
-            Kind:     "ClusterRole",
-            Name:     fmt.Sprintf("chatcli-aiops-%s", role),
-        },
-        Subjects: []rbacv1.Subject{
-            {Kind: "User", Name: user, APIGroup: "rbac.authorization.k8s.io"},
-        },
-    }
-
-    _, err := controllerutil.CreateOrUpdate(ctx, rm.client, binding, func() error { return nil })
-    if err != nil {
-        return err
-    }
-
-    // Registra no audit trail
-    return rm.auditRecorder.RecordRoleChange(user, role, "granted")
-}
-```
-
-```go RevokeRole
-func (rm *RBACManager) RevokeRole(ctx context.Context, user string, role string) error {
-    binding := &rbacv1.ClusterRoleBinding{}
-    bindingName := fmt.Sprintf("chatcli-aiops-%s-%s", role, sanitize(user))
-
-    err := rm.client.Get(ctx, types.NamespacedName{Name: bindingName}, binding)
-    if err != nil {
-        return fmt.Errorf("binding não encontrado: %w", err)
-    }
-
-    err = rm.client.Delete(ctx, binding)
-    if err != nil {
-        return err
-    }
-
-    // Registra no audit trail
-    return rm.auditRecorder.RecordRoleChange(user, role, "revoked")
-}
-```
-</CodeGroup>
+<Note>
+  A API REST e o dashboard usam um modelo próprio, API keys com `viewer`, `operator` ou `admin`, descrito em [Web Dashboard](/pt/features/aiops/web-dashboard). As ClusterRoles acima são para pessoas e ferramentas que chegam aos CRDs via `kubectl`.
+</Note>
 
 
 

@@ -19,28 +19,52 @@ O **Motor de Decisão** é o componente central que determina _quando_ e _como_ 
 
 ```mermaid
 flowchart TD
-    A[AIInsight CR] -->|confidence base| B[Decision Engine]
+    A[AIInsight CR] -->|confiança base| B[Motor de Decisão]
     B --> C{Ajustes de Confiança}
-    C --> D[Historical Success Rate]
+    C --> D[Taxa de Sucesso Histórica]
     C --> E[Pattern Match]
-    C --> F[Time of Day]
-    C --> G[Active Issues Count]
-    C --> H[Severity Modifier]
+    C --> F[Horário do Dia]
+    C --> G[Issues Ativas]
+    C --> H[Modificador de Severidade]
     D & E & F & G & H --> I[Confiança Final]
     I --> J{Circuit Breaker}
-    J -->|aberto| K[Bloqueia Auto-Remediação]
-    J -->|fechado| L{Decision Threshold}
-    L -->|≥0.95 + low| M[Auto-Remediação]
-    L -->|≥0.85 + medium| N[Auto + Notificação]
-    L -->|≥0.80 + high| O[Requer Aprovação]
-    L -->|below 0.70 ou critical| P[Apenas Manual]
-
+    J -->|aberto| K[Espera: blocked]
+    J -->|fechado| L{Threshold de Decisão}
+    L -->|>=0.95 + low| M[Auto-Remediação]
+    L -->|>=0.85 + medium| N[Auto + Notificação]
+    L -->|>=0.80 + high| O[Espera: approval]
+    L -->|demais casos ou critical| P[Espera: manual]
     style M fill:#a6e3a1,color:#000
     style N fill:#f9e2af,color:#000
     style O fill:#fab387,color:#000
     style P fill:#f38ba8,color:#000
     style K fill:#f38ba8,color:#000
 ```
+
+### Habilitando o motor
+
+O motor vem **desligado por padrão**: as ApprovalPolicies são então a única barreira. Ligue por operator:
+
+```yaml
+# Helm values (chatcli-operator)
+decisionEngine:
+  enabled: true
+```
+
+ou defina `CHATCLI_OPERATOR_DECISION_ENGINE=true` no Deployment do operator. O RemediationReconciler passa a avaliar todo plano que chega a `Pending`, depois de as ApprovalPolicies e o [tier do cluster](/pt/features/aiops/federation#politica-de-remediacao-por-tier) darem sua palavra: um plano que uma ApprovalPolicy já segurou não é reavaliado; um que uma regra `auto` liberou ainda é.
+
+Toda avaliação deixa o veredito no plano, tenha ele rodado ou esperado:
+
+```yaml
+metadata:
+  annotations:
+    platform.chatcli.io/decision-mode: "auto-notify"   # auto | auto-notify | approval | manual | blocked
+    platform.chatcli.io/confidence: "0.91"             # confiança final após os ajustes
+    platform.chatcli.io/risk: "medium"                 # low | medium | high | critical
+    platform.chatcli.io/decision-reason: "Auto-approved with notification: confidence 0.91 + medium severity"
+```
+
+Um plano que precisa esperar fica em `WaitingApproval` sob a política sintética `decision-engine`: um ApprovalRequest com `policyRef: decision-engine`, um aprovador exigido e timeout de 30 minutos, decidido como qualquer outro (dashboard, annotation `platform.chatcli.io/approve` ou API REST). Nenhum objeto ApprovalPolicy é necessário.
 
 
 
@@ -71,324 +95,153 @@ Todo o processo começa com o campo `confidence` do `AIInsight` CR, que é gerad
 
 ## Fatores de Ajuste de Confiança
 
-A confiança base nunca é usada diretamente. Ela passa por **5 fatores de ajuste** que a refinam com base no contexto operacional atual.
+A confiança base do AIInsight é ajustada por cinco fatores e depois limitada a `0.0`–`1.0`. Todos os números abaixo são os que o operator aplica.
 
 ### 1. Taxa de Sucesso Histórica
 
-<Steps>
-  <Step title="Consulta o Pattern Store">
-    O engine calcula a taxa de sucesso de remediações anteriores para o mesmo
-    tipo de sinal (`signalType`).
-  </Step>
-  <Step title="Aplica o ajuste">
-    - **Taxa de sucesso alta** (&gt;80%): ajuste de **+0.10**
-    - **Taxa de sucesso baixa** (&lt;40%): ajuste de **-0.10**
-    - **Sem histórico**: nenhum ajuste (0.00)
-  </Step>
-</Steps>
+O motor conta os RemediationPlans dos últimos 30 dias no namespace da Issue cujas ações incluem o primeiro tipo de ação do plano, e precisa de pelo menos **3** concluídos (Completed, Failed ou RolledBack) antes de ajustar:
 
-```go
-// Cálculo do ajuste histórico
-if successRate > 0.8 {
-    adjustment += 0.10
-} else if successRate < 0.4 {
-    adjustment -= 0.10
-}
-```
+| Taxa de sucesso | Ajuste |
+|-----------------|--------|
+| ≥ 90% | **+0,10** |
+| ≥ 70% | **+0,05** |
+| 50%–70% | 0,00 |
+| < 50% | **−0,10** |
+| menos de 3 planos concluídos | 0,00 |
+
+Planos agênticos não carregam ações pré-planejadas, então este fator não se aplica a eles.
 
 ### 2. Pattern Match (Correspondência de Padrão)
 
-Quando o Pattern Store encontra um padrão previamente resolvido que corresponde ao incidente atual, a confiança recebe um boost significativo.
-
-| Condição | Ajuste |
-|----------|--------|
-| Padrão encontrado com resolução bem-sucedida | **+0.15** |
-| Nenhum padrão correspondente | **0.00** |
-
-<Tip>
-  O Pattern Match é o fator mais poderoso. Um incidente idêntico resolvido
-  anteriormente pode elevar a confiança o suficiente para permitir auto-remediação
-  mesmo em cenários que normalmente exigiriam aprovação.
-</Tip>
+Quando o [Pattern Store](#pattern-store) guarda um padrão resolvido com o mesmo tipo de sinal, tipo de recurso e severidade, o `ConfidenceBoost` armazenado dele é somado. O boost é aprendido por padrão a partir de resoluções passadas; não há valor fixo.
 
 ### 3. Horário do Dia (Time of Day)
 
-Ações automáticas fora do horário comercial carregam risco adicional porque há menos engenheiros disponíveis para intervir caso algo dê errado.
-
 | Condição | Ajuste |
 |----------|--------|
-| Dentro do horário comercial (09:00-18:00 local) | **0.00** |
-| Fora do horário comercial | **-0.05** |
+| 09:00–17:59 **UTC** | 0,00 |
+| qualquer outra hora | **−0,05** |
+
+O relógio é UTC de propósito: o operator não sabe o horário comercial do time.
 
 ### 4. Issues Ativas Simultâneas
 
-Quando o cluster está sob pressão com múltiplos incidentes ativos, o motor se torna mais conservador para evitar ações em cadeia que possam agravar a situação.
+Issues não terminais no mesmo namespace, incluída a que está sendo avaliada:
 
 | Condição | Ajuste |
 |----------|--------|
-| Até 3 issues ativas | **0.00** |
-| Cada issue além de 3 | **-0.02 por issue** |
-
-```go
-// Exemplo: 7 issues ativas
-// Ajuste = -(7 - 3) * 0.02 = -0.08
-activeIssues := countActiveIssues(namespace)
-if activeIssues > 3 {
-    adjustment -= float64(activeIssues - 3) * 0.02
-}
-```
-
-<Warning>
-  Com 10 ou mais issues ativas simultâneas, o ajuste cumulativo (-0.14 ou mais)
-  torna praticamente impossível atingir o threshold de auto-remediação, forçando
-  revisão humana — exatamente o comportamento desejado durante um incidente em
-  cascata.
-</Warning>
+| até 3 issues ativas | 0,00 |
+| cada issue além de 3 | **−0,02**, limitado a **−0,10** |
 
 ### 5. Severidade do Incidente
 
-A severidade do `Issue` CR aplica um modificador fixo que reflete o risco operacional inerente.
-
-| Severidade | Ajuste | Justificativa |
-|-----------|--------|---------------|
-| **critical** | **-0.10** | Impacto em produção, requer máxima cautela |
-| **high** | **-0.05** | Risco significativo, conservadorismo moderado |
-| **medium** | **0.00** | Nível padrão, sem ajuste |
-| **low** | **+0.05** | Baixo risco, favorece automação |
-
-
+| Severidade | Ajuste |
+|------------|--------|
+| `critical` | **−0,10** |
+| `high` | **−0,05** |
+| `medium` | 0,00 |
+| `low` | **+0,05** |
 
 ## Exemplo Prático de Cálculo
 
-<Accordion title="Cenário: CrashLoopBackOff após deploy em horário comercial">
-  **Dados do incidente:**
-  - Confiança base do AIInsight: **0.88**
-  - Severidade: **high**
-  - Horário: 14:30 (horário comercial)
-  - Issues ativas: 2
-  - Pattern Store: padrão encontrado (rollback bem-sucedido há 5 dias)
-  - Taxa de sucesso histórica: 90%
+```text
+Issue: error_rate no Deployment checkout (medium), namespace production, 03:10 UTC
+Confiança do AIInsight (base):                     0,88
+1. Histórico: 5 planos ScaleDeployment concluídos,
+   4 completados (80%)  → ≥ 70%                    +0,05
+2. Pattern Store: padrão correspondente, boost      +0,10
+3. Horário: 03:10 UTC                               −0,05
+4. Issues ativas no namespace: 2                    0,00
+5. Severidade medium                                0,00
+Confiança final                                    0,98  → o limite mantém 0,98
+Veredito: 0,98 ≥ 0,85 e severidade medium → auto-notify (executa, operadores notificados)
+```
 
-  **Cálculo:**
-  ```
-  Base:                    0.88
-  + Historical success:   +0.10  (90% > 80%)
-  + Pattern match:        +0.15  (padrão encontrado)
-  + Time of day:           0.00  (horário comercial)
-  + Active issues:         0.00  (2 ≤ 3)
-  + Severity (high):      -0.05
-  ─────────────────────────────
-  Confiança final:         1.00  (capped at 1.0)
-  ```
-
-  **Decisão:** Confiança 1.00 + severidade high = **Requer aprovação** (threshold ≥0.80 + high).
-
-  Mesmo com confiança máxima, incidentes `high` sempre exigem aprovação humana.
-</Accordion>
-
-<Accordion title="Cenário: Pod com OOMKilled em namespace de staging à noite">
-  **Dados do incidente:**
-  - Confiança base do AIInsight: **0.92**
-  - Severidade: **low**
-  - Horário: 02:15 (fora do horário comercial)
-  - Issues ativas: 1
-  - Pattern Store: padrão encontrado (ajuste de memória bem-sucedido)
-  - Taxa de sucesso histórica: 95%
-
-  **Cálculo:**
-  ```
-  Base:                    0.92
-  + Historical success:   +0.10  (95% > 80%)
-  + Pattern match:        +0.15  (padrão encontrado)
-  + Time of day:          -0.05  (fora do horário)
-  + Active issues:         0.00  (1 ≤ 3)
-  + Severity (low):       +0.05
-  ─────────────────────────────
-  Confiança final:         1.00  (capped at 1.0)
-  ```
-
-  **Decisão:** Confiança 1.00 + severidade low = **Auto-remediação** (threshold ≥0.95 + low).
-</Accordion>
-
-<Accordion title="Cenário: Problema desconhecido em cluster sobrecarregado">
-  **Dados do incidente:**
-  - Confiança base do AIInsight: **0.65**
-  - Severidade: **critical**
-  - Horário: 10:00 (horário comercial)
-  - Issues ativas: 8
-  - Pattern Store: nenhum padrão correspondente
-  - Taxa de sucesso histórica: 30%
-
-  **Cálculo:**
-  ```
-  Base:                    0.65
-  + Historical success:   -0.10  (30% < 40%)
-  + Pattern match:         0.00  (nenhum padrão)
-  + Time of day:           0.00  (horário comercial)
-  + Active issues:        -0.10  (8-3=5 × 0.02)
-  + Severity (critical):  -0.10
-  ─────────────────────────────
-  Confiança final:         0.35
-  ```
-
-  **Decisão:** Confiança 0.35 + severidade critical = **Apenas manual** (&lt;0.70 ou critical).
-</Accordion>
+A mesma Issue com severidade `critical` terminaria em 0,88 e ficaria em espera como `manual`: critical nunca roda sem alguém.
 
 
 
 ## Thresholds de Decisão
 
-A combinação de confiança final e severidade determina o nível de autonomia permitido.
+A confiança final e a severidade decidem juntas quanta autonomia o plano recebe.
 
 <Tabs>
-  <Tab title="Auto-Remediação Completa">
-    **Requisitos:** Confiança ≥ 0.95 **e** severidade `low`
+  <Tab title="Auto-Remediação">
+    **Requisitos:** confiança ≥ 0,95 **e** severidade `low`
 
-    A plataforma executa a remediação automaticamente sem qualquer intervenção humana.
-    O `RemediationPlan` é criado e executado imediatamente.
+    O plano executa imediatamente. O veredito fica no plano:
 
     ```yaml
-    # RemediationPlan gerado automaticamente
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
     metadata:
-      name: auto-fix-oom-api-server
       annotations:
         platform.chatcli.io/decision-mode: "auto"
         platform.chatcli.io/confidence: "0.97"
-    spec:
-      issueRef:
-        name: issue-oom-api-server
-      actions:
-        - type: AdjustResources
-          target: deployment/api-server
-          parameters:
-            memoryLimit: "512Mi"
-            memoryRequest: "256Mi"
+        platform.chatcli.io/risk: "low"
     ```
   </Tab>
   <Tab title="Auto com Notificação">
-    **Requisitos:** Confiança ≥ 0.85 **e** severidade `medium`
+    **Requisitos:** confiança ≥ 0,85 **e** severidade `medium`
 
-    A remediação é executada automaticamente, mas uma notificação é enviada
-    aos operadores para awareness. O `RemediationPlan` inclui a annotation
-    de notificação.
+    O plano executa; as mudanças de estado da Issue chegam às NotificationPolicies como sempre, então os operadores são avisados.
 
     ```yaml
     metadata:
       annotations:
         platform.chatcli.io/decision-mode: "auto-notify"
         platform.chatcli.io/confidence: "0.89"
-        platform.chatcli.io/notify: "true"
+        platform.chatcli.io/risk: "medium"
     ```
   </Tab>
   <Tab title="Requer Aprovação">
-    **Requisitos:** Confiança ≥ 0.80 **e** severidade `high`
+    **Requisitos:** confiança ≥ 0,80 **e** severidade `high`
 
-    Um `ApprovalRequest` CR é criado e a remediação fica pendente até que um
-    operador com a role adequada aprove a execução.
+    O plano espera em `WaitingApproval`. O ApprovalRequest aponta para a política sintética:
 
     ```yaml
     apiVersion: platform.chatcli.io/v1alpha1
     kind: ApprovalRequest
     metadata:
-      name: approval-rollback-payment-svc
+      name: approval-checkout-error-rate-plan-1
     spec:
-      remediationPlanRef:
-        name: plan-rollback-payment-svc
-      requiredRole: Operator
-      expiresIn: 30m
-      summary: "Rollback do deployment payment-svc para revisão 42"
+      remediationPlanRef: checkout-error-rate-plan-1
+      policyRef: decision-engine
+      ruleName: decision-engine
+      requiredApprovers: 1
+      timeoutMinutes: 30
     status:
       state: Pending
     ```
+
+    O plano carrega `decision-mode: approval`. Aprove ou rejeite como qualquer requisição; após 30 minutos sem decisão ela expira e o plano falha.
   </Tab>
-  <Tab title="Apenas Manual">
-    **Requisitos:** Confiança &lt; 0.70 **ou** severidade `critical`
+  <Tab title="Manual">
+    **Requisitos:** severidade `critical`, ou qualquer severidade abaixo do seu threshold
 
-    Nenhuma ação automática é tomada. O `Issue` é marcado como
-    `RequiresManualIntervention` e um alerta é enviado à equipe de plantão.
-
-    ```yaml
-    status:
-      phase: RequiresManualIntervention
-      conditions:
-        - type: AutoRemediationBlocked
-          status: "True"
-          reason: "LowConfidenceOrCritical"
-          message: "Confiança 0.35 abaixo do threshold; severidade critical"
-    ```
+    Mesmo mecanismo, com `decision-mode: manual` e o motivo por extenso, por exemplo `Manual approval required: critical severity (confidence 0.88)`. Nada roda até alguém decidir.
   </Tab>
 </Tabs>
 
-
+<Note>
+  Um plano que uma ApprovalPolicy já segurou não é avaliado de novo. Um plano que uma regra `auto` liberou ainda é: o motor só pode adicionar cautela, nunca remover a barreira de uma política.
+</Note>
 
 ## Circuit Breaker
 
-O circuit breaker é um mecanismo de segurança que **bloqueia todas as auto-remediações** quando detecta falhas consecutivas, prevenindo que a plataforma cause danos em cascata.
+O circuit breaker bloqueia todo plano novo num namespace quando as remediações ali continuam falhando, para a plataforma parar de acumular dano.
 
 <Steps>
-  <Step title="Monitoramento de Falhas">
-    Cada falha de remediação é registrada com timestamp. O circuit breaker
-    mantém uma janela deslizante de **1 hora**.
+  <Step title="Janela de falhas">
+    A cada avaliação o motor conta os RemediationPlans do namespace que terminaram `Failed` ou `RolledBack` na última **1 hora**. O momento da falha é `completedAt`, ou `startedAt` quando o caminho de falha não o carimbou, ou a criação do plano.
   </Step>
-  <Step title="Disparo do Circuit Breaker">
-    Quando **3 ou mais falhas** ocorrem dentro da janela de 1 hora, o circuit
-    breaker **abre** e bloqueia toda auto-remediação no namespace.
+  <Step title="Abre">
+    **3 ou mais** falhas na janela abrem o breaker: o plano fica em espera como `decision-mode: blocked` com o motivo `Circuit breaker open: 3 remediations failed in last hour`, e `chatcli_operator_decision_engine_circuit_breaker_state{namespace}` marca `1`.
   </Step>
-  <Step title="Estado Aberto">
-    Enquanto aberto, todos os `RemediationPlan` CRs são criados com
-    `requiresApproval: true`, independente da confiança calculada.
-  </Step>
-  <Step title="Reset">
-    O circuit breaker fecha automaticamente após o período de cooldown ou quando
-    um operador faz reset manual via annotation.
+  <Step title="Fecha">
+    O breaker fecha sozinho quando as falhas saem da janela de uma hora. Não há reset manual: aprove as requisições em espera que quiser rodar, ou corrija a causa e aguarde.
   </Step>
 </Steps>
 
-```go
-type CircuitBreaker struct {
-    failures    []time.Time
-    window      time.Duration  // 1 hora
-    threshold   int            // 3 falhas
-    isOpen      bool
-    mu          sync.Mutex
-}
-
-func (cb *CircuitBreaker) RecordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    now := time.Now()
-    cb.failures = append(cb.failures, now)
-
-    // Remove falhas fora da janela
-    cutoff := now.Add(-cb.window)
-    var recent []time.Time
-    for _, f := range cb.failures {
-        if f.After(cutoff) {
-            recent = append(recent, f)
-        }
-    }
-    cb.failures = recent
-
-    if len(cb.failures) >= cb.threshold {
-        cb.isOpen = true
-    }
-}
-
-func (cb *CircuitBreaker) IsOpen() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    return cb.isOpen
-}
-```
-
-<Warning>
-  Quando o circuit breaker está aberto, a annotation
-  `platform.chatcli.io/circuit-breaker: open` é adicionada ao namespace.
-  Isso é visível via `kubectl get ns &lt;namespace&gt; -o yaml` para diagnóstico
-  rápido.
-</Warning>
+O estado é derivado dos planos a cada avaliação, não guardado em memória, então um restart do operator não o perde.
 
 
 
@@ -718,44 +571,20 @@ func (cd *ConvergenceDetector) IsOscillating(observations []string) bool {
 
 ### ShouldStop
 
-Função principal que combina todos os critérios de parada do loop agêntico:
+O RemediationReconciler chama o detector antes de cada passo agêntico, depois dos limites rígidos (máximo de passos, timeout de 10 minutos):
 
 ```go
-func (cd *ConvergenceDetector) ShouldStop(
-    observations []string,
-    startTime time.Time,
-    consecutiveFailures int,
-) (bool, string) {
-    // 1. Convergência
-    if cd.IsConverged(observations) {
-        return true, "Sistema convergiu (3 observações idênticas)"
-    }
-
-    // 2. Oscilação
-    if cd.IsOscillating(observations) {
-        return true, "Oscilação detectada (padrão A→B→A→B)"
-    }
-
-    // 3. Timeout (10 minutos)
-    if time.Since(startTime) > 10*time.Minute {
-        return true, "Timeout do loop agêntico (10 min)"
-    }
-
-    // 4. Falhas consecutivas
-    if consecutiveFailures >= 5 {
-        return true, "5 falhas consecutivas"
-    }
-
-    return false, ""
-}
+func (cd *ConvergenceDetector) ShouldStop(history []AgenticStep, elapsed time.Duration) (bool, string)
 ```
 
-| Critério | Condição | Ação |
-|----------|----------|------|
-| Convergência | 3 observações idênticas | Para o loop, marca como resolvido ou não |
-| Oscilação | Padrão A-B-A-B | Para o loop, escala para humano |
-| Timeout | > 10 minutos | Para o loop, escala para humano |
-| Falhas consecutivas | ≥ 5 falhas | Para o loop, dispara circuit breaker |
+| Critério | Condição | Motivo registrado |
+|----------|----------|-------------------|
+| Convergência | as últimas 3 observações são idênticas | `Converged: Last 3 observations identical: …` |
+| Oscilação | as últimas 4 ações alternam A, B, A, B | `Oscillating: between A and B` |
+| Perto do timeout | mais de 8 minutos decorridos (limite 10) | `Approaching timeout: 8m12s elapsed (limit: 10m)` |
+| Falha repetida | as últimas 5 ações observaram `FAILED:` | `Last 5 actions all failed` |
+
+Uma parada falha o plano com `status.result` igual a `Agentic loop stopped: <motivo> (estimated progress NN%)` e incrementa `chatcli_operator_agentic_convergence_stops_total{reason}` com `converged`, `oscillating`, `timeout` ou `failures`. A Issue então tenta de novo com a próxima tentativa ou escalona, exatamente como após qualquer plano falho.
 
 ### EstimateProgress
 
@@ -787,60 +616,43 @@ func (cd *ConvergenceDetector) EstimateProgress(
 
 ```mermaid
 flowchart TD
-    START([Novo Issue CR]) --> INSIGHT[AIInsight gerado pelo LLM]
+    START([Issue em Analyzing]) --> INSIGHT[AIInsight respondido pelo servidor]
     INSIGHT --> RCA[Enriquecimento RCA]
-    RCA --> PATTERN[Consulta Pattern Store]
-    PATTERN --> CALC[Calcula confiança ajustada]
-
-    CALC --> CB{Circuit Breaker<br/>aberto?}
-    CB -->|Sim| MANUAL[Apenas Manual]
-    CB -->|Não| THRESHOLD{Avalia threshold}
-
-    THRESHOLD -->|≥0.95 + low| AUTO[Auto-Remediação]
-    THRESHOLD -->|≥0.85 + medium| NOTIFY[Auto + Notificação]
-    THRESHOLD -->|≥0.80 + high| APPROVAL[Cria ApprovalRequest]
-    THRESHOLD -->|below 0.70 ou critical| MANUAL
-
-    AUTO --> EXEC[Executa RemediationPlan]
-    NOTIFY --> EXEC
-    APPROVAL -->|Aprovado| EXEC
-    APPROVAL -->|Rejeitado/Expirado| END_REJECT([Fim - Rejeitado])
-
+    RCA --> PLAN[RemediationPlan Pending]
+    PLAN --> POLICY{ApprovalPolicy<br/>casa?}
+    POLICY -->|manual / quorum| PARK[WaitingApproval]
+    POLICY -->|sem match ou auto| TIER{Tier do cluster<br/>exige aprovação?}
+    TIER -->|sim| PARK
+    TIER -->|não ou não configurado| ENGINE{Motor de decisão<br/>habilitado?}
+    ENGINE -->|não| EXEC[Executa]
+    ENGINE -->|sim| CB{Circuit breaker<br/>aberto?}
+    CB -->|sim| PARK
+    CB -->|não| CALC[Ajusta confiança]
+    CALC --> THRESHOLD{Threshold}
+    THRESHOLD -->|>=0.95 + low| EXEC
+    THRESHOLD -->|>=0.85 + medium| EXEC
+    THRESHOLD -->|demais| PARK
+    PARK -->|aprovado| EXEC
+    PARK -->|rejeitado ou expirado| FAIL([Plano Failed])
     EXEC --> RESULT{Resultado}
-    RESULT -->|Sucesso| RECORD_OK[RecordResolution<br/>no Pattern Store]
-    RESULT -->|Falha| ROLLBACK[Rollback Automático<br/>para snapshot pré-remediação]
-    ROLLBACK --> HEALTH{Recurso<br/>healthy?}
-    HEALTH -->|Sim| RECORD_FAIL[RecordFailure + RolledBack<br/>+ Circuit Breaker check]
-    HEALTH -->|Não| RECORD_FAIL_HARD[RecordFailure + Failed<br/>+ Circuit Breaker check]
-
-    RECORD_OK --> END_OK([Issue Resolvida])
-    RECORD_FAIL --> RETRY{Retry<br/>disponível?}
-    RECORD_FAIL_HARD --> RETRY
-    RETRY -->|Sim| EXEC
-    RETRY -->|Não| MANUAL
-
-    style AUTO fill:#a6e3a1,color:#000
-    style NOTIFY fill:#f9e2af,color:#000
-    style APPROVAL fill:#fab387,color:#000
-    style MANUAL fill:#f38ba8,color:#000
-    style END_OK fill:#a6e3a1,color:#000
+    RESULT -->|saudável| OK[Completed + RecordResolution]
+    RESULT -->|não saudável| RB[Rollback + RecordFailure]
+    RB --> RETRY{Tentativas restantes?}
+    RETRY -->|sim| PLAN
+    RETRY -->|não| ESC([Issue Escalated])
+    style EXEC fill:#a6e3a1,color:#000
+    style PARK fill:#fab387,color:#000
+    style FAIL fill:#f38ba8,color:#000
+    style OK fill:#a6e3a1,color:#000
 ```
-
-
 
 ## Métricas do Motor de Decisão
 
-O motor expõe métricas Prometheus para observabilidade:
-
-| Métrica | Tipo | Descrição |
-|---------|------|-----------|
-| `decision_engine_evaluations_total` | Counter | Total de avaliações de confiança |
-| `decision_engine_confidence_histogram` | Histogram | Distribuição de confiança final |
-| `decision_engine_auto_remediations_total` | Counter | Total de auto-remediações por modo |
-| `decision_engine_circuit_breaker_state` | Gauge | Estado do circuit breaker (0=fechado, 1=aberto) |
-| `decision_engine_pattern_matches_total` | Counter | Total de correspondências no Pattern Store |
-| `decision_engine_rca_enrichment_duration` | Histogram | Tempo de enriquecimento RCA |
-| `decision_engine_convergence_stops_total` | Counter | Total de paradas por tipo (convergência, oscilação, timeout, falhas) |
+| Métrica | Tipo | Labels | Descrição |
+|---------|------|--------|-----------|
+| `chatcli_operator_decision_engine_evaluations_total` | Counter | `mode` | Avaliações pelo modo concedido: `auto`, `auto-notify`, `approval`, `manual`, `blocked` |
+| `chatcli_operator_decision_engine_circuit_breaker_state` | Gauge | `namespace` | `1` enquanto o breaker do namespace está aberto, `0` caso contrário |
+| `chatcli_operator_agentic_convergence_stops_total` | Counter | `reason` | Loops agênticos parados pelo detector: `converged`, `oscillating`, `timeout`, `failures` |
 
 ```yaml
 # Exemplo de alerta Prometheus
@@ -848,26 +660,24 @@ groups:
   - name: decision-engine
     rules:
       - alert: CircuitBreakerOpen
-        expr: decision_engine_circuit_breaker_state == 1
+        expr: chatcli_operator_decision_engine_circuit_breaker_state == 1
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Circuit breaker do motor de decisão aberto"
-          description: "3+ falhas de remediação na última hora. Auto-remediação bloqueada."
-      - alert: LowPatternMatchRate
+          summary: "Circuit breaker do motor de decisão aberto em {{ $labels.namespace }}"
+          description: "3+ falhas de remediação na última hora. Planos novos esperam por um humano."
+      - alert: MostPlansWaitForHumans
         expr: >
-          rate(decision_engine_pattern_matches_total[1h])
-          / rate(decision_engine_evaluations_total[1h]) < 0.1
-        for: 24h
+          sum(rate(chatcli_operator_decision_engine_evaluations_total{mode=~"approval|manual"}[6h]))
+          / sum(rate(chatcli_operator_decision_engine_evaluations_total[6h])) > 0.8
+        for: 6h
         labels:
           severity: info
         annotations:
-          summary: "Baixa taxa de correspondência de padrões"
-          description: "Menos de 10% dos incidentes têm padrão conhecido. Considere revisar runbooks."
+          summary: "Mais de 80% dos planos ficam em espera por aprovação"
+          description: "A confiança raramente ultrapassa os thresholds. Revise runbooks e o Pattern Store."
 ```
-
-
 
 ## Próximos Passos
 
