@@ -522,7 +522,7 @@ Adicionalmente, no início de cada turno do agente, o ChatCLI faz `stty sane` no
 
 O stdout e o stderr de todo comando do agente passam por uma redação por regex de formatos de segredo (API keys, tokens, credenciais em strings de conexão) antes de serem guardados no resultado que o modelo recebe, e depois pela [redação no caminho ao LLM](#redação-de-segredos-no-caminho-ao-llm), como qualquer outra saída de tool.
 
-<Warning>`CHATCLI_MAX_COMMAND_OUTPUT` aparece no `/config`, mas não tem efeito nas versões atuais: o helper que cortaria a saída dos comandos nesse tamanho, removeria sequências de controle e sinalizaria frases de prompt injection não está ligado ao caminho do agente.</Warning>
+Quando o agente devolve o resultado de um comando ao modelo (as continuações `c<N>` e `ac<N>`), stdout e stderr também vão cercados como dados num bloco `<COMMAND_OUTPUT cmd="...">`, precedidos de um aviso quando frases de prompt injection são detectadas, e limitados a `CHATCLI_MAX_COMMAND_OUTPUT` bytes (padrão `102400`, cortados numa fronteira de caractere e marcados `[TRUNCATED: output exceeded N bytes]`). O terminal mostra a saída inteira; só a cópia enviada ao modelo é limitada. Os resultados de ferramentas do coder são dimensionados por `CHATCLI_TOOL_RESULT_MAX_CHARS`.
 
 ### Validação do EDITOR
 
@@ -858,24 +858,26 @@ As API keys são carregadas com hot-reload a cada 30 segundos, na seguinte ordem
 O Secret `chatcli-operator-secrets` precisa estar **no mesmo namespace que o pod do operator** (o controller chama `Secrets(resolveNamespace()).Get(...)` — `resolveNamespace()` lê a env var `POD_NAMESPACE`, o arquivo de namespace do ServiceAccount, ou cai para o padrão `chatcli-system`). Se você fez `helm install --namespace <X>`, crie o Secret em `<X>`.
 </Warning>
 
-<Tip>API keys armazenadas no Secret são recarregadas a cada 30s -- nenhum restart do operator é necessário. Remover uma entrada do Secret revoga aquela chave em até 30 segundos; esvaziar o campo `api-keys`, ou deixar um YAML que não faz parse, rejeita toda chamada. Excluir o Secret `chatcli-operator-secrets` e também o ConfigMap `chatcli-operator-config` revoga todas as chaves na próxima leitura (em até ~30 segundos, `401` a partir daí). Se a leitura do Secret ou do ConfigMap falhar por qualquer motivo que não seja "não encontrado", as chaves em vigor são mantidas, para que uma instabilidade do API server não tranque todo mundo do lado de fora.</Tip>
+<Tip>API keys armazenadas no Secret são recarregadas a cada 30s -- nenhum restart do operator é necessário. Remover uma entrada do Secret revoga aquela chave em até 30 segundos, e uma lista vazia (`[]`) não deixa nenhuma chave válida. Um Secret sem a entrada `api-keys` (ou com ela em branco) cai para o ConfigMap. Quando nenhum dos dois fornece chaves (`chatcli-operator-secrets` e `chatcli-operator-config` apagados, ou nenhum tem a entrada), todas as chaves são revogadas na próxima leitura (em até ~30 segundos, `401` a partir daí). Uma entrada `api-keys` que não é YAML válido mantém em vigor o último conjunto de chaves válido e é registrada no log uma vez por versão, para que um erro de digitação não tranque todo mundo do lado de fora; revogue removendo entradas, não quebrando o YAML. Se a leitura do Secret ou do ConfigMap falhar por qualquer motivo que não seja "não encontrado", as chaves em vigor são mantidas, para que uma instabilidade do API server não tranque todo mundo do lado de fora. A inicialização aplica essas mesmas regras.</Tip>
 
 ### Allowlist de Tipos de Recursos
 
 A ação de remediação `ApplyManifest` (que aplica um manifest guardado num ConfigMap, somente no namespace do alvo) só cria ou atualiza kinds que estão numa allowlist. As outras ações de remediação agem direto no workload alvo e são governadas por políticas de aprovação, não por esta lista. O padrão é mais largo que um único tipo de workload, porque remediação que não pode tocar um Service ou um HPA é remediação que escala para um humano em trabalho de rotina:
 
 ```text
-Deployment, StatefulSet, DaemonSet, ReplicaSet, Service, ConfigMap,
+Deployment, StatefulSet, DaemonSet, Service, ConfigMap,
 HorizontalPodAutoscaler, PodDisruptionBudget, Ingress, CronJob, Job,
 ServiceMonitor, PrometheusRule, PodMonitor,
 ServiceEntry, VirtualService, DestinationRule
 ```
 
+ReplicaSet não está na lista: o Deployment dono dele reverteria uma escrita direta. O RBAC do operator concede create e update em cada kind padrão; um kind que você acrescenta com `CHATCLI_ALLOWED_RESOURCE_TYPES` também precisa de uma regra de ClusterRole correspondente.
+
 <Warning>
-**`CHATCLI_ALLOWED_RESOURCE_TYPES` soma a essa lista; não substitui.** Definir uma lista curta não restringe nada — os dezessete padrões continuam, e suas entradas entram por cima. Os kinds casam pela grafia exata do `Kind` (`Deployment`, não `deployments`), então um plural minúsculo não acrescenta nada.
+**`CHATCLI_ALLOWED_RESOURCE_TYPES` soma a essa lista; não substitui.** Definir uma lista curta não restringe nada — os dezesseis padrões continuam, e suas entradas entram por cima. Os kinds casam pela grafia exata do `Kind` (`Deployment`, não `deployments`), então um plural minúsculo não acrescenta nada.
 
 ```bash
-# Soma dois kinds do ecossistema Istio aos dezessete já permitidos
+# Soma dois kinds do ecossistema Istio aos dezesseis já permitidos
 export CHATCLI_ALLOWED_RESOURCE_TYPES="Gateway,Sidecar"
 ```
 
@@ -945,7 +947,7 @@ Uma allowlist com várias origens devolve a origem da própria requisição depo
 
 ### RBAC e NetworkPolicy
 
-**Operator.** O chart do operator (`rbac.create: true`) concede ao operator uma ClusterRole **cluster-wide**: acesso total às CRDs do ChatCLI; get/list/watch/create/update/patch em Secrets e ConfigMaps de todos os namespaces; os workloads, Services, PVCs, Jobs e objetos de RBAC que ele provisiona para as Instances; get/list/watch/create/update/delete em pods (remediações de pod e os pods de stress do chaos); create em `pods/eviction` (o `DrainNode` despeja pela Eviction API, então os PodDisruptionBudgets são respeitados); update de nodes (remediações de cordon/drain); create/patch em Events do core e de `events.k8s.io`; leases para leader election. As mesmas regras estão em `operator/config/rbac/role.yaml`. Não existe modo namespace-scoped para o operator. O chart também pré-provisiona a ClusterRole `chatcli-watcher` e as ClusterRoles `chatcli-role-*`, e o operator só pode fazer bind dessas.
+**Operator.** O chart do operator (`rbac.create: true`) concede ao operator uma ClusterRole **cluster-wide**: acesso total às CRDs do ChatCLI; get/list/watch/create/update/patch em Secrets e ConfigMaps de todos os namespaces; os workloads, Services, PVCs, Jobs e objetos de RBAC que ele provisiona para as Instances; get/list/watch/create/update/delete em pods (remediações de pod e os pods de stress do chaos); create em `pods/eviction` (o `DrainNode` despeja pela Eviction API, então os PodDisruptionBudgets são respeitados); update de nodes (remediações de cordon/drain); create/patch em Events do core e de `events.k8s.io`; create/update em todo kind que o allowlist do `ApplyManifest` admite, inclusive os kinds do Prometheus Operator (`servicemonitors`, `podmonitors`, `prometheusrules`) e do Istio (`serviceentries`, `virtualservices`, `destinationrules`) (regras para um API group não instalado ficam inertes); ReplicaSets só leitura; leases para leader election. As mesmas regras estão em `operator/config/rbac/role.yaml`. Não existe modo namespace-scoped para o operator. O chart também pré-provisiona a ClusterRole `chatcli-watcher` (leitura das cargas observadas, inclusive Jobs e CronJobs) e as ClusterRoles `chatcli-role-*`, e o operator só pode fazer bind dessas.
 
 **Chart do servidor.** O chart standalone do servidor é namespace-scoped por padrão:
 
@@ -1296,7 +1298,7 @@ Referência completa de todas as variáveis de ambiente relacionadas à seguran�
 | `CHATCLI_AGENT_SOURCE_SHELL_CONFIG` | Carrega a config do shell (`~/.bashrc`, etc.) nos comandos do agente | `false` |
 | `CHATCLI_AGENT_ALLOW_SUDO` | Permite `sudo` sem bloqueio automático | `false` |
 | `CHATCLI_AGENT_CMD_TIMEOUT` | Timeout por comando executado, limitado a `1h` | `10m` |
-| `CHATCLI_MAX_COMMAND_OUTPUT` | Teto pretendido para a saída de comandos (bytes); sem efeito nas versões atuais (veja [Sanitizador de Saída](#sanitizador-de-saída)) | `102400` |
+| `CHATCLI_MAX_COMMAND_OUTPUT` | Teto, em bytes, da saída de comandos que o agente devolve ao modelo; o terminal mostra a saída inteira (veja [Sanitizador de Saída](#sanitizador-de-saída)) | `102400` |
 | `CHATCLI_CODER_SANDBOX` | Confinamento do SO para `@coder exec` e `@coder test`: `off`, `workspace`, `strict`, `docker`/`podman`/`container` | `off` |
 
 ### Segurança de Plugins e Autenticação
@@ -1326,7 +1328,7 @@ Referência completa de todas as variáveis de ambiente relacionadas à seguran�
 | `CHATCLI_GRPC_TLS_CERT` | Certificado de cliente que o operator apresenta a servidores cuja Instance não nomeia um | `""` |
 | `CHATCLI_GRPC_TLS_KEY` | Chave desse certificado de cliente | `""` |
 | `CHATCLI_GRPC_TLS_CA` | CA em que o operator confia para servidores cujo Secret TLS não tem `ca.crt` | `""` (CAs do sistema) |
-| `CHATCLI_ALLOWED_RESOURCE_TYPES` | Kinds extras que o `ApplyManifest` pode aplicar, somados aos padrões (separados por vírgula) | 17 tipos de workload, rede e Istio — veja acima |
+| `CHATCLI_ALLOWED_RESOURCE_TYPES` | Kinds extras que o `ApplyManifest` pode aplicar, somados aos padrões (separados por vírgula) | 16 tipos de workload, rede e Istio — veja acima |
 | `CHATCLI_LOG_SCRUB_PATTERNS` | Regex extras removidas do contexto enviado ao LLM (separadas por vírgula) | 18 padrões embutidos |
 | `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` | Comandos somente-leitura extras que o engine de remediação pode rodar (separados por vírgula, somados à lista embutida) | `""` |
 | `CHATCLI_CORS_ALLOWED_ORIGINS` | Origens autorizadas a chamar a API REST do operator pelo navegador (separadas por vírgula, ou `*`) | `""` (nega tudo) |

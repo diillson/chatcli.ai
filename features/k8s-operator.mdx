@@ -135,18 +135,19 @@ The operator pod is Ready once its `/readyz` (port 8081) answers. Until you crea
   | `prometheusUrl` | `""` | Prometheus the operator queries for metrics during incident analysis (`PROMETHEUS_URL`) |
   | `alertTransport` | `stream` | `stream` (StreamAlerts, falls back to polling on servers without it) or `poll` (GetAlerts every 30s) |
   | `decisionEngine.enabled` | `false` | Confidence and circuit-breaker gate before a plan executes ([Decision Engine](/features/aiops/decision-engine)) |
-  | `clusterName` | `""` | Name of this cluster's ClusterRegistration; its tier decides which severities wait for a human |
+  | `clusterName` | `""` | Name of this cluster's ClusterRegistration; its tier decides which severities wait for a human. A name no registration carries sends every plan to manual approval |
   | `apiKeys.create` / `apiKeys.entries` | `false` / `[]` | Render the dashboard key Secret `chatcli-operator-secrets` from `{key, role, description}` entries |
   | `security.devMode` | `false` | With no keys configured, admit every REST call as admin. Never in production |
   | `security.apiTLS.certFile` / `keyFile` | `""` | TLS 1.3 for the REST API and dashboard (paths inside the pod; mount them with `extraVolumes`) |
   | `security.grpcTLS.certFile` / `keyFile` / `caFile` | `""` | Operator-wide client certificate and trust root for dialing Instances. Per-Instance settings win |
-  | `security.allowedResourceTypes` | `""` | Extra kinds `ApplyManifest` may create or update, added to the 17 built-in ones |
+  | `security.allowedResourceTypes` | `""` | Extra kinds `ApplyManifest` may create or update, added to the 16 built-in ones |
   | `security.allowedDiagnosticCommands` | `""` | Extra `ExecDiagnostic` commands (see [ExecDiagnostic Allowlist](#execdiagnostic-allowlist)) |
   | `security.logScrubPatterns` | `""` | Extra regexes scrubbed from logs before they reach the LLM |
   | `security.corsAllowedOrigins` / `corsOrigin` / `corsAllowedMethods` / `corsAllowCredentials` | deny-all | CORS for the REST API |
   | `security.auditLogPath` | `""` | Deprecated and ignored: the operator records its actions as AuditEvent resources |
   | `networkPolicy.enabled` | `false` | Optional NetworkPolicy for the operator pod (see [Network policies](#network-policies)) |
   | `extraEnv` / `extraVolumes` / `extraVolumeMounts` | `[]` | Extra environment, volumes and mounts for the operator container |
+  | `tmpVolume.sizeLimit` | `1Gi` | Size of the writable `/tmp` emptyDir (the root filesystem is read-only), where SourceRepository clones and per-sync git credential files live |
   | `serviceMonitor.enabled` | `false` | Prometheus Operator ServiceMonitor for the operator metrics |
   | `crdUpgrade.*` | enabled, `registry.k8s.io/kubectl:v1.31.10` | The CRD re-apply hook |
   | `resources` | 100m/128Mi requests, 500m/256Mi limits | Operator container resources |
@@ -423,7 +424,7 @@ chatcli connect localhost:50051 --tls --ca-cert ca.crt --token "$TOKEN" -p "summ
 | `[address]` or `--addr` | `CHATCLI_REMOTE_ADDR` | `host:port` of the server |
 | `--token` | `CHATCLI_REMOTE_TOKEN` | Sent as `authorization: Bearer <token>`: the shared token or a JWT |
 | `--tls` | — | TLS 1.3 to the server |
-| `--ca-cert` | — | CA file that verifies the server certificate (the `ca.crt` above) |
+| `--ca-cert` | — | CA file that verifies the server certificate (the `ca.crt` above); implies `--tls` |
 | `--provider`, `--model` | — | Override the server's default provider and model |
 | `--llm-key`, `--use-local-auth` | `CHATCLI_CLIENT_API_KEY` | Use your own LLM credential instead of the server's |
 | `-p`, `--raw`, `--max-tokens` | — | One-shot prompt and output options |
@@ -484,7 +485,9 @@ The operator serves the web dashboard at `/` and the REST API under `/api/v1/` o
   </Tab>
 </Tabs>
 
-Roles: `viewer` (read everything), `operator` (acknowledge, snooze, resolve, approve, review post-mortems, write runbooks), `admin` (everything, including deleting runbooks). Any other role string grants nothing. An optional `name` on an entry is the identity recorded on the approval decisions that key takes; a quorum counts each key once, so give each approver their own key. Deleting both the Secret and the ConfigMap `chatcli-operator-config` revokes every key within about 30 seconds.
+Roles: `viewer` (read everything), `operator` (acknowledge, snooze, resolve, approve, review post-mortems, write runbooks), `admin` (everything, including deleting runbooks). Any other role string grants nothing. An optional `name` on an entry is the identity recorded on the approval decisions that key takes; a quorum counts each key once, so give each approver their own key.
+
+How the operator applies a change, at startup and on every 30-second poll alike: a Secret without an `api-keys` entry falls back to the ConfigMap; when neither object provides one (both deleted, or neither holds the entry), every key is revoked within about 30 seconds (`401` from then on). An `api-keys` entry that is not valid YAML keeps the last valid key set in force and is logged once per version, so a typo does not lock everyone out; revoke a key by removing its entry, not by breaking the YAML. A read error other than not found also keeps the keys in force.
 
 ```bash
 kubectl -n chatcli-system port-forward svc/chatcli-operator 8090:8090
@@ -536,12 +539,12 @@ What happens next:
 The full state machine, the action catalog and the rollback rules are in [Incident Lifecycle](/features/aiops/incident-lifecycle) and [AIOps Platform](/features/aiops-platform). Watcher collection details are in [K8s Watcher](/features/k8s-watcher).
 
 <Warning>
-Use `targets`. The legacy single-target form (`watcher.deployment` + `watcher.namespace`) only gets a namespaced Role in the Instance namespace, so a legacy target in another namespace fails with `forbidden` errors. With `targets` in other namespaces the operator binds the shared `chatcli-watcher` ClusterRole instead.
+Prefer `targets`. The legacy single-target form (`watcher.deployment` + `watcher.namespace`) still works: in the Instance namespace it gets the namespaced watcher Role, and in another namespace it gets the same `<namespace>-<name>-watcher` ClusterRoleBinding to the shared `chatcli-watcher` ClusterRole that `targets` in other namespaces get. `targets` is the only form that watches several resources or kinds other than Deployment.
 </Warning>
 
 ### ExecDiagnostic Allowlist
 
-`ExecDiagnostic` runs a command inside a pod only when it matches, character for character, an entry of a read-only allowlist of about 100 built-in commands (process and filesystem inspection, cgroup v1/v2 files, `/proc`, network and DNS introspection, `curl`/`wget` against `localhost` health, metrics and pprof endpoints on the common ports, `nc -zv` to the API server and DNS). Anything else is rejected with `command "..." not in approved diagnostic commands whitelist`.
+`ExecDiagnostic` runs a command inside a pod only when it matches, character for character, an entry of a read-only allowlist of 100 built-in commands (process and filesystem inspection, cgroup v1/v2 files, `/proc`, network and DNS introspection, `curl`/`wget` against `localhost` health, metrics and pprof endpoints on the common ports, `nc -zv` to the API server and DNS). Anything else is rejected with `command "..." not in approved diagnostic commands whitelist`.
 
 The list is read by the **operator** process, so extend it on the operator chart, not on the Instance. Commas separate entries, so escape them for `--set`, or put the value in your values file (`operator-values.yaml` here):
 
@@ -554,6 +557,27 @@ kubectl -n chatcli-system logs deploy/chatcli-operator | grep 'Effective ExecDia
 ```
 
 The startup log line prints the default, custom and total counts and every custom entry.
+
+### Source repositories
+
+A `SourceRepository` links a workload to its git repository, so incident analysis sees the recent commits and the code around stack traces. Create it and its Secret in the workload's namespace. The operator makes a shallow clone under its writable `/tmp` emptyDir (chart value `tmpVolume.sizeLimit`, default `1Gi`) and re-syncs every `syncIntervalMinutes` (default 30). The operator image ships `git` and `openssh-client`.
+
+| `authType` | Secret keys (`secretRef`) | How the credential is used |
+|------------|---------------------------|----------------------------|
+| `none` (default) | — | Public repository |
+| `token` | `token` | HTTPS, through a `GIT_ASKPASS` helper |
+| `basic` | `username`, `password` | HTTPS, through the same helper |
+| `ssh` | `ssh-key`, `known_hosts` | SSH, host key checked against `known_hosts` with `StrictHostKeyChecking=yes` |
+
+Credentials are handed to git for each command and never written to the clone's `.git/config`. A clone made by an earlier version, which kept the token in the origin URL, has the token stripped from `origin` and its reflog expired on the next sync. Without `known_hosts` an SSH sync fails unless `spec.sshHostKeyPolicy: acceptNew` trusts the key the host presents on first contact (and rejects a different key afterwards, for the life of the operator pod); the default is `strict`.
+
+```bash
+ssh-keyscan github.com > known_hosts
+kubectl -n production create secret generic api-server-git \
+  --from-file=ssh-key=./deploy_key --from-file=known_hosts=./known_hosts
+```
+
+A full example is in [AIOps production setup](/cookbook/aiops-production-setup#4-link-source-repositories-optional).
 
 ### Watching the pipeline
 
@@ -658,8 +682,8 @@ Only `spec.provider` is required. The CRD schema is the only validation: there i
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy |
 | `apiKeys.name` | string | — | Secret loaded whole with `envFrom` (optional: the pod starts without it) |
 | `resources` | ResourceRequirements | **none** | Copied verbatim; the operator sets no requests or limits |
-| `securityContext` | PodSecurityContext | non-root UID 1000, RuntimeDefault seccomp | **Replaces** the default entirely when set |
-| `persistence` | object | — | `enabled`, `size` (`1Gi`), `storageClassName` |
+| `securityContext` | PodSecurityContext | non-root UID 1000, `fsGroup: 1000` with `fsGroupChangePolicy: OnRootMismatch`, RuntimeDefault seccomp | **Replaces** the default entirely when set |
+| `persistence` | object | — | `enabled`, `size` (`1Gi`), `storageClassName`. When enabled the Deployment strategy is `Recreate` (see [High availability](#high-availability)) |
 | `scheduling` | object | — | `nodeSelector`, `tolerations`, `affinity`, `imagePullSecrets`, `priorityClassName`, `podAnnotations` (the operator's hash annotations win on a key clash) |
 | `serviceAccount.annotations` | map | — | Merged into the managed ServiceAccount (IRSA `eks.amazonaws.com/role-arn`, GKE `iam.gke.io/gcp-service-account`); annotations other tools add are kept |
 | `extraEnv` | []EnvVar | — | Extra variables. Rendered before the typed fields, so a typed field wins when both set the same name |
@@ -699,7 +723,7 @@ Only `spec.provider` is required. The CRD schema is the only validation: there i
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Run the watcher in the server pod |
 | `targets[]` | list | — | Resources to watch (below). When set, `deployment`/`namespace` are ignored |
-| `deployment` / `namespace` | string | — | Legacy single target (namespaced RBAC only) |
+| `deployment` / `namespace` | string | — | Legacy single target (`Deployment` only; another namespace gets the `chatcli-watcher` ClusterRoleBinding) |
 | `interval` | string | `30s` | Collection interval |
 | `window` | string | `2h` | Observation window |
 | `maxLogLines` | int32 | `100` | Log lines per pod |
@@ -712,8 +736,8 @@ Only `spec.provider` is required. The CRD schema is the only validation: there i
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | **required** | Render the chain |
-| `providers[]` | `{name, model}` | **required** | Ordered providers; `name` is enum-validated (same values as `provider`, plus `DEVIN`) |
-| `maxRetries` | int32 | `2` | Retries per provider. `0` is treated as unset and keeps the server default of 2 |
+| `providers[]` | `{name, model}` | **required** | Ordered providers; `name` is enum-validated (same values as `provider`, plus `DEVIN`). An entry without `model` runs that provider's own default model (its model variable, then the built-in default); only the primary provider keeps `spec.model` |
+| `maxRetries` | int32 | `2` | Retries per provider (`CHATCLI_FALLBACK_MAX_RETRIES`, always written). `0` means no retry: fail over to the next provider at once |
 | `cooldownBase` / `cooldownMax` | string | `30s` / `5m` | Exponential cooldown of a failed provider |
 
 The operator puts `spec.provider` (with `spec.model`) first unless the list already names it, in which case your order is kept. The server builds the chain only when at least two of its providers have credentials, and uses it for requests that bring no credentials or explicit provider of their own. Put every provider's key in the `apiKeys` Secret. Behavior details: [Provider Fallback](/features/provider-fallback).
@@ -749,7 +773,7 @@ The AIOps pipeline reads these settings from the Instance the WatcherBridge stre
 |-------|---------|-------|
 | `features.memory.enabled` / `.mode` | `CHATCLI_MEMORY_ENABLED`, `CHATCLI_MEMORY_MODE` | `mode`: `index`, `pull` or `off` |
 | `features.knowledge` | `CHATCLI_CHAT_KNOWLEDGE` | Unset keeps the server default |
-| `features.budget.sessionUSD` / `.dailyUSD` / `.hardStop` | `CHATCLI_SESSION_BUDGET_USD`, `CHATCLI_DAILY_BUDGET_USD`, `CHATCLI_BUDGET_HARD_STOP` | Spend limits |
+| `features.budget.sessionUSD` / `.dailyUSD` / `.hardStop` | `CHATCLI_SESSION_BUDGET_USD`, `CHATCLI_DAILY_BUDGET_USD`, `CHATCLI_BUDGET_HARD_STOP` | Spend limits, enforced on the pipeline RPCs `ChatTurn`, `RunCoder` and `RunAgent`. `SendPrompt`, `StreamPrompt`, `InteractiveSession` and the AIOps calls (`AnalyzeIssue`, `AgenticStep`) are not metered against them |
 | `features.hub` | `CHATCLI_HUB_ENABLED` | Conversation hub; unset keeps the server default |
 | `features.caBundleSecretName` | Secret `ca.crt` at `/etc/chatcli/ca`, `CHATCLI_CA_BUNDLE` | Corporate CA for every outbound TLS connection |
 | `features.allowHTTPProviders` | `CHATCLI_ALLOW_HTTP_PROVIDERS=true` | Allow plain-HTTP provider endpoints |
@@ -794,12 +818,13 @@ Everything is named after the Instance, labeled `app.kubernetes.io/name: chatcli
 | Deployment | `<name>` | See below |
 | PersistentVolumeClaim | `<name>-sessions` | When `persistence.enabled`: ReadWriteOnce, created once and never resized, mounted at `/home/chatcli/.chatcli/sessions` |
 | Role + RoleBinding | `<name>-watcher` | Watcher enabled, all targets in the Instance namespace |
-| ClusterRoleBinding | `<namespace>-<name>-watcher` | Watcher targets in other namespaces; binds the shared `chatcli-watcher` ClusterRole. Removed by the Instance finalizer |
+| ClusterRoleBinding | `<namespace>-<name>-watcher` | Watcher targets (or a legacy `watcher.namespace`) in other namespaces; binds the shared `chatcli-watcher` ClusterRole. Removed by the Instance finalizer |
 
 **The Deployment** runs `chatcli server --port <port> --metrics-port <metricsPort> --provider ... [--model ...] [--tls-cert ... --tls-key ... [--tls-client-ca ...]] [--mcp-config ...] [--watch-config ... | --watch-deployment ...]` with:
 
+- strategy `Recreate` when `persistence.enabled` (the sessions PVC is ReadWriteOnce, so the old pod releases it before the new one starts; each rollout has a brief downtime), otherwise `RollingUpdate`;
 - probes on `GET /healthz` of the `metrics` port (plain HTTP, no credential): startup every 5s up to 5 minutes, readiness every 10s (out of the Service after 30s of failures), liveness every 20s (restart after 2 minutes);
-- pod security context `runAsNonRoot`, UID 1000, `seccompProfile: RuntimeDefault` (unless `spec.securityContext`), and for every container, the `plugin-loader` init container included, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, all capabilities dropped: the pod passes the `restricted` Pod Security Standard;
+- pod security context `runAsNonRoot`, UID 1000, `fsGroup: 1000` with `fsGroupChangePolicy: OnRootMismatch` (so a fresh sessions volume is writable whatever the provisioner does), `seccompProfile: RuntimeDefault` (unless `spec.securityContext`), and for every container, the `plugin-loader` init container included, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, all capabilities dropped: the pod passes the `restricted` Pod Security Standard;
 - writable emptyDirs `/tmp` (100Mi) and `/home/chatcli/.chatcli` (200Mi); anything outside the sessions PVC is lost when the pod restarts;
 - `HOME=/home/chatcli`, the `<name>` ConfigMap and the `apiKeys` Secret as `envFrom`, then `extraEnv`, then the typed credential and feature variables. Secret references are optional, so a missing Secret does not block the pod: it starts without the value.
 
@@ -813,13 +838,14 @@ The pod reads its configuration at startup, so the operator stamps hashes on the
 | `chatcli.io/watch-config-hash` | Watcher targets change |
 | `chatcli.io/secret-hash` | Any key of the `apiKeys` Secret changes, or the Secret appears |
 | `chatcli.io/tls-hash` | Any key of the TLS Secret changes (certificate renewal) |
+| `chatcli.io/mounted-configmaps-hash` | The MCP ConfigMap (`<name>-mcp`, rendered from `mcp.servers`, or `mcp.existingConfigMap`) or the ConfigMaps behind `agents.configMapRef` and `agents.skillsConfigMapRef` change, appear or disappear. The operator watches these ConfigMaps, so an edit reconciles the Instances that mount them |
 | `chatcli.io/credentials-hash` | The referenced key of `server.token`, `jwtSecretRef`, `jwtPublicKeyRef`, `ca.crt` of `tls.clientCASecretName` or `features.caBundleSecretName`, `features.encryptionKeyRef`, or any `extraEnv` `secretKeyRef` changes, appears or disappears |
 
 Changes to the pod template itself (image, resources, env, scheduling) roll the pods as with any Deployment. Every Secret the Instance references is watched, so creating or rotating one reconciles the Instance right away.
 
 **What refreshes only the operator:** `operatorTokenRef` and `operatorClientCertSecretName` are read by the operator, not by the pod. Rotating them does not restart the server; the operator rebuilds its connection with the new material (the status probe dials fresh every time).
 
-**What does not roll the pods:** edits to the ConfigMaps behind `agents.configMapRef`, `agents.skillsConfigMapRef` and `mcp.existingConfigMap`, changes to `mcp.servers`, and a new plugin image under the same tag. Run `kubectl -n <ns> rollout restart deploy/<name>` after changing them.
+**What does not roll the pods:** a new plugin image under the same tag. Run `kubectl -n <ns> rollout restart deploy/<name>` after pushing one.
 
 ## Running in production
 
@@ -839,9 +865,9 @@ Changes to the pod template itself (image, resources, env, scheduling) roll the 
 ### TLS and RBAC
 
 - **TLS everywhere the operator talks.** The operator dials Instances with TLS 1.3 only, verifying the certificate against the Instance's `ca.crt` (or the system CAs, or `security.grpcTLS.caFile`). The server itself accepts TLS 1.3 only. Rotate with cert-manager or by replacing the Secret: the pods roll (`chatcli.io/tls-hash`) and the operator trusts the new `ca.crt` on its next dial.
-- **Operator RBAC.** The operator's ClusterRole is broad by necessity: full access to its 17 CRDs; Deployments, Services, ConfigMaps, ServiceAccounts and PVCs; read and write on Secrets cluster-wide (it reads referenced Secrets and executes `RotateSecret`); pods (including create, for chaos stress pods), pod eviction (`DrainNode` uses the Eviction API), logs, and core and `events.k8s.io` events; nodes (cordon/drain); workloads, HPAs, Ingresses and NetworkPolicies for remediation; leases for leader election.
+- **Operator RBAC.** The operator's ClusterRole is broad by necessity: full access to its 17 CRDs; Deployments, Services, ConfigMaps, ServiceAccounts and PVCs; read and write on Secrets cluster-wide (it reads referenced Secrets and executes `RotateSecret`); pods (including create, for chaos stress pods), pod eviction (`DrainNode` uses the Eviction API), logs, and core and `events.k8s.io` events; nodes (cordon/drain); create and update on every kind the `ApplyManifest` allowlist admits (workloads, Jobs, CronJobs, Services, ConfigMaps, HPAs, PDBs, Ingresses, and the Prometheus Operator and Istio kinds; rules for an API group that is not installed are inert), plus NetworkPolicies, for remediation; read-only ReplicaSets; leases for leader election.
 - **No runtime RBAC escalation.** The operator never creates or modifies ClusterRoles. It may only `bind` the pre-provisioned `chatcli-watcher` and `chatcli-role-{viewer,operator,admin,superadmin}` (restricted with `resourceNames`), so a compromised operator cannot bind a more privileged ClusterRole. The `chatcli-role-*` ClusterRoles are there for you to bind to people; the operator binds nothing to users.
-- **Remediation guardrails.** `ApplyManifest` only creates or updates the 17 allowed kinds (Deployment, StatefulSet, DaemonSet, ReplicaSet, Service, ConfigMap, HorizontalPodAutoscaler, PodDisruptionBudget, Ingress, CronJob, Job, ServiceMonitor, PrometheusRule, PodMonitor, ServiceEntry, VirtualService, DestinationRule; extend with `security.allowedResourceTypes`) in the Issue's namespace, and only where the operator's own RBAC allows the write: the chart grants writes on Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, ConfigMaps, HPAs, Ingresses and NetworkPolicies, so kinds such as ServiceMonitor or VirtualService also need a ClusterRole you add. `ExecDiagnostic` is limited to the allowlist. Logs pass through 18 scrub patterns (cloud and API keys, JWTs, bearer tokens, passwords, connection strings, private keys, IPv4 addresses, e-mail addresses, long base64/hex secrets) before they reach the LLM.
+- **Remediation guardrails.** `ApplyManifest` only creates or updates the 16 allowed kinds (Deployment, StatefulSet, DaemonSet, Service, ConfigMap, HorizontalPodAutoscaler, PodDisruptionBudget, Ingress, CronJob, Job, ServiceMonitor, PrometheusRule, PodMonitor, ServiceEntry, VirtualService, DestinationRule; extend with `security.allowedResourceTypes`) in the Issue's namespace. The operator RBAC (chart and kustomize) grants create and update on each of them, the ServiceMonitor, PodMonitor, PrometheusRule, ServiceEntry, VirtualService and DestinationRule kinds included; a kind you add with `security.allowedResourceTypes` also needs a ClusterRole rule you add. ReplicaSet is not on the list: its Deployment owns it and would revert a direct write. `ExecDiagnostic` is limited to the allowlist. Logs pass through 18 scrub patterns (cloud and API keys, JWTs, bearer tokens, passwords, connection strings, private keys, IPv4 addresses, e-mail addresses, long base64/hex secrets) before they reach the LLM.
 
 ### Credentials and rotation
 
@@ -864,7 +890,7 @@ The operator applies **no** requests or limits to Instances, which leaves the po
 
 - **Operator:** run `replicaCount: 2` or more with `leaderElect: true`. The controllers and the WatcherBridge run on the leader only; the REST API and dashboard are served by every replica, so the Service keeps answering during a failover. The chart creates no PodDisruptionBudget for the operator; add one if you drain nodes often.
 - **Instances:** `replicas` > 1 turns the Service headless and the operator balances round-robin across pods. Each pod is an independent server (its own memory, watcher and emptyDir state), and the alert stream attaches to one pod at a time. For an AIOps Instance, one replica is usually right.
-- **Persistence and replicas:** the sessions PVC is ReadWriteOnce and the Deployment uses the default RollingUpdate strategy. With `persistence.enabled`, a second replica, or the surge pod of a rollout, scheduled on another node cannot attach the volume (`Multi-Attach error`) and the rollout stalls. Keep one replica with persistence and pin it with `scheduling.affinity` if your storage is zonal, or run without persistence when you scale out.
+- **Persistence and replicas:** the sessions PVC is ReadWriteOnce, so with `persistence.enabled` the Deployment uses the `Recreate` strategy: the old pod stops and releases the volume before the new one starts, and each rollout (image, configuration or credential change) has a brief downtime. Without persistence the strategy is `RollingUpdate`. A second replica scheduled on another node still cannot attach the volume (`Multi-Attach error`): keep one replica with persistence and pin it with `scheduling.affinity` if your storage is zonal, or run without persistence when you scale out.
 - The operator creates no PodDisruptionBudget, HorizontalPodAutoscaler or NetworkPolicy for Instances.
 
 ### Network policies
@@ -900,7 +926,7 @@ The operator applies **no** requests or limits to Instances, which leaves the po
 
 ### Pod Security
 
-Instance pods and the operator pod meet the `restricted` Pod Security Standard with the defaults, so you can label their namespaces `pod-security.kubernetes.io/enforce: restricted`. If you set `spec.securityContext`, it replaces the default entirely: keep `runAsNonRoot: true` and `seccompProfile: {type: RuntimeDefault}` in it. With persistence on storage that is not group-writable, add `fsGroup: 1000` so the server can write its sessions.
+Instance pods and the operator pod meet the `restricted` Pod Security Standard with the defaults, so you can label their namespaces `pod-security.kubernetes.io/enforce: restricted`. If you set `spec.securityContext`, it replaces the default entirely: keep `runAsNonRoot: true` and `seccompProfile: {type: RuntimeDefault}` in it. The default also sets `fsGroup: 1000` with `fsGroupChangePolicy: OnRootMismatch`, so a fresh sessions volume is writable whatever the provisioner does; keep `fsGroup: 1000` in your own context when you enable persistence.
 
 ### Metrics and monitoring
 
@@ -988,12 +1014,12 @@ Instance pods and the operator pod meet the `restricted` Pod Security Standard w
 | Rollout stuck with `Multi-Attach error` | ReadWriteOnce sessions PVC and a pod on another node | See [High availability](#high-availability) |
 | `chatcli connect` fails with `x509: certificate is valid for ..., not localhost` | Port-forward reaches the server as `localhost` | Add `localhost` and `127.0.0.1` to the SANs, or connect by a name the certificate has |
 | `chatcli connect` handshake error against a server without TLS | Without `--tls` the CLI still dials TLS unless told otherwise | Use TLS, or `CHATCLI_ALLOW_INSECURE=true` for a local plaintext server |
-| Dashboard/API `401` `no API keys configured; set CHATCLI_OPERATOR_DEV_MODE=true for development` | No keys loaded: the Secret is missing, in another namespace, has no `api-keys` key, or its YAML does not parse (a bad edit clears the loaded keys) | Create or fix `chatcli-operator-secrets` in the operator namespace; wait up to 30s; check the operator log for `failed to parse api-keys` |
+| Dashboard/API `401` `no API keys configured; set CHATCLI_OPERATOR_DEV_MODE=true for development` | No keys loaded: the Secret and the ConfigMap are missing, in another namespace, or hold no `api-keys` entry, or the entry is not valid YAML and no valid set was loaded before (an invalid edit keeps the last valid set, it never clears it) | Create or fix `chatcli-operator-secrets` in the operator namespace; wait up to 30s; check the operator log for `not valid YAML; keeping the last valid key set in force` |
 | `401` `missing API key in X-API-Key header` / `invalid API key` | Header missing or wrong key | Send `X-API-Key` |
 | `403` `insufficient permissions` | The key's role is below what the endpoint needs, or not one of `viewer`, `operator`, `admin` | Use a key with the right role |
 | `429` `rate limit exceeded: 30 requests per minute` (or `600`) | Too many calls without a valid key from one host (or per key) | Honor `Retry-After`; use a valid key |
 | No Anomalies or Issues although the watcher runs | Another ready Instance was picked by the WatcherBridge, or the operator cannot reach this one | Operator log `Connected to Instance` names the one in use; keep a single AIOps Instance and make its `ServerReachable` True |
-| Watcher `forbidden` errors in the server log | Legacy `watcher.namespace` in another namespace, or `chatcli-watcher` ClusterRole missing (`rbac.create=false`) | Use `watcher.targets`; keep the chart's RBAC |
+| Watcher `forbidden` errors in the server log | `chatcli-watcher` ClusterRole missing (`rbac.create=false`), or a ClusterRole from an older chart without Jobs and CronJobs | Keep the chart's RBAC and upgrade it with the operator |
 | `ExecDiagnostic` rejected: `command "..." not in approved diagnostic commands whitelist` | The exact string is not allowlisted | Add it to `security.allowedDiagnosticCommands` |
 | Instance stuck `Terminating` | The operator is not running to remove the finalizer | Start the operator, or remove the finalizer by hand |
 | `helm upgrade` renders `nil pointer evaluating` on a new key | `--reuse-values` without the new chart defaults | Upgrade with your values file, or `--reset-then-reuse-values` |

@@ -76,15 +76,11 @@ networkPolicy:
     - port: 587            # SMTP para as notificações por email (passo 5)
       protocol: TCP
 
-# O sistema de arquivos raiz é somente leitura. O SourceRepository clona em
-# /tmp, então dê a ele um volume gravável se for usar o passo 4.
-extraVolumes:
-  - name: tmp
-    emptyDir:
-      sizeLimit: 1Gi
-extraVolumeMounts:
-  - name: tmp
-    mountPath: /tmp
+# O sistema de arquivos raiz é somente leitura; o chart monta um emptyDir
+# gravável em /tmp, onde ficam os clones do SourceRepository (passo 4).
+# Aumente o limite para repositórios grandes.
+tmpVolume:
+  sizeLimit: 1Gi
 ```
 
 ```bash
@@ -344,7 +340,7 @@ O que o operator cria, e o que não cria:
 - **Nenhum** PodDisruptionBudget, HPA ou NetworkPolicy. Crie você mesmo se precisar (há um exemplo de NetworkPolicy abaixo).
 
 <Warning>
-**Persistência e réplicas.** `persistence.enabled: true` cria um único PVC `ReadWriteOnce` (`chatcli-prod-sessions`) que todas as réplicas montam, e o modo de acesso não pode ser alterado. Com `replicas > 1`, pods agendados em nós diferentes ficam em `ContainerCreating` com erro `Multi-Attach`. Ou mantenha `replicas: 1` com persistência, ou rode várias réplicas sem ela, como acima. O pipeline de AIOps não precisa do volume de sessões. Sem ele, as sessões de quem usa `chatcli connect` duram só enquanto o pod existir.
+**Persistência e réplicas.** `persistence.enabled: true` cria um único PVC `ReadWriteOnce` (`chatcli-prod-sessions`) que todas as réplicas montam, e o modo de acesso não pode ser alterado. Com `replicas > 1`, pods agendados em nós diferentes ficam em `ContainerCreating` com erro `Multi-Attach`. Ou mantenha `replicas: 1` com persistência, ou rode várias réplicas sem ela, como acima. Com persistência o operator define a estratégia do Deployment como `Recreate`, então o pod antigo libera o volume antes de o novo subir: cada rollout tem uma breve indisponibilidade. Sem ela a estratégia é `RollingUpdate`. O pipeline de AIOps não precisa do volume de sessões. Sem ele, as sessões de quem usa `chatcli connect` duram só enquanto o pod existir.
 </Warning>
 
 <Note>
@@ -405,7 +401,7 @@ A coluna `VERSION` de `kubectl get instance` mostra a versão do servidor que o 
 
 ## 4. Vincular repositórios de código (opcional)
 
-Um `SourceRepository` entrega à IA os commits recentes e o código em volta dos stack traces de uma carga. Crie o repositório, e o Secret do git, **no namespace da carga**, e dê ao operator um `/tmp` gravável (passo 1).
+Um `SourceRepository` entrega à IA os commits recentes e o código em volta dos stack traces de uma carga. Crie o repositório, e o Secret do git, **no namespace da carga**. O operator o clona no emptyDir gravável `/tmp` dele (valor `tmpVolume.sizeLimit` do chart, passo 1).
 
 ```bash
 kubectl -n production create secret generic api-gateway-git \
@@ -432,8 +428,16 @@ spec:
   syncIntervalMinutes: 30
 ```
 
+As chaves do Secret dependem do `authType`: `token` para `token`, `username` e `password` para `basic`, `ssh-key` e `known_hosts` para `ssh`. As credenciais HTTPS chegam ao git por um helper `GIT_ASKPASS` a cada comando e nunca são gravadas no `.git/config` do clone; um clone feito por uma versão anterior, que guardava o token na URL do origin, tem o token removido do `origin` e o reflog expirado na próxima sincronização. A imagem do operator traz o `openssh-client`, e um clone por SSH confere a chave do host do servidor contra o `known_hosts` do Secret com `StrictHostKeyChecking=yes`:
+
+```bash
+ssh-keyscan git.example.com > known_hosts
+kubectl -n production create secret generic api-gateway-git \
+  --from-file=ssh-key=./deploy_key --from-file=known_hosts=./known_hosts
+```
+
 <Warning>
-Use `authType: token` sobre HTTPS. O token fica gravado na URL remota do clone, no volume `/tmp` do operator. `authType: basic` não autentica nas releases atuais: usuário e senha nunca chegam ao git. Com `authType: ssh` (chave `ssh-key` no Secret), a chave do host não é verificada e a imagem do operator não lista um cliente SSH, então confirme que um clone por SSH funciona na sua imagem antes de depender dele.
+Sem `known_hosts` a sincronização por SSH falha (`secret ... has no "known_hosts" key`), a menos que o SourceRepository defina `spec.sshHostKeyPolicy: acceptNew`, que confia na chave que o host apresenta no primeiro contato e rejeita uma chave diferente depois (lembrada enquanto durar o pod do operator). O padrão, `strict`, é a escolha segura: fixe as chaves do host no Secret.
 </Warning>
 
 **Verificação:** `kubectl -n production get sourcerepositories` mostra o repositório pronto depois da primeira sincronização.
@@ -657,7 +661,7 @@ EOF
 | `operator` | Também reconhecer, adiar e resolver incidentes, aprovar ou rejeitar pedidos, revisar postmortems, criar e editar runbooks |
 | `admin` | Tudo, inclusive apagar runbooks |
 
-Qualquer outro nome de papel não dá acesso nenhum. O operator relê o Secret a cada 30 segundos, então mudar chaves não exige restart. Editar o Secret para tirar uma chave revoga essa chave, e um YAML que não faz parse ou uma lista vazia não deixa nenhuma chave válida. Apagar o Secret e também o ConfigMap `chatcli-operator-config` revoga todas as chaves em cerca de 30 segundos (`401` a partir daí). Um erro de leitura que não seja "não encontrado" mantém as chaves em vigor.
+Qualquer outro nome de papel não dá acesso nenhum. O operator relê o Secret a cada 30 segundos, então mudar chaves não exige restart. Editar o Secret para tirar uma chave revoga essa chave, e uma lista vazia não deixa nenhuma chave válida. Um YAML que não faz parse mantém em vigor o último conjunto de chaves válido (o operator registra isso no log uma vez por versão), então corrija o erro em vez de contar com ele para revogar. Um Secret sem a entrada `api-keys` cai para o ConfigMap; apagar o Secret e também o ConfigMap `chatcli-operator-config` revoga todas as chaves em cerca de 30 segundos (`401` a partir daí). Um erro de leitura que não seja "não encontrado" mantém as chaves em vigor. A inicialização aplica as mesmas regras da consulta periódica.
 
 Cada entrada também aceita um `name` opcional, a identidade registrada nas aprovações feitas com aquela chave (na falta dele vale o `description`, e depois uma impressão digital `key-<hash>`). Um quorum conta cada chave uma vez, então dê a cada aprovador a sua própria chave.
 
@@ -795,7 +799,7 @@ spec:
 ```
 
 <Warning>
-`deploy/grafana/dashboards-configmap.yaml` traz só dois ServiceMonitors, não os dashboards. O ServiceMonitor `chatcli-server` dele seleciona um label (`app.kubernetes.io/name: chatcli-server`) que os Services das Instances não têm, então use o ServiceMonitor da Instance acima em vez de aplicar esse arquivo como está.
+`deploy/grafana/dashboards-configmap.yaml` traz só dois ServiceMonitors, não os dashboards. O ServiceMonitor do servidor dele seleciona `app.kubernetes.io/name: chatcli` e a porta `metrics`, que os Services das Instances (operator) e o Helm chart do servidor têm, em qualquer namespace; aplique-o, ou fique com o ServiceMonitor mais restrito da Instance acima.
 </Warning>
 
 **Consultas durante a análise.** Com `prometheusUrl` definido no chart do operator (variável `PROMETHEUS_URL`), o operator consulta o Prometheus no intervalo do incidente e junta o resultado à análise de IA: CPU, memória, restarts e rede por pod, taxas de requisição e de erro, percentis de latência e réplicas do HPA. Ele chama `/api/v1/query_range` sem autenticação, então a URL precisa chegar a uma API HTTP do Prometheus sem autenticação, normalmente o Service interno do cluster. As métricas de container vêm do cAdvisor e os restarts do kube-state-metrics. Sem essa URL a análise roda do mesmo jeito, só que sem essas métricas.
@@ -959,7 +963,8 @@ Veja [Chaos Engineering](/pt/features/aiops/chaos-engineering) para todos os tip
 | A API REST devolve 429 | Rate limit: 30 por minuto por host sem chave válida | Envie um `X-API-Key` válido; cada chave tem 600 por minuto |
 | A página do dashboard abre atrás de um ingress, mas todo painel dá erro | Servido num sub-path | Use um host próprio na raiz `/` (passo 8) |
 | Nenhuma Issue para uma carga observada | O alvo está em outro namespace sem RBAC, ou há várias Instances prontas | Confira o ClusterRoleBinding `chatcli-chatcli-prod-watcher`; mantenha uma Instance por cluster |
-| A sincronização do `SourceRepository` falha com `read-only file system` | O operator não tem `/tmp` gravável | Acrescente os `extraVolumes` do passo 1 |
+| A sincronização do `SourceRepository` falha com `read-only file system` ou `no space left on device` | Um chart do operator sem o emptyDir `/tmp`, ou um clone maior que `tmpVolume.sizeLimit` | Atualize o chart do operator; aumente `tmpVolume.sizeLimit` |
+| A sincronização SSH do `SourceRepository` falha com `has no "known_hosts" key` ou `Host key verification failed` | O Secret não tem `known_hosts`, ou a chave do host mudou | Acrescente a saída do `ssh-keyscan` como `known_hosts`, ou defina `spec.sshHostKeyPolicy: acceptNew` |
 | Grafana: `Datasource ${DS_PROMETHEUS} was not found` | Provisionado pelo sidecar sem trocar o UID do datasource | Use o laço com `sed` do passo 11, ou importe pela interface |
 | O experimento de chaos fica em `Pending` | `requireApproval: true`, ou `maxConcurrentExperiments` atingido | Tire o `requireApproval`; espere o experimento em execução terminar |
 
