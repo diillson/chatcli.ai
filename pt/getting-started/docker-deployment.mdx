@@ -232,13 +232,15 @@ Para mTLS com uma CA de cliente no mesmo Secret use `security.tlsClientCA: /etc/
 | Valor | Padrão | Descrição |
 |---|---|---|
 | `replicaCount` | `1` | Réplicas (ignorado com `autoscaling.enabled`) |
+| `strategy` | `{}` | Estratégia de atualização do Deployment, renderizada como escrita; vazia = escolhida pela persistência (veja [Rollouts no volume de sessões](#rollouts-no-volume-de-sessões)) |
 | `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/diillson/chatcli` / `appVersion` do chart / `IfNotPresent` | Imagem do servidor |
 | `imagePullSecrets` | `[]` | Pull secrets |
 | `server.port` | `50051` | Porta gRPC |
 | `server.metricsPort` | `9090` | `/metrics` e `/healthz`; `0` desliga os dois |
 | `server.token` | `""` | Token compartilhado (obrigatório sem JWT ou mTLS) |
 | `server.grpcReflection` | `false` | Define `CHATCLI_GRPC_REFLECTION=true`, que registra o reflection gRPC do servidor; as chamadas de reflection continuam exigindo a credencial do servidor. Deixe desligado em produção |
-| `extraEnv` | `[]` | Variáveis extras (por exemplo `LOG_LEVEL=debug`) |
+| `extraEnv` | `[]` | Variáveis extras (por exemplo `LOG_LEVEL=debug`); uma entrada para uma variável `CHATCLI_LOG_*` substitui o valor de `logging` do chart |
+| `logging.maxSizeMB` / `maxBackups` / `maxAgeDays` / `compress` | `20` / `3` / `28` / `true` | Rotação do arquivo de log → `CHATCLI_LOG_MAX_SIZE_MB`, `CHATCLI_LOG_MAX_BACKUPS`, `CHATCLI_LOG_MAX_AGE_DAYS`, `CHATCLI_LOG_COMPRESS` (veja [Logs, health e métricas](#logs-health-e-métricas)) |
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Volumes extras para o container do servidor |
 
 #### LLM
@@ -331,25 +333,60 @@ watcher:
 
 | Valor | Padrão | Descrição |
 |---|---|---|
-| `persistence.enabled` | `true` | PVC `<fullname>-sessions` para as sessões |
-| `persistence.storageClass` / `accessModes` / `size` | `""` / `[ReadWriteOnce]` / `1Gi` | `-` = `storageClassName: ""` |
-| `memory.enabled` | `false` | Memória de longo prazo em `~/.chatcli/memory` (no PVC de sessões quando a persistência está ligada) |
+| `persistence.enabled` | `true` | PVC `<fullname>-sessions` para as sessões, montado em `~/.chatcli/sessions` |
+| `persistence.storageClass` / `accessModes` / `size` | `""` / `[ReadWriteOnce]` / `1Gi` | `-` = `storageClassName: ""`. Sem `ReadWriteMany` um rollout para o pod antigo primeiro; `ReadWriteOncePod` falha o render com mais de uma réplica |
+| `memory.enabled` | `false` | Memória de longo prazo em `~/.chatcli/memory` (no PVC de sessões quando a persistência está ligada, num emptyDir de 200Mi caso contrário) |
+| `memory.subPath` | `memory` | Diretório do PVC de sessões que guarda a memória quando a persistência está ligada; a memória gravada na raiz do PVC por charts anteriores é copiada para ele uma vez. `""` = a raiz do PVC, compartilhada com os arquivos de sessão (o layout antigo) |
 | `pipeline.enabled` | `false` | [RPCs de pipeline](/pt/features/server-mode#rpcs-de-pipeline) (`CHATCLI_SERVER_PIPELINE`) |
-| `agents.*`, `skills.*`, `bootstrap.*` | desligados | `enabled`, `definitions` (arquivos inline), `existingConfigMap` |
+| `agents.*`, `skills.*`, `bootstrap.*` | desligados | `enabled`, `definitions` (arquivos inline), `existingConfigMap`; ligado sem nenhum dos dois, nada é montado |
 | `skillRegistry.enabled`, `registryUrls`, `registryDisable`, `installDir` | `false`, `""` | Configuração dos registries de skills |
 | `plugins.enabled`, `initImage`, `existingPVC` | `false`, `""` | Diretório de plugins, preenchido por uma init image ou por um PVC |
 | `resources` | requests `100m`/`128Mi`, limits `500m`/`512Mi` | Recursos do container |
 | `podSecurityContext` / `securityContext` | UID/GID/fsGroup 1000, não root, `RuntimeDefault`; sem escalonamento de privilégio, raiz somente leitura, drop `ALL` | Segurança do pod e do container |
 | `nodeSelector`, `tolerations`, `affinity` | vazios | Agendamento |
 
-O chart monta um emptyDir em `/home/chatcli/.chatcli` e `/tmp` e define `HOME=/home/chatcli`, então a raiz somente leitura funciona. Com o PVC `ReadWriteOnce` padrão, mais de uma réplica exige uma storage class `ReadWriteMany`.
+O chart monta um emptyDir em `/home/chatcli/.chatcli` e `/tmp` e define `HOME=/home/chatcli`, então a raiz somente leitura funciona.
+
+O servidor lê os ConfigMaps de MCP, agents, skills e bootstrap só no startup. Cada um que o chart renderiza (a partir de `mcp.servers` ou `*.definitions`) entra no hash de uma anotação `checksum/<nome>` do pod, então um `helm upgrade` que o altera recria os pods. Um ConfigMap que você mesmo gerencia (`*.existingConfigMap`) não pode ser hasheado pelo Helm: depois de editar um, rode `kubectl -n chatcli rollout restart deploy/chatcli`. `agents`, `skills` ou `bootstrap` ligados sem `definitions` nem `existingConfigMap` não montam nada, e o servidor encontra um diretório vazio (charts anteriores montavam um ConfigMap que não existia, deixando o pod em `ContainerCreating`).
+
+#### Rollouts no volume de sessões
+
+Com `persistence.enabled` e sem o modo de acesso `ReadWriteMany`, um rollout para o pod antigo antes de subir o novo: o chart renderiza `RollingUpdate` com `maxSurge: 0` e `maxUnavailable: 1`. Com o padrão do API server (um pod extra, nenhum indisponível), um pod novo agendado em outro nó não conseguia anexar o volume `ReadWriteOnce` enquanto o antigo o segurava, e o antigo só parava quando o novo ficava pronto, então o rollout travava. Parar o pod antigo primeiro troca isso por uma curta interrupção a cada rollout. Sem persistência, ou com `ReadWriteMany`, nada é renderizado e vale o padrão do API server.
+
+Uma `strategy` explícita vence sempre; `type: Recreate` sem `rollingUpdate` é renderizado com `rollingUpdate: null`. Uma instalação nova, um release do Helm 3 e um release já atualizado uma vez no padrão do chart podem trocar para `Recreate` direto. Um release instalado pelo Helm 4 num chart anterior (até 1.211.x, que não renderizava estratégia) precisa antes de um upgrade no padrão, porque o server-side apply do Helm 4 não consegue remover o bloco `rollingUpdate` preenchido por padrão (o upgrade falha com `spec.strategy.rollingUpdate: Forbidden`), ou deste patch:
+
+```bash
+kubectl -n chatcli patch deploy/chatcli --type=json \
+  -p '[{"op":"remove","path":"/spec/strategy/rollingUpdate"},{"op":"replace","path":"/spec/strategy/type","value":"Recreate"}]'
+```
+
+```yaml
+strategy:
+  type: Recreate
+```
+
+Um volume `ReadWriteOnce` anexa a um nó por vez, então várias réplicas nele só funcionam enquanto todas rodam nesse nó; pods agendados em outro lugar ficam em `ContainerCreating`. Rode uma réplica, ou use uma storage class `ReadWriteMany` para várias. `ReadWriteOncePod` admite um único pod: o render falha quando `replicaCount` (ou `autoscaling.maxReplicas` com o HPA ligado) passa de 1.
+
+#### Memória no PVC de sessões
+
+Com `memory.enabled` e persistência, as sessões ficam na raiz do PVC (montada em `~/.chatcli/sessions`) e a memória fica no diretório `memory.subPath` do mesmo PVC (montado em `~/.chatcli/memory`). O kubelet cria esse diretório na primeira montagem, e o `podSecurityContext.fsGroup` padrão o torna gravável. Charts anteriores (até 1.211.x) montavam a memória também na raiz do PVC, então os stores JSON dela ficavam entre os arquivos de sessão, onde a lista de sessões os mostrava e a expiração de sessões podia apagá-los.
+
+O upgrade de uma instalação que rodava com memória e persistência migra sozinho. Nenhuma sessão muda de lugar. O chart define `CHATCLI_MEMORY_LEGACY_DIR=/home/chatcli/.chatcli/sessions` (a raiz do PVC como o servidor a vê) sempre que persistência, memória e um `memory.subPath` estão ligados, e na primeira vez que o servidor abre a memória no layout novo ele copia de lá os arquivos da própria memória para o diretório de memória:
+
+- só os arquivos da memória (`MEMORY.md` e seus backups, `memory_index.json`, `memory_tombstones.json`, `episodes.json`, `user_profile.json`, `topics.json`, `projects.json`, `usage_stats.json`, `graph.json`, `vector_index.json`, `memory_archive.json`, `compactor_state.json`, as quarentenas `.corrupt` deles, as notas diárias `YYYYMM/`, `weekly/`, `monthly/` e `pending/`); os arquivos de sessão ficam onde estão;
+- só cópia: nada na raiz é movido, apagado ou reescrito, e um arquivo que já existe no diretório de memória nunca é sobrescrito; cada arquivo chega de forma atômica com modo 0600;
+- uma vez: roda só enquanto o diretório de memória não tem nenhum arquivo da memória, e grava o marcador `.migrated-from-legacy` lá ao terminar;
+- um arquivo ilegível é pulado com um aviso; um arquivo selado com `CHATCLI_ENCRYPTION_KEY` é selado de novo para o caminho novo, e enquanto a chave falta ou está errada a cópia fica pendente (`.migrating-from-legacy`) e retoma no próximo start;
+- o log registra `memory: adopted the legacy memory directory`.
+
+`memory.subPath: ""` mantém o layout compartilhado antigo (sem cópia, sem `CHATCLI_MEMORY_LEGACY_DIR`). Um upgrade só com `--reuse-values` não traz a chave `memory.subPath` e também mantém o layout antigo; `--reset-then-reuse-values` pega o novo padrão.
 
 #### Segurança
 
 | Valor | Padrão | Descrição |
 |---|---|---|
-| `security.jwtSecret` / `jwtSecretRef` | `""` / `{}` | Segredo HS256, inline / de um Secret |
-| `security.jwtPublicKey` / `jwtPublicKeyRef` | `""` / `{}` | Chave(s) pública(s) RS256, PEM inline ou caminho / de um Secret |
+| `security.jwtSecret` / `jwtSecretRef` | `""` / `{}` | Segredo HS256, inline / de um Secret; defina um, não os dois (os dois falham o render) |
+| `security.jwtPublicKey` / `jwtPublicKeyRef` | `""` / `{}` | Chave(s) pública(s) RS256, PEM inline ou caminho / de um Secret; defina um, não os dois (os dois falham o render) |
 | `security.jwtIssuer` / `jwtAudience` | `""` | `iss` / `aud` exigidos |
 | `security.tlsClientCA` | `""` | Caminho do bundle de CA para mTLS (exige `tls.*`) |
 | `security.mtlsRole` | `""` (`user`) | Role de quem se identifica só por certificado |
@@ -446,7 +483,27 @@ curl -s localhost:9090/healthz                       # ok
 curl -s localhost:9090/metrics | grep '^chatcli_server_info'
 ```
 
-Num pod o servidor escreve toda entrada de log no stderr, em linhas JSON, que é o que o `kubectl logs` e o seu coletor de logs leem; o arquivo rotativo em `/home/chatcli/.chatcli/app.log` (um emptyDir, sem shell para ler) é uma cópia que morre com o pod. `CHATCLI_LOG_STDERR=false` no `extraEnv` desliga a cópia no stderr. A porta de métricas não tem autenticação; restrinja com `networkPolicy.ingressFrom` onde isso importar.
+Num pod o servidor escreve toda entrada de log no stderr, em linhas JSON, que é o que o `kubectl logs` e o seu coletor de logs leem; o arquivo rotativo em `/home/chatcli/.chatcli/app.log` (um emptyDir, sem shell para ler) é uma cópia que morre com o pod. `CHATCLI_LOG_STDERR=false` no `extraEnv` desliga a cópia no stderr.
+
+Com a raiz somente leitura padrão, `/home/chatcli/.chatcli` é um emptyDir limitado a 200Mi, e um volume acima do limite faz o pod ser despejado. Os padrões de rotação do próprio servidor (100 MB, 3 backups: até 400 MB) não cabem, então o chart define uma rotação que cabe, no máximo 80 MB de log:
+
+| Valor | Padrão | Variável |
+|---|---|---|
+| `logging.maxSizeMB` | `20` | `CHATCLI_LOG_MAX_SIZE_MB`: tamanho em que o arquivo roda |
+| `logging.maxBackups` | `3` | `CHATCLI_LOG_MAX_BACKUPS`: arquivos rotacionados mantidos |
+| `logging.maxAgeDays` | `28` | `CHATCLI_LOG_MAX_AGE_DAYS`: dias que um arquivo rotacionado é mantido |
+| `logging.compress` | `true` | `CHATCLI_LOG_COMPRESS`: gzip nos arquivos rotacionados |
+
+Enquanto esse emptyDir está em uso, o render falha quando `maxSizeMB × (maxBackups + 1)` passa de 100 MB. Um campo definido como `null` não renderiza variável (vale o padrão do servidor, que conta como tal na checagem). Uma entrada de mesmo nome no `extraEnv` vence o valor do chart, e uma para o tamanho ou os backups pula a checagem.
+
+```yaml
+logging:
+  maxSizeMB: 10
+  maxBackups: 5
+extraEnv:
+  - name: LOG_LEVEL              # debug | info | warn | error
+    value: info
+``` A porta de métricas não tem autenticação; restrinja com `networkPolicy.ingressFrom` onde isso importar.
 
 ### Upgrade, rollback, desinstalação
 
@@ -458,7 +515,8 @@ helm rollback chatcli <revisão> -n chatcli
 helm uninstall chatcli -n chatcli
 ```
 
-- Uma mudança no Secret ou ConfigMap gerenciado pelo chart recria os pods (anotações de checksum). Uma mudança no `secrets.existingSecret` não: rode `kubectl -n chatcli rollout restart deploy/chatcli`.
+- Uma mudança no Secret ou ConfigMap gerenciado pelo chart recria os pods (anotações de checksum), incluindo os ConfigMaps de MCP, agents, skills e bootstrap. Uma mudança no `secrets.existingSecret` ou num `*.existingConfigMap` não: rode `kubectl -n chatcli rollout restart deploy/chatcli`.
+- Com persistência num volume sem `ReadWriteMany`, cada rollout para o pod antigo antes de subir o novo: espere uma curta interrupção (veja [Rollouts no volume de sessões](#rollouts-no-volume-de-sessões)).
 - Se o chart do servidor e o chart `chatcli-operator` estiverem instalados, mantenha os dois na mesma versão: cada um reaplica a própria cópia dos CRDs.
 - O `helm uninstall` apaga o PVC de sessões; faça backup antes. Os CRDs ficam; apagá-los apaga todos os recursos daqueles tipos.
 
@@ -474,6 +532,12 @@ helm uninstall chatcli -n chatcli
 | `Error: values don't meet the specifications of the schema(s)` | Valor desconhecido ou com erro de digitação | Confira a chave nas tabelas acima |
 | O watcher não traz nada de um namespace | RBAC: o chart criou uma Role e o alvo está em outro lugar | Defina o namespace do alvo em `watcher.targets` ou `watcher.namespace` (ClusterRole automática), ou use `rbac.clusterWide: true` |
 | Sessões somem no restart | `persistence.enabled: false` | Ligue |
+| O rollout trava; o pod novo fica em `ContainerCreating` com `Multi-Attach error` | Um chart que não renderizava estratégia (até 1.211.x), ou uma `strategy` explícita com surge, num volume `ReadWriteOnce` | Faça o upgrade com a `strategy` padrão (para o antigo primeiro), ou uma réplica num nó |
+| Réplicas extras presas em `ContainerCreating` | Várias réplicas num volume de sessões `ReadWriteOnce`, agendadas em outros nós | Uma réplica, ou `persistence.accessModes: [ReadWriteMany]` |
+| `helm install` falha com `ReadWriteOncePod admits a single pod` | `ReadWriteOncePod` com `replicaCount` ou `autoscaling.maxReplicas` acima de 1 | Uma réplica, ou `ReadWriteMany` |
+| `helm install` falha com `logging.maxSizeMB x (logging.maxBackups + 1) = … MB` | Rotação de log maior que 100 MB no emptyDir de dados | Reduza `logging.maxSizeMB` ou `logging.maxBackups` |
+| `helm install` falha com `security.jwtSecret and security.jwtSecretRef both set` (ou `jwtPublicKey` e `jwtPublicKeyRef`) | Valor inline e referência a Secret definidos juntos | Mantenha só a referência |
+| `*.existingConfigMap` editado não é aplicado | O servidor só o lê no startup, e o Helm não consegue hasheá-lo | `kubectl -n chatcli rollout restart deploy/chatcli` |
 | Duas réplicas, uma recebe todo o tráfego | O ClusterIP prende as conexões HTTP/2 | `service.headless: true` |
 
 Veja também a [tabela de problemas do servidor](/pt/features/server-mode#solução-de-problemas).
