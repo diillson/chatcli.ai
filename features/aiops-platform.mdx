@@ -45,12 +45,12 @@ This page covers the internal architecture in depth. For configuration and usage
 The operator also exposes a **REST HTTP API** on port `8090` (chart value `api.port`, env `CHATCLI_AIOPS_PORT`), reached through the Service `chatcli-operator` in the operator namespace (not the Instance Service). Its 40+ endpoints cover incidents, AI insights, remediations, runbooks, approvals, SLOs, post-mortems, analytics (including LLM cost), clusters, federation, policies and audit. A **Web Dashboard** is embedded and served at `/` on the same port.
 
 - **Authentication:** header `X-API-Key`. Keys are read from the Secret `chatcli-operator-secrets`, key `api-keys` (fallback: ConfigMap `chatcli-operator-config`), in the operator namespace, as a YAML list of `{key, role, description}`. Roles are `viewer` < `operator` < `admin`; any other role string is denied. Changes are picked up within about 30 seconds. No chart creates this Secret: with no keys configured every `/api/` call returns `401`, unless `CHATCLI_OPERATOR_DEV_MODE=true` (admin without a key, development only).
-- **Rate limit:** 30 requests per minute per client address (`429` with `Retry-After: 60`).
+- **Rate limit:** 30 requests per minute per client host without a valid API key, 600 per minute per valid key (`429` with `Retry-After`).
 - **CORS:** deny-all unless `CHATCLI_CORS_ALLOWED_ORIGINS` / `CHATCLI_CORS_ORIGIN` are set. **TLS:** set `CHATCLI_AIOPS_TLS_CERT` and `CHATCLI_AIOPS_TLS_KEY` to serve HTTPS (TLS 1.3).
 - **Local preview:** `make dash-preview` in `operator/` serves the dashboard over synthetic data, no cluster needed, at `http://127.0.0.1:8085` with the API key `preview`.
 
 <Note>
-  In 1.211.2 and earlier the REST API and dashboard run only on the **leader** replica: with `replicaCount > 1`, non-leader pods pass readiness but do not listen on 8090. Starting with the release after 1.211.2, every replica serves the API and dashboard.
+  Every operator replica serves the REST API and the dashboard on 8090, so `replicaCount > 1` works behind the Service without pinning requests to the leader.
 </Note>
 
 For the complete reference, see the [API Reference](/reference/api/overview).
@@ -198,10 +198,10 @@ Watches Anomaly CRs and correlates them into Issues.
     Newly created Anomaly with `Status.Correlated = false`.
   </Step>
   <Step title="Attaches to an active Issue">
-    If a non-terminal Issue already exists for the same resource (kind, name, namespace), the Anomaly is attached to it; the Issue's risk score is recalculated from the anomalies still uncorrelated and only ever goes up.
+    If a non-terminal Issue already exists for the same resource (kind, name, namespace), the Anomaly is attached to it; the Issue's risk score is recalculated from every anomaly the Issue now holds in the correlation window, the one just attached included, and only ever goes up.
   </Step>
   <Step title="Suppression checks">
-    Skips the Anomaly when the same resource was resolved within the resolution cooldown (Instance `spec.aiops.resolutionCooldownMinutes`, default 10) or when the noise reducer flags it (repetitive, flapping, seasonal).
+    Skips the Anomaly when the same resource was resolved within the resolution cooldown (Instance `spec.aiops.resolutionCooldownMinutes`, default 10; `0` turns the cooldown off) or when the noise reducer flags it (repetitive, flapping, seasonal).
   </Step>
   <Step title="Groups anomalies and calculates risk score and severity">
     Calls `CorrelationEngine.FindRelatedAnomalies()` for uncorrelated anomalies on the same resource within 10 minutes.
@@ -308,11 +308,13 @@ stateDiagram-v2
     Escalated --> [*]
 ```
 
-`Contained` means the plan silenced the workload (for example `ScaleDeployment` to 0 with `containment=true`) without fixing it: the Issue carries `status.requiresHumanAction: true` and `status.requiredAction`, and it moves to `Resolved` only once the workload is restored. `Escalated` Issues are re-checked every 30 seconds and auto-resolve when the resource is healthy again, unless the Instance sets `spec.aiops.enableAutoResolve: false`. `Failed` is terminal.
+`Contained` means the plan silenced the workload (for example `ScaleDeployment` to 0 with `containment=true`) without fixing it: the Issue carries `status.requiresHumanAction: true` and `status.requiredAction`, and it moves to `Resolved` only once the workload is restored. `Escalated` Issues are re-checked every 30 seconds and auto-resolve when the resource is healthy again, unless the Instance sets `spec.aiops.enableAutoResolve: false`. The health check understands Deployments, StatefulSets, DaemonSets, Jobs (healthy once `Complete`) and Nodes (healthy when `Ready`); an Issue on any other kind is not auto-resolved. `Failed` is terminal.
+
+The AIOps settings (`spec.aiops`) come from the Instance the WatcherBridge uses: the WatcherBridge labels each Anomaly with `platform.chatcli.io/instance` and `platform.chatcli.io/instance-namespace`, the Issue inherits them, and without the labels the first Ready Instance applies.
 
 <AccordionGroup>
   <Accordion title="handleDetected()">
-    1. Sets `detectedAt` and `maxRemediationAttempts` (default: 5, configurable via Instance `aiops.maxRemediationAttempts`; read from the first Instance in the cluster)
+    1. Sets `detectedAt` and `maxRemediationAttempts` (default: 5, configurable via Instance `aiops.maxRemediationAttempts`; read from the Instance the WatcherBridge uses)
     2. Creates AIInsight CR `<issue>-insight` with owner reference (Issue -> AIInsight), annotated with the candidate Runbooks
     3. Transitions to `Analyzing`
     4. Runs the federation checks (cascade detection, cross-cluster correlation), best effort
@@ -330,7 +332,7 @@ stateDiagram-v2
     - **Tier 1**: SignalType + Severity + ResourceKind (exact match, preferred)
     - **Tier 2**: Severity + ResourceKind (fallback when signal doesn't match)
     - `SignalType` resolved from: `issue.Spec.SignalType` -> fallback `issue.Labels["platform.chatcli.io/signal"]`
-    - Runbooks are searched in **every namespace**, not only the Issue's
+    - Runbooks are searched in **every namespace**, not only the Issue's: the Issue's namespace first, then the others, each Runbook once
   </Accordion>
   <Accordion title="generateRunbookFromAI()">
     - Materializes `SuggestedActions` from AI as a reusable Runbook CR

@@ -1,264 +1,176 @@
 ---
 title: "Kubernetes Monitoring (K8s Watcher)"
 sidebarTitle: "K8s Watcher"
-description: "Monitor multiple Kubernetes deployments simultaneously with Prometheus metrics, context budget management, and AI analysis."
+description: "Watch Kubernetes workloads (status, pods, events, logs, metrics, nodes, Prometheus) and inject that context into every prompt, locally or on the server."
 icon: "binoculars"
 ---
 
-The **K8s Watcher** allows ChatCLI to monitor **multiple deployments simultaneously**, collecting infrastructure and application metrics, logs, events, and pod status. The context is automatically injected into LLM prompts with **intelligent budget management** to avoid exceeding the context window.
+The **K8s Watcher** polls one or more Kubernetes workloads on an interval, keeps a rolling window of what it saw, raises alerts on common failures, and adds a summary of it all to every prompt. It runs in three places:
 
+| Where | Command | Who sees the context |
+|---|---|---|
+| Your terminal | `chatcli watch …`, or `/watch start …` inside ChatCLI | you |
+| The server | `chatcli server --watch-config …` / `--watch-deployment …` (Helm: `watcher.*`) | every client of the server; the [operator](/features/k8s-operator) also reads its alerts |
+| An operator-managed server | `spec.watcher` on an `Instance` | same as the server |
 
+## Quick start
 
-## Architecture
+```bash
+# Uses your current kubeconfig context
+chatcli watch --deployment myapp --namespace production
+```
 
-<Tabs>
-  <Tab title="Single-Target (legacy)">
-    ```text
-    ChatCLI -> ResourceWatcher -> 6 Collectors -> ObservabilityStore -> Summarizer -> LLM
-    ```
-  </Tab>
-  <Tab title="Multi-Target (current)">
-    ```text
-                            |-> ResourceWatcher[0] -> Store[0] --|
-    ChatCLI -> MultiWatcher-|-> ResourceWatcher[1] -> Store[1] --|-> MultiSummarizer -> LLM
-                            +-> ResourceWatcher[N] -> Store[N] --+   (budget-controlled)
-    ```
-  </Tab>
-</Tabs>
+```text
+Starting K8s watcher: 1 targets (interval: 30s, window: 2h0m0s)
+Initial data collected. K8s context will be injected into all prompts.
+Type your questions about the deployments. K8s context is automatically included.
+Use /watch to see current status.
+```
 
-Each `ResourceWatcher` has its own collectors (including an optional `PrometheusCollector`) and all share **a single Kubernetes clientset**, minimizing connections.
+Then ask: `Is the deployment healthy?`, `Why is pod myapp-7d9f-abcde restarting?`. One-shot:
 
+```bash
+chatcli watch --deployment myapp --namespace production -p "Is the deployment healthy?"
+chatcli watch --config targets.yaml -p "Which workloads need attention?"
+```
 
+## Commands and flags
 
-## Usage Modes
+### `chatcli watch`
 
-<Tabs>
-  <Tab title="Single Resource">
-    ```bash
-    # Deployment (default)
-    chatcli watch --deployment myapp --namespace production
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--deployment` | `CHATCLI_WATCH_DEPLOYMENT` | | Deployment to watch (single target) |
+| `--namespace` | `CHATCLI_WATCH_NAMESPACE` | `default` | Its namespace |
+| `--config` | — | | Multi-target YAML (wins over `--deployment`) |
+| `--interval` | `CHATCLI_WATCH_INTERVAL` | `30s` | Collection interval |
+| `--window` | `CHATCLI_WATCH_WINDOW` | `2h` | How long data is kept |
+| `--max-log-lines` | `CHATCLI_WATCH_MAX_LOG_LINES` | `100` | Log lines per container per collection |
+| `--kubeconfig` | `CHATCLI_KUBECONFIG` | in-cluster, else `~/.kube/config` | Kubeconfig file |
+| `--provider` / `--model` | `LLM_PROVIDER` / — | your configuration | LLM override |
+| `-p` | — | | One-shot prompt with the context, then exit |
+| `--max-tokens` | — | | Response token limit |
 
-    # StatefulSet
-    chatcli watch --deployment postgres --kind StatefulSet --namespace production
+The single-target flags always watch a **Deployment**. StatefulSets, DaemonSets, Jobs and CronJobs are watched through `kind` in a [config file](#multi-target-configuration-file) (with the Helm chart, `watcher.targets[].kind`).
 
-    # DaemonSet
-    chatcli watch --deployment fluentd --kind DaemonSet --namespace logging
+### Inside ChatCLI
 
-    # CronJob
-    chatcli watch --deployment etl-pipeline --kind CronJob --namespace data
+```text
+/watch start --deployment myapp --namespace production --interval 15s
+/watch status        # or just /watch
+/watch stop
+```
 
-    # One-shot with prompt
-    chatcli watch --deployment myapp -p "Is the deployment healthy?"
-    ```
-  </Tab>
-  <Tab title="Multiple Resources (YAML)">
-    ```bash
-    chatcli watch --config targets.yaml
-    chatcli watch --config targets.yaml -p "Which deployments need attention?"
-    ```
-  </Tab>
-  <Tab title="Server with Watcher">
-    ```bash
-    # Multi-target
-    chatcli server --watch-config targets.yaml
+`/watch start` accepts `--deployment`, `--namespace`, `--interval`, `--window`, `--max-log-lines` and `--kubeconfig`.
 
-    # Single-target (legacy)
-    chatcli server --watch-deployment myapp --watch-namespace production
-    ```
+### `chatcli server`
 
-    Clients connected via `chatcli connect` receive the K8s context automatically.
-  </Tab>
-</Tabs>
+| Flag | Env var | Default |
+|---|---|---|
+| `--watch-config` | `CHATCLI_WATCH_CONFIG` | |
+| `--watch-deployment` | `CHATCLI_WATCH_DEPLOYMENT` | |
+| `--watch-namespace` | `CHATCLI_WATCH_NAMESPACE` | `default` |
+| `--watch-interval` | `CHATCLI_WATCH_INTERVAL` | `30s` |
+| `--watch-window` | `CHATCLI_WATCH_WINDOW` | `2h` |
+| `--watch-max-log-lines` | `CHATCLI_WATCH_MAX_LOG_LINES` | `100` |
+| `--watch-kubeconfig` | `CHATCLI_KUBECONFIG` | in-cluster, else `~/.kube/config` |
 
+On the server the context is added to prompts server-side, so every [`chatcli connect`](/features/remote-connect) client gets it without setup, and the alerts are served by `GetAlerts` / `StreamAlerts`. The server prints `K8s watcher active: N targets (interval: 30s)` at startup; a config file that fails to load stops the server with `failed to load watch config: …` (in the log, see [Logs](/features/server-mode#logs)).
 
-
-## Multi-Target Configuration File
+## Multi-target configuration file
 
 ```yaml
 # targets.yaml
-interval: "30s"           # Collection interval
-window: "2h"              # Time window of retained data
-maxLogLines: 100          # Log lines per pod per cycle
-maxContextChars: 32000     # Maximum character budget for LLM context
+interval: "30s"         # Go duration; default 30s
+window: "2h"            # default 2h
+maxLogLines: 100        # default 100
+maxContextChars: 32000  # context budget with several targets; default 32000
 
 targets:
-  - deployment: api-gateway                                  # Deployment (default kind)
-    namespace: production
-    metricsPort: 9090                                        # Prometheus port
+  - deployment: api-gateway          # resource name (required)
+    namespace: production            # default "default"
+    metricsPort: 9090                # scrape Prometheus metrics from a pod
     metricsFilter: ["http_requests_total", "http_request_duration_*"]
 
-  - deployment: auth-service
-    namespace: production
-    metricsPort: 9090
-
   - deployment: worker
-    namespace: batch
-    # No metricsPort = Prometheus disabled for this target
+    namespace: batch                 # no metricsPort: no scraping
 
-  - deployment: postgres                                     # StatefulSet (database)
+  - deployment: postgres
     kind: StatefulSet
-    namespace: production
+    namespace: data
 
-  - deployment: fluentd                                      # DaemonSet (logging)
+  - deployment: fluent-bit
     kind: DaemonSet
     namespace: logging
 
-  - deployment: etl-pipeline                                 # CronJob (scheduled batch)
+  - deployment: nightly-etl
     kind: CronJob
     namespace: data
 ```
 
-### Target Fields
+| Field | Required | Description |
+|---|:---:|---|
+| `deployment` | yes | Name of the resource, whatever its kind |
+| `kind` | no | `Deployment` (default), `StatefulSet`, `DaemonSet`, `Job`, `CronJob` |
+| `namespace` | no | Default `default` |
+| `metricsPort` | no | Pod port serving Prometheus text format; unset = no scraping |
+| `metricsPath` | no | Default `/metrics` when `metricsPort` is set |
+| `metricsFilter` | no | Metric-name globs (`*` wildcard); empty = all metrics |
 
-| Field | Description | Required |
-|-------|-------------|:--------:|
-| `deployment` | Resource name to monitor | Yes |
-| `kind` | Resource kind: `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob` (default: `Deployment`) | No |
-| `namespace` | Namespace (default: `default`) | No |
-| `metricsPort` | Prometheus endpoint port (0 = disabled) | No |
-| `metricsPath` | HTTP path for metrics (default: `/metrics`) | No |
-| `metricsFilter` | Glob filters for metrics (empty = all) | No |
+The file is checked at load: `watch config file has no targets`, `target[0]: deployment (resource name) is required`, `target[2]: invalid kind "Pod" (must be Deployment, StatefulSet, DaemonSet, Job, or CronJob)`, `invalid interval "30"`. The kubeconfig is not a file field; pass `--kubeconfig` / `--watch-kubeconfig`.
 
+### Kubeconfig and cluster access
 
+The watcher uses the kubeconfig given by `--kubeconfig` / `--watch-kubeconfig` / `CHATCLI_KUBECONFIG`. Without one it tries the in-cluster service account, then `~/.kube/config`, always with the file's current context. The `KUBECONFIG` environment variable is not read.
 
-## Complete Flags
+## What is collected
 
-### `chatcli watch`
+Every interval, per target:
 
-| Flag | Description | Default | Env Var |
-|------|-------------|---------|---------|
-| `--config` | Multi-target YAML file | | |
-| `--deployment` | Resource name to monitor | | `CHATCLI_WATCH_DEPLOYMENT` |
-| `--kind` | Resource kind: `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob` | `Deployment` | |
-| `--namespace` | Resource namespace | `default` | `CHATCLI_WATCH_NAMESPACE` |
-| `--interval` | Interval between collections | `30s` | `CHATCLI_WATCH_INTERVAL` |
-| `--window` | Data time window | `2h` | `CHATCLI_WATCH_WINDOW` |
-| `--max-log-lines` | Log lines per pod | `100` | `CHATCLI_WATCH_MAX_LOG_LINES` |
-| `--kubeconfig` | Kubeconfig path | Auto-detected | `CHATCLI_KUBECONFIG` |
-| `--provider` | LLM provider | `.env` | `LLM_PROVIDER` |
-| `--model` | LLM model | `.env` | |
-| `-p <prompt>` | One-shot: send and exit | | |
-| `--max-tokens` | Token limit in response | | |
+| Data | Source |
+|---|---|
+| Resource status | replicas ready/updated/available and strategy (Deployment, StatefulSet); nodes ready/unavailable (DaemonSet); active/succeeded/failed (Job); schedule, suspended, last schedule (CronJob); conditions |
+| Pods | phase, readiness, restarts, last termination (reason, exit code), conditions, CPU/memory from metrics-server when installed |
+| Events | events of the resource and of its pods |
+| Logs | the last `maxLogLines` lines of each container of each pod, classified (errors are listed separately) |
+| HPA | the HPA whose target is this resource: current/desired/min/max replicas, metrics |
+| Nodes | for the nodes running the pods: Ready, DiskPressure, MemoryPressure, PIDPressure, NetworkUnavailable, cordoned, CPU/memory (metrics-server), pod count vs capacity, kubelet version |
+| Prometheus | see below, when `metricsPort` is set |
 
-### `chatcli server` (watcher flags)
+The store keeps `window / interval + 1` snapshots (at least 10) and up to `10 × maxLogLines` log lines per target; older data falls out of the window.
 
-| Flag | Description | Default | Env Var |
-|------|-------------|---------|---------|
-| `--watch-config` | Multi-target YAML file | | `CHATCLI_WATCH_CONFIG` |
-| `--watch-deployment` | Single deployment (legacy) | | `CHATCLI_WATCH_DEPLOYMENT` |
-| `--watch-namespace` | Namespace | `default` | `CHATCLI_WATCH_NAMESPACE` |
-| `--watch-interval` | Collection interval | `30s` | `CHATCLI_WATCH_INTERVAL` |
-| `--watch-window` | Observation window | `2h` | `CHATCLI_WATCH_WINDOW` |
-| `--watch-max-log-lines` | Max log lines | `100` | `CHATCLI_WATCH_MAX_LOG_LINES` |
-| `--watch-kubeconfig` | Kubeconfig path | Auto-detected | `CHATCLI_KUBECONFIG` |
+### Prometheus scraping
 
+- Scrapes **one** pod: the first `Running` pod with an IP among the resource's pods, at `http://<podIP>:<metricsPort><metricsPath>` (plain HTTP, 5 s timeout). The watcher must be able to reach pod IPs (run it in the cluster, or from a network that routes to pods).
+- Parses the text exposition format, skips comments, `NaN` and `±Inf`.
+- Keeps **one value per metric name**: labels are dropped and the last sample of a name wins, so `http_requests_total{code="200"}` and `{code="500"}` collapse into one number. Filter to metrics that make sense unlabeled, or expose aggregates.
+- `metricsFilter` globs use `*` as the only wildcard: `http_*`, `*_errors_total`, `go_goroutines`.
 
+## Alerts
 
-## What Is Collected
+| Alert type | Condition | Severity |
+|---|---|---|
+| `HighRestartCount` | a pod has more than 5 restarts | CRITICAL |
+| `OOMKilled` | a container's last termination was `OOMKilled` | CRITICAL |
+| `PodNotReady` | a pod is `Running` but not Ready | WARNING |
+| `DeploymentFailing` | ready replicas below desired (Deployment, StatefulSet, DaemonSet) | WARNING |
+| `JobFailed` | a Job has failed pods | CRITICAL |
+| `CronJobMissed` | a CronJob not suspended has not been scheduled for more than 2 hours | WARNING |
+| `NodeNotReady` | a node running the pods is not Ready | CRITICAL |
+| `DiskPressure` / `MemoryPressure` / `NetworkUnavailable` | node condition true | CRITICAL |
+| `PIDPressure` | node condition true | WARNING |
+| `NodeUnschedulable` | node cordoned | WARNING |
+| `PodCapacityHigh` | node running more than 90% of its pod capacity | WARNING |
 
-### Collectors per Target
+An alert with the same type and object as one already in the window is not raised again. Alerts appear in the context (`## Active Alerts`), drive the context budget, and on the server feed `GetAlerts` / `StreamAlerts`.
 
-| Collector | Data Collected |
-|-----------|---------------|
-| **Deployment** | Replicas (ready/available/updated), strategy, conditions |
-| **Pod Status** | Phase, readiness, restarts, termination info, container status |
-| **Events** | K8s events (Warning/Normal), message, reason, timestamp |
-| **Logs** | Last N lines per container per pod |
-| **Metrics** | CPU and memory per pod (via metrics-server) |
-| **HPA** | Min/max replicas, current metrics, desired replicas |
-| **Prometheus** | Application metrics from the pod `/metrics` endpoint |
-| **Node Health** | Node conditions (Ready, DiskPressure, MemoryPressure, PIDPressure, NetworkUnavailable), cordoned state, CPU/mem usage, pod count vs capacity, kubelet version |
+## Context and budget
 
-### Node Health Collector
-
-The `NodeCollector` automatically monitors the health of nodes where the target's pods are running:
-
-1. **Discovers nodes** — via pod label selector, identifies which nodes the pods are scheduled on
-2. **Collects conditions** — all 5 official Kubernetes conditions (`Ready`, `DiskPressure`, `MemoryPressure`, `PIDPressure`, `NetworkUnavailable`)
-3. **Collects metrics** — node CPU and memory via metrics-server (when available)
-4. **Pod capacity** — counts active pods vs node maximum capacity
-5. **Cordoned** — detects nodes marked as `unschedulable`
-
-**Alerts emitted:**
-
-| Condition | Severity | Example message |
-|-----------|:--------:|-----------------|
-| NotReady | CRITICAL | `Node worker-1 is NotReady` |
-| DiskPressure | CRITICAL | `Node worker-1 has DiskPressure` |
-| MemoryPressure | CRITICAL | `Node worker-1 has MemoryPressure` |
-| PIDPressure | WARNING | `Node worker-1 has PIDPressure` |
-| NetworkUnavailable | CRITICAL | `Node worker-1 has NetworkUnavailable` |
-| Cordoned | WARNING | `Node worker-1 is cordoned (unschedulable)` |
-| Pod capacity >90% | WARNING | `Node worker-1 pod capacity at 95/110 (>90%)` |
-
-Node context is included in the summary sent to the LLM, enabling the AI to correlate pod problems with infrastructure:
-
-```
-## Nodes (2)
-  - worker-1: Ready cpu=1200m/4 mem=3Gi/8Gi pods=45/110 k8s=v1.31.4
-  - worker-2: NOT READY [MemoryPressure] cpu=3800m/4 mem=7.8Gi/8Gi pods=98/110 k8s=v1.31.4
-    MemoryPressure: kubelet has insufficient memory available
-```
-
-### Prometheus Collector (New)
-
-The `PrometheusCollector` scrapes Prometheus metrics directly from pods:
-
-- Discovers deployment pods and selects **1 Ready pod**
-- Makes HTTP GET to `http://podIP:port/path` (timeout: 5s)
-- Parses the Prometheus text exposition format (stdlib, no dependencies)
-- Filters by configured **glob patterns**
-- Ignores NaN, Inf, and comment lines
-
-**Glob filter examples:**
-
-```yaml
-metricsFilter:
-  - "http_requests_*"          # All HTTP metrics
-  - "process_*"                # Process metrics
-  - "go_goroutines"            # Specific metric
-  - "*_duration_seconds_*"     # Any duration metric
-```
-
-
-
-## Context Budget Management (MultiSummarizer)
-
-With multiple targets, the **MultiSummarizer** ensures the context does not exceed the LLM window:
-
-### Algorithm
-
-<Steps>
-  <Step title="Scores each target">
-    `0 = healthy`, `1 = warning`, `2 = critical`
-    - **Critical**: CrashLoopBackOff, OOMKilled, critical alerts
-    - **Warning**: replicas &lt; desired, error logs, warning alerts
-    - **Healthy**: everything ok
-  </Step>
-  <Step title="Sorts by priority">
-    Critical first, then warning, then healthy.
-  </Step>
-  <Step title="Allocates context">
-    - Score >= 1 -- full context (~1-3 KB per target)
-    - Score == 0 -- compact one-liner (~80 chars per target)
-  </Step>
-  <Step title="Compresses if exceeding maxContextChars">
-    Compresses healthy targets first.
-  </Step>
-  <Step title="Omits if still exceeding">
-    Omits healthy targets when necessary.
-  </Step>
-</Steps>
-
-### Example with 20 Targets (2 with issues)
+With one target the full context is sent (resource status, pods, HPA, nodes, recent events, application metrics, active alerts, recent error logs):
 
 ```text
-[K8s Multi-Watcher: 20 targets monitored]
-
---- Targets Requiring Attention ---
-
 [K8s Context: deployment/api-gateway in namespace/production]
-Collected at: 2026-02-15T10:30:00Z
+Collected at: 2026-09-28T10:30:00Z
 
 ## Deployment Status
   Replicas: 2/3 ready, 3 updated, 2 available
@@ -266,199 +178,136 @@ Collected at: 2026-02-15T10:30:00Z
 
 ## Pods (3 total)
   Total restarts: 12 (delta in window: 8)
-  - api-gateway-abc12: Running [Ready] restarts=0 cpu=45m mem=128Mi
-  - api-gateway-def34: Running [Ready] restarts=0 cpu=52m mem=135Mi
-  - api-gateway-ghi56: Running [NOT READY] restarts=8 cpu=12m mem=95Mi
-    Last terminated: OOMKilled (exit code 137) at 2026-02-15T10:28:00Z
-
-## Application Metrics (4)
-  http_request_duration_seconds_sum: 8453
-  http_requests_total: 1.542e+06
-  process_resident_memory_bytes: 1.34e+08
-  go_goroutines: 245
-
+  - api-gateway-7d9f-abcde: Running [NOT READY] restarts=8 cpu=12m mem=95Mi
+    Last terminated: OOMKilled (exit code 137) at 2026-09-28T10:28:00Z
+...
 ## Active Alerts (2)
-  [CRITICAL] CrashLoopBackOff: pod/api-gateway-ghi56
-  [CRITICAL] OOMKilled: pod/api-gateway-ghi56
+  [CRITICAL] HighRestartCount: Pod api-gateway-7d9f-abcde has 8 restarts (api-gateway-7d9f-abcde)
+  [CRITICAL] OOMKilled: Pod api-gateway-7d9f-abcde was OOMKilled (exit code 137) (api-gateway-7d9f-abcde)
+```
 
-## Recent Error Logs (3)
-  [10:27:45] api-gateway-ghi56/app: OutOfMemoryError: heap space
-  [10:27:46] api-gateway-ghi56/app: Shutting down...
-  [10:28:00] api-gateway-ghi56/app: Process exited with code 137
+With several targets the context is budgeted to `maxContextChars`:
+
+1. Each target is scored: `2` with a critical alert; `1` with ready replicas below desired, a warning alert or error logs; `0` otherwise.
+2. Targets are sorted by score, then by alert count.
+3. Targets scoring 1 or 2 get their full context; healthy ones a one-line summary.
+4. Over budget, the healthiest detailed targets are reduced to one line, then the healthiest lines are dropped.
+
+```text
+[K8s Multi-Watcher: 12 targets monitored]
+
+--- Targets Requiring Attention ---
+
+[K8s Context: deployment/api-gateway in namespace/production]
+...
 
 --- Healthy Targets ---
-- production/auth-service: 3/3 pods ready | healthy | 0 alerts | 42 snapshots
-- production/frontend: 2/2 pods ready | healthy | 0 alerts | 42 snapshots
-- production/backend: 5/5 pods ready | healthy | 0 alerts | 42 snapshots
-- batch/worker: 3/3 pods ready | healthy | 0 alerts | 42 snapshots
-... (16 compact targets)
+- production/auth-service (Deployment): 3/3 ready | healthy | 0 alerts | 240 snapshots
+- data/nightly-etl (CronJob): schedule=0 2 * * * active=0 suspended=false | healthy | 0 alerts
 ```
 
-**Total budget**: ~2 KB (detail) + 18 x 80 chars (compact) = ~3.5 KB, within the 8 KB limit.
+`/watch status` in `chatcli watch` shows `K8s Watcher: Watching 12 targets: 10 healthy, 1 warning, 1 critical`.
 
+## Prometheus metrics of the watcher
 
+When the watcher runs inside `chatcli server` with metrics on (`--metrics-port`, default 9090):
 
-## Anomaly Detection
+| Metric | Type | Labels |
+|---|---|---|
+| `chatcli_watcher_collection_duration_seconds` | histogram | `target` |
+| `chatcli_watcher_collection_errors_total` | counter | `target` |
+| `chatcli_watcher_alerts_total` | counter | `target`, `severity`, `type` |
+| `chatcli_watcher_targets_monitored` | gauge | — |
+| `chatcli_watcher_pods_ready` / `chatcli_watcher_pods_desired` | gauge | `namespace`, `deployment` |
+| `chatcli_watcher_snapshots_stored` | gauge | `target` |
+| `chatcli_watcher_pod_restarts_total` | gauge | `target` |
 
-| Anomaly | Condition | Severity |
-|---------|-----------|----------|
-| **CrashLoopBackOff** | Pod with more than 5 restarts | Critical |
-| **OOMKilled** | Container terminated due to lack of memory | Critical |
-| **PodNotReady** | Pod is not in the Ready state | Warning |
-| **DeploymentFailing** | Deployment with Available=False | Critical |
+`chatcli_watcher_alerts_total` counts an alert when the watcher stores it as new. A condition that persists is seen on every collection, but a repeat of the same type on the same object is dropped while the earlier alert is still held in the window (`--watch-window`), so a standing problem counts once rather than once per collection. It is a counter: use `increase()` or `rate()` over a range.
 
-Alerts are included in the context sent to the LLM and influence the **budget priority** of the MultiSummarizer.
+## RBAC
 
+Read-only access the watcher uses. The node section (cluster-scoped) is optional: without it the node data and node alerts are missing and everything else works.
 
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role                     # one per watched namespace, or a ClusterRole for all
+metadata:
+  name: chatcli-watcher
+  namespace: production
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole              # node health: nodes, node metrics, pods on those nodes
+metadata:
+  name: chatcli-watcher-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+```
 
-## Observability Store
+Bind them to the identity the watcher runs as: your user for `chatcli watch`, the pod's ServiceAccount for the server.
 
-Collected data is stored in a **ring buffer** per target with a configurable time window:
+- **Helm chart**: `rbac.create: true` (default) creates the RBAC; it becomes a ClusterRole automatically when targets are outside the release namespace or span several, or when a single-target `watcher.namespace` is not the release namespace (an empty one means `default`). `watcher.targets[].kind` picks `Deployment` (default), `StatefulSet`, `DaemonSet`, `Job` or `CronJob`, as in the config file. The chart's rules are broader than the watcher needs (they also cover the AIOps remediation resources) but grant no access to Secrets; review `rbac.*` before installing in a sensitive cluster, and use `rbac.additionalRules` for a plugin that needs a Secret.
+- **Operator**: for a watcher spanning namespaces the operator binds the pre-provisioned `chatcli-watcher` ClusterRole; see [K8s Operator](/features/k8s-operator).
 
-- **Snapshots**: Complete periodic state (pods, deployment, HPA, events, metrics, app metrics)
-- **Logs**: Recent logs from each pod with classification (info/warning/error)
-- **Alerts**: Detected anomalies with severity and timestamps
-
-### Automatic Rotation
-
-Data older than the time window (`--window`) is automatically discarded, keeping memory usage constant regardless of the number of targets.
-
-
-
-## `/watch` Command
-
-Inside interactive ChatCLI (local or remote), use `/watch` to see the status:
-
-<Tabs>
-  <Tab title="Single-Target">
-    ```text
-    /watch
-    K8s Watcher Active
-      Deployment:  myapp
-      Namespace:   production
-      Snapshots:   42
-      Pods:        3
-      Alerts:      1
-    ```
-  </Tab>
-  <Tab title="Multi-Target">
-    ```text
-    /watch
-    K8s Multi-Watcher Active
-      Watching 20 targets: 18 healthy, 1 warning, 1 critical
-    ```
-  </Tab>
-</Tabs>
-
-
-
-## One-Shot with K8s Context
+Check your own access before starting:
 
 ```bash
-# Single deployment
-chatcli watch --deployment myapp -p "Is the deployment healthy?"
-
-# Multi-target
-chatcli watch --config targets.yaml -p "Summarize the status of all deployments"
-
-# Via remote server
-chatcli connect myserver:50051 -p "Why are the pods restarting?"
+kubectl auth can-i list pods -n production
+kubectl auth can-i get pods/log -n production
+kubectl auth can-i list events -n production
+kubectl auth can-i get deployments.apps -n production
 ```
 
+## AIOps integration
 
+The operator reads the server's watcher alerts over `StreamAlerts` (falling back to polling `GetAlerts` against a server without the stream) and turns them into `Anomaly` resources, which it correlates into `Issue`s, analyzes (`AIInsight`) and remediates (`RemediationPlan`). See [AIOps Platform](/features/aiops-platform).
 
-## Example Questions
+## Troubleshooting
 
-```text
-> Is the deployment healthy?
-> Which deployments need attention?
-> Why is pod xyz restarting?
-> Analyze the HTTP metrics of api-gateway. Is the latency acceptable?
-> Compare the auth-service state with 30 minutes ago
-> What warning events occurred in the last hour?
-> Based on the Prometheus metrics, do I need to scale any deployment?
-> Summarize the status of all targets for a team report
-```
+| Symptom | Cause | Fix |
+|---|---|---|
+| `deployment name or config file required (use --deployment or --config)` | No target | Pass one |
+| `failed to create K8s watcher: …` | No kubeconfig or cluster unreachable | `--kubeconfig`, or check `kubectl get pods` works with the current context |
+| Status stays empty, log shows `forbidden` | Missing RBAC | Grant the [rules above](#rbac) |
+| No `## Nodes` section | No node RBAC, or no pods scheduled | Add the cluster-scoped rules |
+| No CPU/memory numbers | metrics-server not installed or no `metrics.k8s.io` access | Install metrics-server / grant access |
+| No `## Application Metrics` | Pod IP not reachable from the watcher, wrong port/path, non-200, or the filter matches nothing | Run the watcher in the cluster; check the port and `metricsFilter` |
+| A labeled metric shows one odd value | Labels are dropped, last sample wins | Filter to unlabeled or aggregate metrics |
+| `/watch status` over `chatcli connect` says no watcher | The server runs none: its connect banner has no `K8s watcher active` line | Turn the watcher on in the server (`--watch-config`, Helm `watcher.enabled`), see [Remote Connection](/features/remote-connect#remote-plugins-sessions-and-watcher-status) |
 
-
-
-## Requirements
-
-- **Kubernetes Cluster**: Access via kubeconfig or in-cluster config
-- **RBAC Permissions**: Read access to pods, events, logs, deployments, HPA, ingresses
-- **metrics-server** (optional): For CPU/memory collection
-- **Prometheus endpoints** (optional): Apps that expose `/metrics` in Prometheus text format
-
-### RBAC
-
-<Tabs>
-  <Tab title="Single-namespace (Role + RoleBinding)">
-    ```yaml
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: Role
-    metadata:
-      name: chatcli-watcher
-      namespace: production
-    rules:
-      - apiGroups: [""]
-        resources: ["pods", "pods/log", "events", "services", "endpoints"]
-        verbs: ["get", "list", "watch"]
-      - apiGroups: ["apps"]
-        resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-        verbs: ["get", "list", "watch"]
-      - apiGroups: ["autoscaling"]
-        resources: ["horizontalpodautoscalers"]
-        verbs: ["get", "list", "watch"]
-      - apiGroups: ["networking.k8s.io"]
-        resources: ["ingresses"]
-        verbs: ["get", "list"]
-      - apiGroups: ["metrics.k8s.io"]
-        resources: ["pods"]
-        verbs: ["get", "list"]
-    ```
-  </Tab>
-  <Tab title="Multi-namespace (ClusterRoleBinding + shared ClusterRole)">
-    When targets are in different namespaces, the Operator creates only a per-Instance `ClusterRoleBinding` pointing at the shared `chatcli-watcher` ClusterRole, which is pre-provisioned by the operator Helm chart (H5 hardening — see [k8s-operator#tls-and-rbac](/features/k8s-operator#tls-and-rbac)). The `chatcli-watcher` rules match the Role above, applied cluster-wide.
-  </Tab>
-</Tabs>
-
-
-
-## AIOps Integration
-
-K8s Watcher alerts automatically feed into the Operator's **AIOps pipeline**. The Operator receives alerts over the `StreamAlerts` RPC the moment the watcher raises them (polling `GetAlerts` only for a server without the stream) and creates Anomaly CRs that are correlated into Issues, analyzed by AI, and automatically remediated.
-
-```text
-Alerts detected by Watcher -> Anomaly -> Issue -> AIInsight -> RemediationPlan -> Resolution
-```
-
-See [AIOps Platform](/features/aiops-platform) for the complete flow.
-
-<Note>
-Starting with AIOps Platform v2, Watcher alerts also feed into:
-- **NotificationPolicy** for automatic routing to Slack, PagerDuty, OpsGenie, Email, Webhook and Teams
-- **ApprovalPolicy** for approval gates before production remediations
-- **ServiceLevelObjective** for burn rate and error budget calculation
-- **NoiseReducer** for suppression of repetitive, seasonal and flapping alerts
-
-See the [full AIOps Platform documentation](/features/aiops/notifications) for details.
-</Note>
-
-
-
-## Next Steps
+## Next steps
 
 <CardGroup cols={2}>
   <Card title="Server Mode" icon="server" href="/features/server-mode">
-    Configure the server with watcher
+    Share the watcher with a team
+  </Card>
+  <Card title="K8s Monitoring recipe" icon="chart-line" href="/cookbook/k8s-monitoring">
+    Step by step
   </Card>
   <Card title="K8s Operator" icon="dharmachakra" href="/features/k8s-operator">
-    K8s Operator (AIOps)
+    Managed Instances and AIOps
   </Card>
-  <Card title="AIOps Platform" icon="brain" href="/features/aiops-platform">
-    AIOps Platform (deep-dive)
-  </Card>
-  <Card title="Deploy on Kubernetes" icon="docker" href="/getting-started/docker-deployment">
-    Deploy on Kubernetes
+  <Card title="Docker & Kubernetes" icon="docker" href="/getting-started/docker-deployment">
+    Deploy the server
   </Card>
 </CardGroup>

@@ -1,438 +1,463 @@
 ---
 title: "Production Security Hardening"
 sidebarTitle: "Security Hardening"
-description: "Step-by-step guide to configure all ChatCLI security measures for production environments."
+description: "Harden a production ChatCLI deployment step by step: credentials, TLS and mTLS, audit, encryption at rest, agent and plugin controls, network and pod settings, the operator's REST API, and the gaps you must cover yourself."
 icon: "lock"
 ---
 
-This guide shows how to deploy ChatCLI in production with **all security measures enabled**. Follow each step in order to ensure a complete configuration.
+This guide hardens the two production shapes:
 
----
+- **the ChatCLI server**, installed with the `chatcli` Helm chart or managed by the operator as an `Instance`;
+- **the operator**, with its REST API and web dashboard.
+
+It only uses controls that exist in the code. The [last section](#what-chatcli-does-not-protect) lists what ChatCLI does not protect, and what to put in place instead.
+
+<Info>
+For the full AIOps install (operator, Instance, policies, observability), follow [AIOps Production Setup](/cookbook/aiops-production-setup). This page is about the security settings on top of it.
+</Info>
 
 ## Prerequisites
 
-- Kubernetes cluster with Helm 3.8+
-- `kubectl` and `helm` configured
-- `openssl` available for key generation
-- Access to create Secrets in the target namespace
+- Helm 3.8 or later, `kubectl`, `openssl`.
+- A namespace for the server (`chatcli` below) and rights to create Secrets in it.
+- For the certificate steps, cert-manager or your own CA.
 
----
+## The server's security model
 
-## Step 1: Generate JWT Secret and Create K8s Secret
+Read this before you choose settings. It explains what each control does and does not cover.
 
-JWT is used to authenticate connections between clients and the ChatCLI server.
+| Area | Behavior |
+|---|---|
+| Listener | gRPC on port 50051. Inside Kubernetes it binds every interface, and **refuses to start** without a credential (token, JWT material or client CA). JWT material that fails to load does not count: if it is the only credential, the server refuses to start. |
+| TLS | Optional on the server, TLS 1.3 minimum when on. The operator always dials TLS, so an operator-managed Instance must enable it. |
+| Shared token | Every holder is the same identity (`legacy-token`) with the **admin** role, and they all share one rate-limit bucket. |
+| JWT | HS256 (`CHATCLI_JWT_SECRET`) or RS256 (`CHATCLI_JWT_PUBLIC_KEY`), never both. `exp` is required; `iss` and `aud` are checked when configured. The server verifies tokens but never issues them. |
+| mTLS | `CHATCLI_SERVER_TLS_CLIENT_CA` makes **every** connection present a client certificate. A caller with only a certificate gets `CHATCLI_MTLS_ROLE` (default `user`). A bearer token, when present, wins over the certificate. |
+| Roles | `admin`, `user` (JWT `operator` or `user`) and `readonly` (JWT `viewer` or `readonly`). Roles are enforced only on the pipeline execution RPCs (admin), some hub operations, plugin management and remote plugins (a read-only caller lists and downloads none). A read-only caller can still send prompts and manage its sessions, so treat every valid credential as permission to spend your LLM budget. |
+| Rate limit | Per authenticated subject, 10 requests per second with a burst of 20 by default. It is always on. |
+| Unauthenticated endpoints | `grpc.health.v1` and the `Health` RPC; the metrics port (`/metrics`, `/healthz`), plain HTTP on every interface. |
 
-```bash
-# Generate a 256-bit JWT secret
-JWT_SECRET=$(openssl rand -hex 32)
-
-# Create the Secret in Kubernetes
-kubectl create namespace chatcli
-kubectl -n chatcli create secret generic chatcli-jwt \
-  --from-literal=secret="$JWT_SECRET"
-```
-
-<Warning>
-Store the `$JWT_SECRET` value in a secrets vault (Vault, AWS Secrets Manager, etc.). You will need it to configure remote clients.
-</Warning>
-
-Verify the Secret:
-
-```bash
-kubectl -n chatcli get secret chatcli-jwt -o jsonpath='{.data.secret}' | base64 -d
-```
-
----
-
-## Step 2: Configure TLS Certificates
+## Step 1: Choose and create the credential
 
 <Tabs>
-  <Tab title="cert-manager (recommended)">
-    ```yaml
-    # chatcli-certificate.yaml
-    apiVersion: cert-manager.io/v1
-    kind: Certificate
-    metadata:
-      name: chatcli-tls
-      namespace: chatcli
-    spec:
-      secretName: chatcli-tls-certs
-      issuerRef:
-        name: letsencrypt-prod
-        kind: ClusterIssuer
-      dnsNames:
-        - chatcli.mydomain.com
-    ```
+  <Tab title="Shared token">
+    The simplest option, for machine clients you control. Everyone who has it is admin.
 
     ```bash
-    kubectl apply -f chatcli-certificate.yaml
+    kubectl create namespace chatcli
+    kubectl -n chatcli create secret generic chatcli-token \
+      --from-literal=token="$(openssl rand -hex 32)"
+    ```
+
+    Server chart: put `CHATCLI_SERVER_TOKEN` in the Secret named by `secrets.existingSecret`, or set `server.token`, which the chart stores in a Secret and never passes as a command-line argument. Instance: `spec.server.token: {name: chatcli-token, key: token}`.
+  </Tab>
+  <Tab title="JWT HS256">
+    One shared secret verifies tokens you mint, each with its own subject, role and expiry.
+
+    ```bash
+    kubectl -n chatcli create secret generic chatcli-jwt \
+      --from-literal=secret="$(openssl rand -hex 32)"
+    ```
+
+    Server chart: `security.jwtSecretRef: {name: chatcli-jwt, key: secret}`, plus `security.jwtIssuer` and `security.jwtAudience`. Instance: `spec.server.security.jwtSecretRef`, `jwtIssuer`, `jwtAudience`; the operator then mints its own short-lived tokens with the same secret.
+
+    The server does not issue tokens. Mint them with your identity system, or, for a first test, with this script (standard library only):
+
+    ```bash
+    export JWT_SECRET="$(kubectl -n chatcli get secret chatcli-jwt -o jsonpath='{.data.secret}' | base64 -d)"
+    python3 - <<'EOF'
+    import base64, hashlib, hmac, json, os, time
+    b64 = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=")
+    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    claims = b64(json.dumps({
+        "sub": "alice@example.com",
+        "role": "user",                  # admin | operator/user | viewer/readonly
+        "iss": "chatcli-prod",           # must equal security.jwtIssuer
+        "aud": "chatcli",                # must equal security.jwtAudience (a string, not a list)
+        "exp": int(time.time()) + 3600,  # required
+    }).encode())
+    sig = b64(hmac.new(os.environ["JWT_SECRET"].encode(), header + b"." + claims, hashlib.sha256).digest())
+    print((header + b"." + claims + b"." + sig).decode())
+    EOF
     ```
   </Tab>
-  <Tab title="Manual certificate">
-    ```bash
-    # Generate self-signed certificate (for testing only)
-    openssl req -x509 -newkey rsa:4096 -keyout tls.key -out tls.crt \
-      -days 365 -nodes -subj "/CN=chatcli.mydomain.com"
+  <Tab title="JWT RS256">
+    Your identity provider signs, and the server holds only the public key.
 
-    kubectl -n chatcli create secret tls chatcli-tls-certs \
-      --cert=tls.crt --key=tls.key
+    ```bash
+    kubectl -n chatcli create secret generic chatcli-jwt-pub \
+      --from-file=public.pem=idp-public.pem
     ```
 
-    <Warning>
-    The snippet above covers the **standalone chatcli server** exposed on a public domain. If you are using the **Operator + Instance CR** to dial gRPC via in-cluster DNS (`<instance>.<ns>.svc.cluster.local`), this cert will fail with `x509: certificate is not valid for any names` (no SANs) and `x509: certificate signed by unknown authority` (no `ca.crt` in the Secret). For that path, use the `openssl.cnf` with `subjectAltName` and the 3-key Secret documented in [AIOps Production Setup §2.1](/cookbook/aiops-production-setup#2-1-create-the-chatcli-tls-secret-correctly-sans-ca).
-    </Warning>
+    Server chart: `security.jwtPublicKeyRef: {name: chatcli-jwt-pub, key: public.pem}`. Instance: `spec.server.security.jwtPublicKeyRef`. The operator cannot mint RS256 tokens, so it needs its own credential: `spec.server.security.operatorTokenRef` (a token your IdP issued for it) or `operatorClientCertSecretName`.
+
+    The `aud` claim is compared as a single string. Tokens whose `aud` is a list are rejected when `jwtAudience` is set.
+  </Tab>
+  <Tab title="mTLS">
+    Every connection must present a certificate signed by your client CA. Use a CA dedicated to clients, not the CA that signed the server certificate, or every certificate that CA ever issued becomes a valid client.
+
+    ```bash
+    kubectl -n chatcli create secret generic chatcli-client-ca \
+      --from-file=ca.crt=client-ca.crt
+    ```
+
+    Server chart: mount it with `extraVolumes`/`extraVolumeMounts` and set `security.tlsClientCA` to the mounted path (TLS must be on). Instance: `spec.server.tls.clientCASecretName: chatcli-client-ca`, plus `spec.server.security.operatorClientCertSecretName` for the operator's own certificate.
+
+    Clients: `CHATCLI_TLS_CLIENT_CERT` and `CHATCLI_TLS_CLIENT_KEY` with `chatcli connect --tls`. There is no command-line flag for the client certificate.
   </Tab>
 </Tabs>
 
----
+## Step 2: TLS certificates
 
-## Step 3: Set Up Rate Limiting
-
-Define request limits to prevent abuse and DoS:
+The certificate must cover the name clients dial. An operator-managed Instance is dialed as `<instance>.<namespace>.svc.cluster.local`, which needs a private CA; see [TLS certificate](/cookbook/aiops-production-setup#tls-certificate) in the AIOps setup. For a server reached from outside the cluster under a public name:
 
 ```yaml
-# values-security.yaml (partial)
-security:
-  rateLimitRps: 20        # 20 requests per second
-  # bindAddress: "0.0.0.0"  # Unset means every interface in Kubernetes — not loopback
-```
-
-<Warning>
-In Kubernetes, leaving `bindAddress` unset means the server listens on
-**every interface**, not on loopback. A reachable server with no credential
-would admit every caller as an administrator, so it refuses to start and
-the operator does not provision the Deployment — it raises the
-`AuthenticationConfigured` condition on the Instance instead.
-
-Set `server.token`, `security.jwtSecretRef` (HS256), `security.jwtPublicKey`
-(RS256) or `security.tlsClientCA` (mutual TLS; callers are then identified by
-their certificate with the role in `security.mtlsRole`), or bind loopback with
-`security.bindAddress: "127.0.0.1"` when the server is only reached from
-inside its own pod.
-</Warning>
-
-<Tip>
-For multi-tenant environments, consider lower values (5-10 RPS per instance) and use HPA to scale horizontally.
-</Tip>
-
----
-
-## Step 4: Enable Audit Logging
-
-Audit logging records each operation with details of who, what, and when:
-
-```yaml
-# values-security.yaml (partial)
-security:
-  auditLog: true
-```
-
-```bash
-# Equivalent environment variable — the audit trail is a path, not a flag:
-# setting it turns the trail on and says where it is written.
-export CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.jsonl
-```
-
-Audit logs include:
-- Authenticated user (via JWT claims)
-- Command or operation executed
-- Timestamp and result (success/failure)
-- Source IP of the request
-
----
-
-## Step 5: Configure Agent Command Allowlist
-
-Enable `strict` mode to ensure only approved commands are executed:
-
-```yaml
-# values-security.yaml (partial)
-security:
-  agentSecurityMode: strict
-
-# If you need additional commands:
-env:
-  - name: CHATCLI_AGENT_ALLOWLIST
-    value: "terraform;ansible;packer;vault"
-  - name: CHATCLI_AGENT_WORKSPACE_STRICT
-    value: "true"
-  - name: CHATCLI_MAX_COMMAND_OUTPUT
-    value: "50000"
-```
-
-<Info>
-In `strict` mode, over 150 common commands are already pre-approved across 8 categories (file, text, dev, containers, network, system, editors, shell). Only add commands specific to your workflow.
-</Info>
-
----
-
-## Step 6: Sign Plugins with Ed25519
-
-To ensure only trusted plugins are loaded:
-
-```bash
-# Generate Ed25519 key pair
-openssl genpkey -algorithm Ed25519 -out plugin-sign.key
-openssl pkey -in plugin-sign.key -pubout -out plugin-sign.pub
-
-# Extract the public key in base64 format
-PLUGIN_PUB_KEY=$(openssl pkey -in plugin-sign.key -pubout -outform DER | base64)
-
-# Sign a plugin
-openssl pkeyutl -sign -inkey plugin-sign.key \
-  -rawin -in my-plugin.so -out my-plugin.so.sig
-```
-
-<Warning>
-ChatCLI does not verify plugin signatures. Signing the artifact as shown
-above documents its provenance for your own distribution process, and
-nothing in the CLI checks it at load time — treat every plugin you install
-as code you are choosing to run.
-
-What the CLI does enforce is that a plugin subprocess never inherits your
-secrets: the encryption key, the JWT secret, the auth directory and the
-audit path are stripped from its environment, and anything it needs must
-be passed explicitly. Install plugins from sources you control.
-</Warning>
-
----
-
-## Step 7: Set Up Session Encryption
-
-Enable encryption for sessions stored on disk:
-
-```bash
-# Generate AES-256 encryption key
-SESSION_KEY=$(openssl rand -hex 32)
-
-kubectl -n chatcli create secret generic chatcli-session-key \
-  --from-literal=key="$SESSION_KEY"
-```
-
-```yaml
-# values-security.yaml (partial)
-security:
-  sessionEncryption: true
-env:
-  - name: CHATCLI_ENCRYPTION_KEY
-    valueFrom:
-      secretKeyRef:
-        name: chatcli-session-key
-        key: key
-```
-
----
-
-## Step 8: Configure Operator Security
-
-For environments with the K8s operator, configure additional protections.
-
-First, create a Secret with the operator API keys (dashboard / REST API auth):
-
-```yaml
-apiVersion: v1
-kind: Secret
+apiVersion: cert-manager.io/v1
+kind: Certificate
 metadata:
-  name: chatcli-operator-secrets
-  # Must match the operator pod's namespace (POD_NAMESPACE / SA file).
-  # Code default: chatcli-system. Adjust if you ran `helm install --namespace <other>`.
-  namespace: chatcli-system
-type: Opaque
-stringData:
-  api-keys: |
-    - key: "<your-api-key>"
-      role: admin
-      description: "Dashboard admin"
+  name: chatcli-tls
+  namespace: chatcli
+spec:
+  secretName: chatcli-tls
+  issuerRef:
+    name: letsencrypt-prod        # your ClusterIssuer
+    kind: ClusterIssuer
+  dnsNames:
+    - chatcli.example.com
 ```
 
-<Note>
-This Secret is **different** from the `chatcli-api-keys` Secret consumed by the chatcli server (which carries `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` etc. via `Instance.spec.apiKeys.name`). See [Security — Operator Authentication](/features/security#operator-authentication) for the comparison table.
-</Note>
-
-<Tip>
-Changes to the Secret `chatcli-operator-secrets` (or the ConfigMap `chatcli-operator-config` as fallback — same `api-keys` field) are picked up automatically within 30 seconds. No operator restart is needed.
-</Tip>
-
-Then, configure the security environment variables:
+With the server chart, TLS needs two values. `tls.existingSecret` mounts the Secret at `/etc/chatcli/tls`, and the certificate and key paths default to `/etc/chatcli/tls/tls.crt` and `/etc/chatcli/tls/tls.key` (set `certFile` / `keyFile` only for other file names). `tls.enabled: true` without a Secret or both paths fails the install rather than serving plaintext:
 
 ```yaml
-# values-security.yaml (partial)
-env:
-  # NOTE: this variable ADDS to the 17 built-in kinds, it does not replace
-  # them, and kinds match by exact spelling ("Deployment", not "deployments").
-  # To genuinely restrict the operator, restrict its RBAC Role instead.
-  - name: CHATCLI_ALLOWED_RESOURCE_TYPES
-    value: "Gateway,Sidecar"
-  - name: CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS
-    value: "get,describe,logs"
+tls:
+  enabled: true
+  existingSecret: chatcli-tls
 ```
 
-| Setting | Effect |
-|---------|--------|
-| `CHATCLI_ALLOWED_RESOURCE_TYPES` | Adds kinds to the 17 the operator may act on (it does not narrow them — use RBAC for that) |
-| `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` | Limits which diagnostic verbs it may run |
+cert-manager renewals change the Secret, but the server reads the certificate only at startup. Restart the Deployment after a renewal, or use an operator-managed Instance, which rolls its pods when the TLS Secret changes.
 
----
+## Step 3: Deploy the server with hardened values
 
-## Step 9: Deploy with Helm (Complete Configuration)
+Every key below exists in the chart's schema, which rejects unknown keys. This example uses HS256 JWTs.
 
-Combine all configurations into a single `values-prod.yaml`:
+```bash
+kubectl -n chatcli create secret generic chatcli-llm-keys \
+  --from-literal=ANTHROPIC_API_KEY='<anthropic-key>'
+kubectl -n chatcli create secret generic chatcli-encryption-key \
+  --from-literal=key="$(openssl rand -hex 32)"
+```
 
 ```yaml
 # values-prod.yaml
 llm:
   provider: CLAUDEAI
+  model: claude-sonnet-5
+
 secrets:
   existingSecret: chatcli-llm-keys
+
 server:
-  token: ""  # Using JWT via jwtSecretRef
-  metricsPort: 9090
+  port: 50051
+  metricsPort: 9090             # /metrics and /healthz, plain HTTP: keep it behind the NetworkPolicy
+  grpcReflection: false
+
 tls:
   enabled: true
-  existingSecret: chatcli-tls-certs
+  existingSecret: chatcli-tls   # certFile/keyFile default to /etc/chatcli/tls/tls.crt and tls.key
+
 security:
-  rateLimitRps: 20
-  # bindAddress: "0.0.0.0"  # Unset means every interface in Kubernetes — not loopback
-  agentSecurityMode: strict
-  auditLog: true
-  sessionEncryption: true
   jwtSecretRef:
     name: chatcli-jwt
     key: secret
+  jwtIssuer: chatcli-prod
+  jwtAudience: chatcli
+  rateLimitRps: 20
+  rateLimitBurst: 40
+  auditLogPath: /var/log/chatcli/audit.jsonl
+  agentSecurityMode: strict     # the default; set it so a stray env var cannot flip it
+  envRedactMode: strict
+
+extraEnv:
+  - name: CHATCLI_ENCRYPTION_KEY
+    valueFrom:
+      secretKeyRef:
+        name: chatcli-encryption-key
+        key: key
+
+extraVolumes:
+  - name: audit
+    persistentVolumeClaim:
+      claimName: chatcli-audit   # create it first; the root filesystem is read-only
+extraVolumeMounts:
+  - name: audit
+    mountPath: /var/log/chatcli
+
 persistence:
   enabled: true
   size: 5Gi
-resources:
-  requests:
-    memory: 256Mi
-    cpu: 200m
-  limits:
-    memory: 1Gi
-    cpu: "1"
-podSecurityContext:
-  runAsNonRoot: true
-  runAsUser: 1000
-  runAsGroup: 1000
-  fsGroup: 1000
-  seccompProfile:
-    type: RuntimeDefault
-securityContext:
-  allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: true
-  capabilities:
-    drop:
-      - ALL
+
+rbac:
+  create: false                  # no Secret access either way, but it grants workload and node remediation verbs; skip it when the watcher is off
+
 networkPolicy:
   enabled: true
-podDisruptionBudget:
-  enabled: true
-  minAvailable: 1
+  ingressFrom:                   # applies to the gRPC and metrics ports
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: chatcli-clients
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  egress: restricted             # DNS, 443 and the Kubernetes API only
+  kubernetesApiPort: 6443
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
 serviceMonitor:
   enabled: true
-  interval: 30s
 ```
 
 ```bash
 helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --namespace chatcli --create-namespace \
+  --version 1.211.2 \
+  --namespace chatcli \
   -f values-prod.yaml
 ```
 
----
+The chart's default pod settings already run as non-root (UID 1000) with a read-only root filesystem, no capabilities and the `RuntimeDefault` seccomp profile, and meet the `restricted` Pod Security Standard. Probes use `/healthz` on the metrics port and a TCP check on the gRPC port, which work with TLS on.
 
-## Step 10: Verify Security
+<Note>
+The chart renders a PodDisruptionBudget only when `replicaCount` is greater than 1. Several replicas on one `ReadWriteOnce` sessions volume fail to schedule across nodes. Use `persistence.accessModes: [ReadWriteMany]` with a storage class that supports it, or stay on one replica.
+</Note>
 
-Run this checklist to confirm everything is configured correctly:
+The same controls on an operator-managed Instance:
+
+```yaml
+spec:
+  server:
+    token: {name: chatcli-token, key: token}   # or security.jwtSecretRef / jwtPublicKeyRef
+    tls:
+      enabled: true
+      secretName: chatcli-prod-tls
+      # clientCASecretName: chatcli-client-ca   # mTLS
+    security:
+      rateLimitRps: 20
+      rateLimitBurst: 40
+      # enableReflection stays unset (false)
+  features:
+    encryptionKeyRef: {name: chatcli-encryption-key, key: key}
+  resources:                                    # the operator sets none
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+```
+
+## Step 4: Audit trail
+
+With `CHATCLI_AUDIT_LOG_PATH` (chart `security.auditLogPath`, Instance `spec.server.security.auditLogPath`), the server appends one JSON line per RPC to a hash-chained file. Each line records the time, action and method, the caller (`user:<subject>` or `anonymous`), the role, the client host, the result (`success`, `error` or `denied`) and the duration. The path must be absolute and on a writable, persistent volume, as in step 3. On an Instance the only writable paths are `emptyDir` volumes, lost when the pod restarts, unless you enable persistence.
+
+To check that nobody edited the file, read it from the volume (for example in a helper pod that mounts the same PVC) and run, in the `chatcli` REPL:
+
+```text
+/config security verify-audit /path/to/audit.jsonl
+```
+
+The operator does not write a file audit log. It records its actions as `AuditEvent` resources, readable with `kubectl get auditevents -A` and exportable through `GET /api/v1/audit/export`. Enable the Kubernetes API server audit log to capture who changed ChatCLI resources.
+
+## Step 5: Encryption at rest
+
+With `CHATCLI_ENCRYPTION_KEY` set, the server encrypts what it writes under `~/.chatcli` (sessions, history, memory and other local stores). Pass it from a Secret, as in step 3, or with `spec.features.encryptionKeyRef` on an Instance. Do not use the chart's `security.encryptionKey`: it puts the key in the pod spec as a plain value. Rotation is described in [Security](/features/security).
+
+## Step 6: Agent, pipeline and plugin controls
+
+These matter only if the server runs agent work or loads plugins.
+
+- **Pipeline.** `pipeline.enabled` (Instance `spec.pipeline.enabled`) lets clients run the coder, agent and tools on the server. Those RPCs require the admin role. Leave it off unless you need it.
+- **Command allowlist.** `strict` is the default mode: only commands in the allowlist run, and `CHATCLI_AGENT_ALLOWLIST` adds more (separated by `,` or `;`). The built-in list includes shells and interpreters such as `bash`, `python`, `node` and `eval`, so it is not a sandbox. Contain the pod instead: restricted NetworkPolicy egress, no chart RBAC when the watcher is off (`rbac.create: false`), and nothing sensitive on the pod's volumes.
+- **Plugins.** At load, every plugin needs a detached signature (`<plugin>.sig`) that verifies against a public key in `~/.chatcli/trusted-keys/`. Unsigned plugins, and plugins on a machine with no trusted key, are skipped unless `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true`, which you must never set in production. A plugin whose signature does not verify is always skipped.
+
+  ```bash
+  chatcli plugin keygen --output ./keys                    # plugin-signing.key and plugin-signing.pub
+  chatcli plugin sign --binary ./my-plugin --key ./keys/plugin-signing.key
+  chatcli plugin trust --key ./keys/plugin-signing.pub      # on each machine that loads it
+  chatcli plugin verify --binary ./my-plugin
+  ```
+
+  In a pod, `~/.chatcli` is `/home/chatcli/.chatcli`. Mount the trusted public keys at `/home/chatcli/.chatcli/trusted-keys` with `extraVolumes`/`extraVolumeMounts`. Keep the private key out of the cluster.
+
+## Step 7: Operator, REST API and dashboard
 
 <Steps>
-  <Step title="Verify TLS">
-    ```bash
-    kubectl -n chatcli get secret chatcli-tls-certs
-    # Should return the secret with type: kubernetes.io/tls
+  <Step title="API keys">
+    The REST API and dashboard authenticate only with the `X-API-Key` header, against the Secret `chatcli-operator-secrets` (key `api-keys`) in the operator's namespace. Create one key per team and role (`viewer`, `operator`, `admin`), and keep admin keys few. See [Dashboard and REST API keys](/cookbook/aiops-production-setup#8-dashboard-and-rest-api-keys) for the commands.
+
+    Keys are re-read every 30 seconds. To revoke one, remove it from the Secret. Deleting both the Secret and the ConfigMap `chatcli-operator-config` revokes every key within about 30 seconds. Give each approver their own key and set its `name`: approvals are recorded against the key, and a quorum counts each key once.
+  </Step>
+  <Step title="Never enable dev mode">
+    `security.devMode: true` (`CHATCLI_OPERATOR_DEV_MODE`) makes the REST API accept every caller as admin while no keys are loaded. Keep it `false`.
+  </Step>
+  <Step title="TLS for the REST API">
+    Terminate TLS at your ingress, or serve HTTPS (TLS 1.3) from the operator itself:
+
+    ```yaml
+    # values-operator.yaml
+    extraVolumes:
+      - name: api-tls
+        secret:
+          secretName: chatcli-operator-api-tls
+    extraVolumeMounts:
+      - name: api-tls
+        mountPath: /etc/chatcli-operator/api-tls
+        readOnly: true
+    security:
+      apiTLS:
+        certFile: /etc/chatcli-operator/api-tls/tls.crt
+        keyFile: /etc/chatcli-operator/api-tls/tls.key
     ```
   </Step>
-  <Step title="Verify JWT Secret">
+  <Step title="CORS stays closed">
+    Cross-origin calls are denied until you name an origin in `security.corsAllowedOrigins`. The dashboard is served from the same origin as the API and needs none.
+  </Step>
+  <Step title="NetworkPolicy">
+    Set `networkPolicy.enabled: true` on the operator chart, restrict `apiIngressFrom` and `metricsIngressFrom`, and keep `egress: restricted`. The values are in [step 1 of the AIOps setup](/cookbook/aiops-production-setup#1-install-the-operator).
+  </Step>
+  <Step title="RBAC on ChatCLI resources">
+    The operator runs with a cluster-wide ClusterRole that can read and write Secrets in every namespace, change workloads, create pods (chaos stress pods), evict pods (`DrainNode`) and update nodes. No admission webhook checks what users submit, so Kubernetes RBAC is the only gate on who can make the operator act. Grant `create`/`update` on `remediationplans`, `runbooks`, `instances`, `chaosexperiments`, `approvalrequests` and the policy kinds only to the people who should hold that power. The chart pre-provisions the ClusterRoles `chatcli-role-viewer`, `chatcli-role-operator`, `chatcli-role-admin` and `chatcli-role-superadmin`; bind them yourself, since nothing binds them automatically.
+  </Step>
+  <Step title="Remediation guardrails">
+    - `security.allowedDiagnosticCommands` adds commands to the read-only `ExecDiagnostic` allowlist; everything else is refused.
+    - `security.allowedResourceTypes` adds kinds that the `ApplyManifest` action may create. It extends the built-in list and never narrows it.
+    - `security.logScrubPatterns` adds comma-separated regular expressions to the scrubbing applied to the logs and context the operator sends to the LLM. It does not scrub the operator's own logs.
+    - Gate risky actions with an ApprovalPolicy: see [Approvals](/cookbook/aiops-production-setup#9-approvals).
+  </Step>
+</Steps>
+
+## Step 8: Verify the images
+
+Release images are signed with cosign (keyless) and carry SBOM and provenance attestations.
+
+```bash
+cosign verify ghcr.io/diillson/chatcli:1.211.2 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/diillson/chatcli/\.github/workflows/(3-publish-release|image-refresh)\.yml@refs/heads/main$'
+```
+
+Use the same command for `ghcr.io/diillson/chatcli-operator:1.211.2`. Pin image tags, or digests, in production instead of `latest`.
+
+## Step 9: Verify the hardening
+
+<Steps>
+  <Step title="TLS 1.3 only, with the right name">
     ```bash
-    kubectl -n chatcli get secret chatcli-jwt
-    # Should exist with the 'secret' key
+    kubectl -n chatcli port-forward svc/chatcli 50051:50051 &
+    openssl s_client -connect localhost:50051 -servername chatcli.example.com -tls1_3 </dev/null 2>/dev/null \
+      | openssl x509 -noout -subject -ext subjectAltName
+    openssl s_client -connect localhost:50051 -tls1_2 </dev/null   # handshake fails
     ```
   </Step>
-  <Step title="Verify Pod SecurityContext">
+  <Step title="Health answers, without a credential">
     ```bash
-    kubectl -n chatcli get pod -l app.kubernetes.io/name=chatcli -o jsonpath='{.items[0].spec.securityContext}'
-    # Should show runAsNonRoot: true, etc.
+    kubectl -n chatcli exec deploy/chatcli -- \
+      grpc-health-probe -addr=localhost:50051 -tls -tls-no-verify   # status: SERVING
+    ```
+    With mTLS, add `-tls-client-cert` and `-tls-client-key`.
+  </Step>
+  <Step title="Calls without a credential are refused">
+    ```bash
+    chatcli connect --addr localhost:50051 --tls --ca-cert ca.crt -p "hello"
+    # fails: authentication failed
+    chatcli connect --addr localhost:50051 --tls --ca-cert ca.crt --token "$JWT" -p "hello"
+    # answers
+    ```
+    `ca.crt` is the CA of the server certificate (not needed for a public CA). `$JWT` is a token from step 1.
+  </Step>
+  <Step title="Reflection is off">
+    ```bash
+    grpcurl -cacert ca.crt localhost:50051 list
+    # Failed to list services: server does not support the reflection API
     ```
   </Step>
-  <Step title="Verify NetworkPolicy">
+  <Step title="Pod settings">
+    ```bash
+    kubectl -n chatcli get pod -l app.kubernetes.io/name=chatcli \
+      -o jsonpath='{.items[0].spec.securityContext}{"\n"}{.items[0].spec.containers[0].securityContext}{"\n"}'
+    ```
+  </Step>
+  <Step title="Network isolation">
     ```bash
     kubectl -n chatcli get networkpolicy
-    # Should list the ChatCLI NetworkPolicy
+    # From a namespace that is not allowed, both ports must time out:
+    kubectl -n default run np-test --rm -it --restart=Never --image=curlimages/curl -- \
+      curl -m 5 http://chatcli.chatcli.svc:9090/metrics
     ```
   </Step>
-  <Step title="Verify gRPC Reflection is disabled">
-    ```bash
-    kubectl -n chatcli exec deploy/chatcli -- env | grep GRPC_REFLECTION
-    # Should be empty or 'false'
-    ```
+  <Step title="Audit lines are written">
+    After a few calls, the audit file on the volume grows by one line per RPC, and `/config security verify-audit` reports the chain as intact.
   </Step>
-  <Step title="Test authenticated connection">
+  <Step title="Operator REST API">
     ```bash
-    chatcli connect chatcli.mydomain.com:50051 --token "$JWT_SECRET" --tls
-    ```
-  </Step>
-  <Step title="Verify rate limiting">
-    ```bash
-    # Send multiple rapid requests -- should return 429 error after the limit
-    for i in $(seq 1 30); do
-      chatcli -p "ping" --remote chatcli.mydomain.com:50051 &
-    done
-    ```
-  </Step>
-  <Step title="Verify audit logs">
-    ```bash
-    kubectl -n chatcli logs deploy/chatcli | grep "audit"
-    # Should show audit entries for the operations above
+    kubectl -n chatcli-system port-forward svc/chatcli-operator 8090:8090 &
+    curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8090/api/v1/incidents   # 401
     ```
   </Step>
 </Steps>
 
----
+## What ChatCLI does not protect
 
-## Final Checklist
+These gaps exist in current releases. Cover each one with the mitigation next to it.
 
-| Item | Status |
-|------|--------|
-| JWT Secret created and referenced | |
-| TLS enabled with valid certificate | |
-| Rate limiting configured | |
-| Audit logging enabled | |
-| Agent `strict` mode active | |
-| Workspace strict enabled | |
-| Plugins with signature verification | |
-| Session encryption active | |
-| Operator in fail-closed mode | |
-| Log scrubbing enabled | |
-| NetworkPolicy created | |
-| PodDisruptionBudget created | |
-| Restrictive SecurityContext | |
-| gRPC Reflection disabled | |
-| ServiceMonitor for metrics | |
+| Gap | What it means | Mitigation |
+|---|---|---|
+| No admission webhook | Nothing validates ChatCLI resources before they are stored. Anyone who can create a RemediationPlan, Runbook, Instance or ChaosExperiment can make the operator act with its ClusterRole | Kubernetes RBAC on the `platform.chatcli.io` resources; ApprovalPolicies for remediation |
+| Metrics endpoints without authentication | The server's metrics port (`/metrics`, `/healthz`) listens on every interface in plain HTTP, and so does the operator's port 8080 | NetworkPolicy allowing only Prometheus (and the node CIDR for probes, where your CNI needs it) |
+| No SSO or OIDC for the dashboard | Access is by API key only. The browser keeps the key in `localStorage`. Dashboard approvals are recorded as the typed name plus the key's identity: the name is free text, only the key is authenticated | Few keys, one per team and role, and one per approver where quorum rules apply (set each key's `name`); TLS; restrict ingress sources; put an authenticating proxy in front if you need per-person login |
+| Coarse server roles | A `viewer`/`readonly` credential can still send prompts and manage its sessions | Issue credentials only to people allowed to use the LLM; run separate servers per trust boundary |
+| Shared token is admin | Every holder has the same admin identity and shares one rate-limit bucket | JWT or mTLS for people; the token only for machine clients |
+| No operator file audit log | The operator's own actions are only in `AuditEvent` resources | Kubernetes API audit logging; export `AuditEvent`s through the REST API |
+| No automatic user RBAC | The `chatcli-role-*` ClusterRoles are never bound for you | Bind them to your groups |
+| No NetworkPolicy, PDB or HPA for Instances | The operator creates none of them | Create them yourself (see the AIOps setup) |
+| Optional Secret references on Instances | A missing Secret or key silently drops the variable; with the token gone the pod exits on startup | Check the Instance conditions and pod status after every change |
+| Server log destinations | In a pod the log goes to stderr (`kubectl logs`) and to the pod's ephemeral file; the file is lost with the pod | Ship `kubectl logs` through your log collector; the audit trail is the durable record |
+| Authentication failure limiter | Each client host may fail authentication 5 times in a burst, then once every 12 seconds; a host that exhausts it is refused (`authentication failed`, log `auth failure rate limit exceeded`) until a slot refills. Valid credentials never spend from it | Nothing to tune; find the caller with the wrong or expired credential |
 
----
+## Final checklist
 
-## Next Steps
+| Item | Done |
+|---|---|
+| Credential chosen: JWT or mTLS for people, shared token only for machines | |
+| JWT `iss` and `aud` configured, tokens short-lived | |
+| TLS on, certificate covering the dialed name, renewal handled | |
+| mTLS client CA separate from the server CA (if used) | |
+| Reflection off (`grpcReflection` / `enableReflection` false) | |
+| Audit log on a persistent volume, chain verified | |
+| Encryption key from a Secret, not a plain value | |
+| Pipeline off unless needed; plugins signed and trusted keys mounted | |
+| Server NetworkPolicy with restricted ingress and egress | |
+| Server chart RBAC off when the watcher is off | |
+| Operator dev mode off, API keys per team, revocation by editing the Secret | |
+| REST API behind TLS, CORS closed | |
+| Operator NetworkPolicy on | |
+| RBAC on `platform.chatcli.io` resources limited to the right people | |
+| Images verified with cosign and pinned | |
+
+## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Security and Hardening" icon="lock" href="/features/security">
-    Complete documentation of all security measures.
+  <Card title="Security" icon="lock" href="/features/security">
+    Every security control in detail.
   </Card>
-  <Card title="Deploy with Docker and Helm" icon="docker" href="/getting-started/docker-deployment">
-    Complete containerized deployment guide.
+  <Card title="AIOps Production Setup" icon="rocket" href="/cookbook/aiops-production-setup">
+    The complete operator and Instance runbook.
   </Card>
   <Card title="K8s Operator" icon="dharmachakra" href="/features/k8s-operator">
-    Configure the Kubernetes operator.
+    Instance fields and what the operator creates.
   </Card>
-  <Card title="Configuration Reference" icon="gear" href="/reference/configuration">
-    All available environment variables.
+  <Card title="Environment variables" icon="gear" href="/reference/environment-variables">
+    Every variable the server and the operator read.
   </Card>
 </CardGroup>

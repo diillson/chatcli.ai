@@ -48,7 +48,7 @@ A porta vem do value `api.port` do chart (padrão `8090`), que define a variáve
 </Info>
 
 <Note>
-**Várias réplicas do operator.** Até a 1.211.2, a API REST e o dashboard rodam só na réplica **líder**: as demais passam na readiness probe (que fica na porta 8081), mas não escutam na 8090, então um Service com várias réplicas pode mandar a requisição para um pod que recusa a conexão. Mantenha `replicaCount: 1` ou faça port-forward para o líder. A partir da versão seguinte à 1.211.2, todas as réplicas servem a API e o dashboard.
+**Várias réplicas do operator.** Toda réplica serve a API REST e o dashboard na 8090, então um Service com várias réplicas pode mandar a requisição para qualquer pod. Leituras são respondidas por qualquer réplica; um resolve manual aceito por uma réplica que não é a líder é concluído pelo reconciler de Issue da líder.
 </Note>
 
 ---
@@ -59,7 +59,7 @@ A porta vem do value `api.port` do chart (padrão `8090`), que define a variáve
 flowchart LR
   Client[Cliente<br/>curl / SDK / CI] --> CORS{Política<br/>CORS}
   CORS -->|preflight permitido| P204[204 No Content]
-  CORS --> Rate{Rate limiter<br/>por endereço do cliente}
+  CORS --> Rate{Rate limiter<br/>por chave, ou por host do cliente}
   Rate -->|excedido| E429[429 Too Many Requests]
   Rate -->|ok| Auth{Checagem<br/>X-API-Key}
   Auth -->|ausente / inválida| E401[401 Unauthorized]
@@ -141,7 +141,7 @@ As chaves são lidas do **namespace do operator** (`chatcli-system` por padrão)
 1. Secret **`chatcli-operator-secrets`**, chave **`api-keys`** (recomendado)
 2. ConfigMap **`chatcli-operator-config`**, chave **`api-keys`** (fallback, usado só quando o Secret não existe)
 
-O valor é uma lista YAML de entradas `{key, role, description}`. **Nenhum chart ou manifesto cria esse objeto** — é você quem cria:
+O valor é uma lista YAML de entradas `{key, role, name, description}`. O `name` é opcional: é a identidade registrada nas decisões de aprovação tomadas com a chave (na falta dele vale o `description`, e depois uma impressão digital `key-<hash>`), e um quorum conta cada chave uma vez, então dê a cada aprovador a sua própria chave. O chart do operator só gera o Secret com `apiKeys.create: true` (as chaves ficam então guardadas no release do Helm); fora isso, é você quem cria:
 
 ```yaml
 apiVersion: v1
@@ -173,7 +173,7 @@ O operator consulta o Secret e o ConfigMap a cada **30 segundos** e recarrega as
 <Warning>
 **Nenhuma chave configurada = toda chamada em `/api/` retorna `401`.** Se nenhum dos dois objetos tiver uma chave válida, a API fica fechada (fail-closed). Já `CHATCLI_OPERATOR_DEV_MODE=true` no operator (chart: `security.devMode: true`) deixa toda requisição passar **como `admin`, sem chave** — só para desenvolvimento local, **nunca em produção**.
 
-Apagar o Secret e o ConfigMap não limpa as chaves já carregadas (fora do dev mode elas continuam válidas até o operator reiniciar). Para revogar chaves, edite a lista no próprio objeto.
+As chaves seguem a origem delas: uma lista vazia ou um YAML que não faz parse não deixa nenhuma chave válida, e apagar o Secret e também o ConfigMap revoga todas as chaves carregadas na próxima consulta (em cerca de 30 s, `401` a partir daí). Um erro de leitura que não seja "não encontrado" mantém as chaves em vigor, para que uma instabilidade do API server não tranque todo mundo do lado de fora.
 </Warning>
 
 <Tip>
@@ -184,9 +184,9 @@ Apagar o Secret e o ConfigMap não limpa as chaves já carregadas (fora do dev m
 
 ## Rate limiting
 
-A API aceita **30 requisições por minuto por endereço de cliente** (token bucket, rajadas de até 30, reposto continuamente a 0,5 req/s). O limite é o mesmo para todas as roles e chaves.
+A API aceita **30 requisições por minuto por host de cliente** para requisições sem API key válida (token bucket, rajadas de até 30, reposto continuamente a 0,5 req/s), e **600 requisições por minuto por API key válida** (rajadas de até 600, repostas a 10 req/s), com a chave identificada por um digest. O limite roda antes da autenticação; o limite por chave é o mesmo para todas as roles. Headers de forwarding não são honrados, então atrás de um proxy todo chamador sem chave divide o bucket do host do proxy. Buckets ociosos são descartados depois de 10 minutos.
 
-Ao estourar, o operator retorna `429 Too Many Requests` com o header `Retry-After: 60` e o envelope de erro padrão. Nenhum header `X-RateLimit-*` é enviado. Implemente backoff nos clientes de produção e mantenha dashboards ou coletores que consultam muitos endpoints dentro do orçamento.
+Ao estourar, o operator retorna `429 Too Many Requests` com o envelope de erro padrão (`rate limit exceeded: N requests per minute`) e um header `Retry-After` com os segundos até o bucket voltar a ter um token (2 no limite por host, 1 no limite por chave). Nenhum header `X-RateLimit-*` é enviado. Implemente backoff nos clientes de produção e mantenha dashboards ou coletores que consultam muitos endpoints dentro do orçamento.
 
 ---
 
@@ -267,10 +267,11 @@ Todas as respostas seguem um padrão **Kubernetes-like**:
 |:-------|:------------|:----------------|
 | `400` | Bad Request | Corpo JSON malformado ou campo do corpo inválido/ausente |
 | `401` | Unauthorized | `X-API-Key` ausente ou inválida, ou nenhuma chave configurada |
-| `403` | Forbidden | Role abaixo da mínima do endpoint, ou role desconhecida |
+| `403` | Forbidden | Role abaixo da mínima do endpoint, role desconhecida, ou o RBAC do operator não permite criar o runbook |
 | `404` | Not Found | Recurso não existe, ou combinação de path/método desconhecida |
 | `405` | Method Not Allowed | Requisição não-GET em um grupo somente leitura (`analytics`, `clusters`, `policies`, `audit`, `federation`) |
-| `409` | Conflict | Estado inválido para a operação (por exemplo, resolver um incident já resolvido), modificação concorrente ou falha ao criar runbook |
+| `409` | Conflict | Estado inválido para a operação (por exemplo, resolver um incident já resolvido, ou decidir sobre uma solicitação de aprovação que não está mais `Pending` ou que a mesma API key já decidiu), modificação concorrente ou criação de um runbook cujo nome já existe |
+| `422` | Unprocessable Entity | O API server do Kubernetes rejeitou um runbook sendo criado (por exemplo, um valor fora dos enums do CRD) |
 | `429` | Too Many Requests | Rate limit excedido — veja `Retry-After` |
 | `500` | Internal Server Error | Falha na API do Kubernetes — verifique os logs do operator |
 

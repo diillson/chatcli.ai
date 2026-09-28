@@ -11,10 +11,10 @@ The ChatCLI AIOps platform includes three subsystems that sit next to the incide
 
 ## Capacity Planner
 
-The Capacity Planner produces a CPU and memory forecast for each Deployment that appears as the resource of an Issue. It is not a background job: it runs only when `GET /api/v1/analytics/capacity` is called, and it keeps no history of its own.
+The Capacity Planner produces a CPU and memory report for each Deployment that appears as the resource of an Issue. It is not a background job: it runs only when `GET /api/v1/analytics/capacity` is called, and it keeps no history of its own.
 
 <Warning>
-  The planner does not read real usage. It reads no metrics-server and no Prometheus data (`PROMETHEUS_URL` is not used here). "Current usage" is the **requests** of the Deployment's first container, and the percentage is requests divided by limits. Treat the output as a requests-versus-limits check plus an incident count, not as a usage forecast.
+  The planner does not read real usage and collects no usage history. It reads no metrics-server and no Prometheus data (`PROMETHEUS_URL` is not used here). "Current usage" is the **requests** of the Deployment's first container (`UsageSource: "requests"`), and the percentage is requests divided by limits. Without history there is no trend to fit, so the response says `Trend.Direction: "insufficient_history"` and `HistoryAvailable: false`, and it never projects an exhaustion date. Treat the output as a requests-versus-limits check plus an incident count, not as a usage forecast.
 </Warning>
 
 ### What It Computes
@@ -23,38 +23,24 @@ For every distinct resource (`kind/namespace/name`) among the Issues listed (all
 
 1. Reads the **Deployment** with that name and namespace. If there is none (the resource is a StatefulSet, a DaemonSet, a Pod or has been deleted), the resource is skipped with no error.
 2. Takes the first container's `resources.limits` and `resources.requests` for CPU and memory, and computes `usage% = requests / limits × 100` (0 when there is no limit).
-3. Builds regression points from the namespace's Anomalies of that resource name inside the window with signal `cpu_high` (CPU) or `memory_high` (memory), with at least **2** points per resource.
-4. Projects exhaustion, generates one recommendation and correlates incidents (below).
+3. Correlates the resource with the incidents of its namespace inside the window (below).
+4. Sets an **urgency** and one recommendation from what it knows: the requests/limits percentage and the incident correlation.
 
 The window defaults to **7 days**. When both `from` and `to` are passed (RFC 3339), the window becomes their difference, still ending now.
 
-### Linear Regression Algorithm
-
-The planner fits a **least-squares linear regression** over the points:
+### Trend and Urgency
 
 ```text
-Points (x_i, y_i):
-  x_i = anomaly creation time (Unix seconds)
-  y_i = the resource's current usage percentage (requests/limits)
+UsageSource      = "requests"
+HistoryAvailable = false
+Trend.Direction  = "insufficient_history"   (CPUTrendPerDay = MemoryTrendPerDay = 0)
+Forecast.*ExhaustionDate = null, Forecast.DaysUntil*Exhaustion = 0
 
-  slope     = (n * sum(x*y) - sum(x) * sum(y)) / (n * sum(x^2) - sum(x)^2)
-  intercept = (sum(y) - slope * sum(x)) / n
-  trend_per_day = slope * 86400
-
-Direction:
-  increasing  if CPU or memory trend > 1 %/day
-  decreasing  if CPU or memory trend < -1 %/day
-  stable      otherwise
-
-Exhaustion (per resource type):
-  if trend_per_day > 0 and usage% < 100:
-    days_left = (100 - usage%) / trend_per_day
-    exhaustion date is set only when 0 < days_left < 365
+Urgency = "plan" if CPU usage% >= 80 or memory usage% >= 80 or ResourceIsBottleneck
+          "none" otherwise
 ```
 
-<Warning>
-  Every point carries the **same** y value (today's requests/limits percentage), so the fitted slope is always zero. In the current release the trend is always `stable`, no exhaustion date is ever projected, and the `URGENT` / `30 days` recommendations cannot fire. What the endpoint does deliver today is the requests/limits percentage, the "above 80%" warning and the incident correlation.
-</Warning>
+`Urgency` has only these two values: without history nothing is ever `urgent`. The dashboard's capacity banner lists the resources with `Urgency: "plan"`.
 
 ### Response Fields
 
@@ -71,23 +57,26 @@ The endpoint returns `kind: CapacityForecastList` with one `CapacityForecast` pe
     | `Trend` | `ResourceTrend` | See below |
     | `Forecast` | `ForecastResult` | See below |
     | `IncidentCorrelation` | `IncidentResourceCorrelation` | See below |
+    | `UsageSource` | `string` | Where `CurrentUsage` comes from: always `requests` |
+    | `HistoryAvailable` | `bool` | Always `false`: no usage samples are collected |
+    | `Urgency` | `string` | `plan` or `none` (see above) |
   </Accordion>
 
   <Accordion title="ResourceTrend">
     | Field | Type | Description |
     |-------|------|-------------|
-    | `CPUTrendPerDay` | `float64` | CPU slope in percentage points per day |
-    | `MemoryTrendPerDay` | `float64` | Memory slope in percentage points per day |
-    | `Direction` | `string` | `increasing`, `decreasing` or `stable` |
+    | `CPUTrendPerDay` | `float64` | Always `0` (no history to fit) |
+    | `MemoryTrendPerDay` | `float64` | Always `0` (no history to fit) |
+    | `Direction` | `string` | `insufficient_history` |
   </Accordion>
 
   <Accordion title="ForecastResult">
     | Field | Type | Description |
     |-------|------|-------------|
-    | `CPUExhaustionDate` | `time` or `null` | Projected CPU exhaustion (only within 365 days) |
-    | `MemoryExhaustionDate` | `time` or `null` | Projected memory exhaustion (only within 365 days) |
-    | `DaysUntilCPUExhaustion` | `int` | Whole days left, `0` when not projected |
-    | `DaysUntilMemoryExhaustion` | `int` | Whole days left, `0` when not projected |
+    | `CPUExhaustionDate` | `time` or `null` | Always `null`: no exhaustion date is projected |
+    | `MemoryExhaustionDate` | `time` or `null` | Always `null` |
+    | `DaysUntilCPUExhaustion` | `int` | Always `0` |
+    | `DaysUntilMemoryExhaustion` | `int` | Always `0` |
     | `Recommendation` | `string` | One recommendation (table below) |
   </Accordion>
 
@@ -110,7 +99,7 @@ For each Issue in the resource's namespace created inside the window (any state)
 ResourceIsBottleneck = ResourceRelatedIncidents > 2
 ```
 
-The flag is informational. It does not change the recommendation text or its priority.
+A bottleneck raises `Urgency` to `plan` and, when requests are within limits, sets the recommendation.
 
 ### Recommendation Generation
 
@@ -118,15 +107,9 @@ The first matching rule wins:
 
 | Condition | Recommendation |
 |-----------|---------------|
-| Memory exhaustion in 1–6 days | "URGENT: Memory exhaustion projected within 7 days. Increase memory limits or optimize application memory usage." |
-| CPU exhaustion in 1–6 days | "URGENT: CPU exhaustion projected within 7 days. Increase CPU limits or scale horizontally." |
-| Memory exhaustion in 1–29 days | "Memory exhaustion projected within 30 days. Plan capacity increase." |
-| CPU exhaustion in 1–29 days | "CPU exhaustion projected within 30 days. Plan capacity increase." |
-| CPU or memory requests above 80% of limits | "Resource usage above 80%. Consider increasing limits proactively." |
-| Direction `stable` | "Resource usage is stable. No action needed." |
-| Otherwise | "Resource trends are within acceptable ranges." |
-
-There is no urgency field in the response: the level of concern is only in the recommendation text.
+| CPU or memory requests above 80% of limits | "Requests are above 80% of limits. Consider increasing limits proactively." |
+| `ResourceIsBottleneck` | "Repeated incidents on this resource. Review its capacity." |
+| Otherwise | "No usage history is collected, so no trend or exhaustion date can be projected; requests are within limits." |
 
 ### How to Use
 
@@ -150,27 +133,30 @@ curl -H "X-API-Key: $KEY" \
       "CurrentUsage": {"CPUMillicores": 900, "MemoryBytes": 536870912},
       "Limits": {"CPUMillicores": 1000, "MemoryBytes": 1073741824},
       "UsagePercentage": {"CPU": 90, "Memory": 50},
-      "Trend": {"CPUTrendPerDay": 0, "MemoryTrendPerDay": 0, "Direction": "stable"},
+      "Trend": {"CPUTrendPerDay": 0, "MemoryTrendPerDay": 0, "Direction": "insufficient_history"},
       "Forecast": {
         "CPUExhaustionDate": null,
         "MemoryExhaustionDate": null,
         "DaysUntilCPUExhaustion": 0,
         "DaysUntilMemoryExhaustion": 0,
-        "Recommendation": "Resource usage above 80%. Consider increasing limits proactively."
+        "Recommendation": "Requests are above 80% of limits. Consider increasing limits proactively."
       },
-      "IncidentCorrelation": {"IncidentsInWindow": 4, "ResourceRelatedIncidents": 3, "ResourceIsBottleneck": true}
+      "IncidentCorrelation": {"IncidentsInWindow": 4, "ResourceRelatedIncidents": 3, "ResourceIsBottleneck": true},
+      "UsageSource": "requests",
+      "HistoryAvailable": false,
+      "Urgency": "plan"
     }
   ]
 }
 ```
 
-The endpoint needs the `viewer` role (GET only). Each call lists every Issue in scope and reads one Deployment plus the namespace's Anomalies and Issues per resource, so keep the calls occasional on large clusters.
+The endpoint needs the `viewer` role (GET only). Each call lists every Issue in scope and reads one Deployment plus the namespace's Issues per resource, so keep the calls occasional on large clusters.
 
 
 
 ## Noise Reducer
 
-The Noise Reducer runs inside the Anomaly controller. It is consulted only for an anomaly that would open a **new** Issue: an anomaly whose resource already has an active Issue is correlated to it first, and one that arrives within the resolution cooldown (`spec.aiops.resolutionCooldownMinutes`, default 10) after a resolution is suppressed before the Noise Reducer is reached.
+The Noise Reducer runs inside the Anomaly controller. It is consulted only for an anomaly that would open a **new** Issue: an anomaly whose resource already has an active Issue is correlated to it first, and one that arrives within the resolution cooldown (`spec.aiops.resolutionCooldownMinutes` of the Instance the anomaly came from, default 10, `0` turns it off) after a resolution is suppressed before the Noise Reducer is reached.
 
 The four checks run in order and the first one that fires wins. A suppressed anomaly is marked `status.correlated: true` with the reason recorded as `suppressed:<reason>`, no Issue is created, and `chatcli_operator_anomalies_processed_total{result="suppressed_noise"}` is incremented. If a check fails (for example, a List error), the anomaly is not suppressed. Resources are matched by **name** within the anomaly's namespace.
 
@@ -300,7 +286,7 @@ data:
 ```
 
 <Note>
-  An entry applies to every model of that provider; there is no per-model key. Without the ConfigMap, for a provider it does not list, or when the `pricing` value is not valid JSON, the pricing engine's per-model rates apply. The ConfigMap is read on every booking, so an update is picked up on the next call, but entries already booked are not repriced until the incident's next call.
+  An entry applies to every model of that provider; there is no per-model key. Without the ConfigMap, for a provider it does not list, or when the `pricing` value is not valid JSON, the pricing engine's per-model rates apply. The ConfigMap is read on every booking, so an update applies from the next call on; calls already booked keep the price they were booked at.
 </Note>
 
 ### IncidentCost
@@ -314,15 +300,15 @@ One ledger entry per incident, written by the AIInsight and Remediation controll
 | `llmCosts.totalOutputTokens` | `int64` | Output tokens across all calls |
 | `llmCosts.analysisCalls` | `int32` | `AnalyzeIssue` calls |
 | `llmCosts.agenticSteps` | `int32` | `AgenticStep` calls |
-| `llmCosts.estimatedCostUSD` | `float64` | Spend priced by the pricing engine or the ConfigMap override |
+| `llmCosts.estimatedCostUSD` | `float64` | Sum of every call's cost, each priced at its own provider and model rate (pricing engine or ConfigMap override) when it was booked |
 | `llmCosts.provider` / `llmCosts.model` | `string` | Provider and model of the **latest** call |
 | `engineerTimeSavedMinutes` | `float64` | Reserved for future estimation, `0` today |
 | `totalCostUSD` | `float64` | Equals `llmCosts.estimatedCostUSD` |
 | `recordedAt` | `time` | When the entry was last booked |
 
-<Warning>
-  On every booking the entry's **cumulative** tokens are repriced at the rates of the latest call's provider and model. If an incident's calls were answered by different models (for example after a fallback), the whole entry ends up priced at the last model's rate.
-</Warning>
+<Note>
+  Each call is priced once, at the rates of the provider and model that answered it, and added to the entry's total. A later call on another model (for example after a fallback) never reprices the earlier ones; `provider` and `model` only name the latest call.
+</Note>
 
 **Calculation example** (with the `CLAUDEAI` override above):
 
@@ -338,28 +324,28 @@ Incident: CrashLoopBackOff on api-server
 
 The usage the server reports on each response (`usage` on `AnalyzeIssue` and `AgenticStep`) is what gets booked, so the ledger reflects real token counts, not estimates.
 
-<Warning>
-  Bookings are best effort. The controllers discard the tracker's error, so a booking that fails (a write conflict when two calls of the same namespace land at once, the ConfigMap size limit, missing RBAC) is lost without a log line, and the ledger can under-count.
-</Warning>
+<Note>
+  Two calls booked at the same time in one namespace do not overwrite each other: the ledger update carries the version it read, and a write conflict is retried. A booking that still fails (the ConfigMap size limit, missing RBAC, a ledger that cannot be read or an entry that cannot be decoded) is logged by the controller (`Failed to book the analysis cost on the ledger` or `Failed to book the agentic step cost on the ledger`); the analysis or step itself is not affected, and an unreadable entry is never overwritten with a fresh one.
+</Note>
 
 ### CostSummary
 
-Aggregation over a window, served by the REST API (`viewer` role, GET only), as `kind: CostSummary` with the summary under `spec`:
+Aggregation over a period, served by the REST API (`viewer` role, GET only), as `kind: CostSummary` with the summary under `spec`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `periodStart` / `periodEnd` | `time` | Window boundaries: `now - window` and now |
+| `periodStart` / `periodEnd` | `time` | Period boundaries (see below) |
 | `totalLLMCost` | `float64` | Sum of the `estimatedCostUSD` of every entry in the window |
 | `incidentCount` | `int` | Ledger entries in the window |
 | `costPerIncident` | `float64` | `totalLLMCost / incidentCount` (`0` when there are none) |
 
-The window defaults to **30 days**. When both `from` and `to` are passed (RFC 3339), only their difference is used: the window still ends now, and entries booked after `to` are not excluded. An entry is counted in full when its `recordedAt` (last booking) falls in the window; entries without `recordedAt` are always counted. Without `namespace`, the summary aggregates every `chatcli-cost-ledger` in the cluster; a namespace without a ledger returns zeros, not an error.
+`from` and `to` (RFC 3339) set an **absolute period**: with both, it is exactly `[from, to]`; with only `from`, it runs to now; with only `to`, it is the 30 days ending at `to`; with neither, it is the **last 30 days**. An entry is counted in full when its `recordedAt` (last booking) falls in the period; entries without `recordedAt` are always counted. Without `namespace`, the summary aggregates every `chatcli-cost-ledger` in the cluster. A namespace without a ledger returns zeros; any other failure to read a ledger returns `500` (`failed to read the cost ledger: ...`) instead of zeros.
 
 ```bash
 # last 30 days (default), all namespaces
 curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost"
 
-# one namespace, 24-day window ending now
+# one namespace, 1 to 25 September
 curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost?namespace=production&from=2026-09-01T00:00:00Z&to=2026-09-25T00:00:00Z"
 ```
 
@@ -368,8 +354,8 @@ curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost?namespace
   "apiVersion": "v1",
   "kind": "CostSummary",
   "spec": {
-    "periodStart": "2026-09-03T12:00:00Z",
-    "periodEnd": "2026-09-27T12:00:00Z",
+    "periodStart": "2026-09-01T00:00:00Z",
+    "periodEnd": "2026-09-25T00:00:00Z",
     "totalLLMCost": 1.84,
     "incidentCount": 23,
     "costPerIncident": 0.08
@@ -393,7 +379,7 @@ These subsystems persist their data in ConfigMaps in the **namespace of the Issu
 | `chatcli-cost-config` | You | Per-provider pricing override (`pricing` key) | User-managed |
 
 <Warning>
-  ConfigMaps have a 1MB limit in Kubernetes, roughly 3,000 ledger entries. The operator does not compact the ledger or the seasonal patterns: on a namespace with that volume, prune old keys periodically, or new bookings are dropped (silently, see above).
+  ConfigMaps have a 1MB limit in Kubernetes, roughly 3,000 ledger entries. The operator does not compact the ledger or the seasonal patterns: on a namespace with that volume, prune old keys periodically, or new bookings fail (each failure is logged, see above).
 </Warning>
 
 ### Storage Format
@@ -434,11 +420,11 @@ Entries are never compacted or expired by the operator: delete keys, or the Conf
 ## Integrations
 
 <CardGroup cols={2}>
-  <Card title="REST API" icon="code" href="/reference/api-reference">
+  <Card title="REST API" icon="code" href="/reference/api/overview">
     `/api/v1/analytics/cost` serves the ledger summary; `/api/v1/analytics/capacity` serves the capacity forecasts; `/api/v1/analytics/summary` exposes incident data.
   </Card>
   <Card title="Web Dashboard" icon="chart-mixed" href="/features/aiops/web-dashboard">
-    The Overview view has a capacity-warnings panel fed by `/analytics/capacity`, but it filters on an `Urgency` field the response does not carry, so the panel stays hidden in the current release. The dashboard does not show the cost ledger.
+    The Overview view has a capacity-warnings banner fed by `/analytics/capacity`: it lists the resources with `Urgency: "plan"` and their recommendation. The dashboard does not show the cost ledger.
   </Card>
   <Card title="Grafana" icon="chart-area" href="/features/aiops/web-dashboard#grafana-dashboards">
     The `remediation-stats.json` dashboard covers remediation success by action type. No bundled dashboard covers capacity or LLM cost.

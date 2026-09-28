@@ -16,14 +16,14 @@ O módulo de **Chaos Engineering** permite injetar falhas em workloads Kubernete
 </Info>
 
 <Warning>
-  **O que funciona sem ajustes.** Com o RBAC distribuído pelo Helm chart do operator e por
-  `operator/config/rbac/role.yaml`, o operator só pode fazer `get`, `list`, `watch` e `delete` em pods. Isso basta para
-  `pod_kill` e `pod_failure`. Os demais tipos precisam de mais:
+  **O que funciona sem ajustes.** O RBAC distribuído pelo Helm chart do operator e por
+  `operator/config/rbac/role.yaml` deixa o operator fazer `get`, `list`, `watch`, `create`, `update` e `delete` em pods, então todos os tipos de experimento suportados podem rodar:
 
-  - `cpu_stress`, `memory_stress` e `disk_stress` criam um pod de stress e precisam de `create` em pods. Sem isso o experimento vai para `Failed` (`execution failed: creating ... stress pod: ... forbidden`).
-  - `network_delay` e `network_loss` apenas **anotam** os pods do alvo (precisam de `update` em pods). Nada no ChatCLI lê essas anotações, então nenhuma latência ou perda de pacotes é injetada, mesmo quando a anotação é gravada. Sem a permissão, os erros de anotação só vão para o log e o experimento termina `Completed` mesmo assim.
+  - `pod_kill` e `pod_failure` deletam pods do alvo.
+  - `cpu_stress`, `memory_stress` e `disk_stress` criam um pod de stress que passa no Pod Security Standard `restricted`.
+  - `network_delay` e `network_loss` **não são suportados**. O CRD os aceita, mas um experimento de qualquer um dos dois falha na hora, em `Pending`, com um result dizendo que nada foi injetado: falhas de rede precisam de um injetor tc/netem privilegiado que o operator não instala.
 
-  Veja [Concedendo permissões em pods](#concedendo-permissões-em-pods) abaixo.
+  Se você gerencia o RBAC do operator por conta própria, veja [Concedendo permissões em pods](#concedendo-permissões-em-pods) abaixo.
 </Warning>
 
 
@@ -53,9 +53,9 @@ flowchart LR
     derrubados.
   </Card>
   <Card title="Game Days" icon="calendar-check">
-    Rode experimentos sob demanda. O campo `schedule` ainda não foi
-    implementado; use um agendador externo para criar experimentos
-    periodicamente.
+    Rode experimentos sob demanda. Agendamentos recorrentes não são
+    suportados (um experimento com `schedule` falha); use um agendador
+    externo para criar experimentos periodicamente.
   </Card>
   <Card title="Analytics que Reconhece Simulações" icon="stopwatch">
     Issues induzidas por chaos são contadas à parte, então simulações não
@@ -90,8 +90,8 @@ A Issue então segue o pipeline normal de AIOps, com estas diferenças:
 | Listas de incidentes do dashboard | Visível | Oculta por padrão (filtro "Ocultar simulações de chaos") |
 
 <Note>
-  Os endpoints REST `analytics/mttd` e `analytics/mttr` **não** filtram as
-  simulações de chaos; só o histograma de resolução do Prometheus faz isso. As
+  Os endpoints REST `analytics/mttd` e `analytics/mttr` deixam as simulações
+  de chaos de fora, como o histograma de resolução do Prometheus. As
   regras de NotificationPolicy não conseguem casar por label, então as
   simulações ainda chegam a todo canal cuja regra case com a severidade,
   namespace, kind ou estado da Issue. Rode as simulações num namespace
@@ -145,7 +145,7 @@ spec:
   # Só roda os safety checks e registra o que aconteceria
   dryRun: false
 
-  # Aceito, mas NÃO implementado: o controller ignora
+  # Reservado: um valor não vazio faz o experimento falhar (execuções recorrentes não são suportadas)
   schedule: ""
 
   # Link opcional para uma Issue no namespace do experimento (só o nome)
@@ -179,10 +179,10 @@ status:
   state: Completed               # Pending | Running | Completed | Failed | Aborted
   startedAt: "2026-03-19T03:00:00Z"
   completedAt: "2026-03-19T03:05:02Z"
-  result: "completed: pod_kill experiment finished; recovery verified in 4ms"
+  result: "completed: pod_kill experiment finished; recovery verified in 2.004s"
   podsAffected: 2
   recoveryVerified: true
-  recoveryTime: "4ms"
+  recoveryTime: "2.004s"
   preExperimentSnapshot: "Deployment staging/api-server: replicas=5, ready=5, available=5, updated=5"
   postExperimentSnapshot: "Deployment staging/api-server: replicas=5, ready=5, available=5, updated=5"
 ```
@@ -266,12 +266,30 @@ metadata:
 spec:
   nodeName: <node do primeiro pod do alvo>  # não passa pelo scheduler
   restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:                          # Pod Security Standard restricted
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile: { type: RuntimeDefault }
   tolerations:
     - operator: Exists                      # tolera qualquer taint
+  volumes:
+    - name: scratch
+      emptyDir: {}
   containers:
     - name: stress
       image: alexeiled/stress-ng:latest
       command: ["stress-ng", "--cpu", "2", "--cpu-load", "80", "--timeout", "2m"]
+      workingDir: /tmp
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - name: scratch
+          mountPath: /tmp                   # o único caminho gravável
       resources:
         requests: { cpu: 100m, memory: 64Mi }
         limits:   { cpu: 500m, memory: 512Mi }
@@ -286,8 +304,11 @@ spec:
   Os recursos do pod de stress são fixos: ele usa no máximo **500m de CPU e
   512Mi de memória**, não importa o que `cores`, `loadPercent` ou `bytes`
   digam. A imagem (`alexeiled/stress-ng:latest`, do Docker Hub) não pode ser
-  trocada, e o pod não tem `securityContext`, então namespaces que aplicam o
-  Pod Security Standard `restricted` o rejeitam.
+  trocada. O pod passa no Pod Security Standard `restricted`: roda como
+  UID/GID 65534, não-root, com o perfil seccomp `RuntimeDefault`, sem escalada
+  de privilégio, com todas as capabilities removidas, root filesystem somente
+  leitura (um `emptyDir` em `/tmp` é o único caminho gravável) e sem token de
+  ServiceAccount.
 </Warning>
 
 ### 4. Memory Stress
@@ -316,56 +337,19 @@ Por causa do limite de 512Mi, pedir mais memória faz o container de stress ser 
 
 ### 5. Network Delay
 
-Adiciona uma anotação em **todos** os pods do alvo. Nenhuma latência é injetada: o ChatCLI não traz sidecar nem integração com CNI que leia essa anotação. Ela é só um marcador que ferramentas próprias poderiam usar.
+**Não suportado.** O tipo é aceito pelo CRD por compatibilidade, mas injetar latência exige um injetor tc/netem privilegiado que o operator não instala. O experimento falha assim que é pego, ainda em `Pending` e antes de qualquer safety check, aprovação ou dry run; nenhum pod é tocado:
 
 ```yaml
-spec:
-  experimentType: network_delay
-  target:
-    kind: Deployment
-    name: api-gateway
-    namespace: staging
-  parameters:
-    latencyMs: "500"
-    jitterMs: "50"
-  duration: 5m
+status:
+  state: Failed
+  result: "network_delay is not supported: injecting network faults needs a privileged tc/netem injector the operator does not deploy; nothing was injected"
 ```
 
-**Anotação aplicada:**
-
-```yaml
-metadata:
-  annotations:
-    platform.chatcli.io/chaos-network-delay: "500ms jitter=50ms experiment=<nome-do-experimento>"
-```
-
-| Parâmetro | Tipo | Padrão | Descrição |
-|-----------|------|--------|-----------|
-| `latencyMs` | string | `"100"` | Latência escrita na anotação |
-| `jitterMs` | string | `"10"` | Jitter escrito na anotação |
-
-A anotação é removida quando o experimento termina ou é abortado. `podsAffected` conta todos os pods do alvo, mesmo quando a gravação da anotação falhou.
+Use uma ferramenta dedicada de chaos de rede para testes de latência.
 
 ### 6. Network Loss
 
-Mesmo mecanismo do `network_delay`, com a anotação `platform.chatcli.io/chaos-network-loss: "<percent>% correlation=<correlation>% experiment=<nome>"`. Nenhum pacote é descartado.
-
-```yaml
-spec:
-  experimentType: network_loss
-  target:
-    kind: Deployment
-    name: api-gateway
-    namespace: staging
-  parameters:
-    percent: "30"
-  duration: 2m
-```
-
-| Parâmetro | Tipo | Padrão | Descrição |
-|-----------|------|--------|-----------|
-| `percent` | string | `"10"` | Percentual de perda escrito na anotação |
-| `correlation` | string | `"25"` | Percentual de correlação escrito na anotação |
+**Não suportado**, pelo mesmo motivo do `network_delay`. Um experimento desse tipo falha em `Pending` com `result: "network_loss is not supported: ... nothing was injected"`, e nenhum pacote é descartado.
 
 ### 7. Disk Stress
 
@@ -395,15 +379,15 @@ spec:
 |------|-----------|------------------------------|---------|
 | `pod_kill` | Deleção com grace period 0 | `delete` (concedida) | ReplicaSet/StatefulSet recria os pods |
 | `pod_failure` | Deleção com `gracePeriodSeconds` | `delete` (concedida) | ReplicaSet/StatefulSet recria os pods |
-| `cpu_stress` | Pod stress-ng no node do alvo | `create` (não concedida) | O stress-ng sai no `--timeout`; o pod é deletado no fim |
-| `memory_stress` | Pod stress-ng no node do alvo | `create` (não concedida) | Igual ao anterior |
-| `disk_stress` | Pod stress-ng no node do alvo | `create` (não concedida) | Igual ao anterior |
-| `network_delay` | Só anotação (sem efeito) | `update` (não concedida) | Anotação removida no fim |
-| `network_loss` | Só anotação (sem efeito) | `update` (não concedida) | Anotação removida no fim |
+| `cpu_stress` | Pod stress-ng no node do alvo | `create` (concedida) | O stress-ng sai no `--timeout`; o pod é deletado no fim |
+| `memory_stress` | Pod stress-ng no node do alvo | `create` (concedida) | Igual ao anterior |
+| `disk_stress` | Pod stress-ng no node do alvo | `create` (concedida) | Igual ao anterior |
+| `network_delay` | Não suportado: falha em `Pending`, nada é injetado | - | - |
+| `network_loss` | Não suportado: falha em `Pending`, nada é injetado | - | - |
 
 ### Concedendo Permissões em Pods
 
-Para usar os tipos de stress (e para que as anotações de rede sejam gravadas), dê à ServiceAccount do operator os verbos que faltam. Por exemplo, no cluster inteiro:
+O chart (`rbac.create: true`) e o `operator/config/rbac/role.yaml` já concedem esses verbos. Se você roda o operator com um RBAC gerenciado por você (`rbac.create: false`), os tipos de stress precisam de `create` em pods; sem isso, os tipos de stress falham (`execution failed: creating ... stress pod: ... forbidden`). Por exemplo, no cluster inteiro:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -413,7 +397,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "update"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -492,7 +476,7 @@ Essa verificação roda uma vez, antes da injeção. Ela não acompanha a saúde
 
 ### RequireApproval
 
-Quando `true`, o controller procura um `ApprovalRequest` chamado `chaos-<nome-do-experimento>` no namespace do experimento, cria se não existir e verifica de novo a cada 30 segundos. O experimento só começa quando o `status.state` desse pedido for `Approved`.
+Quando `true`, o controller procura um `ApprovalRequest` chamado `chaos-<nome-do-experimento>` no namespace do experimento, cria se não existir (pertencente ao experimento, então é apagado junto com ele) e verifica de novo a cada 30 segundos. O experimento só começa quando o `status.state` desse pedido for `Approved`. Se o pedido ficar `Rejected` ou `Expired`, o experimento vai para `Failed` (`approval rejected by <aprovador>: <motivo>` ou `approval request chaos-<nome-do-experimento> expired without a decision`).
 
 O pedido que o controller monta é este:
 
@@ -511,29 +495,29 @@ spec:
   policyRef: chaos-safety
   ruleName: chaos-experiment-approval
   requester: chaos-controller
+  requestedActions:
+    - type: Custom                     # chaos não é uma remediação
+      params:
+        chaosExperiment: validate-api-server-recovery
+        experimentType: pod_kill
+        target: Deployment/staging/api-server
+        duration: 2m
   timeoutMinutes: 30
   requiredApprovers: 1
 ```
 
-<Warning>
-  **Limitações conhecidas do `requireApproval` (deduzidas do código):**
-
-  - O controller não preenche `spec.requestedActions`, que o CRD de ApprovalRequest marca como obrigatório. O API server rejeita a criação, então o experimento fica em `Pending` e o operator registra `checking approval: creating approval request: ...` a cada nova tentativa.
-  - `policyRef: chaos-safety` não aponta para nenhuma policy embutida. A menos que você crie uma ApprovalPolicy com esse nome e uma regra chamada `chaos-experiment-approval` no mesmo namespace, o controller de aprovações nunca processa o pedido: não o expira depois de 30 minutos e não reage às anotações de aprovar/rejeitar.
-  - Se o pedido ficar `Rejected` ou `Expired`, o experimento **não** vai para `Failed`. Ele continua `Pending` e o controller segue tentando com backoff. Delete o experimento para pará-lo.
-
-  Contorno: crie o pedido você mesmo antes do experimento (mesmo nome, com `requestedActions: []`) e aprove-o gravando o status diretamente:
+<Note>
+  `policyRef: chaos-safety` não é uma policy embutida. Quando existe no namespace do experimento uma ApprovalPolicy chamada `chaos-safety` com uma regra chamada `chaos-experiment-approval`, é essa regra que decide o pedido (por exemplo, um quorum ou uma change window). Sem ela, o pedido é avaliado com as próprias configurações: uma aprovação humana, expirando depois de 30 minutos. Aprove ou rejeite como qualquer outro pedido, com a anotação `platform.chatcli.io/approve` / `reject`, a API REST ou o dashboard:
 
   ```bash
-  kubectl patch approvalrequest chaos-validate-api-server-recovery -n staging \
-    --subresource=status --type=merge \
-    -p '{"status":{"state":"Approved","autoApproved":false}}'
+  kubectl annotate approvalrequest chaos-validate-api-server-recovery -n staging \
+    platform.chatcli.io/approve="alice:drill combinado com o time"
   ```
-</Warning>
+</Note>
 
 ### AbortOnIssueDetected
 
-Enquanto o experimento está `Running` e a `duration` ainda não passou, cada reconcile (a cada 10 segundos no máximo) lista as Issues do namespace do alvo. Se alguma Issue tiver exatamente o mesmo kind, nome e namespace em `spec.resource` que o alvo e tiver sido criada depois de `status.startedAt`, o experimento vai para `Aborted` com `result: "aborted: new issue detected: <issue>"`. Em seguida os pods de stress são deletados e as anotações de rede removidas.
+Enquanto o experimento está `Running` e a `duration` ainda não passou, cada reconcile (a cada 10 segundos no máximo) lista as Issues do namespace do alvo. Se alguma Issue tiver exatamente o mesmo kind, nome e namespace em `spec.resource` que o alvo e tiver sido criada depois de `status.startedAt`, o experimento vai para `Aborted` com `result: "aborted: new issue detected: <issue>"`. Em seguida os pods de stress são deletados.
 
 <Warning>
   A verificação não distingue Issues causadas pelo próprio experimento. Se o
@@ -546,7 +530,7 @@ Enquanto o experimento está `Running` e a `duration` ainda não passou, cada re
 
 ## Verificação Pós-Experimento
 
-Quando a `duration` passa, o controller deleta os pods de stress, remove as anotações de rede, grava o `postExperimentSnapshot` e executa os passos abaixo. A partir daqui o experimento sempre termina em `Completed`, mesmo que a recuperação não tenha sido verificada.
+Quando a `duration` passa, o controller deleta os pods de stress, grava o `postExperimentSnapshot` e executa os passos abaixo. A partir daqui o experimento sempre termina em `Completed`, mesmo que a recuperação não tenha sido verificada.
 
 ### VerifyRecovery
 
@@ -556,14 +540,7 @@ O alvo é considerado saudável quando um Deployment tem `readyReplicas` e `avai
 
 Por quanto tempo continuar verificando depois que a `duration` passou. Padrão `5m`. Um valor inválido cai em `5m` sem aviso. Quando o prazo estoura, o experimento é marcado `Completed` com `recoveryVerified: false`, `recoveryTime: "timeout"` e um result terminando em `recovery NOT verified (timeout)`. Ele não é marcado `Failed`.
 
-<Warning>
-  **`recoveryTime` não mede a recuperação.** O cronômetro começa logo antes da
-  verificação de saúde final que dá certo, então o valor (e o histograma
-  `chatcli_operator_chaos_recovery_time_seconds`) é sempre de alguns
-  milissegundos. Use `recoveryVerified` como sinal de passou/falhou e compare
-  `status.startedAt`/`status.completedAt` se precisar de um limite superior
-  para o tempo de recuperação.
-</Warning>
+O `recoveryTime` (e o histograma `chatcli_operator_chaos_recovery_time_seconds`) é medido do **fim da injeção** (`startedAt + duration`) até a primeira verificação de saúde que passa. As verificações rodam a cada 5 segundos, então o valor tem essa granularidade; um alvo que já está saudável quando o experimento termina registra os poucos segundos entre o fim da injeção e essa verificação.
 
 ### RunRemediationTest
 
@@ -593,7 +570,7 @@ stateDiagram-v2
     [*] --> Pending: CR criado
 
     Pending --> Pending: Limite de concorrência / aguardando aprovação
-    Pending --> Failed: Namespace não permitido / minHealthyPods
+    Pending --> Failed: Tipo ou schedule não suportado / namespace não permitido / minHealthyPods / aprovação rejeitada ou expirada
     Pending --> Completed: dryRun
     Pending --> Running: Verificações OK
 
@@ -611,12 +588,12 @@ stateDiagram-v2
 | **Pending** | Safety checks, limite de concorrência e aprovação são avaliados | Running, Failed, Completed (dry run) |
 | **Running** | Falha injetada uma vez; o controller espera a `duration` | Completed, Failed, Aborted |
 | **Completed** | Duração encerrada e passos pós-experimento feitos (a recuperação pode não ter sido verificada), ou dry run concluído | Terminal |
-| **Failed** | Namespace bloqueado, `minHealthyPods` violado, `duration` inválida, nenhum pod no alvo (tipos de pod e de stress), `target.kind` não suportado ou erro na injeção | Terminal |
+| **Failed** | `network_delay`/`network_loss` ou um `schedule` (não suportados), namespace bloqueado, `minHealthyPods` violado, aprovação rejeitada ou expirada, `duration` inválida, nenhum pod no alvo (tipos de pod e de stress), `target.kind` não suportado ou erro na injeção | Terminal |
 | **Aborted** | Uma nova Issue para o alvo foi detectada (`abortOnIssueDetected`) | Terminal |
 
 Experimentos em estado terminal nunca rodam de novo. Para repetir um experimento, delete e crie de novo (redefinir o status manualmente não reinjeta a falha, porque o controller pula a injeção quando `podsAffected` já está preenchido).
 
-Não existe campo para abortar um experimento em execução. Deletar o CR ou definir `enabled: false` faz o controller parar de tratá-lo, mas sem limpeza: os pods de stress continuam rodando até o `--timeout` do stress-ng, e as anotações de rede ficam nos pods.
+Não existe campo para abortar um experimento em execução. Deletar o CR ou definir `enabled: false` faz o controller parar de tratá-lo, mas sem limpeza: os pods de stress continuam rodando até o `--timeout` do stress-ng.
 
 <Note>
   A `duration` só é interpretada quando o experimento já está `Running`, então
@@ -670,9 +647,9 @@ Um dry run incrementa `chatcli_operator_chaos_experiments_total{result="dry_run"
 ## Schedule (Experimentos Recorrentes)
 
 <Warning>
-  O campo `schedule` existe no CRD, mas **não está implementado**: o
-  controller de chaos nunca o lê. Um experimento com `schedule` roda uma vez,
-  como qualquer outro, e nunca se repete.
+  O campo `schedule` existe no CRD, mas experimentos recorrentes **não são
+  suportados**. Um experimento que define `schedule` falha na hora, em
+  `Pending`, sem injetar nada, com `result: "schedule is not supported: recurring experiments are not implemented; remove spec.schedule and create one ChaosExperiment per run"`.
 </Warning>
 
 Para game days recorrentes, crie um `ChaosExperiment` novo de forma agendada, fora do operator, por exemplo com um CronJob do Kubernetes que rode `kubectl create -f` num manifesto com `metadata.generateName` (assim cada execução ganha um nome e um status novos). Limpe os experimentos antigos por conta própria; o operator não os remove.
@@ -827,8 +804,8 @@ O controller de chaos registra três métricas no endpoint de métricas do opera
 | Métrica | Tipo | Labels | Descrição |
 |---------|------|--------|-----------|
 | `chatcli_operator_chaos_experiments_total` | Counter | `type`, `result` | Experimentos por tipo e desfecho. `result` é `completed`, `failed`, `aborted` ou `dry_run` |
-| `chatcli_operator_chaos_recovery_time_seconds` | Histogram | `type` | Só é registrado quando a recuperação é verificada. Veja o aviso sobre `recoveryTime` acima: os valores ficam perto de zero |
-| `chatcli_operator_chaos_pods_affected_total` | Counter | `type` | Pods deletados, pods de stress criados (1 por experimento) ou pods anotados |
+| `chatcli_operator_chaos_recovery_time_seconds` | Histogram | `type` | Só é registrado quando a recuperação é verificada: tempo do fim da injeção até a primeira verificação de saúde que passa |
+| `chatcli_operator_chaos_pods_affected_total` | Counter | `type` | Pods deletados, ou pods de stress criados (1 por experimento) |
 
 `result="failed"` significa que um safety check ou a injeção falhou. Um alvo que não se recuperou a tempo ainda conta como `completed`.
 

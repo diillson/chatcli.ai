@@ -1,418 +1,339 @@
 ---
 title: "Modo Servidor (chatcli server)"
 sidebarTitle: "Modo Servidor"
-description: "Transforme o ChatCLI em um servidor gRPC para acesso remoto de qualquer terminal, Docker ou Kubernetes."
+description: "Rode o ChatCLI como servidor gRPC: flags, autenticação, TLS e mTLS, health, métricas, logs, limites, a superfície de RPCs, operação e solução de problemas."
 icon: "server"
 ---
 
-O **Modo Servidor** transforma o ChatCLI em um serviço gRPC de alta performance que pode ser acessado remotamente por qualquer terminal. Isso permite centralizar o acesso a IA em um servidor (bare-metal, VM, Docker ou Kubernetes) e conectar de qualquer lugar.
+`chatcli server` (alias `chatcli serve`) roda o ChatCLI como serviço gRPC. As chaves de API ficam no servidor; os clientes se conectam com [`chatcli connect`](/pt/features/remote-connect), com o [operator](/pt/features/k8s-operator) ou com qualquer cliente gRPC. O mesmo binário roda no notebook, em container ([Docker](/pt/getting-started/docker-deployment#docker)) e no Kubernetes ([Helm chart](/pt/getting-started/docker-deployment#kubernetes-helm)).
 
-
-
-## Por que usar o Modo Servidor?
-
-<CardGroup cols={2}>
-  <Card title="Centralização" icon="building">
-    Um único servidor com API keys configuradas atende múltiplos clientes
-  </Card>
-  <Card title="Segurança" icon="lock">
-    As chaves de API ficam no servidor, nunca expostas nos terminais clientes
-  </Card>
-  <Card title="Flexibilidade" icon="arrows-rotate">
-    Clientes podem usar suas **próprias credenciais** (API key ou OAuth) se desejarem
-  </Card>
-  <Card title="Performance" icon="bolt">
-    Comunicação via gRPC com suporte a TLS e streaming real do provedor
-  </Card>
-</CardGroup>
-
-<Tip>
-O modo servidor oferece integração nativa com o K8s Watcher para monitoramento de deployments Kubernetes.
-</Tip>
-
-
-
-## Iniciando o Servidor
+## Início rápido
 
 <Steps>
-  <Step title="Modo mais simples">
-    Servidor na porta padrão (50051):
-    ```bash
-    chatcli server
-    ```
-  </Step>
-  <Step title="Com porta e autenticação customizados">
-    ```bash
-    chatcli server --port 8080 --token meu-token-secreto
-    ```
-  </Step>
-  <Step title="Com TLS habilitado">
-    ```bash
-    chatcli server --tls-cert cert.pem --tls-key key.pem
-    ```
-  </Step>
-  <Step title="Com K8s Watcher integrado (opcional)">
-    ```bash
-    # Single-target (legado)
-    chatcli server --watch-deployment myapp --watch-namespace production
+  <Step title="Suba um servidor local">
+    Sem credencial, o servidor só escuta em loopback:
 
-    # Multi-target + Prometheus metrics
-    chatcli server --watch-config targets.yaml
+    ```bash
+    export ANTHROPIC_API_KEY=sk-ant-xxx
+    chatcli server --provider CLAUDEAI
+    ```
+
+    ```text
+    🚀 ChatCLI server listening on 127.0.0.1:50051
+    📊 Prometheus metrics on :9090/metrics
     ```
   </Step>
-  <Step title="Com fallback de provedores (opcional)">
+  <Step title="Conecte de outro terminal">
+    O listener é texto puro, e o cliente disca TLS a menos que você libere o texto puro explicitamente:
+
     ```bash
-    chatcli server --fallback-providers OPENAI,CLAUDEAI,GOOGLEAI,OPENROUTER,ZAI,MINIMAX,MOONSHOT,COPILOT
+    CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051
     ```
   </Step>
-  <Step title="Com MCP (opcional)">
+  <Step title="Deixe acessível por outras máquinas">
+    Faça bind em todas as interfaces e defina uma credencial, senão o servidor se recusa a subir (veja [Endereço de bind e a regra da credencial](#endereço-de-bind-e-a-regra-da-credencial)):
+
     ```bash
-    chatcli server --mcp-config ~/.chatcli/mcp_servers.json
+    export CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)"
+    CHATCLI_BIND_ADDRESS=0.0.0.0 chatcli server --provider CLAUDEAI \
+      --tls-cert server.crt --tls-key server.key
+    ```
+
+    ```bash
+    chatcli connect chatcli.example.com:50051 --tls --ca-cert ca.crt --token "$CHATCLI_SERVER_TOKEN"
     ```
   </Step>
 </Steps>
 
+## Endereço de bind e a regra da credencial
 
+O endereço de escuta vem de `CHATCLI_BIND_ADDRESS`. Sem ele, o servidor escolhe:
 
-## Flags Disponíveis
+| Onde roda | Detectado por | Bind padrão |
+|---|---|---|
+| Pod no Kubernetes | `KUBERNETES_SERVICE_HOST` definido (o kubelet injeta) | `0.0.0.0` |
+| Qualquer outro lugar (notebook, VM, **Docker**) | — | `127.0.0.1` |
 
-| Flag | Descrição | Padrão | Env Var |
-|------|-----------|--------|---------|
-| `--port` | Porta do servidor gRPC | `50051` | `CHATCLI_SERVER_PORT` |
-| `--token` | Token de autenticação. Obrigatório a menos que o servidor escute em loopback — veja abaixo | `""` | `CHATCLI_SERVER_TOKEN` |
-| `--tls-cert` | Arquivo de certificado TLS | `""` | `CHATCLI_SERVER_TLS_CERT` |
-| `--tls-key` | Arquivo de chave TLS | `""` | `CHATCLI_SERVER_TLS_KEY` |
-| `--provider` | Provedor de LLM padrão | Auto-detectado | `LLM_PROVIDER` |
-| `--model` | Modelo de LLM padrão | Auto-detectado | |
-| `--metrics-port` | Porta HTTP para métricas Prometheus (0 = desabilita) | `9090` | `CHATCLI_METRICS_PORT` |
+Um `CHATCLI_BIND_ADDRESS` explícito sempre vence. Não existe flag `--bind`.
 
-### Flags de Fallback (opcionais)
+Em endereço de loopback (`127.0.0.1`, `::1`, `localhost`) o servidor pode rodar sem credencial: a fronteira de confiança é a máquina. Em **qualquer outro endereço**, um servidor sem credencial aceitaria todo chamador como administrador, então ele se recusa a subir e sai com status 1:
 
-| Flag | Descrição | Padrão | Env Var |
-|------|-----------|--------|---------|
-| `--fallback-providers` | Lista de provedores separados por vírgula para failover | `""` | `CHATCLI_FALLBACK_PROVIDERS` |
-| `--fallback-max-retries` | Tentativas por provedor antes de avançar | `2` | `CHATCLI_FALLBACK_MAX_RETRIES` |
-| `--fallback-cooldown-base` | Cooldown base após falha | `30s` | `CHATCLI_FALLBACK_COOLDOWN_BASE` |
-| `--fallback-cooldown-max` | Cooldown máximo (backoff exponencial) | `5m` | `CHATCLI_FALLBACK_COOLDOWN_MAX` |
-
-### Flag MCP (opcional)
-
-| Flag | Descrição | Padrão | Env Var |
-|------|-----------|--------|---------|
-| `--mcp-config` | Arquivo JSON de configuração MCP | `""` | `CHATCLI_MCP_CONFIG` |
-
-### Prometheus Metrics
-
-O servidor expõe métricas Prometheus em `http://localhost:9090/metrics` por padrão. As métricas incluem:
-
-- **gRPC**: `chatcli_grpc_requests_total`, `chatcli_grpc_request_duration_seconds`, `chatcli_grpc_in_flight_requests`
-- **LLM**: `chatcli_llm_requests_total`, `chatcli_llm_request_duration_seconds`, `chatcli_llm_errors_total`
-- **Watcher**: `chatcli_watcher_collection_duration_seconds`, `chatcli_watcher_alerts_total`, `chatcli_watcher_pods_ready`
-- **Session**: `chatcli_session_active_total`, `chatcli_session_operations_total`
-- **Server**: `chatcli_server_uptime_seconds`, `chatcli_server_info`
-- **Go runtime**: goroutines, memória, GC (via GoCollector/ProcessCollector)
-
-Para desabilitar, use `--metrics-port 0`.
-
-### Exportação OpenTelemetry (OTLP)
-
-Toda superfície — o REPL, execuções one-shot, o gateway, o servidor MCP/ACP e este servidor gRPC — pode enviar seus contadores de sessão a um collector OpenTelemetry por OTLP/HTTP (codificação JSON, sem dependência de SDK). A configuração é só o contrato de ambiente padrão do OTel:
-
-```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4318"
-export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20token"
-export OTEL_SERVICE_NAME="chatcli"          # padrão
-export OTEL_METRIC_EXPORT_INTERVAL=60000      # ms, padrão
+```text
+refusing to serve an unauthenticated API on 0.0.0.0: every caller that can reach it would be admitted as an administrator. Set CHATCLI_SERVER_TOKEN (or --token) for a shared token, CHATCLI_JWT_SECRET for HS256 JWTs, CHATCLI_JWT_PUBLIC_KEY for RS256 JWTs, or CHATCLI_SERVER_TLS_CLIENT_CA (--tls-client-ca) for mTLS. To run without authentication, bind loopback instead (CHATCLI_BIND_ADDRESS=127.0.0.1)
 ```
 
-Somas cumulativas enviadas a cada intervalo (e mais uma vez no encerramento), com `service.name`, `chatcli.surface` e `chatcli.tenant` no recurso: `chatcli.llm.tokens` (`kind` = input/output/cache_read/cache_write/reasoning, `provider`, `model`), `chatcli.llm.cost` (USD por provider/modelo), `chatcli.context.compactions` (`level` = summary/truncation) e `chatcli.context.compaction_cost`, `chatcli.cache.requests` (`outcome` = total/miss/expected_rebuild) e `chatcli.cache.storage_cost`, `chatcli.session.cost`. `/config server` mostra o endpoint, a contagem de envios e o último erro.
+Qualquer uma destas opções satisfaz a regra:
 
-### Variáveis de Segurança
+| Credencial | Configuração | Identidade do chamador |
+|---|---|---|
+| Token compartilhado | `--token` / `CHATCLI_SERVER_TOKEN` | subject `legacy-token`, role `admin` |
+| JWTs HS256 | `CHATCLI_JWT_SECRET` | claims `sub` e `role` do token |
+| JWTs RS256 | `CHATCLI_JWT_PUBLIC_KEY` | claims `sub` e `role` do token |
+| TLS mútuo | `--tls-client-ca` / `CHATCLI_SERVER_TLS_CLIENT_CA` (com `--tls-cert`/`--tls-key`) | `mtls:<nome do certificado>`, role `CHATCLI_MTLS_ROLE` |
 
-| Env Var | Descrição | Padrão |
-|---------|-----------|--------|
-| `CHATCLI_GRPC_REFLECTION` | Habilita gRPC reflection para debugging. Requer **AMBOS** a flag `--grpc-reflection` **E** esta variável como `true`. **Mantenha desabilitado em produção.** Configurável via Helm com `server.grpcReflection`. | `false` |
-| `CHATCLI_DISABLE_VERSION_CHECK` | Desabilita verificação automática de versão no startup. | `false` |
-| `CHATCLI_BIND_ADDRESS` | Endereço de bind do servidor. Padrão `127.0.0.1` (local); em Kubernetes, auto-detecta via `KUBERNETES_SERVICE_HOST` e usa `0.0.0.0`. Valor explícito sempre prevalece. | `127.0.0.1` / `0.0.0.0` (K8s) |
-| `CHATCLI_SERVER_TLS_CLIENT_CA` | Bundle de CA contra o qual certificados de cliente são verificados (`--tls-client-ca`); habilita TLS mútuo e identifica chamadores pelo certificado. Exige `--tls-cert`/`--tls-key`. | `""` |
-| `CHATCLI_MTLS_ROLE` | Papel concedido a um chamador identificado só pelo certificado de cliente (sem bearer token): `viewer`, `user` ou `admin`. Valor não reconhecido vira somente-leitura. | `user` |
-
-<Warning>
-O gRPC reflection agora requer **duas condições**: a flag `--grpc-reflection` **E** a variável `CHATCLI_GRPC_REFLECTION=true`. Isso evita habilitação acidental em produção. Veja a [documentação de segurança](/pt/features/security) para todas as medidas de hardening.
-</Warning>
-
-<Note>
-O endereço de bind padrão é `127.0.0.1` (seguro para uso local). Em Kubernetes, o servidor auto-detecta o ambiente via `KUBERNETES_SERVICE_HOST` e automaticamente usa `0.0.0.0`. Um valor explícito em `CHATCLI_BIND_ADDRESS` sempre prevalece.
-</Note>
+Material JWT configurado que não carrega não conta como credencial. Quando o JWT é a única credencial, o servidor se recusa a subir com `refusing to start: CHATCLI_JWT_PUBLIC_KEY is set but no RSA public key could be loaded: ...` (ou a mensagem equivalente de `CHATCLI_JWT_SECRET`). Quando também há token ou mTLS, o servidor sobe, registra o erro do JWT no log e aceita só as credenciais que funcionam.
 
 <Warning>
-**Um servidor alcançável precisa de credencial.** A autenticação é
-opcional só em loopback, onde a fronteira de confiança é a máquina. Em
-qualquer outro endereço — inclusive o `0.0.0.0` que o Kubernetes usa — um
-servidor sem credencial admitiria todo chamador como administrador, então
-ele **recusa subir** e diz o que falta.
-
-Forneça uma destas:
-
-- `--token` / `CHATCLI_SERVER_TOKEN` — uma credencial compartilhada;
-- `CHATCLI_JWT_SECRET` (HS256) ou `CHATCLI_JWT_PUBLIC_KEY` (RS256) — JWTs
-  por usuário, carregando identidade e papel. Os tokens precisam do claim
-  `exp`; um sem expiração é recusado;
-- `--tls-client-ca` / `CHATCLI_SERVER_TLS_CLIENT_CA` — TLS mútuo: todo
-  chamador apresenta um certificado assinado pela CA e é identificado por
-  ele (veja a aba TLS abaixo);
-- `CHATCLI_BIND_ADDRESS=127.0.0.1` — sem credencial, alcançável apenas da
-  própria máquina.
-
-No Docker, a porta publicada só chega a um servidor que escute na
-interface do container, então `CHATCLI_BIND_ADDRESS=0.0.0.0` e um token
-andam juntos ali.
+A recusa vai para o log estruturado. Num container, numa unit do systemd ou num pipe o servidor também escreve esse log no **stderr**, então `docker logs`/`kubectl logs` mostram a recusa sem nenhuma configuração extra; num terminal interativo ela vai só para o arquivo de log. Veja [Logs](#logs).
 </Warning>
 
-### Flags do K8s Watcher (opcionais)
+## Flags
 
-| Flag | Descrição | Padrão | Env Var |
-|------|-----------|--------|---------|
-| `--watch-config` | Arquivo YAML multi-target | `""` | `CHATCLI_WATCH_CONFIG` |
-| `--watch-deployment` | Deployment único (legado) | `""` | `CHATCLI_WATCH_DEPLOYMENT` |
-| `--watch-namespace` | Namespace do deployment | `"default"` | `CHATCLI_WATCH_NAMESPACE` |
-| `--watch-interval` | Intervalo de coleta | `30s` | `CHATCLI_WATCH_INTERVAL` |
-| `--watch-window` | Janela de observação | `2h` | `CHATCLI_WATCH_WINDOW` |
-| `--watch-max-log-lines` | Max linhas de log por pod | `100` | `CHATCLI_WATCH_MAX_LOG_LINES` |
-| `--watch-kubeconfig` | Caminho do kubeconfig | Auto-detectado | `CHATCLI_KUBECONFIG` |
+| Flag | Variável | Padrão | Descrição |
+|---|---|---|---|
+| `--port` | `CHATCLI_SERVER_PORT` | `50051` | Porta gRPC |
+| `--token` | `CHATCLI_SERVER_TOKEN` | `""` | Token bearer compartilhado. Prefira a variável: flag aparece na lista de processos |
+| `--tls-cert` | `CHATCLI_SERVER_TLS_CERT` | `""` | Certificado do servidor (PEM). O TLS exige cert e chave; um sem o outro é recusado na inicialização |
+| `--tls-key` | `CHATCLI_SERVER_TLS_KEY` | `""` | Chave privada do servidor (PEM) |
+| `--tls-client-ca` | `CHATCLI_SERVER_TLS_CLIENT_CA` | `""` | Bundle de CA a que os certificados de cliente devem encadear; liga o TLS mútuo |
+| `--provider` | `LLM_PROVIDER` | primeiro provedor com credenciais | Provedor LLM padrão |
+| `--model` | — | modelo padrão do provedor (por exemplo `ANTHROPIC_MODEL`) | Modelo padrão |
+| `--metrics-port` | `CHATCLI_METRICS_PORT` | `9090` | Porta HTTP de `/metrics` e `/healthz`; `0` desliga os dois |
+| `--enable-reflection` | `CHATCLI_GRPC_REFLECTION` | `false` | Registra o gRPC reflection; veja [gRPC reflection](#grpc-reflection) |
+| `--fallback-providers` | `CHATCLI_FALLBACK_PROVIDERS` | `""` | Cadeia de provedores separada por vírgula; veja [Cadeia de fallback](#cadeia-de-fallback) |
+| `--fallback-max-retries` | `CHATCLI_FALLBACK_MAX_RETRIES` | `2` | Tentativas por provedor antes do próximo |
+| `--fallback-cooldown-base` | `CHATCLI_FALLBACK_COOLDOWN_BASE` | `30s` | Cooldown depois de uma falha |
+| `--fallback-cooldown-max` | `CHATCLI_FALLBACK_COOLDOWN_MAX` | `5m` | Teto do cooldown (backoff exponencial) |
+| `--mcp-config` | `CHATCLI_MCP_CONFIG` | `""` | JSON dos servidores MCP. `CHATCLI_MCP_ENABLED=true` sem caminho carrega o padrão `~/.chatcli/mcp_servers.json` |
+| `--watch-config` | `CHATCLI_WATCH_CONFIG` | `""` | YAML multi-target do watcher; veja [K8s Watcher](/pt/features/k8s-watcher) |
+| `--watch-deployment` | `CHATCLI_WATCH_DEPLOYMENT` | `""` | Um único Deployment a observar |
+| `--watch-namespace` | `CHATCLI_WATCH_NAMESPACE` | `default` | Namespace dele |
+| `--watch-interval` | `CHATCLI_WATCH_INTERVAL` | `30s` | Intervalo de coleta |
+| `--watch-window` | `CHATCLI_WATCH_WINDOW` | `2h` | Janela de retenção |
+| `--watch-max-log-lines` | `CHATCLI_WATCH_MAX_LOG_LINES` | `100` | Linhas de log por pod |
+| `--watch-kubeconfig` | `CHATCLI_KUBECONFIG` | in-cluster, senão `~/.kube/config` | Kubeconfig do watcher |
 
-<Info>
-Use `--watch-config` para monitorar **múltiplos deployments** simultaneamente com métricas Prometheus. Veja [K8s Watcher](/pt/features/k8s-watcher) para o formato do arquivo YAML.
-</Info>
+Uma flag passada na linha de comando vence a variável. `chatcli server --help` lista as flags.
 
+## Variáveis de ambiente
 
+Tudo o que a CLI local lê (chaves de provedor como `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `*_MODEL`, `*_MAX_TOKENS`, `CHATCLI_CA_BUNDLE`) também configura o servidor. Estas são específicas do modo servidor:
 
-## Autenticação do Servidor
+| Variável | Padrão | Significado |
+|---|---|---|
+| `CHATCLI_BIND_ADDRESS` | `127.0.0.1`, ou `0.0.0.0` no Kubernetes | Endereço de escuta |
+| `CHATCLI_JWT_SECRET` | `""` | Segredo HS256. Um valor que seja PEM, ou caminho para arquivo PEM, é tratado como chave RSA (RS256) |
+| `CHATCLI_JWT_PUBLIC_KEY` | `""` | Chave(s) pública(s) RS256: PEM inline ou caminho. Vários blocos PEM são todos aceitos. Vence `CHATCLI_JWT_SECRET` |
+| `CHATCLI_JWT_ISSUER` | `""` | Se definida, o `iss` do token tem de ser igual |
+| `CHATCLI_JWT_AUDIENCE` | `""` | Se definida, o `aud` do token tem de ser igual (uma string) |
+| `CHATCLI_MTLS_ROLE` | `user` | Role de quem se identifica só pelo certificado de cliente |
+| `CHATCLI_RATE_LIMIT_RPS` | `10` | Requisições por segundo por chamador |
+| `CHATCLI_RATE_LIMIT_BURST` | `20` | Burst por chamador |
+| `CHATCLI_MAX_RECV_MSG_SIZE` | `52428800` (50 MB) | Maior mensagem aceita, em bytes |
+| `CHATCLI_MAX_SEND_MSG_SIZE` | `52428800` (50 MB) | Maior mensagem enviada, em bytes |
+| `CHATCLI_MAX_CONCURRENT_STREAMS` | `100` | Streams simultâneos por conexão |
+| `CHATCLI_AUDIT_LOG_PATH` | `""` (desligado) | Caminho absoluto da trilha de auditoria; veja [Log de auditoria](#log-de-auditoria) |
+| `CHATCLI_HUB_ENABLED` | ligado | `false` desliga os RPCs do [hub de conversas](/pt/features/conversation-hub) |
+| `CHATCLI_SERVER_PIPELINE` | `false` | `true` serve os [RPCs de pipeline](#rpcs-de-pipeline) |
+| `CHATCLI_GATEWAY_IN_SERVER` | `false` | `true` roda o [chat gateway](/pt/features/chat-gateway) dentro do processo do servidor |
+| `CHATCLI_ALLOW_HTTP_PROVIDERS` | `false` | `true` deixa URLs de provedor enviadas pelo chamador usarem `http://`; veja [Proteção contra SSRF](#proteção-contra-ssrf) |
+| `CHATCLI_ENV` | `prod` | `dev` troca para o console colorido de desenvolvimento no stdout; veja [Logs](#logs) |
+| `CHATCLI_LOG_STDERR` | auto | `true`/`false` força as linhas JSON de log no stderr ligadas ou desligadas; sem valor, ficam ligadas sempre que o stderr não é um terminal |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_FILE` | `~/.chatcli/app.log` | Arquivo do log estruturado em JSON (`CHATCLI_LOG_FILE` é um alias) |
+| `LOG_MAX_SIZE` | `100MB` | Tamanho em que o arquivo de log rotaciona (`CHATCLI_LOG_MAX_SIZE_MB`, em MB, tem precedência; backups, idade e compactação: `CHATCLI_LOG_MAX_BACKUPS`, `CHATCLI_LOG_MAX_AGE_DAYS`, `CHATCLI_LOG_COMPRESS`) |
+
+## Autenticação do servidor
+
+O chamador envia a credencial como metadata gRPC `authorization: Bearer <token>`. `chatcli connect --token` faz isso tanto para o token compartilhado quanto para um JWT.
 
 <Tabs>
-  <Tab title="Sem Autenticação">
-    Em loopback, o servidor não exige autenticação e qualquer cliente local pode conectar (um bind alcançável recusa subir sem credencial — veja o aviso acima):
-
+  <Tab title="Token compartilhado">
     ```bash
-    chatcli server  # sem --token = acesso livre
-    ```
-  </Tab>
-  <Tab title="Com Token">
-    Defina um token para proteger o servidor:
-
-    ```bash
-    # Via flag
-    chatcli server --token meu-token-secreto
-
-    # Via variável de ambiente
-    export CHATCLI_SERVER_TOKEN=meu-token-secreto
+    export CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)"
     chatcli server
     ```
 
-    O cliente precisa fornecer o mesmo token ao conectar:
-
-    ```bash
-    chatcli connect servidor:50051 --token meu-token-secreto
-    ```
+    Todo mundo que tem o token é o mesmo principal, `legacy-token`, com role `admin`. Isso também significa que todos dividem um único bucket de rate limit.
   </Tab>
-  <Tab title="JWT com RBAC">
-    Para controle de acesso baseado em roles, configure autenticação JWT:
-
+  <Tab title="JWT (HS256 ou RS256)">
     ```bash
-    export CHATCLI_JWT_SECRET="minha-chave-secreta-256-bits"
-    export CHATCLI_JWT_ISSUER="chatcli-server"
-    export CHATCLI_JWT_AUDIENCE="chatcli-api"
+    # HS256: um segredo compartilhado assina e verifica
+    export CHATCLI_JWT_SECRET="$(openssl rand -hex 32)"
+
+    # ou RS256: o servidor guarda só a chave pública
+    # export CHATCLI_JWT_PUBLIC_KEY=/etc/chatcli/jwt-public.pem
+
+    export CHATCLI_JWT_ISSUER=chatcli          # opcional
+    export CHATCLI_JWT_AUDIENCE=chatcli-api    # opcional
     chatcli server
     ```
 
-    O servidor valida tokens JWT e extrai a role do claim `role`. Três roles estão disponíveis:
+    O servidor verifica, nesta ordem:
 
-    | Role | Permissões |
-    |------|------------|
-    | `admin` | Acesso total: gerenciar sessões, executar plugins, configurar servidor |
-    | `user` | Executar plugins, gerenciar suas próprias sessões, enviar prompts |
-    | `readonly` | Apenas visualizar: listar sessões, consultar status do servidor |
+    - o `alg` do cabeçalho é igual ao algoritmo configurado (`HS256` ou `RS256`); `none` e divergências são rejeitados;
+    - a assinatura;
+    - `exp` é **obrigatório** (token sem ele é rejeitado), com 30 segundos de tolerância de relógio; `nbf` é respeitado quando presente;
+    - `iss` e `aud`, só quando `CHATCLI_JWT_ISSUER` / `CHATCLI_JWT_AUDIENCE` estão definidas.
 
-    **Exemplo: gerando um JWT para um usuário:**
+    Claims lidos: `sub` (padrão `jwt-user`), `role`, `email`, `tenant_id`.
+
+    **Gere um token de teste com openssl (HS256):**
+
+    ```bash
+    b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+    HEADER=$(printf '{"alg":"HS256","typ":"JWT"}' | b64url)
+    PAYLOAD=$(printf '{"sub":"alice@example.com","role":"user","iss":"chatcli","aud":"chatcli-api","exp":%d}' \
+      $(( $(date +%s) + 3600 )) | b64url)
+    SIG=$(printf '%s.%s' "$HEADER" "$PAYLOAD" \
+      | openssl dgst -sha256 -hmac "$CHATCLI_JWT_SECRET" -binary | b64url)
+    JWT="$HEADER.$PAYLOAD.$SIG"
+
+    CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$JWT"
+    ```
+
+    **Ou em Go:**
 
     ```go
-    import "github.com/golang-jwt/jwt/v5"
-
     claims := jwt.MapClaims{
-        "sub":  "usuário@empresa.com",
+        "sub":  "alice@example.com",
         "role": "user",
-        "iss":  "chatcli-server",
+        "iss":  "chatcli",
         "aud":  "chatcli-api",
-        "exp":  time.Now().Add(24 * time.Hour).Unix(),
+        "exp":  time.Now().Add(time.Hour).Unix(),
     }
-    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-    signed, _ := token.SignedString([]byte(os.Getenv("CHATCLI_JWT_SECRET")))
+    signed, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).
+        SignedString([]byte(os.Getenv("CHATCLI_JWT_SECRET")))
     ```
 
-    <Warning>
-    O rate limiting de autenticação bloqueia IPs após **5 falhas por minuto**. Isso protege contra ataques de força bruta em tokens e JWTs.
-    </Warning>
+    Token compartilhado e JWTs podem coexistir: o servidor tenta o bearer primeiro como JWT e depois o compara com o token compartilhado.
   </Tab>
-  <Tab title="TLS (HTTPS)">
-    Para conexões encriptadas, forneça certificado e chave TLS. O servidor exige **TLS 1.3** como versão mínima:
-
+  <Tab title="TLS mútuo">
     ```bash
-    chatcli server --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+    chatcli server --tls-cert server.crt --tls-key server.key --tls-client-ca clients-ca.crt
     ```
 
-    O cliente usa a flag `--tls` e opcionalmente `--ca-cert`:
+    Toda conexão precisa apresentar um certificado de cliente que encadeie em `clients-ca.crt`; sem isso o handshake TLS falha (inclusive para os RPCs de health). `--tls-client-ca` sem `--tls-cert`/`--tls-key` é fatal: `FATAL: --tls-client-ca requires --tls-cert and --tls-key`.
+
+    Quem não envia token bearer é identificado pelo certificado: `mtls:<CN>`, caindo para o primeiro URI SAN e depois o primeiro DNS SAN. A role vem de `CHATCLI_MTLS_ROLE` (padrão `user`). Um token bearer, quando enviado, vence a identidade do certificado.
 
     ```bash
-    chatcli connect servidor:50051 --tls --ca-cert /path/to/ca.pem
+    CHATCLI_TLS_CLIENT_CERT=alice.crt CHATCLI_TLS_CLIENT_KEY=alice.key \
+      chatcli connect chatcli.example.com:50051 --tls --ca-cert ca.crt
     ```
-
-    **mTLS (Mutual TLS):** Para autenticação mútua, o servidor verifica os certificados de cliente contra um bundle de CA e o cliente apresenta o seu certificado:
-
-    ```bash
-    # Servidor: exige certificado assinado por ca.pem (env: CHATCLI_SERVER_TLS_CLIENT_CA)
-    chatcli server --tls-cert cert.pem --tls-key key.pem --tls-client-ca ca.pem
-
-    # Cliente: apresenta o próprio certificado
-    export CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
-    export CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
-    chatcli connect servidor:50051 --tls --ca-cert ca.pem
-    ```
-
-    Com `--tls-client-ca`, um chamador que não envia bearer token é identificado pelo certificado verificado: o principal é `mtls:<CN>` (o primeiro URI SAN, depois o primeiro DNS SAN, quando o CN está vazio) e o papel vem de `CHATCLI_MTLS_ROLE` (`viewer`, `user` ou `admin`; padrão `user`; valor não reconhecido vira somente-leitura). Um bearer token, quando presente, continua prevalecendo, pois carrega o papel que o emissor escolheu. O Helm chart expõe isso como `security.mtlsRole`.
-
-    <Info>
-    Se o carregamento do certificado TLS falhar, o erro é escrito tanto em **stderr** quanto no log estruturado, incluindo os caminhos do certificado e da chave para facilitar o diagnóstico. Em Kubernetes, verifique com `kubectl logs` para visualizar o erro.
-    </Info>
   </Tab>
 </Tabs>
 
+### Roles
 
+| Role | Concedida por |
+|---|---|
+| `admin` | token compartilhado; JWT `role: admin`; nenhuma credencial configurada (loopback) |
+| `user` | JWT `role: user` ou `operator`; JWT sem claim `role`; padrão do mTLS |
+| `readonly` | JWT `role: readonly` ou `viewer`; **qualquer role não reconhecida** (registrada no log) |
 
-## Modos de Credencial
+Onde o servidor as aplica:
 
-O servidor suporta múltiplos modos de credencial LLM, dando flexibilidade total:
+| RPCs | Regra |
+|---|---|
+| `RunCoder`, `RunAgent`, `RunPipelineTool`, `ListPipelineTools` | só `admin` |
+| `ExecuteRemotePlugin` | `user` ou `admin` |
+| `ListRemotePlugins` | `readonly` recebe lista vazia; plugins com nome `_*` só aparecem para `admin` |
+| `DownloadPlugin` | `readonly` recebe `PermissionDenied`; um plugin com nome `_*` é `NotFound` para quem não é `admin` |
+| RPCs do hub agindo por outro principal, lendo a conversa de outro principal, listando todos os bindings | só `admin` |
+| Todos os outros RPCs (prompts, sessões, info do servidor, watcher, alertas, análise) | qualquer chamador autenticado |
 
-<AccordionGroup>
-  <Accordion title="1. Credenciais do Servidor (Padrão)">
-    O servidor usa suas próprias API keys configuradas via variáveis de ambiente:
+### Limitador de falhas de autenticação
 
-    ```bash
-    export OPENAI_API_KEY=sk-xxx
-    export LLM_PROVIDER=OPENAI
-    chatcli server
-    ```
+Cada host de cliente tem uma cota de autenticações bearer/JWT **que falharam**: rajada de 5, reposta a uma a cada 12 segundos; a tabela é zerada a cada 5 minutos. Só uma autenticação que falha consome a cota (credencial ausente, malformada, errada ou expirada); credenciais válidas nunca são limitadas, então um cliente movimentado, as sondas do operator e um laço de chamadas one-shot passam em velocidade normal. Quando um host esgota a cota, suas chamadas recebem `Unauthenticated: authentication failed` antes de a credencial ser conferida, até uma vaga ser reposta, e o log do servidor registra `auth failure rate limit exceeded`. Chamadores identificados só pelo certificado de cliente não passam por ele.
 
-    Nenhuma configuração adicional necessária no cliente.
-  </Accordion>
-  <Accordion title="2. Credenciais do Cliente (API Key)">
-    O cliente pode enviar sua própria API key, que o servidor usa em vez das suas:
+## TLS
 
-    ```bash
-    chatcli connect servidor:50051 --llm-key sk-minha-chave --provider OPENAI
-    ```
-  </Accordion>
-  <Accordion title="3. Credenciais do Cliente (OAuth Local)">
-    O cliente pode usar tokens OAuth do auth store local (`~/.chatcli/auth-profiles.json`):
+O servidor liga o TLS quando `--tls-cert` e `--tls-key` estão definidos; a versão mínima é **TLS 1.3**. Nenhum dos dois significa texto puro de propósito. Um sem o outro é recusado antes de qualquer coisa subir, em vez de cair num listener em texto puro: `FATAL: --tls-cert foi definido (server.crt) mas --tls-key não: recusando iniciar um listener em texto puro. Defina os dois, ou nenhum para texto puro` (e a mensagem espelhada para chave sem certificado). Certificado que não carrega é fatal e aparece no stderr: `FATAL: TLS certificate load failed: ... (cert=..., key=...)`.
 
-    ```bash
-    # Primeiro, faça login OAuth localmente
-    /auth login anthropic
+O certificado precisa valer para o nome que os clientes discam. Uma CA privada para testes:
 
-    # Depois, conecte usando as credenciais locais
-    chatcli connect servidor:50051 --use-local-auth
-    ```
-  </Accordion>
-  <Accordion title="4. Credenciais StackSpot">
-    Para o provedor StackSpot, envie as credenciais completas:
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout ca.key -out ca.crt -subj "/CN=chatcli-ca"
+openssl req -newkey rsa:2048 -nodes \
+  -keyout server.key -out server.csr -subj "/CN=chatcli.example.com"
+printf "subjectAltName=DNS:chatcli.example.com,DNS:localhost,IP:127.0.0.1\n" > server.ext
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -extfile server.ext -out server.crt
 
-    ```bash
-    chatcli connect servidor:50051 --provider STACKSPOT \
-      --client-id <id> --client-key <key> --realm <realm> --agent-id <agent>
-    ```
-  </Accordion>
-  <Accordion title="5. GitHub Copilot (OAuth Local)">
-    Para usar GitHub Copilot, faça login via Device Flow e conecte com `--use-local-auth`:
+# Opcional: certificado de cliente para mTLS
+openssl req -newkey rsa:2048 -nodes -keyout alice.key -out alice.csr -subj "/CN=alice"
+printf "extendedKeyUsage=clientAuth\n" > client.ext
+openssl x509 -req -in alice.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -extfile client.ext -out alice.crt
+```
 
-    ```bash
-    # Primeiro, faça login no GitHub Copilot
-    /auth login github-copilot
+O certificado é lido uma vez na inicialização: um certificado renovado só vale depois de reiniciar.
 
-    # Conecte usando as credenciais locais
-    chatcli connect servidor:50051 --use-local-auth --provider COPILOT
-    ```
-  </Accordion>
-  <Accordion title="6. Ollama (Sem Credenciais)">
-    Para modelos locais via Ollama, basta informar a URL:
+## Credenciais do LLM
 
-    ```bash
-    chatcli connect servidor:50051 --provider OLLAMA --ollama-url http://gpu-server:11434
-    ```
-  </Accordion>
-</AccordionGroup>
+O servidor chama o modelo com as próprias chaves, a menos que a requisição traga credenciais. Opções do `chatcli connect`:
 
+| Modo | Flags do cliente | Observações |
+|---|---|---|
+| Chaves do servidor (padrão) | nenhuma | `LLM_PROVIDER` / `--provider` do servidor e as chaves dele |
+| Chave de API do chamador | `--llm-key <chave> --provider <P>` | a chave vai ao servidor só para aquela requisição |
+| OAuth local do chamador | `--use-local-auth [--provider CLAUDEAI\|OPENAI\|COPILOT]` | lê `~/.chatcli/auth-profiles.json`; sem `--provider` tenta Anthropic, OpenAI e depois Copilot |
+| StackSpot | `--provider STACKSPOT --client-id … --client-key … --realm … --agent-id …` | |
+| Ollama | `--provider OLLAMA --ollama-url https://…` | a URL passa pela [checagem de SSRF](#proteção-contra-ssrf): HTTPS e endereço público. Para um Ollama em rede privada, defina `OLLAMA_ENABLED=true` e `OLLAMA_BASE_URL` no **servidor** e conecte só com `--provider OLLAMA` |
 
+A imagem do servidor não inclui o Devin CLI, então `DEVIN` não está disponível como provedor do servidor.
 
-## Arquitetura gRPC
+## Roteamento de requisições
 
-O servidor implementa um serviço gRPC com os seguintes RPCs:
+Todo RPC de prompt (`SendPrompt`, `StreamPrompt`, `InteractiveSession`, `AnalyzeIssue`, `AgenticStep`) resolve o cliente do modelo do mesmo jeito:
 
-| RPC | Descrição |
-|-----|-----------|
-| `SendPrompt` | Envia um prompt e recebe a resposta completa |
-| `StreamPrompt` | Envia um prompt e recebe a resposta em chunks progressivos |
-| `InteractiveSession` | Streaming bidirecional para sessões interativas |
-| `ListSessions` | Lista sessões salvas no servidor |
-| `LoadSession` | Carrega uma sessão salva |
-| `SaveSession` | Salva a sessão atual |
-| `DeleteSession` | Remove uma sessão salva |
-| `Health` | Health check do servidor |
-| `GetServerInfo` | Informações do servidor (versão, provider, modelo, watcher) |
-| `GetWatcherStatus` | Status do K8s Watcher (se ativo) |
-| `ListRemotePlugins` | Lista plugins disponíveis no servidor |
-| `ListRemoteAgents` | Lista agents disponíveis no servidor |
-| `ListRemoteSkills` | Lista skills disponíveis no servidor |
-| `GetAgentDefinition` | Retorna o conteúdo completo de um agent (markdown + frontmatter) |
-| `GetSkillContent` | Retorna o conteúdo completo de uma skill |
-| `ExecuteRemotePlugin` | Executa um plugin no servidor e retorna o resultado |
-| `DownloadPlugin` | Streaming de download do binário de um plugin |
-| `GetAlerts` | Retorna alertas ativos do K8s Watcher (usado pelo Operator) |
-| `StreamAlerts` | Empurra alertas do K8s Watcher conforme surgem, com heartbeats (streaming do servidor; usado pelo Operator) |
-| `AnalyzeIssue` | Envia contexto de um Issue ao LLM e retorna análise + ações sugeridas |
-| `AgenticStep` | Executa um turno do loop de remediação guiado por IA (usado pelo Operator) |
-| `ResolveActiveConversation` | Retorna a conversa atual do principal, criando uma no primeiro contato (conversation hub) |
-| `NewConversation` | Rotaciona a conversa ativa do principal para um thread novo; todo canal acompanha |
-| `AppendEvent` | Anexa um turno de diálogo ao log compartilhado de uma conversa |
-| `ReadConversation` | Retorna os eventos após um número de sequência (hidratação/resume) |
-| `SubscribeConversation` | Acompanha uma conversa ao vivo: backlog e depois os eventos que qualquer canal anexar (server streaming) |
-| `SetBinding` | Mapeia uma identidade de canal (plataforma, user id) a um principal |
-| `ListBindings` | Lista os vínculos canal → principal |
-| `ChatTurn` | Turno de chat com o pipeline completo no servidor (memória, contextos, skills, knowledge, compactação); opt-in, veja [RPCs de pipeline](#rpcs-de-pipeline) |
-| `RunCoder` | Roda o loop do coder no servidor com as ferramentas dele (streaming: linhas da transcrição e, por fim, a resposta final) |
-| `RunAgent` | Roda o loop do agent no servidor (mesmo contrato) |
-| `ListPipelineTools` | Lista as ferramentas que o engine hospedado no servidor expõe |
-| `RunPipelineTool` | Invoca uma dessas ferramentas |
+- Uma requisição que encaminha credencial (`--llm-key`, `--use-local-auth`, campos da StackSpot, URL do Ollama) ou que nomeia provedor ou modelo ganha um cliente dedicado só para ela.
+- Uma requisição que não nomeia nada nem encaminha nada passa pela [cadeia de fallback](#cadeia-de-fallback) quando há uma instalada; senão, usa o provedor e o modelo padrão do servidor.
+- `max_tokens` é o valor da requisição quando definido; senão o override `*_MAX_TOKENS` do provedor (`ANTHROPIC_MAX_TOKENS`, `OPENAI_MAX_TOKENS`, `BEDROCK_MAX_TOKENS`, …); senão o teto do catálogo para o modelo.
+- Um 401/403 do provedor nas credenciais **do servidor** reconstrói os provedores uma vez e tenta de novo; as reconstruções são limitadas a uma a cada 30 segundos no processo inteiro. Credenciais encaminhadas pelo chamador nunca são renovadas.
+- Uma resposta interrompida por classificador de segurança (`stop_reason: refusal`) é reenviada uma vez para o modelo irmão do mesmo provedor; em stream, só enquanto nenhum texto foi enviado.
 
-### gRPC com Múltiplas Réplicas
+As requisições rodam em paralelo, cada uma com seu cliente.
 
-O gRPC usa conexões HTTP/2 persistentes que, por padrão, fixam em um único pod via kube-proxy. Para cenários com múltiplas réplicas no Kubernetes:
+### Cadeia de fallback
 
-- **1 réplica**: Service ClusterIP padrão — sem configuração extra necessária
-- **Múltiplas réplicas**: Use um Service headless (`ClusterIP: None`) para que o DNS retorne os IPs individuais dos pods, habilitando balanceamento round-robin client-side via resolver `dns:///` do gRPC
-- O client do ChatCLI já possui **keepalive** (ping a cada 10s) e suporte a **round-robin** integrados
-- No Helm chart, habilite `service.headless: true` quando `replicaCount > 1`
-- No Operator, o headless é ativado **automaticamente** quando `spec.replicas > 1`
+```bash
+export ANTHROPIC_API_KEY=sk-ant-xxx OPENAI_API_KEY=sk-xxx GOOGLEAI_API_KEY=xxx
+export CHATCLI_FALLBACK_MODEL_OPENAI=gpt-6-sol
+chatcli server --provider CLAUDEAI --fallback-providers CLAUDEAI,OPENAI,GOOGLEAI
+```
 
-<Info>
-Para mais detalhes, veja a [documentação do K8s Operator](/pt/features/k8s-operator) e o [deploy com Helm](/pt/getting-started/docker-deployment).
-</Info>
+- A cadeia é montada **só** a partir de `--fallback-providers` / `CHATCLI_FALLBACK_PROVIDERS`, nessa ordem. O servidor não acrescenta o `--provider`: coloque você mesmo o primário na frente. O [Helm chart](/pt/getting-started/docker-deployment#fallback-de-provedor) e o `spec.fallback` do operator já colocam o primário na frente para você.
+- Cada entrada usa `CHATCLI_FALLBACK_MODEL_<PROVEDOR>` quando definido, senão `--model`, senão o padrão do provedor.
+- Um provedor cujo cliente não pode ser criado (sem chave) é pulado com um aviso. A cadeia só é instalada com **pelo menos duas** entradas restantes; aí o log mostra `Fallback chain initialized`.
+- Ela atende só requisições que não trazem credenciais nem nomeiam provedor ou modelo. A resposta informa o provedor e o modelo que de fato responderam.
+- `CHATCLI_FALLBACK_ENABLED` não é lida pelo servidor; é a lista que liga a cadeia.
+
+Veja [Fallback de provedores](/pt/features/provider-fallback) para a classificação de erros e os cooldowns.
+
+## API gRPC
+
+Serviço `chatcli.v1.ChatCLIService` (proto: `proto/chatcli/v1/chatcli.proto` no repositório), mais o padrão `grpc.health.v1.Health`:
+
+| RPC | Tipo | Para quê |
+|---|---|---|
+| `SendPrompt` | unário | Um prompt, a resposta completa |
+| `StreamPrompt` | stream do servidor | Um prompt, a resposta conforme o provedor transmite |
+| `InteractiveSession` | stream bidirecional | Uma conversa num único stream |
+| `ListSessions`, `LoadSession`, `SaveSession`, `DeleteSession` | unário | Sessões guardadas no servidor |
+| `GetServerInfo` | unário | Versão, provedor, modelo, provedores disponíveis, watcher, contagem de plugins/agentes/skills, `pipeline_enabled` |
+| `GetWatcherStatus` | unário | Estado do K8s watcher |
+| `Health` | unário | Liveness e versão, sem credencial |
+| `GetAlerts` | unário | Alertas ativos do watcher |
+| `StreamAlerts` | stream do servidor | Alertas do watcher assim que surgem, com heartbeats |
+| `AnalyzeIssue` | unário | Análise de causa raiz e ações sugeridas para uma Issue (operator) |
+| `AgenticStep` | unário | Um passo do loop de remediação por IA (operator) |
+| `ListRemotePlugins`, `ExecuteRemotePlugin`, `DownloadPlugin` | unário / unário / stream do servidor | Plugins instalados no servidor |
+| `ListRemoteAgents`, `GetAgentDefinition`, `ListRemoteSkills`, `GetSkillContent` | unário | Agentes e skills do servidor |
+| `ResolveActiveConversation`, `NewConversation`, `AppendEvent`, `ReadConversation`, `SubscribeConversation`, `SetBinding`, `ListBindings` | unário; `SubscribeConversation` stream do servidor | [Hub de conversas](/pt/features/conversation-hub) |
+| `ChatTurn` | unário | Turno de chat com o pipeline completo no servidor |
+| `RunCoder`, `RunAgent` | stream do servidor | Loop do coder / agente no servidor |
+| `ListPipelineTools`, `RunPipelineTool` | unário | Ferramentas do motor hospedado no servidor |
 
 ### Streaming
 
-`StreamPrompt` transmite o texto conforme o provedor o produz: cada chunk é um fragmento que o provedor emitiu, não uma fatia de uma resposta pronta. A mensagem final (`done: true`) carrega o `usage` que o provedor reportou e o `stop_reason`. Quando a rota escolhida não consegue fazer streaming, a resposta é concluída em uma chamada e entregue como um único chunk, então o cliente nunca precisa de um segundo caminho de código.
+`StreamPrompt` repassa cada fragmento assim que o provedor o emite. A mensagem final (`done: true`) traz o `usage` e o `stop_reason` do provedor. Quando a rota escolhida não faz streaming, a resposta é gerada numa chamada e enviada como um único chunk.
 
-### Atribuição da Resposta e Uso de Tokens
+### Atribuição da resposta e uso de tokens
 
-As respostas de `SendPrompt`, `AnalyzeIssue` e `AgenticStep`, e a mensagem final do `StreamPrompt`, carregam uma mensagem `TokenUsage` e um `stop_reason`, e nomeiam o `provider` e o `model` que de fato responderam (a cadeia de fallback pode responder com um provedor diferente do configurado):
+`SendPrompt`, `AnalyzeIssue`, `AgenticStep` e a mensagem final do `StreamPrompt` trazem um `TokenUsage`, um `stop_reason`, e o `provider` e o `model` que responderam (a cadeia de fallback pode responder com outro provedor que não o padrão):
 
 ```protobuf
 message TokenUsage {
@@ -421,367 +342,295 @@ message TokenUsage {
   int32 cache_read_tokens = 3;
   int32 cache_write_tokens = 4;
   int32 reasoning_tokens = 5;
-  bool estimated = 6;   // provedor não retornou usage; contagem derivada do tamanho em caracteres
-  double cost_usd = 7;  // precificado pelo servidor com as mesmas tabelas do /cost
-  bool cost_known = 8;  // false quando o modelo não tem preço publicado (cost_usd é 0)
+  bool estimated = 6;   // provedor não devolveu usage; contagem derivada do tamanho
+  double cost_usd = 7;  // precificado com as mesmas tabelas do /cost
+  bool cost_known = 8;  // false quando o modelo não tem preço publicado
 }
 ```
 
-`stop_reason` é o que o provedor reportou (`end_turn`, `max_tokens`, `refusal`, ...). O `chatcli connect` alimenta o cost tracker local com esse usage, então o `/cost` numa conexão remota precifica os tokens reais em vez de uma estimativa por caracteres.
-
-### Roteamento das Requisições
-
-Todo RPC de prompt (`SendPrompt`, `StreamPrompt`, `InteractiveSession`, `AnalyzeIssue`, `AgenticStep`) resolve seu cliente de LLM pelas mesmas regras:
-
-- Uma credencial encaminhada pelo chamador (`--llm-key`, `--use-local-auth`, campos do StackSpot) ou um override explícito de provedor/modelo recebe um cliente dedicado.
-- Uma requisição que não nomeia provedor nem modelo e não encaminha credencial passa pela **cadeia de fallback** configurada (`CHATCLI_FALLBACK_*`) quando existe uma, senão pelo cliente padrão do servidor. A resposta nomeia a entrada da cadeia que respondeu.
-- `max_tokens` é o valor da requisição quando informado, senão o override de ambiente `*_MAX_TOKENS` do provedor (`OPENAI_MAX_TOKENS`, `ANTHROPIC_MAX_TOKENS`, `GOOGLEAI_MAX_TOKENS`, `BEDROCK_MAX_TOKENS`, ...), senão o teto do catálogo para o modelo.
-- Uma credencial **do servidor** expirada (401/403 do provedor) dispara um refresh dos provedores e uma nova tentativa. O refresh é limitado a um a cada 30 segundos por processo, então uma rajada de 401 sob carga reconstrói os provedores uma vez só. Credenciais encaminhadas pelo chamador nunca são renovadas: o cliente remoto é dono delas.
-- Uma resposta interrompida por classificador de segurança (`stop_reason: refusal`) é reenviada uma vez no modelo irmão do mesmo provedor, como o loop do agente faz. Num stream isso só acontece enquanto nenhum texto foi exibido.
-
-As requisições não são serializadas: cada RPC continua rodando concorrentemente na sua própria instância de cliente.
+O `chatcli connect` alimenta o rastreador de custo com esse usage, então o `/cost` numa conexão remota precifica tokens reais.
 
 ### RPCs de pipeline
 
-`SendPrompt` é um proxy de modelo: com `chatcli connect`, o pipeline de enriquecimento (memória, anexos do `/context`, skills, recuperação de knowledge, compactação) roda na **sua** CLI e o servidor só fala com o modelo. Clientes finos, o operator e automações que querem que o **servidor** seja dono do turno inteiro usam os RPCs de pipeline, o mesmo engine que os servidores MCP e ACP em stdio expõem:
+`SendPrompt` é um proxy do modelo: com `chatcli connect`, memória, anexos de `/context`, skills, knowledge e compactação rodam na **sua** CLI e o servidor só chama o modelo. Os RPCs de pipeline fazem o **servidor** assumir o turno inteiro, com o mesmo motor que os servidores MCP e ACP via stdio expõem:
 
 ```bash
-CHATCLI_SERVER_PIPELINE=true chatcli server --port 50051 --token meu-token
+CHATCLI_SERVER_PIPELINE=true LLM_PROVIDER=CLAUDEAI chatcli server --token "$CHATCLI_SERVER_TOKEN"
 ```
 
-| RPC | O que roda no servidor | Papel |
+| RPC | O que roda no servidor | Role |
 |---|---|---|
-| `ChatTurn` | um turno de chat com o pipeline completo (`plain: true` pede o passthrough cru); provider/modelo opcionais por turno | qualquer chamador autenticado |
-| `RunCoder`, `RunAgent` | o loop do coder / agent com as ferramentas do servidor; o stream traz as linhas da transcrição e, por fim, a resposta final | `admin` |
-| `ListPipelineTools`, `RunPipelineTool` | as ferramentas admitidas pela policy (`@git`, `@read`, ...) | `admin` |
+| `ChatTurn` | um turno de chat com o pipeline de enriquecimento (`plain: true` pede o repasse puro); provedor/modelo opcional por turno | qualquer chamador autenticado |
+| `RunCoder`, `RunAgent` | o loop do coder / agente com as ferramentas do servidor; o stream traz linhas da transcrição e depois a resposta final | `admin` |
+| `ListPipelineTools`, `RunPipelineTool` | as ferramentas admitidas pela policy (`@git`, `@read`, …) | `admin` |
 
-As sessões são namespaced pelo principal autenticado (`<subject>/<sessão>`; a sessão padrão quando nenhuma é informada), então dois chamadores nunca dividem uma conversa por escolher o mesmo id. `GetServerInfo` informa `pipeline_enabled`.
+- O motor lê o provedor e o modelo padrão de `LLM_PROVIDER` / `LLM_MODEL`, não de `--provider` / `--model`.
+- As sessões ficam no namespace do principal autenticado (`<subject>/<sessão>`), então dois chamadores nunca dividem uma conversa por escolherem o mesmo id.
+- Sem `CHATCLI_SERVER_PIPELINE=true` os RPCs devolvem `Unavailable: the pipeline RPCs are not enabled on this server (start it with CHATCLI_SERVER_PIPELINE=true)`.
+- `GetServerInfo.pipeline_enabled` informa se eles estão ativos.
 
 <Warning>
-O engine hospeda um ChatCLI dentro do processo do servidor: os workers dele (memória, servidores MCP, scheduler) rodam ali e os turnos são **serializados**; chamadores concorrentes entram na fila, limitados pelo próprio deadline. É exclusivo com o gateway co-localizado (`CHATCLI_GATEWAY_IN_SERVER`), que constrói o próprio engine; com os dois definidos o pipeline fica desligado e o motivo vai para o log. Prefira uma Instance (ou conjunto de réplicas) dedicada ao tráfego de pipeline.
+O motor é um ChatCLI dentro do processo do servidor: os workers dele (memória, servidores MCP, scheduler) rodam ali e os turnos são serializados, então chamadores simultâneos entram em fila. Ele não divide o processo com o gateway co-localizado: com `CHATCLI_SERVER_PIPELINE=true` e `CHATCLI_GATEWAY_IN_SERVER=true` juntos, o gateway roda, o pipeline fica desligado e o log diz `Pipeline RPCs disabled: CHATCLI_SERVER_PIPELINE and CHATCLI_GATEWAY_IN_SERVER cannot share one process; run the gateway separately`.
 </Warning>
 
-Helm: `pipeline.enabled: true` no chart do servidor; Operator: `spec.pipeline.enabled: true` na Instance.
+Helm: `pipeline.enabled: true` no chart do servidor. Operator: `spec.pipeline.enabled: true` na Instance.
 
-### RPCs de Descoberta de Recursos
+### RPCs de AIOps
 
-Os RPCs `ListRemotePlugins`, `ListRemoteAgents`, `ListRemoteSkills`, `GetAgentDefinition`, `GetSkillContent`, `ExecuteRemotePlugin` e `DownloadPlugin` permitem que clientes conectados descubram e usem recursos instalados no servidor.
-
-- **Plugins**: Executados no servidor via `ExecuteRemotePlugin` ou baixados via `DownloadPlugin` (streaming binário)
-- **Agents/Skills**: Conteúdo markdown transferido ao client via `GetAgentDefinition`/`GetSkillContent` para composição local de prompts
-
-### RPCs da Plataforma AIOps
-
-Os RPCs `GetAlerts`, `StreamAlerts`, `AnalyzeIssue` e `AgenticStep` são usados pelo [Operator AIOps](/pt/features/k8s-operator) para alimentar o pipeline autônomo de remediação. As respostas de `AnalyzeIssue` e `AgenticStep` também carregam os campos `usage`, `provider` e `model` descritos acima.
-
-#### GetAlerts
-
-Retorna os alertas ativos detectados pelo K8s Watcher:
+`GetAlerts`, `StreamAlerts`, `AnalyzeIssue` e `AgenticStep` alimentam o pipeline de remediação do [operator](/pt/features/k8s-operator). Os alertas são os do [K8s watcher](/pt/features/k8s-watcher#alertas):
 
 ```protobuf
-rpc GetAlerts(GetAlertsRequest) returns (GetAlertsResponse);
+message WatcherAlert {
+  string type = 1;            // HighRestartCount, OOMKilled, PodNotReady, DeploymentFailing, JobFailed, CronJobMissed, NodeNotReady, ...
+  string severity = 2;        // INFO, WARNING, CRITICAL
+  string message = 3;
+  string object = 4;          // nome do pod, ou Kind/nome
+  string namespace = 5;
+  string deployment = 6;
+  int64 timestamp_unix = 7;
+}
 
 message GetAlertsRequest {
-  string namespace = 1;     // Filtrar por namespace (vazio = todos)
-  string deployment = 2;    // Filtrar por deployment (vazio = todos)
+  string namespace = 1;       // filtro opcional
+  string deployment = 2;      // filtro opcional
 }
-
-message AlertInfo {
-  string alert_type = 1;    // HighRestartCount, OOMKilled, PodNotReady, DeploymentFailing
-  string deployment = 2;
-  string namespace = 3;
-  string message = 4;
-  string severity = 5;      // critical, warning
-  int64 timestamp = 6;
-}
+message GetAlertsResponse { repeated WatcherAlert alerts = 1; }
 ```
 
 #### StreamAlerts
-
-Empurra os alertas no instante em que o watcher os gera, então o operator não precisa mais fazer polling. É streaming do lado do servidor sobre a mesma conexão autenticada:
 
 ```protobuf
 rpc StreamAlerts(StreamAlertsRequest) returns (stream StreamAlertsResponse);
 
 message StreamAlertsRequest {
-  string namespace = 1;     // Filtrar por namespace (vazio = todos)
-  string deployment = 2;    // Filtrar por deployment (vazio = todos)
-  bool include_current = 3; // Abrir com os alertas ativos agora
+  string namespace = 1;       // filtro opcional
+  string deployment = 2;      // filtro opcional
+  bool include_current = 3;   // abre com os alertas ativos agora
 }
-
 message StreamAlertsResponse {
-  WatcherAlert alert = 1;   // Vazio num heartbeat
-  bool heartbeat = 2;       // Sinal de vida a cada 15s enquanto o watcher está quieto
+  WatcherAlert alert = 1;     // vazio num heartbeat
+  bool heartbeat = 2;         // a cada 15s enquanto o watcher está quieto
 }
 ```
 
-- Com `include_current` o stream abre com os alertas que `GetAlerts` devolveria e depois só chegam os novos. O dedup do próprio watcher (mesmo tipo e objeto dentro da janela) garante que cada alerta é empurrado uma vez.
-- Heartbeats a cada 15 segundos permitem distinguir um watcher quieto de uma conexão morta. Sem watcher configurado o stream carrega só heartbeats, equivalente ao `GetAlerts` devolver lista vazia.
-- Cada assinante tem um buffer limitado. Quem fica para trás é derrubado com `ABORTED`: reabra o stream com `include_current` para ressincronizar. `GetAlerts` continua disponível para leituras pontuais e para clientes que preferem polling.
+- Com `include_current` o stream começa com o que o `GetAlerts` devolveria e depois só chegam alertas novos. O watcher deduplica por tipo e objeto dentro da janela, então cada alerta é enviado uma vez.
+- Heartbeats a cada 15 segundos distinguem um watcher quieto de uma conexão morta. Sem watcher, o stream só traz heartbeats.
+- Um assinante que estoura o buffer limitado é derrubado com `ABORTED`; reabra com `include_current` para ressincronizar.
 
 #### AnalyzeIssue
 
-Envia o contexto de um Issue ao LLM e retorna análise estruturada com ações sugeridas:
-
 ```protobuf
-rpc AnalyzeIssue(AnalyzeIssueRequest) returns (AnalyzeIssueResponse);
-
 message AnalyzeIssueRequest {
   string issue_name = 1;
   string namespace = 2;
   string resource_kind = 3;
   string resource_name = 4;
-  string signal_type = 5;
-  string severity = 6;
+  string signal_type = 5;              // error_rate, oom_kill, pod_restart, ...
+  string severity = 6;                 // low, medium, high, critical
   string description = 7;
   int32 risk_score = 8;
-  string provider = 9;
-  string model = 10;
-}
-
-message SuggestedAction {
-  string name = 1;
-  string action = 2;
-  string description = 3;
-  map<string, string> params = 4;
+  string provider = 9;                 // override opcional
+  string model = 10;                   // override opcional
+  string kubernetes_context = 11;      // status do deployment, pods, eventos, revisões
+  string previous_failure_context = 12; // tentativas de remediação anteriores que falharam
 }
 
 message AnalyzeIssueResponse {
   string analysis = 1;
-  float confidence = 2;     // 0.0-1.0
+  float confidence = 2;                // 0.0 a 1.0
   repeated string recommendations = 3;
-  string provider = 4;
-  string model = 5;
+  string model = 4;
+  string provider = 5;
   repeated SuggestedAction suggested_actions = 6;
   TokenUsage usage = 7;
 }
 ```
 
-### REST API Gateway
+### Descoberta de recursos
 
-Além do gRPC, o operator agora expõe uma **API REST HTTP** na porta `:8090` com:
+`ListRemotePlugins`, `ExecuteRemotePlugin` e `DownloadPlugin` expõem os plugins instalados no servidor; `ListRemoteAgents`, `GetAgentDefinition`, `ListRemoteSkills` e `GetSkillContent` expõem seus agentes e skills. O comando `/connect` dentro do REPL registra os plugins do servidor na sua sessão; veja [Conexão Remota](/pt/features/remote-connect#plugins-remotos-sessões-e-status-do-watcher).
 
-- **30+ endpoints** cobrindo incidents, SLOs, runbooks, approvals, postmortems, analytics, clusters e audit
-- **Autenticação** via `X-API-Key` com mapeamento de roles (viewer/operator/admin)
-- **Rate limiting** de 100 req/min por chave
-- **Web Dashboard** embutido servido em `/`
+## Health checks
 
-Para referência completa, consulte a [API Reference](/pt/reference/api/overview).
-
-
-
-## Comandos Remotos via InteractiveSession
-
-Ao conectar a um servidor via `chatcli connect`, a sessão interativa suporta comandos executados diretamente no servidor:
-
-| Comando | Descrição |
-|---------|-----------|
-| `/status` | Informações do servidor (versão, provider, modelo, uptime) |
-| `/watcher status` | Detalhes do K8s Watcher (targets, snapshots, alertas) |
-| `/plugins list` | Lista plugins disponíveis no servidor |
-| `/agents list` | Lista agents disponíveis no servidor |
-| `/skills list` | Lista skills disponíveis no servidor |
-
-Esses comandos são processados pelo servidor e retornam resultados via streaming gRPC bidirecional (`InteractiveSession`).
-
-
-
-## Integração com K8s Watcher
-
-Quando o servidor é iniciado com `--watch-config` ou `--watch-deployment`, o K8s Watcher monitora continuamente os deployments e **injeta automaticamente o contexto Kubernetes em todos os prompts** dos clientes remotos.
-
-<Tabs>
-  <Tab title="Single-Target (legado)">
-    ```bash
-    chatcli server --watch-deployment myapp --watch-namespace production
-    ```
-  </Tab>
-  <Tab title="Multi-Target (recomendado)">
-    ```bash
-    chatcli server --watch-config targets.yaml
-    ```
-
-    O arquivo `targets.yaml` define múltiplos deployments, métricas Prometheus e budget de contexto. Veja [K8s Watcher](/pt/features/k8s-watcher) para o formato completo.
-  </Tab>
-</Tabs>
-
-Qualquer usuário conectado pode fazer perguntas sobre os deployments sem configuração adicional:
-
-```text
-Conectado ao ChatCLI server (version: 1.0.0, provider: OPENAI, model: gpt-4o)
-K8s watcher active: 5 targets (interval: 30s)
-
-> Quais deployments precisam de atenção?
-> Análise as métricas HTTP do api-gateway
-```
-
-
-
-## Rate Limiting
-
-O servidor implementa rate limiting por cliente usando token bucket para proteger contra abuso. O limitador roda **depois** da autenticação e usa como chave o sujeito do chamador — o `sub` do JWT ou o principal do certificado — então tenants atrás do mesmo NAT ou ingress não dividem um bucket; chamadores anônimos são chaveados pelo endereço. Rajadas não autenticadas são contidas à parte pelo limitador de falhas de autenticação por endereço.
-
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `CHATCLI_RATE_LIMIT_RPS` | Requisições por segundo por cliente | `10` |
-| `CHATCLI_RATE_LIMIT_BURST` | Burst máximo permitido | `30` |
-
-Quando o limite é atingido, o servidor retorna o código gRPC `ResourceExhausted` com um header `Retry-After` indicando quantos segundos o cliente deve aguardar.
+| Checagem | Onde | Credencial | Resposta |
+|---|---|---|---|
+| `grpc.health.v1.Health/Check` | porta gRPC | nenhuma | `SERVING` quando o listener está servindo, `NOT_SERVING` durante o desligamento. Nomes de serviço `""` e `chatcli.v1.ChatCLIService` |
+| `chatcli.v1.ChatCLIService/Health` | porta gRPC | nenhuma | status e versão do servidor (o que o `chatcli connect` chama primeiro) |
+| `GET /healthz` | porta de métricas (`9090`) | nenhuma | `200 ok`; só quando `--metrics-port` não é `0` |
 
 ```bash
-export CHATCLI_RATE_LIMIT_RPS=20
-export CHATCLI_RATE_LIMIT_BURST=50
-chatcli server
+grpc-health-probe -addr=localhost:50051                                  # texto puro
+grpc-health-probe -addr=chatcli.example.com:50051 -tls -tls-ca-cert ca.crt  # TLS
+curl -s http://localhost:9090/healthz
 ```
 
-<Tip>
-Em ambientes com múltiplos clientes legítimos, aumente o burst para acomodar picos de uso. O RPS controla a taxa sustentada.
-</Tip>
+Os RPCs de health pulam a checagem do bearer, mas com mTLS o handshake TLS ainda exige certificado de cliente (`grpc-health-probe -tls-client-cert … -tls-client-key …`). A imagem do container traz o `grpc-health-probe` em `/usr/local/bin/grpc-health-probe`. Probe `grpc` do kubelet não faz TLS, por isso o Helm chart usa `/healthz` e uma checagem TCP.
 
+## Métricas
 
+`--metrics-port` (padrão `9090`) serve métricas Prometheus em `/metrics` (com negociação OpenMetrics) e `/healthz`. O listener de métricas faz bind em **todas as interfaces**, independente de `CHATCLI_BIND_ADDRESS`, e não tem autenticação: coloque firewall ou use `--metrics-port 0`.
 
-## Prevenção de SSRF
+| Métrica | Tipo | Labels |
+|---|---|---|
+| `chatcli_grpc_requests_total` | counter | `method`, `code` |
+| `chatcli_grpc_request_duration_seconds` | histogram | `method` |
+| `chatcli_grpc_in_flight_requests` | gauge | `method` |
+| `chatcli_grpc_stream_messages_sent_total` / `_received_total` | counter | `method` |
+| `chatcli_llm_requests_total` | counter | `provider`, `model`, `status` |
+| `chatcli_llm_request_duration_seconds` | histogram | `provider`, `model` |
+| `chatcli_llm_tokens_used_total` | counter | `provider`, `model`, `type` |
+| `chatcli_llm_errors_total` | counter | `provider`, `model`, `error_type` |
+| `chatcli_session_active_total` | gauge | — |
+| `chatcli_session_operations_total` | counter | `operation` |
+| `chatcli_server_info` | gauge (1) | `version`, `provider`, `model` |
+| `chatcli_server_uptime_seconds` | gauge | — |
+| `chatcli_watcher_*` | | veja [métricas do K8s Watcher](/pt/features/k8s-watcher#métricas-prometheus-do-watcher) |
 
-O servidor valida todas as URLs configuradas em `provider_config` antes de utilizá-las, bloqueando:
+Os coletores de runtime Go e de processo (`go_*`, `process_*`) também são registrados.
 
-- **IPs privados**: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
-- **Metadados de cloud**: `169.254.169.254` (AWS, GCP, Azure)
-- **Link-local**: `169.254.0.0/16`, `fe80::/10`
-- **Loopback**: `127.0.0.0/8`, `::1`
+### Exportação OpenTelemetry (OTLP)
 
-<Warning>
-Isso impede que provedores LLM maliciosos ou configurações incorretas acessem recursos internos da rede. A validação ocorre antes de qualquer requisição HTTP ser enviada.
-</Warning>
-
-
-
-## Limites de Tamanho de Mensagem
-
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `CHATCLI_MAX_RECV_MSG_SIZE` | Tamanho máximo de mensagem recebida | `50MB` |
-| `CHATCLI_MAX_SEND_MSG_SIZE` | Tamanho máximo de mensagem enviada | `50MB` |
-| `CHATCLI_MAX_CONCURRENT_STREAMS` | Streams simultâneas por conexão | `100` |
-
-Esses limites protegem contra ataques de esgotamento de recursos e garantem estabilidade do servidor sob carga.
-
-
-
-## Audit Logging
-
-O servidor pode gerar logs de auditoria em formato JSON-lines para rastreabilidade completa:
-
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `CHATCLI_AUDIT_LOG_PATH` | Caminho do arquivo de audit log (vazio = desabilitado) | `""` |
-
-Cada requisição recebe um **Request ID** único para correlação. Os eventos registrados incluem:
-
-- Autenticação (sucesso/falha)
-- Execução de prompts e plugins
-- Operações de sessão (save/load/delete)
-- Alterações de configuração
+O motor do ChatCLI pode enviar os contadores de sessão para um coletor OpenTelemetry via OTLP/HTTP (JSON), configurado só pelas variáveis padrão do OTel:
 
 ```bash
-export CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.jsonl
-chatcli server
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4318"
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20token"
+export OTEL_SERVICE_NAME="chatcli"          # padrão
+export OTEL_METRIC_EXPORT_INTERVAL=60000    # ms, padrão
 ```
 
-<Info>
-O formato JSON-lines facilita integração com ferramentas como `jq`, Elasticsearch, Loki e Splunk. Cada linha é um objeto JSON independente com timestamp, request ID, ação e resultado.
-</Info>
+No modo servidor isso cobre os turnos que rodam num motor dentro do processo, ou seja, os [RPCs de pipeline](#rpcs-de-pipeline) e o gateway co-localizado. O tráfego de proxy `SendPrompt`/`StreamPrompt` é medido pelas métricas Prometheus acima. Somas exportadas: `chatcli.llm.tokens`, `chatcli.llm.cost`, `chatcli.context.compactions`, `chatcli.context.compaction_cost`, `chatcli.cache.requests`, `chatcli.cache.storage_cost` e, só com `OTEL_RESOURCE_ATTRIBUTES` contendo `chatcli.session=attr`, `chatcli.session.cost`.
 
+## Limites e keepalive
 
+| Configuração | Padrão | Variável |
+|---|---|---|
+| Requisições por segundo por chamador | `10` | `CHATCLI_RATE_LIMIT_RPS` |
+| Burst por chamador | `20` | `CHATCLI_RATE_LIMIT_BURST` |
+| Mensagem máxima recebida / enviada | 50 MB / 50 MB | `CHATCLI_MAX_RECV_MSG_SIZE` / `CHATCLI_MAX_SEND_MSG_SIZE` |
+| Streams simultâneos por conexão | `100` | `CHATCLI_MAX_CONCURRENT_STREAMS` |
 
-## Rotação de Logs
+O rate limiter é um token bucket por chamador que roda **depois** da autenticação. A chave é o subject do chamador: `sub` do JWT, `mtls:<nome>`, `legacy-token` para o token compartilhado (então todos os clientes do token compartilhado dividem **um** bucket), `system` quando não há credencial configurada; os RPCs de health usam o endereço do peer. Acima do limite, uma chamada unária ou um stream falha com `ResourceExhausted: rate limit exceeded, retry after N seconds` e um header `retry-after` com o mesmo N: o tempo para repor um token, arredondado para cima e nunca abaixo de 1 segundo (`1` no padrão de 10 rps).
 
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `CHATCLI_LOG_FILE` | Caminho do arquivo de log principal | `""` (stdout) |
-| `CHATCLI_LOG_MAX_SIZE_MB` | Tamanho máximo antes de rotacionar | `100` |
-| `CHATCLI_LOG_MAX_BACKUPS` | Número de backups antigos a manter | `5` |
-| `CHATCLI_LOG_MAX_AGE_DAYS` | Dias máximos de retenção | `30` |
-| `CHATCLI_LOG_COMPRESS` | Comprimir backups com gzip | `true` |
+Keepalive: o servidor aceita pings de cliente a cada 20 segundos ou mais (mesmo sem stream ativo) e manda ping em conexões ociosas a cada 60 segundos, fechando-as depois de 10 segundos sem resposta. O `chatcli connect` e o operator mandam ping a cada 30 segundos.
+
+## Proteção contra SSRF
+
+URLs de provedor enviadas por um **chamador** (por exemplo `--ollama-url`, campos `base_url`, `api_base`, `endpoint`, `url`, `host`, `server_url`, `realm_url`) são checadas antes do uso:
+
+- só `https://`; `http://` exige `CHATCLI_ALLOW_HTTP_PROVIDERS=true` no servidor;
+- o host (ou cada endereço para o qual ele resolve) não pode estar em `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7`, `fe80::/10`, `ff00::/8` ou faixas IPv4 mapeadas; não há override para endereços privados;
+- hostnames de metadata de nuvem (`metadata.google.internal`, `metadata.goog`, `instance-data`) são recusados.
+
+A configuração do próprio servidor (por exemplo `OLLAMA_BASE_URL`) não passa por essa checagem.
+
+## Log de auditoria
 
 ```bash
-export CHATCLI_LOG_FILE=/var/log/chatcli/server.log
-export CHATCLI_LOG_MAX_SIZE_MB=50
-export CHATCLI_LOG_MAX_BACKUPS=10
-chatcli server
+export CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.jsonl   # precisa ser absoluto
 ```
 
+Cada RPC acrescenta uma linha JSON a uma trilha encadeada por hash e protegida por lock de arquivo (a mesma trilha que o auditor de requisições LLM escreve, então os dois tipos de entrada se intercalam numa única cadeia verificável). Campos: `timestamp`, `kind` (`grpc`), `request_id`, `action` (nome do RPC), `actor` (`user:<subject>` ou `anonymous`), `role`, `ip`, `client_id`, `method`, `resource`, `result` (`success`, `error`, `denied`), `duration`. Caminho relativo desliga o arquivo com um erro no log. As entradas também vão para o log estruturado, no logger `audit`.
 
+## Logs
 
-## Variáveis de Ambiente
+O servidor usa um logger estruturado em JSON:
 
-Todas as variáveis de ambiente usadas pelo ChatCLI local também funcionam no servidor:
+- Toda entrada vai para o arquivo rotativo `LOG_FILE` (padrão `~/.chatcli/app.log`; `CHATCLI_LOG_FILE` é um alias).
+- `chatcli server` e `chatcli gateway` também escrevem as mesmas entradas como **linhas JSON no stderr sempre que o stderr não é um terminal** — container, unit do systemd, pipe — então `docker logs`, `kubectl logs` e coletores de log recebem as recusas de inicialização e tudo o que vem depois sem configuração extra. Num terminal interativo o arquivo é o único destino. `CHATCLI_LOG_STDERR=true|false` força de um jeito ou de outro. O stdout fica livre para os transportes stdio.
+- `CHATCLI_ENV=dev` troca para o console de desenvolvimento (colorido, no stdout) mais o arquivo; as linhas JSON no stderr não são duplicadas nesse caso.
+- `LOG_LEVEL` define o nível. Rotação: `LOG_MAX_SIZE` (ou `CHATCLI_LOG_MAX_SIZE_MB`, em MB), `CHATCLI_LOG_MAX_BACKUPS` (padrão 3), `CHATCLI_LOG_MAX_AGE_DAYS` (padrão 28), `CHATCLI_LOG_COMPRESS` (padrão `true`, gzip). São essas as variáveis que o `spec.features.logRotation` da Instance do operator define.
 
 ```bash
-# Servidor
-CHATCLI_SERVER_PORT=50051
-CHATCLI_SERVER_TOKEN=meu-token
-CHATCLI_SERVER_TLS_CERT=/path/to/cert.pem
-CHATCLI_SERVER_TLS_KEY=/path/to/key.pem
-CHATCLI_BIND_ADDRESS=127.0.0.1  # Auto-detectado como 0.0.0.0 em Kubernetes
-
-# Segurança
-CHATCLI_GRPC_REFLECTION=false
-CHATCLI_DISABLE_VERSION_CHECK=false
-CHATCLI_JWT_SECRET=minha-chave-secreta      # HS256, ou:
-# CHATCLI_JWT_PUBLIC_KEY=/path/to/jwt-public.pem   # RS256
-CHATCLI_JWT_ISSUER=chatcli-server
-CHATCLI_JWT_AUDIENCE=chatcli-api
-
-# Rate Limiting
-CHATCLI_RATE_LIMIT_RPS=10
-CHATCLI_RATE_LIMIT_BURST=30
-
-# Limites de Mensagem
-CHATCLI_MAX_RECV_MSG_SIZE=52428800
-CHATCLI_MAX_SEND_MSG_SIZE=52428800
-CHATCLI_MAX_CONCURRENT_STREAMS=100
-
-# mTLS (lado do servidor)
-CHATCLI_SERVER_TLS_CLIENT_CA=/path/to/ca.pem
-CHATCLI_MTLS_ROLE=user   # papel de quem se identifica só pelo certificado
-
-# mTLS (lado do cliente, chatcli connect)
-CHATCLI_TLS_CLIENT_CERT=/path/to/client-cert.pem
-CHATCLI_TLS_CLIENT_KEY=/path/to/client-key.pem
-
-# Auditoria e Logs
-CHATCLI_AUDIT_LOG_PATH=/var/log/chatcli/audit.jsonl
-CHATCLI_LOG_FILE=/var/log/chatcli/server.log
-CHATCLI_LOG_MAX_SIZE_MB=100
-
-# LLM
-LLM_PROVIDER=CLAUDEAI
-ANTHROPIC_API_KEY=sk-ant-xxx
-ANTHROPIC_MODEL=claude-sonnet-4-6
-
-# K8s Watcher (opcional)
-CHATCLI_WATCH_DEPLOYMENT=myapp
-CHATCLI_WATCH_NAMESPACE=production
-CHATCLI_WATCH_INTERVAL=30s
-CHATCLI_WATCH_WINDOW=2h
-CHATCLI_WATCH_MAX_LOG_LINES=100
+LOG_LEVEL=debug chatcli server 2>server.log      # linhas JSON no stderr, já que ele não é um terminal
+CHATCLI_ENV=dev LOG_LEVEL=debug chatcli server    # console colorido para desenvolvimento
 ```
 
+Nas imagens de container o home é efêmero e a imagem distroless não tem shell para ler um arquivo; lá, o que se lê é o stderr.
 
+## gRPC reflection
 
-## Próximo Passo
+O reflection exige a flag `--enable-reflection` e `CHATCLI_GRPC_REFLECTION=true`. A flag assume o valor de `CHATCLI_GRPC_REFLECTION` como padrão, então só a variável já liga (é o que o `server.grpcReflection` do chart e o `spec.server.security.enableReflection` da Instance definem). As chamadas de reflection exigem a mesma credencial de qualquer RPC:
+
+```bash
+CHATCLI_GRPC_REFLECTION=true chatcli server --token "$CHATCLI_SERVER_TOKEN"
+grpcurl -plaintext -H "authorization: Bearer $CHATCLI_SERVER_TOKEN" localhost:50051 list
+```
+
+Deixe desligado em produção.
+
+## Múltiplas réplicas
+
+O gRPC mantém uma conexão HTTP/2 aberta, então um Service ClusterIP prende cada cliente a um pod. Com mais de uma réplica, use um Service headless: os clientes resolvem `dns:///` para cada endereço de pod e balanceiam em round-robin. Helm: `service.headless: true`; o operator muda para headless sozinho quando `spec.replicas > 1`. Sessões, o banco do hub e a trilha de auditoria são por pod, a menos que o armazenamento seja compartilhado.
+
+## Operando o servidor
+
+<AccordionGroup>
+  <Accordion title="Rotacionar o token compartilhado">
+    O token é lido na inicialização. Troque e reinicie:
+
+    - binário: defina o novo `CHATCLI_SERVER_TOKEN` e reinicie o processo;
+    - Helm com `server.token`: `helm upgrade … --reuse-values --set server.token="$(openssl rand -hex 32)"`; a anotação de checksum do Secret recria os pods;
+    - Helm com `secrets.existingSecret`: atualize o Secret e rode `kubectl -n chatcli rollout restart deploy/chatcli`.
+
+    Os clientes recebem `authentication failed` até usarem o token novo. Para evitar uma virada brusca, adicione JWTs antes (as duas credenciais funcionam ao mesmo tempo) e aposente o token compartilhado depois.
+  </Accordion>
+  <Accordion title="Rotacionar chaves JWT">
+    - **HS256**: um segredo assina e verifica; trocar `CHATCLI_JWT_SECRET` invalida todo token emitido no momento do restart. Mantenha os tokens de vida curta.
+    - **RS256**: `CHATCLI_JWT_PUBLIC_KEY` pode ter vários blocos PEM, e um token verificado por qualquer um deles é aceito. Acrescente a chave pública nova ao lado da antiga, reinicie, passe o emissor para a chave privada nova e remova a chave antiga quando os tokens antigos expirarem.
+  </Accordion>
+  <Accordion title="Renovar certificados TLS">
+    O certificado e o bundle de CA de clientes são carregados na inicialização. Depois de renovar os arquivos (ou o Secret), reinicie o servidor. O operator recria os pods da Instance quando um Secret referenciado muda; com o Helm chart rode `kubectl rollout restart`.
+  </Accordion>
+  <Accordion title="Atualizar">
+    - Binário: `/update` dentro do ChatCLI ou o gerenciador de pacotes, e reinicie o servidor.
+    - Imagem: fixe a tag (`ghcr.io/diillson/chatcli:1.211.2`) e troque de propósito; `latest` se move.
+    - Helm: `helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.211.2 -n chatcli --reuse-values`.
+
+    `GetServerInfo` e `chatcli_server_info{version=…}` informam a versão em execução.
+  </Accordion>
+</AccordionGroup>
+
+## Solução de problemas
+
+| Sintoma (texto exato) | Causa | Correção |
+|---|---|---|
+| Processo ou container sai com status 1 e não imprime nada | O stderr é um terminal (o log foi só para o arquivo), ou `CHATCLI_LOG_STDERR=false` | Leia o `LOG_FILE`, ou rode com `CHATCLI_LOG_STDERR=true`; num container a recusa já está no `docker logs`/`kubectl logs` |
+| `refusing to serve an unauthenticated API on 0.0.0.0: …` | Bind acessível (Kubernetes, ou `CHATCLI_BIND_ADDRESS=0.0.0.0`) sem credencial | Defina `CHATCLI_SERVER_TOKEN`, material JWT ou CA de cliente; ou faça bind em `127.0.0.1` |
+| `refusing to start: CHATCLI_JWT_PUBLIC_KEY is set but no RSA public key could be loaded: …` | Caminho errado ou não é chave pública PEM, e o JWT é a única credencial | Corrija a chave (PEM `PUBLIC KEY`, `RSA PUBLIC KEY` ou `CERTIFICATE`) |
+| `FATAL: TLS certificate load failed: … (cert=…, key=…)` | Cert ou chave ausente, ilegível ou sem par | Confira os caminhos e se a chave corresponde ao certificado |
+| `FATAL: --tls-client-ca requires --tls-cert and --tls-key` | mTLS sem TLS no servidor | Adicione certificado e chave do servidor |
+| `FATAL: --tls-cert foi definido (…) mas --tls-key não: recusando iniciar um listener em texto puro` (ou `--tls-key foi definido … mas --tls-cert não`) | Metade de um par TLS | Defina os dois caminhos, ou nenhum para texto puro |
+| Cliente: `transport: authentication handshake failed: tls: first record does not look like a TLS handshake` | Cliente disca TLS, servidor é texto puro | `CHATCLI_ALLOW_INSECURE=true`, ou ligue TLS no servidor |
+| Cliente: `error reading server preface: remote error: tls: certificate required` | O servidor exige mTLS e o cliente não enviou certificado | Defina `CHATCLI_TLS_CLIENT_CERT` e `CHATCLI_TLS_CLIENT_KEY` e use `--tls` |
+| Cliente: `x509: certificate signed by unknown authority` | Certificado do servidor não confiável | `--ca-cert ca.crt` |
+| Cliente: `x509: certificate is valid for …, not …` | O nome discado não está nos SANs | Disque um nome do certificado, ou reemita com esse SAN |
+| Cliente: `connect: connection refused` | Servidor parado, porta errada, ou bind no loopback de outro host/container | Confira `CHATCLI_BIND_ADDRESS` e a porta |
+| `Connected to ChatCLI server (version: …, provider: remote, model: remote)` e depois `Unauthenticated desc = authentication failed` | Token errado ou ausente (o health check não precisa de token, o `GetServerInfo` precisa) | Passe o `--token` / `CHATCLI_REMOTE_TOKEN` correto |
+| `Unauthenticated desc = authentication failed` com um token que funciona no resto do tempo; o log do servidor mostra `auth failure rate limit exceeded` | Algo no mesmo host de cliente falhou a autenticação mais de 5 vezes num minuto (um token errado em outro script, um JWT expirado) e esgotou a cota de falhas do host | Corrija o chamador que falha; a cota repõe uma vaga a cada 12 s e a tabela zera a cada 5 minutos |
+| `Unauthenticated desc = token expired` | `exp` do JWT no passado (além dos 30 s de tolerância) | Emita um token novo; confira os relógios |
+| `Unauthenticated desc = JWT verification material failed to load; the server accepts no credentials until it is fixed` | A chave JWT não carregou | Corrija a chave e reinicie |
+| `ResourceExhausted desc = rate limit exceeded, retry after 1 seconds` | Chamador acima de `CHATCLI_RATE_LIMIT_RPS`/`BURST`; quem usa o token compartilhado divide um bucket | Aumente os limites ou dê a cada chamador seu próprio `sub` de JWT |
+| `PermissionDenied desc = coder, agent and tool runs execute on the server and require the admin role` | Chamador JWT/mTLS sem `admin` num RPC de execução do pipeline | Use uma credencial admin |
+| `Unavailable desc = the pipeline RPCs are not enabled on this server (start it with CHATCLI_SERVER_PIPELINE=true)` | Pipeline desligado | Defina `CHATCLI_SERVER_PIPELINE=true` (e não `CHATCLI_GATEWAY_IN_SERVER`) |
+| `invalid provider configuration: provider_config[base_url]: non-HTTPS provider URLs are blocked; set CHATCLI_ALLOW_HTTP_PROVIDERS=true to allow` | O chamador mandou uma URL `http://` (por exemplo `--ollama-url`) | Use HTTPS, defina a variável no servidor, ou configure a URL no servidor |
+| `… resolves to blocked IP …` | URL do chamador aponta para endereço privado | Configure esse endpoint no servidor (`OLLAMA_BASE_URL`) |
+| `Fallback chain initialized` nunca aparece | Menos de dois provedores da lista têm credenciais válidas | Adicione chaves ou mais provedores |
+| Container `unhealthy` com TLS ligado | O `HEALTHCHECK` da imagem testa texto puro | Substitua por `grpc-health-probe -tls …` |
+
+## Próximos passos
 
 <CardGroup cols={2}>
   <Card title="Conexão Remota" icon="plug" href="/pt/features/remote-connect">
-    Conectar ao servidor remotamente
+    Conecte ao servidor
+  </Card>
+  <Card title="Docker e Kubernetes" icon="docker" href="/pt/getting-started/docker-deployment">
+    Rode o servidor em container ou com Helm
   </Card>
   <Card title="K8s Watcher" icon="binoculars" href="/pt/features/k8s-watcher">
-    Multi-target + Prometheus
+    Contexto do Kubernetes em todo prompt
   </Card>
   <Card title="K8s Operator" icon="dharmachakra" href="/pt/features/k8s-operator">
-    K8s Operator (AIOps)
-  </Card>
-  <Card title="Deploy" icon="docker" href="/pt/getting-started/docker-deployment">
-    Deploy com Docker e Helm
+    Instances gerenciadas e AIOps
   </Card>
 </CardGroup>

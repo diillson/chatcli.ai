@@ -29,7 +29,7 @@ kubectl get rp -n <ns>      # colunas: Issue, Attempt, State, Age
 <Warning>
 **Estado `Contained`** — Um plano que termina depois de executar uma ação com `containment: "true"` (por exemplo `ScaleDeployment replicas=0 containment=true`) **não** marca o Issue como `Resolved`. Ele transita para `Contained`, que:
 
-- **Não** é terminal: só se auto-resolve quando o workload volta com réplicas desejadas **> 0** e todas as réplicas prontas (verificado a cada 60 segundos; apenas Deployment e StatefulSet — outros tipos ficam em `Contained` até serem resolvidos manualmente)
+- **Não** é terminal: só se auto-resolve quando o workload volta com réplicas desejadas **> 0** e todas as réplicas prontas (verificado a cada 60 segundos). Para DaemonSet, Job ou Node, a verificação é a mesma do [auto-resolve de Escalated](#auto-resolve-para-issues-escalados); outros tipos ficam em `Contained` até serem resolvidos manualmente
 - Define `status.requiresHumanAction: true` e `status.requiredAction` no Issue, além das conditions `Contained` e `RequiresHumanAction`
 - Gera um PostMortem com `requiresHumanAction: true` que não pode permanecer `Closed` até um humano reconhecer a ação (veja [abaixo](#postmortems-com-requireshumanaction))
 - É contado em `analytics/summary` como `containedIssues` **e** como aberto
@@ -58,7 +58,7 @@ Detected → Analyzing → Remediating ──(plano Completed)──────
 
 Quando o watcher bridge transforma um alerta do servidor em um CR `Anomaly`, o controller de Anomaly faz a correlação:
 
-1. **Incidente existente** — se já existe um Issue não terminal (qualquer estado exceto `Resolved`, `Escalated`, `Failed`) para o mesmo recurso (kind + nome + namespace), a anomalia é anexada a ele e o risk score sobe se o novo score for maior
+1. **Incidente existente** — se já existe um Issue não terminal (qualquer estado exceto `Resolved`, `Escalated`, `Failed`) para o mesmo recurso (kind + nome + namespace), a anomalia é anexada a ele e o risk score sobe se o novo score (que conta a anomalia recém-anexada) for maior
 2. **Cooldown de resolução** — se um Issue do mesmo recurso foi `Resolved` dentro de `resolutionCooldownMinutes`, a anomalia é suprimida
 3. **Redução de ruído** — anomalias repetitivas, sazonais, intermitentes (flapping) ou com alta fadiga de alertas (score > 80) são suprimidas
 4. **Pontuação de sinal** — cada tipo de sinal tem um peso (`oom_kill`=40, `error_rate`=30, `pod_restart`=25, `deploy_failing`=25, `latency`=20, `pod_not_ready`=20, `cpu_high`=15, `memory_high`=15, qualquer outro sinal=10); o risk score soma todas as anomalias não correlacionadas do recurso nos últimos 10 minutos, com teto de 100
@@ -94,7 +94,7 @@ O sistema cria um CR AIInsight (`<issue>-insight`) para análise via IA. Na dete
 
 ### Fase de Remediação (`Remediating`)
 
-Antes de executar, o controller de remediação verifica os gates de aprovação nesta ordem: uma `ApprovalPolicy` correspondente, depois o tier do cluster local (quando `CHATCLI_OPERATOR_CLUSTER_NAME` está definido) e depois o [decision engine](/pt/features/aiops/decision-engine) (quando `CHATCLI_OPERATOR_DECISION_ENGINE=true`). Um plano retido espera em `WaitingApproval` (veja [Fluxo de Aprovação](/pt/features/aiops/approval-workflow)).
+Antes de executar, o controller de remediação verifica os gates de aprovação nesta ordem: uma `ApprovalPolicy` correspondente, depois o tier do cluster local (quando `CHATCLI_OPERATOR_CLUSTER_NAME` está definido) e depois o [decision engine](/pt/features/aiops/decision-engine) (quando `CHATCLI_OPERATOR_DECISION_ENGINE=true`). Um plano retido espera em `WaitingApproval` (veja [Fluxo de Aprovação](/pt/features/aiops/approval-workflow)). Os gates falham fechados: se o Issue, o AIInsight ou as policies não puderem ser lidos, ou o decision engine der erro, o plano fica `Pending` com um Event de Warning `ApprovalGateUnavailable` e é tentado de novo; um plano cujo Issue sumiu falha.
 
 Em seguida o plano é executado com um **loop ReAct** (Reason-Act-Observe):
 
@@ -136,19 +136,19 @@ Quando um incidente atinge `Escalated`, o sistema esgotou todas as opções auto
 **O que o sistema faz automaticamente:**
 1. Inicia a primeira `EscalationPolicy` habilitada que corresponde (por `severities`; uma política com `defaultPolicy: true` é o fallback) e notifica o nível 0 — **ignorado para Issues induzidos por chaos**
 2. Envia as notificações de qualquer regra de `NotificationPolicy` que corresponda ao estado `Escalated`
-3. Avança para o próximo nível quando o `timeoutMinutes` do nível atual expira (veja [Notificações](/pt/features/aiops/notifications) para as limitações atuais da progressão de níveis)
+3. Avança para o próximo nível quando o `timeoutMinutes` do nível atual expira, até o último nível (veja [Notificações](/pt/features/aiops/notifications#como-a-escalação-funciona))
 4. Registra um evento de auditoria `issue_escalated`
 5. Continua verificando o recurso a cada 30 segundos para o auto-resolve (abaixo)
 
 **O que os operadores devem fazer:**
-1. **Reconhecer** o incidente (registra quem está cuidando):
+1. **Reconhecer** o incidente (registra quem está cuidando e para a escalação):
    ```bash
    curl -X POST "https://operator:8090/api/v1/incidents/payment-api-oom-kill-1773900000/acknowledge?namespace=production" \
      -H "X-API-Key: $API_KEY"
    ```
-   <Warning>
-   O reconhecimento apenas grava as anotações `aiops.chatcli.io/acknowledged`, `-at` e `-by` (o valor de `-by` é o **role** da API key usada, não uma pessoa; o corpo da requisição é ignorado). Ele **não** pausa nem interrompe a cadeia de escalação — a escalação só para quando o Issue chega a `Resolved`. O snooze (`/snooze`, corpo `{"duration": "1h"}`) também só grava a anotação `aiops.chatcli.io/snoozed-until`; nenhum controller a lê.
-   </Warning>
+   <Note>
+   O reconhecimento grava as anotações `aiops.chatcli.io/acknowledged`, `-at` e `-by` (o valor de `-by` é o **role** da API key usada, não uma pessoa; o corpo da requisição é ignorado). A escalação **para no nível atual**: nenhum nível a mais e nenhuma repetição, e o reconhecimento fica registrado na entrada de `status.activeEscalations` da EscalationPolicy. O snooze (`/snooze`, corpo `{"duration": "1h"}`, uma duração positiva) segura toda notificação exceto `Resolved`, e a escalação, até `aiops.chatcli.io/snoozed-until`; um page de escalação retido sai quando o snooze termina e o timer do nível recomeça. Veja [Notificações](/pt/features/aiops/notifications#reconhecimento-e-como-encerrar-uma-escalação).
+   </Note>
 
 2. **Investigar e corrigir** o problema manualmente
 
@@ -183,7 +183,17 @@ Quando um incidente atinge `Escalated`, o sistema continua verificando o recurso
 
 > "Auto-resolved: resource recovered while awaiting human intervention"
 
-e as anotações `aiops.chatcli.io/resolved-by: auto-resolve` e `aiops.chatcli.io/auto-resolution: "true"`. "Recuperado" significa réplicas prontas ≥ desejadas (e, para um Deployment, nenhuma réplica indisponível). **Apenas alvos Deployment e StatefulSet são verificados** — Issues escalados de qualquer outro tipo (DaemonSet, Job, CronJob, Node, ...) nunca se auto-resolvem e precisam ser resolvidos manualmente.
+e as anotações `aiops.chatcli.io/resolved-by: auto-resolve` e `aiops.chatcli.io/auto-resolution: "true"`. "Recuperado" depende do tipo:
+
+| Tipo | Recuperado quando |
+|------|-------------------|
+| `Deployment` | Réplicas prontas ≥ desejadas e nenhuma réplica indisponível |
+| `StatefulSet` | Réplicas prontas ≥ desejadas |
+| `DaemonSet` | O rollout foi observado e todo pod agendado está atualizado, pronto e disponível |
+| `Job` | O Job tem a condition `Complete` (estar rodando não basta) |
+| `Node` | A condition `Ready` do Node está `True` |
+
+Issues escalados de qualquer outro tipo (CronJob, Pod, ...) nunca se auto-resolvem e precisam ser resolvidos manualmente.
 
 Isso cobre os casos em que:
 - Um operador corrige o problema manualmente (`kubectl rollout undo` etc.) sem usar a API
@@ -215,13 +225,13 @@ spec:
 | Parâmetro | Padrão | Descrição |
 |-----------|--------|-----------|
 | `maxRemediationAttempts` | 5 | Quantas tentativas de remediação antes de escalar |
-| `resolutionCooldownMinutes` | 10 | Depois que um Issue é resolvido, por quanto tempo novas anomalias do mesmo recurso são suprimidas. `0` é aceito pelo CRD, mas cai no padrão de 10 minutos — o cooldown não pode ser desligado |
+| `resolutionCooldownMinutes` | 10 | Depois que um Issue é resolvido, por quanto tempo novas anomalias do mesmo recurso são suprimidas. `0` desliga o cooldown; omitir o campo equivale a `10` |
 | `dedupTTLMinutes` | 30 | Por quanto tempo o cache de dedup do watcher bridge mantém os hashes de alertas (o hash inclui o UID do recurso, então um recurso recriado é detectado na hora) |
 | `enableAutoResolve` | true | Auto-resolve de Issues `Escalated` e `Contained` quando o recurso se recupera |
 | `agenticMaxSteps` | 10 | Máximo de passos por tentativa de remediação agêntica |
 
 <Note>
-Essas configurações são lidas da **primeira Instance** retornada por uma listagem de todo o cluster (o TTL de dedup, da Instance à qual o watcher bridge está conectado). Com várias Instances, mantenha as seções `aiops` idênticas.
+Essas configurações são lidas da Instance que o watcher bridge usa. O bridge carimba a Instance dele em toda Anomaly (labels `platform.chatcli.io/instance` e `platform.chatcli.io/instance-namespace`) e o Issue as herda, então o cooldown segue a Instance de onde veio o alerta; as demais configurações vêm da primeira Instance Ready (aquela à qual o bridge se conecta), ou da primeira Instance quando nenhuma está Ready.
 </Note>
 
 <Tip>
@@ -329,10 +339,10 @@ Node MemoryPressure detectado
             → Verificação de saúde do alvo (veja a nota abaixo)
 ```
 
-O `DrainNode` faz cordon no node e então **apaga** os pods dele com grace period de 30 segundos (pods de DaemonSet e mirror pods são ignorados). Ele não usa a Eviction API, portanto **PodDisruptionBudgets não são respeitados** — exija aprovação para ações de node se isso importar. O contexto do node (CPU, memória, contagem de pods, condições) é incluído na análise da IA.
+O `DrainNode` faz cordon no node e então **despeja** os pods dele pela Eviction API `policy/v1` com grace period de 30 segundos (pods de DaemonSet e mirror pods são ignorados), portanto **PodDisruptionBudgets são respeitados**. Um despejo recusado com `429` (um PDB) ou erro de servidor é refeito a cada 5 segundos até o param opcional `timeout` (uma duração Go, padrão `2m`, no máximo `10m`); depois disso a ação falha, citando os pods que não conseguiu despejar. Mesmo assim, exija aprovação para ações de node. O contexto do node (CPU, memória, contagem de pods, condições) é incluído na análise da IA.
 
 <Note>
-A verificação de saúde, os snapshots de rollback e o auto-resolve só entendem tipos de workload (Deployment, StatefulSet, DaemonSet, Job, CronJob). Um plano cujo alvo é um `Node` nunca passa na verificação: após 90 segundos termina `Failed` ou `RolledBack`, o incidente repete até `maxRemediationAttempts`, depois escala, e um Issue escalado de `Node` nunca se auto-resolve. Conte com resolver incidentes de node manualmente.
+A verificação de saúde e o auto-resolve entendem um alvo `Node`: ele está saudável quando a condition `Ready` está `True` (um cordon a mantém assim). Os snapshots de rollback só cobrem tipos de workload (Deployment, StatefulSet, DaemonSet, Job, CronJob), então um plano de node que falhou não pode ser revertido automaticamente.
 </Note>
 
 A plataforma constrói uma **biblioteca de estratégias aprendidas** ao longo do tempo, reutilizáveis em incidentes futuros com o mesmo trigger.

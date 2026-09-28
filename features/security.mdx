@@ -21,15 +21,17 @@ The table below summarizes all active protections across every layer of the stac
 |-------|------------|--------|
 | **Authentication** | JWT with RS256 or HS256, algorithm fixed by configuration and never by the token | Active |
 | **Authentication** | JWT claim checks: expiry (required), not-before, issuer, audience | Active |
+| **Authentication** | Fixed 30-second clock-skew tolerance on JWT expiry and not-before | Active |
 | **Authentication** | Legacy bearer token with constant-time comparison (`crypto/subtle`) | Active |
-| **Authentication** | Per-IP rate limiting on authentication failures | Active |
+| **Authentication** | Per-host limit on **failed** bearer/JWT authentications (burst 5, then one every 12 s); valid credentials are never throttled | Active |
 | **Authentication** | OAuth 2.0 + PKCE for Anthropic, OpenAI, GitHub Copilot | Active |
 | **Authorization** | Role-based access control (viewer / operator / admin) | Active |
 | **Authorization** | An unrecognised role claim resolves to read-only, never to write | Active |
 | **Encryption** | AES-256-GCM encryption for stored OAuth credentials | Active |
 | **Encryption** | Credential key in the OS keychain instead of a file | Opt-in |
 | **Encryption** | Encryption at rest for sessions, memory, contexts, transcripts, archives, costs | Opt-in |
-| **Transport** | TLS 1.3 for gRPC and REST endpoints | Opt-in |
+| **Transport** | TLS 1.3 for the gRPC server and the operator REST API | Opt-in |
+| **Transport** | The operator always dials ChatCLI servers over TLS 1.3; there is no plaintext mode | Active |
 | **Transport** | Mutual TLS: the server requires and verifies a client certificate, and identifies the caller by it (`CHATCLI_MTLS_ROLE`) | Opt-in |
 | **Keychain** | OS keychain integration (macOS Keychain, Linux secret-service, Windows Credential Manager) | Opt-in |
 | **Shell** | POSIX quoting to prevent shell injection in arguments | Active |
@@ -38,7 +40,7 @@ The table below summarizes all active protections across every layer of the stac
 | **Agent Commands** | 50+ denylist patterns, plus dynamic classification of inline interpreter code | Active |
 | **Agent Paths** | Read path blocking outside the workspace directory | Active |
 | **Agent Shell** | Shell config sourcing disabled by default | Active |
-| **Agent Output** | Output sanitizer strips ANSI escape sequences and truncates large output | Active |
+| **Agent Output** | Regex redaction of secrets in command stdout/stderr before it reaches the model | Active |
 | **Coder** | Dangerous-command guard on every `@coder` subcommand that runs a shell line | Active |
 | **Coder** | OS-level sandbox for `@coder exec` and `@coder test` | Opt-in |
 | **Policies** | Word-boundary matching to prevent permission escalation | Active |
@@ -51,21 +53,36 @@ The table below summarizes all active protections across every layer of the stac
 | **gRPC** | Maximum concurrent stream limits | Active |
 | **gRPC** | Input validation on every RPC, unary and streaming | Active |
 | **gRPC** | Reflection disabled by default (hides service schema) | Active |
-| **gRPC** | Fail-closed bind: refuses to serve an unauthenticated API on a reachable address (a shared token, HS256 secret, RS256 public key or client CA satisfies it) | Active |
+| **gRPC** | Fail-closed bind: refuses to serve an unauthenticated API on a reachable address (a shared token, a client CA, or an HS256 secret / RS256 public key that loads satisfies it) | Active |
+| **gRPC** | JWT material that fails to load stops the server when it is the only credential, instead of leaving it open | Active |
 | **Audit** | Structured JSON audit logging, unary and streaming, naming the authenticated caller | Opt-in |
 | **Audit** | Hash-chained, tamper-evident trail with `/config security verify-audit` | Opt-in |
 | **Binaries** | `stty` resolved via `exec.LookPath` (prevents PATH injection) | Active |
 | **Containers** | Read-only filesystem, no-new-privileges, drop ALL capabilities | Active |
-| **Kubernetes** | Fail-closed authentication for the operator REST API | Active |
-| **Kubernetes** | Resource type allowlist for operator actions, with a dangerous-type approval gate | Active |
-| **Kubernetes** | Log scrubbing of secrets and tokens | Active |
+| **Kubernetes** | Fail-closed API-key authentication for the operator REST API and dashboard (API keys only; no OIDC or SSO) | Active |
+| **Kubernetes** | REST API rate limit: 30 requests/min per client host without a valid key, 600/min per valid key | Active |
+| **Kubernetes** | Resource type allowlist for manifests the `ApplyManifest` remediation action applies; every other kind is refused | Active |
+| **Kubernetes** | Scrubbing of secrets and tokens from the context the operator sends to the LLM | Active |
 | **Kubernetes** | CORS policy with configurable allowed origins | Opt-in |
-| **Kubernetes** | RBAC namespace-scoped by default, restrictive SecurityContext | Active |
-| **Kubernetes** | NetworkPolicy for pod-level network segmentation | Opt-in |
+| **Kubernetes** | Server chart RBAC namespace-scoped by default (the operator itself runs with a cluster-wide ClusterRole) | Active |
+| **Kubernetes** | Operator, server chart and operator-managed Instance pods meet the `restricted` Pod Security Standard | Active |
+| **Kubernetes** | NetworkPolicy templates in the server chart and the operator chart | Opt-in |
 | **Environment** | Secret redaction on the LLM path | Active |
+| **Prompt injection** | Monitored data in AIOps analysis prompts is wrapped in `<DATA>` delimiters and declared data, never instructions | Active |
 | **History** | Disable history recording for sensitive sessions | Opt-in |
 | **Session** | Configurable session TTL with automatic expiration | Active |
-| **CI/CD** | govulncheck, gosec, Dependabot, Cosign image signing | Active |
+| **CI/CD** | govulncheck, gosec (SARIF report), Trivy gate, Dependabot, Cosign keyless signing of images and charts | Active |
+
+<Warning>
+**What does not exist.** Do not plan a deployment around these; each has a mitigation you apply yourself:
+
+- **No admission webhook.** Nothing validates `RemediationPlan` or any other resource at admission; the CRD schema checks run in the API server and the controllers check again when they reconcile. Restrict who may create ChatCLI resources with Kubernetes RBAC.
+- **Metrics endpoints are plain HTTP with no authentication**: the server metrics port (default `9090`, which also serves `/healthz`) listens on every interface regardless of `CHATCLI_BIND_ADDRESS`, and the operator serves `/metrics` on `8080`. Limit who can reach them with a NetworkPolicy (`networkPolicy.metricsIngressFrom` in the operator chart, `networkPolicy.ingressFrom` in the server chart).
+- **No OIDC, SSO or user accounts for the dashboard** — only API keys sent in `X-API-Key`. Keep the dashboard behind port-forward or an authenticating proxy/Ingress, and rotate keys through the Secret.
+- **No file audit log in the operator.** The operator records its actions as `AuditEvent` resources; `CHATCLI_AUDIT_LOG_PATH` is read only by the server and the CLI.
+- **No automatic per-user RBAC.** The chart pre-provisions the `chatcli-role-viewer`, `-operator`, `-admin` and `-superadmin` ClusterRoles; nothing binds them, so bind them yourself.
+- **No NetworkPolicy, PodDisruptionBudget or HPA for operator-managed Instances.** Write your own NetworkPolicy for the Instance pods.
+</Warning>
 
 ---
 
@@ -120,15 +137,21 @@ Setting `CHATCLI_JWT_PUBLIC_KEY` selects RS256. Setting only `CHATCLI_JWT_SECRET
 
 <Info>Issuer and audience are only checked when configured. Leaving them empty accepts any `iss` and `aud`, which means a token minted for a different service by the same issuer is accepted — set both wherever a signing key is shared.</Info>
 
+Expiry and not-before are checked with a fixed 30-second tolerance for clock drift between issuer and server; it is not configurable.
+
 ### RBAC Roles
 
-Three built-in roles control access to API endpoints and operations:
+Three role levels exist. The server resolves every caller to one of them and checks it in the handlers that need it:
 
-| Role claim | Level | Permissions | Typical use |
-|---|---|-------------|-------------|
-| `viewer`, `readonly` | read-only | Read access only; every write is refused | Dashboards, monitoring |
-| `operator`, `user` | operational | Read plus day-to-day operations | On-call engineers |
-| `admin` | full | Everything, including configuration and destructive operations | Platform admins |
+| Role claim | Level | What the server gates on it |
+|---|---|---|
+| `viewer`, `readonly` | read-only | Sees no remote plugins and cannot execute them |
+| `operator`, `user` | operational | Lists and executes remote plugins (not the internal `_`-prefixed ones); owns only its own hub conversations and bindings |
+| `admin` | full | Also the pipeline RPCs that execute on the server host (`RunCoder`, `RunAgent`, `RunPipelineTool`), internal plugins, and other principals' hub conversations and bindings |
+
+<Warning>
+**The role is not checked everywhere.** Prompts, sessions and the AIOps RPCs (`AnalyzeIssue`, `AgenticStep` and the rest) run for any authenticated caller, whatever its role: a `viewer` token can send prompts and manage sessions. Treat every credential that reaches the server as able to spend your LLM budget, and keep execution on the server host behind `admin`.
+</Warning>
 
 Each level has two accepted spellings, and they are exact aliases — `viewer` and `readonly` grant the same thing.
 
@@ -138,11 +161,13 @@ Each level has two accepted spellings, and they are exact aliases — `viewer` a
 A token carrying **no** `role` claim at all keeps the historical operational level, so tokens minted before roles existed are not locked out on upgrade. Issue tokens with an explicit role.
 </Warning>
 
-<Info>The `/Health` endpoint is always accessible without authentication to support load balancer and orchestrator health checks.</Info>
+<Info>The custom `Health` RPC and the standard `grpc.health.v1.Health` service answer without authentication, for load balancers, `grpc-health-probe` and kubelet gRPC probes. Under mTLS the TLS handshake still requires a client certificate, and a kubelet gRPC probe cannot speak TLS, so probe `/healthz` on the metrics port instead.</Info>
+
+The shared token grants **admin**. Callers identified by a client certificate alone get `CHATCLI_MTLS_ROLE` (default `user`). A server with no credential at all (loopback only) treats every caller as admin.
 
 ### Legacy Bearer Token
 
-For simpler deployments, the server supports static bearer token authentication with constant-time comparison (`crypto/subtle.ConstantTimeCompare`), preventing timing attacks.
+For simpler deployments, the server supports static bearer token authentication with constant-time comparison (`crypto/subtle.ConstantTimeCompare`), preventing timing attacks. Every holder of the token is the same caller: subject `legacy-token`, role **admin**, one shared rate-limit bucket. Prefer the environment variable (or a Kubernetes Secret) over the flag, which is visible in the process list. Clients send it with `chatcli connect --token`, or `CHATCLI_REMOTE_TOKEN`.
 
 <Tabs>
   <Tab title="Via flag">
@@ -269,10 +294,11 @@ Every line of the audit trail (`CHATCLI_AUDIT_LOG_PATH`) carries `seq`, `prev_ha
   </Tab>
   <Tab title="Development (no TLS)">
     ```bash
-    chatcli server  # Warning logged when client connects without TLS
+    chatcli server                                        # binds 127.0.0.1 outside Kubernetes
+    CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051
     ```
 
-    <Note>When the client connects without TLS, a warning is emitted to remind about production use. Functional behavior is unchanged.</Note>
+    <Note>Without `--tls`, `chatcli connect` still dials TLS with the system CAs; only `CHATCLI_ALLOW_INSECURE=true` makes it dial plaintext, and it logs a warning when it does.</Note>
   </Tab>
 </Tabs>
 
@@ -364,6 +390,7 @@ The default allowlist holds around 200 commands:
     ruby, gem, bundle, php, composer,
     gofmt, golint, gopls, eslint, prettier, black, jest, mocha
     ```
+    <Note>The allowlist sees the **base command**, not subcommands: `git` is on the list, not `git status` separately. What limits a `git push` is the denylist and the coder policy, not the allowlist.</Note>
   </Accordion>
   <Accordion title="Containers and infrastructure">
     ```text
@@ -466,6 +493,8 @@ export CHATCLI_AGENT_WORKSPACE_STRICT=true
 export CHATCLI_AGENT_EXTRA_READ_PATHS="/etc/hosts:/usr/local/share/config"
 ```
 
+Some paths are refused even inside the workspace, whatever the allowlist says: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.gcloud` and `~/.config/gcloud` (everything under them); `~/.kube/config` (unless `CHATCLI_AGENT_ALLOW_KUBECONFIG=true`); `~/.netrc`, `~/.npmrc`, `~/.docker/config.json`, `~/.pypirc`, `~/.gem/credentials`, `~/.m2/settings.xml` and `~/.gradle/gradle.properties`; `/etc/shadow`, `/etc/gshadow`, `/etc/master.passwd` and `/proc/*/environ`; and key material (`.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.p8`, `.der`) outside the home directory. The refusal names the reason.
+
 ### Shell Configuration Sourcing
 
 By default, shell configuration files (`~/.bashrc`, `~/.zshrc`) are **not** sourced during agent command execution to prevent malicious aliases and functions:
@@ -491,14 +520,9 @@ Additionally, at the start of every agent turn, ChatCLI runs `stty sane` on the 
 
 ### Output Sanitizer
 
-Agent command output is sanitized before being sent to the LLM:
-- ANSI escape sequences are stripped
-- Output is truncated to prevent context overflow
+The stdout and stderr of every agent command pass through a regex redaction of secret shapes (API keys, tokens, credentials in connection strings) before they are stored in the result the model receives, and then through the [LLM-path redaction](#secret-redaction-on-the-llm-path) like any other tool output.
 
-```bash
-# Maximum command output size in bytes (default: 102400)
-export CHATCLI_MAX_COMMAND_OUTPUT=102400
-```
+<Warning>`CHATCLI_MAX_COMMAND_OUTPUT` is shown by `/config` but has no effect in current releases: the helper that would truncate command output at that size, strip control sequences and flag prompt-injection phrases is not wired into the agent path.</Warning>
 
 ### EDITOR Validation
 
@@ -586,6 +610,8 @@ Plugin binaries are verified with **Ed25519 signatures**. A plugin is signed wit
   </Step>
 </Steps>
 
+<Note>The signature is **detached**, in a `.sig` file next to the binary, and covers the binary's SHA-256. There is no plugin manifest: replacing the binary breaks the signature, which is what matters. The plugins directory and `~/.chatcli/trusted-keys/` are created `0700`; the private key is written `0600`, the public key and the `.sig` `0644`.</Note>
+
 ### What happens to an unsigned plugin
 
 | Situation | `CHATCLI_ALLOW_UNSIGNED_PLUGINS=false` (default) | `=true` |
@@ -638,10 +664,14 @@ Provider URLs a client supplies are checked before the server will use them, so 
 - `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918)
 - `127.0.0.0/8` (loopback)
 - `169.254.0.0/16` (link-local, including cloud metadata endpoints)
-- `::1/128`, `fc00::/7` (IPv6 private)
+- `100.64.0.0/10` (shared address space)
+- `::1/128`, `fc00::/7`, `fd00::/8`, `fe80::/10`, `ff00::/8`, `::ffff:0:0/96` (IPv6 loopback, private, link-local, multicast, IPv4-mapped)
+- the hostnames `metadata.google.internal`, `metadata.goog` and `instance-data`
+
+Hostnames are resolved and every returned address is checked. A name that does not resolve is let through (the request then fails on its own). Only `https` URLs are accepted by default:
 
 ```bash
-# Allow HTTP providers (disable SSRF check for trusted internal networks)
+# Also accept http:// provider URLs. The private-range checks above still apply.
 export CHATCLI_ALLOW_HTTP_PROVIDERS=true
 ```
 
@@ -657,7 +687,7 @@ export CHATCLI_RATE_LIMIT_RPS=10
 export CHATCLI_RATE_LIMIT_BURST=20
 ```
 
-The limiter runs **after** authentication and keys on the caller's subject — the JWT `sub` claim, or the certificate principal under mTLS — rather than on the address it shares with every other tenant behind the same NAT or ingress. Anonymous callers (a shared-token or loopback deployment) fall back to the address. Unauthenticated floods are bounded separately by the per-address authentication failure limiter.
+The limiter runs **after** authentication and keys on the caller's subject — the JWT `sub` claim, or the certificate principal under mTLS — rather than on the address it shares with every other tenant behind the same NAT or ingress. Every holder of the shared token is the single subject `legacy-token`, and a server with no credential (loopback) names every caller `system`, so each of those shapes shares one bucket; issue JWTs to give callers buckets of their own. Bearer and JWT callers also pass a per-host failure limiter inside authentication: each client host may fail authentication 5 times in a burst, then once every 12 seconds; while its budget is exhausted every call from that host gets `Unauthenticated` before the credential is checked (the log says `auth failure rate limit exceeded`). Only failed authentications spend from it — valid credentials are never throttled, however many calls a host or an ingress makes — so it bounds credential guessing without touching `CHATCLI_RATE_LIMIT_RPS`. The table of hosts is cleared every 5 minutes; callers identified by a client certificate alone skip it. A call over the per-subject limit gets `ResourceExhausted`.
 
 ### Message Size Limits
 
@@ -751,7 +781,7 @@ export CHATCLI_BIND_ADDRESS=0.0.0.0
 
 <Tip>In Kubernetes, the bind address is automatically set to `0.0.0.0` — no manual configuration required. The server detects the environment via the `KUBERNETES_SERVICE_HOST` variable.</Tip>
 
-<Warning>A reachable bind is fail-closed: with no credential configured the server refuses to start instead of admitting every caller as an administrator. Any one of these satisfies the guard, mirroring what the auth interceptor and the TLS listener actually enforce: `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET` (HS256), `CHATCLI_JWT_PUBLIC_KEY` (RS256) or `CHATCLI_SERVER_TLS_CLIENT_CA` (mTLS).</Warning>
+<Warning>A reachable bind is fail-closed: with no credential configured the server refuses to start instead of admitting every caller as an administrator. Any one of these satisfies the guard, mirroring what the auth interceptor and the TLS listener actually enforce: `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET` (HS256), `CHATCLI_JWT_PUBLIC_KEY` (RS256) or `CHATCLI_SERVER_TLS_CLIENT_CA` (mTLS). JWT material counts only if it loads: when it is the only credential and fails to load, the server refuses to start; next to a token or a client CA, a broken key refuses only JWT callers.</Warning>
 
 ### Interceptor Chain
 
@@ -763,6 +793,9 @@ All requests pass through a chain of gRPC interceptors:
   </Step>
   <Step title="Audit">
     Wraps everything inward so it records refusals as well as successes, and names the caller authentication resolves further in.
+  </Step>
+  <Step title="Metrics">
+    Counts requests, durations and in-flight calls. Present only when the metrics port is not `0`.
   </Step>
   <Step title="Recovery">
     Captures panics and returns a gRPC error instead of crashing the server.
@@ -787,8 +820,12 @@ gRPC reflection exposes the full service schema, allowing tools like `grpcurl` a
 <Warning>By default, reflection is disabled. Enable only for local debugging.</Warning>
 
 ```bash
+chatcli server --enable-reflection
+# or, the flag's default:
 export CHATCLI_GRPC_REFLECTION=true
 ```
+
+The Instance field `spec.server.security.enableReflection` and the server chart value `server.grpcReflection` set that variable.
 
 ---
 
@@ -796,11 +833,17 @@ export CHATCLI_GRPC_REFLECTION=true
 
 ### Fail-Closed Authentication
 
-The operator REST API uses **fail-closed** authentication: without API keys it refuses to serve unless dev mode is set explicitly, and a request whose key cannot be verified is denied. This prevents unauthorized access during outages.
+The operator REST API (port `8090`, which also serves the dashboard) uses **fail-closed** authentication: with no API keys loaded every `/api/` call gets `401` ("no API keys configured") unless dev mode is set explicitly, and a request without a known key in the `X-API-Key` header is denied. API keys are the only mechanism; there is no OIDC, SSO or user login. The dashboard page itself loads without a key and keeps the key you enter in the browser's `localStorage`. `/healthz` and `/readyz` on that port answer without a key.
+
+Roles are `viewer` (read), `operator` (acknowledge, snooze, resolve, approve, reject, runbook edits) and `admin` (everything, including runbook deletion). Any other role string grants nothing.
+
+Each key entry also accepts an optional `name`: the identity recorded on the approval decisions that key takes (it falls back to `description`, then to a `key-<hash>` fingerprint). An approve or reject through the REST API or the dashboard is recorded as `<typed name> (api-key: <identity>)`, and a quorum counts each key once, so give every approver their own key: a shared key, or dev mode, cannot satisfy a rule that requires two approvers.
+
+The API serves on every operator replica. Requests are rate-limited before authentication: a request without a valid key is limited per client host to 30 per minute (behind an Ingress or proxy every client shares the proxy's host, and forwarding headers are not trusted), and a valid key is limited to 600 per minute. Excess requests get `429` with `Retry-After`.
 
 API keys are hot-reloaded every 30 seconds with the following priority order:
 
-1. **Secret** `chatcli-operator-secrets` (priority) — `api-keys` field containing a YAML list of `{key, role, description}` entries
+1. **Secret** `chatcli-operator-secrets` (priority) — `api-keys` field containing a YAML list of `{key, role, name, description}` entries (`name` is optional). The operator chart renders it with `apiKeys.create: true` and `apiKeys.entries`; the keys are then stored in the Helm release, so prefer creating the Secret yourself (kubectl, External Secrets, Vault).
 2. **ConfigMap** `chatcli-operator-config` (fallback) — same `api-keys` field
 3. Reject the request (or accept in dev-mode if `CHATCLI_OPERATOR_DEV_MODE=true`)
 
@@ -815,11 +858,11 @@ API keys are hot-reloaded every 30 seconds with the following priority order:
 `chatcli-operator-secrets` must live **in the same namespace as the operator pod** (the controller calls `Secrets(resolveNamespace()).Get(...)` — `resolveNamespace()` reads the `POD_NAMESPACE` env var, the ServiceAccount namespace file, or falls back to the default `chatcli-system`). If you ran `helm install --namespace <X>`, create the Secret in `<X>`.
 </Warning>
 
-<Tip>API keys stored in the Secret are hot-reloaded every 30s -- no operator restart is needed.</Tip>
+<Tip>API keys stored in the Secret are hot-reloaded every 30s -- no operator restart is needed. Removing an entry from the Secret revokes that key within 30 seconds; emptying the `api-keys` field, or leaving YAML that does not parse, rejects every call. Deleting both the Secret `chatcli-operator-secrets` and the ConfigMap `chatcli-operator-config` revokes every key on the next poll (within ~30 seconds, `401` from then on). If reading the Secret or the ConfigMap fails for any reason other than not found, the keys in force are kept, so an API server hiccup does not lock everyone out.</Tip>
 
 ### Resource Type Allowlist
 
-Automated remediation touches only resource types on an allowlist. The default is wider than a single workload type, because remediation that cannot touch a Service or an HPA is remediation that escalates to a human for routine work:
+The `ApplyManifest` remediation action (which applies a manifest stored in a ConfigMap, in the target's namespace only) creates or updates only resource kinds on an allowlist. The other remediation actions act on the target workload directly and are governed by approval policies, not by this list. The default is wider than a single workload type, because remediation that cannot touch a Service or an HPA is remediation that escalates to a human for routine work:
 
 ```text
 Deployment, StatefulSet, DaemonSet, ReplicaSet, Service, ConfigMap,
@@ -836,19 +879,43 @@ ServiceEntry, VirtualService, DestinationRule
 export CHATCLI_ALLOWED_RESOURCE_TYPES="Gateway,Sidecar"
 ```
 
-To genuinely restrict what the operator may touch, restrict its RBAC: the chart's Role is namespace-scoped by default, and the operator can only act on what its ServiceAccount is granted.
+The operator's own RBAC does not narrow this either: the operator chart grants a cluster-wide ClusterRole (including Secrets, workloads, nodes and RBAC objects), because the operator acts wherever Instances and Issues live. To restrict what it may touch, edit that ClusterRole for your cluster, or keep ChatCLI resources out of namespaces it should not act on.
 </Warning>
 
-A second list names types that are **never** remediated automatically and always require explicit approval, with the reason recorded — `ClusterRole` and `ClusterRoleBinding` (cluster-wide escalation), `Role`, `RoleBinding`, `Namespace`, `Node`, `PersistentVolume`, `StorageClass`, `Secret`, `ServiceAccount`, `NetworkPolicy`, the webhook configurations, `CustomResourceDefinition` and `PriorityClass`. Anything outside both lists is rejected and logged.
+A second list names kinds that are called out as dangerous, and the refusal names the reason — `ClusterRole` and `ClusterRoleBinding` (cluster-wide escalation), `Role`, `RoleBinding`, `Namespace`, `Node`, `PersistentVolume`, `StorageClass`, `Secret`, `ServiceAccount`, `NetworkPolicy`, `PodSecurityPolicy`, the mutating and validating webhook configurations, `CustomResourceDefinition`, `PriorityClass`, `ResourceQuota` and `LimitRange`. `ApplyManifest` refuses them, and anything outside both lists, and the remediation attempt fails with that error; there is no approval path that lets such a manifest through.
 
 ### Log Scrubbing
 
-Secrets, tokens, and sensitive data are automatically scrubbed from operator logs:
+Before the operator sends an incident's enrichment context (pod logs, events, metrics, source snippets) to the LLM, it replaces sensitive values with `[REDACTED:<type>]`. Eighteen built-in patterns cover AWS access keys and secrets, JWTs, bearer tokens, `api_key=`/`password=`/`token=`/`secret=` assignments, database URIs with credentials, Kubernetes service-account tokens, GitHub tokens and fine-grained PATs, Slack tokens, `sk-` API keys, private key headers, IPv4 addresses, e-mail addresses, long base64 strings and long hex strings. The operator's own log output is not scrubbed.
+
+| # | Type | What it matches |
+|---|------|-----------------|
+| 1 | `aws_key` | AWS access key (`AKIA…`) |
+| 2 | `aws_secret` | `aws_secret_access_key=` / `aws_secret:` followed by 40 characters |
+| 3 | `jwt` | JWT tokens (`eyJ….….…`) |
+| 4 | `bearer` | `Bearer <token>` |
+| 5 | `api_key` | `api_key=`, `apikey:`, `access_key=` with 8+ characters |
+| 6 | `password_conn` | `password=`, `passwd:`, `pwd=` |
+| 7 | `db_uri` | `postgres://`, `mysql://`, `mongodb://`, `redis://`, `amqp://` URIs with user and password |
+| 8 | `token` | `token=` / `secret:` with 8+ characters |
+| 9 | `k8s_sa_token` | Kubernetes ServiceAccount tokens |
+| 10 | `github_token` | `ghp_…`, `ghs_…` |
+| 11 | `github_pat` | `github_pat_…` |
+| 12 | `slack_token` | `xoxb-…`, `xoxp-…`, `xoxo-…`, `xoxa-…` |
+| 13 | `openai_key` | `sk-…` |
+| 14 | `private_key` | `-----BEGIN (RSA) PRIVATE KEY-----` header |
+| 15 | `ipv4` | IPv4 addresses |
+| 16 | `email` | E-mail addresses |
+| 17 | `base64_secret` | Long base64 strings (60+ characters) |
+| 18 | `hex_secret` | Hexadecimal strings of 64+ characters |
 
 ```bash
-# Custom scrub patterns (regex, semicolon-separated)
-export CHATCLI_LOG_SCRUB_PATTERNS="Bearer [A-Za-z0-9._-]+;password=[^&\\s]+"
+# Extra patterns (regex, comma-separated). An invalid regex is skipped silently,
+# and a pattern cannot contain a comma.
+export CHATCLI_LOG_SCRUB_PATTERNS='(?i)x-internal-key:\s*\S+'
 ```
+
+In the operator chart: `security.logScrubPatterns`.
 
 ### CORS Policy
 
@@ -878,10 +945,14 @@ An allowlist of several origins echoes the request's own origin after matching i
 
 ### RBAC and NetworkPolicy
 
+**Operator.** The operator chart (`rbac.create: true`) grants the operator a **cluster-wide** ClusterRole: full access to the ChatCLI CRDs; get/list/watch/create/update/patch on Secrets and ConfigMaps in every namespace; workloads, Services, PVCs, Jobs and RBAC objects it provisions for Instances; pods get/list/watch/create/update/delete (pod remediations and the chaos stress pods); `pods/eviction` create (`DrainNode` evicts through the Eviction API, so PodDisruptionBudgets hold); node update (cordon/drain remediations); core and `events.k8s.io` Events create/patch; leases for leader election. The same rules are in `operator/config/rbac/role.yaml`. There is no namespace-scoped mode for the operator. It also pre-provisions the `chatcli-watcher` ClusterRole and the `chatcli-role-*` ClusterRoles, and may bind only those.
+
+**Server chart.** The standalone server chart is namespace-scoped by default:
+
 <Tabs>
   <Tab title="Namespace-Scoped RBAC (Default)">
     ```yaml
-    # values.yaml
+    # values.yaml (chatcli chart)
     rbac:
       create: true
       clusterWide: false   # Role (namespace-scoped)
@@ -890,23 +961,29 @@ An allowlist of several origins echoes the request's own origin after matching i
   <Tab title="Cluster-Wide RBAC">
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
+      --version 1.211.2 \
+      --set server.token="$(openssl rand -hex 32)" \
       --set rbac.clusterWide=true \
       --set watcher.enabled=true
     ```
+    Watcher targets in more than one namespace switch the chart to a ClusterRole on their own.
   </Tab>
 </Tabs>
 
-The chart ships a NetworkPolicy, **disabled by default**. Enabling it restricts ingress to the ports the server actually serves; egress is a separate choice:
+**Server chart NetworkPolicy**, disabled by default. Enabling it restricts ingress to the gRPC and metrics ports; `ingressFrom` narrows who may connect; egress is a separate choice:
 
 ```yaml
-# values.yaml
+# values.yaml (chatcli chart)
 networkPolicy:
   enabled: true
+  ingressFrom:              # empty = any source
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: chatcli-system
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
   egress: restricted        # allowAll (default) | restricted
-  # ingressFrom:
-  #   - podSelector:
-  #       matchLabels:
-  #         app: chatcli-client
   # egressExtraPorts:       # a private model endpoint, say
   #   - port: 8080
   #     protocol: TCP
@@ -921,8 +998,33 @@ networkPolicy:
     - {port: 53, protocol: TCP}
   - ports:
     - {port: 443, protocol: TCP}    # LLM providers and other outbound APIs
-    - {port: 6443, protocol: TCP}   # Kubernetes API
+    - {port: 6443, protocol: TCP}   # Kubernetes API (networkPolicy.kubernetesApiPort)
 ```
+
+**Operator chart NetworkPolicy**, also disabled by default:
+
+```yaml
+# values.yaml (chatcli-operator chart)
+networkPolicy:
+  enabled: true
+  apiIngressFrom:           # who may reach the REST API / dashboard (8090); empty = any source
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  metricsIngressFrom:       # who may scrape 8080; empty = any source
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  egress: restricted        # restricted (default here) | allowAll
+  kubernetesApiPort: 6443
+  instanceGrpcPort: 50051
+  egressExtraPorts:         # SMTP notifications, git over SSH, webhooks on other ports
+    - {port: 587, protocol: TCP}
+```
+
+`restricted` allows DNS, HTTPS, the Kubernetes API, the Instances' gRPC port and, when `prometheusUrl` names one, the Prometheus port. The raw manifests carry the same policy in `operator/config/network-policy/network-policy.yaml` (`make deploy-network-policy`).
+
+Operator-managed Instances get no NetworkPolicy; write one for their pods (label `app.kubernetes.io/instance: <instance name>`) that admits the operator namespace on the gRPC port and your Prometheus on the metrics port.
 
 <Warning>
 Start with `egress: allowAll`, confirm ingress behaves, then tighten. DNS is included in the narrow form and is not optional: a pod that cannot resolve names fails in ways that look nothing like a network policy problem. If the server calls a private model endpoint or an internal service, add its port to `egressExtraPorts` before switching.
@@ -930,10 +1032,10 @@ Start with `egress: allowAll`, confirm ingress behaves, then tighten. DNS is inc
 
 ### Pod SecurityContext
 
-The Helm chart defines a restrictive SecurityContext by default:
+The server chart defines a restrictive SecurityContext by default (the operator chart does the same without fixing a UID; the operator image runs as `65532`):
 
 ```yaml
-# values.yaml
+# values.yaml (chatcli chart)
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -952,35 +1054,60 @@ securityContext:
 
 <Info>When `securityContext.readOnlyRootFilesystem` is `true`, the chart automatically mounts an `emptyDir` volume at `/tmp` (limited to 100Mi) so the application can write temporary files.</Info>
 
+Operator-managed Instance pods get the same shape without configuration: `runAsNonRoot`, UID `1000`, `RuntimeDefault` seccomp, no privilege escalation, read-only root filesystem and every capability dropped, including on the `plugin-loader` init container, so they pass the `restricted` Pod Security Standard. `spec.securityContext` replaces the pod-level part. Nothing labels namespaces for Pod Security Admission; add `pod-security.kubernetes.io/enforce: restricted` yourself.
+
 ### Operator Dev Mode
 
-For local development, the operator can run in dev mode with relaxed security:
+For local development, the operator can run in dev mode:
 
 ```bash
-# Enable dev mode (disables TLS requirement and strict auth)
-export CHATCLI_OPERATOR_DEV_MODE=true
+# With no API keys loaded, every REST caller is admitted as admin
+export CHATCLI_OPERATOR_DEV_MODE=true      # chart: security.devMode: true
 ```
 
-<Warning>Never enable `CHATCLI_OPERATOR_DEV_MODE` in production. It disables critical security checks.</Warning>
+Dev mode changes only that: when no API key is loaded, the REST API admits every request as `admin` instead of refusing it. Once keys are loaded they are enforced as usual. It does not touch TLS or the operator's connection to the servers.
+
+<Warning>Never enable `CHATCLI_OPERATOR_DEV_MODE` in production: an operator without keys then hands admin to anyone who can reach port 8090.</Warning>
 
 ### Operator TLS
 
-```bash
-# AIOps REST API TLS
-export CHATCLI_AIOPS_TLS_CERT=/path/to/cert.pem
-export CHATCLI_AIOPS_TLS_KEY=/path/to/key.pem
+The operator has two TLS surfaces.
 
-# gRPC TLS with CA for mTLS
-export CHATCLI_GRPC_TLS_CERT=/path/to/cert.pem
-export CHATCLI_GRPC_TLS_KEY=/path/to/key.pem
-export CHATCLI_GRPC_TLS_CA=/path/to/ca.pem
+**REST API and dashboard (port 8090).** HTTP by default; TLS 1.3 when both paths are set:
+
+```yaml
+# values.yaml (chatcli-operator chart)
+security:
+  apiTLS:
+    certFile: /etc/chatcli-operator/api-tls/tls.crt   # CHATCLI_AIOPS_TLS_CERT
+    keyFile: /etc/chatcli-operator/api-tls/tls.key    # CHATCLI_AIOPS_TLS_KEY
+extraVolumes:
+  - name: api-tls
+    secret:
+      secretName: chatcli-operator-api-tls
+extraVolumeMounts:
+  - name: api-tls
+    mountPath: /etc/chatcli-operator/api-tls
+    readOnly: true
 ```
+
+**Operator to ChatCLI servers (gRPC).** The operator always dials TLS 1.3, so every Instance it should reach needs `spec.server.tls.enabled: true` with a `secretName` whose certificate is valid for `<instance>.<namespace>.svc.cluster.local`. The trust root is the `ca.crt` key of that Secret, else the system CAs. The credential it presents comes from the Instance (`spec.server.token`, `security.operatorTokenRef`, short-lived HS256 JWTs it mints from `security.jwtSecretRef`, or the client certificate in `security.operatorClientCertSecretName`). Operator-wide fallbacks, mounted the same way through `extraVolumes`:
+
+```yaml
+security:
+  grpcTLS:
+    caFile: /etc/chatcli-operator/grpc/ca.crt    # CHATCLI_GRPC_TLS_CA: only when the Instance Secret has no ca.crt
+    certFile: /etc/chatcli-operator/grpc/tls.crt # CHATCLI_GRPC_TLS_CERT: client cert when the Instance names none
+    keyFile: /etc/chatcli-operator/grpc/tls.key  # CHATCLI_GRPC_TLS_KEY
+```
+
+The Instance reports what it found in its status conditions: `TLSConfigured` is `False` (and no Deployment is created) when TLS is enabled without a Secret name, `AuthenticationConfigured` is `False` when a reachable server has no credential, `OperatorCredentialConfigured` says which credential the operator presents, and `ServerReachable` reports the last probe, repeated every five minutes. Rotating any Secret an Instance references rolls its pods.
 
 ---
 
 ## Container Security (Docker)
 
-The `docker-compose.yml` includes the following hardening measures:
+The development `docker-compose.yml` includes the following hardening measures (it also binds `0.0.0.0` inside the container, so it needs `CHATCLI_SERVER_TOKEN` or JWT material to start):
 
 ```yaml
 services:
@@ -1004,6 +1131,8 @@ services:
 | `no-new-privileges` | Prevents child processes from gaining more privileges than the parent |
 | Resource limits | Prevents excessive CPU/memory consumption (DoS) |
 
+The server image is distroless (`gcr.io/distroless/static-debian12:nonroot`, UID `65532`) and carries `grpc-health-probe` for its `HEALTHCHECK`. The operator image is Alpine-based and runs as `65532`.
+
 ---
 
 ## CI/CD Security
@@ -1024,18 +1153,23 @@ ChatCLI's CI/CD pipeline includes multiple security checks:
     ```bash
     gosec ./...
     ```
+
+    Results are uploaded as a SARIF report to code scanning; gosec findings do not fail the workflow on their own.
+  </Step>
+  <Step title="Trivy">
+    Every release image is scanned before its manifest is published; a fixable HIGH or CRITICAL finding blocks the release. The last stable tags are re-scanned and rebuilt when a fix appears.
   </Step>
   <Step title="Dependabot">
     Automated dependency updates with security alerts for vulnerable packages. Configured via `.github/dependabot.yml`.
   </Step>
   <Step title="Cosign Image Signing">
-    Container images are signed using [Sigstore Cosign](https://github.com/sigstore/cosign) for supply chain verification.
+    Container images and Helm charts are signed keyless with [Sigstore Cosign](https://github.com/sigstore/cosign) from the release workflow; images also carry SBOM and provenance attestations.
 
     ```bash
-    # Verify a ChatCLI image
-    cosign verify ghcr.io/diillson/chatcli:latest \
-      --certificate-identity-regexp=".*" \
-      --certificate-oidc-issuer-regexp=".*"
+    # Verify a ChatCLI image (same for ghcr.io/diillson/chatcli-operator)
+    cosign verify ghcr.io/diillson/chatcli:1.211.2 \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp '^https://github\.com/diillson/chatcli/\.github/workflows/(3-publish-release|image-refresh)\.yml@refs/heads/main$'
     ```
   </Step>
 </Steps>
@@ -1135,19 +1269,19 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_MAX_SEND_MSG_SIZE` | Maximum gRPC send message size (bytes) | `52428800` (50MB) |
 | `CHATCLI_MAX_CONCURRENT_STREAMS` | Maximum concurrent gRPC streams per connection | `100` |
 | `CHATCLI_BIND_ADDRESS` | Network interface to bind to. Auto-detects `0.0.0.0` in Kubernetes. | `127.0.0.1` / `0.0.0.0` (K8s) |
-| `CHATCLI_AUDIT_LOG_PATH` | Path for structured audit log file | `""` |
-| `CHATCLI_LOG_FILE` | Application log file path | `~/.chatcli/app.log` |
-| `CHATCLI_LOG_MAX_SIZE_MB` | Max log file size before rotation (MB) | `100` |
-| `CHATCLI_LOG_MAX_BACKUPS` | Number of rotated log files to keep | `3` |
-| `CHATCLI_LOG_MAX_AGE_DAYS` | Maximum age of rotated log files (days) | `30` |
-| `CHATCLI_DEBUG` | Enable debug mode with verbose logging | `false` |
-| `CHATCLI_ALLOW_HTTP_PROVIDERS` | Allow HTTP (non-TLS) connections to LLM providers | `false` |
-| `CHATCLI_GRPC_REFLECTION` | Enable gRPC reflection (use only in dev) | `false` |
+| `CHATCLI_AUDIT_LOG_PATH` | Absolute path of the hash-chained JSON-lines audit log (server and CLI) | `""` |
+| `LOG_FILE` | Application log file path (`CHATCLI_LOG_FILE` is an alias) | `~/.chatcli/app.log` |
+| `LOG_MAX_SIZE` | Log file size before rotation (e.g. `100MB`); `CHATCLI_LOG_MAX_SIZE_MB`, `CHATCLI_LOG_MAX_BACKUPS` (3), `CHATCLI_LOG_MAX_AGE_DAYS` (28) and `CHATCLI_LOG_COMPRESS` (`true`) tune the rotation | `100MB` |
+| `CHATCLI_LOG_STDERR` | `chatcli server` / `chatcli gateway`: also write the JSON log lines to stderr (`true`/`false`); unset, on whenever stderr is not a terminal, so `kubectl logs` and `docker logs` carry the log | auto |
+| `CHATCLI_DEBUG` | Log the raw panic value and stack trace when the server recovers from a panic (sanitized otherwise) | `false` |
+| `CHATCLI_ALLOW_HTTP_PROVIDERS` | Accept `http://` provider URLs a client supplies (the private-range SSRF checks still apply) | `false` |
+| `CHATCLI_GRPC_REFLECTION` | Default of `--enable-reflection` (use only in dev) | `false` |
+| `CHATCLI_METRICS_PORT` | Metrics and `/healthz` port, plain HTTP without authentication; `0` disables it | `9090` |
 | `CHATCLI_SERVER_TOKEN` | Legacy bearer token for gRPC authentication | `""` |
 | `CHATCLI_SERVER_TLS_CERT` | Server TLS certificate path | `""` |
 | `CHATCLI_SERVER_TLS_KEY` | Server TLS key path | `""` |
 | `CHATCLI_SERVER_TLS_CLIENT_CA` | CA bundle client certificates are verified against; enables mutual TLS. Requires cert and key. | `""` |
-| `CHATCLI_MTLS_ROLE` | Role granted to a caller identified by its client certificate alone (no bearer token): `viewer`, `user` or `admin`. An unrecognized value resolves to read-only. | `user` |
+| `CHATCLI_MTLS_ROLE` | Role granted to a caller identified by its client certificate alone (no bearer token): `viewer`/`readonly`, `user`/`operator` or `admin`. An unrecognized value resolves to read-only. | `user` |
 
 ### Agent Security
 
@@ -1162,7 +1296,7 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_AGENT_SOURCE_SHELL_CONFIG` | Source shell config (`~/.bashrc`, etc.) in agent commands | `false` |
 | `CHATCLI_AGENT_ALLOW_SUDO` | Allow `sudo` without automatic blocking | `false` |
 | `CHATCLI_AGENT_CMD_TIMEOUT` | Timeout per executed command, capped at `1h` | `10m` |
-| `CHATCLI_MAX_COMMAND_OUTPUT` | Maximum command output size (bytes) | `102400` |
+| `CHATCLI_MAX_COMMAND_OUTPUT` | Intended cap on command output (bytes); no effect in current releases (see [Output Sanitizer](#output-sanitizer)) | `102400` |
 | `CHATCLI_CODER_SANDBOX` | OS-level confinement for `@coder exec` and `@coder test`: `off`, `workspace`, `strict`, `docker`/`podman`/`container` | `off` |
 
 ### Plugin and Auth Security
@@ -1171,29 +1305,30 @@ Complete reference of all security-related environment variables:
 |----------|-------------|---------|
 | `CHATCLI_ALLOW_UNSIGNED_PLUGINS` | Allow unsigned plugins to execute | `false` |
 | `CHATCLI_PLUGIN_QUARANTINE` | Hold newly seen unsigned plugins: a duration, `on` (24h), or `off` | `off` |
-| `CHATCLI_ALLOW_INSECURE` | Allow insecure (non-TLS) connections | `false` |
-| `CHATCLI_TLS_CLIENT_CERT` | Client TLS certificate for mTLS | `""` |
-| `CHATCLI_TLS_CLIENT_KEY` | Client TLS key for mTLS | `""` |
-| `CHATCLI_ENCRYPTION_KEY` | Opt-in encryption at rest for sessions, autosaves, MCP mirrors and park snapshots (AES-256-GCM, HKDF-derived) | `""` (off) |
+| `CHATCLI_ALLOW_INSECURE` | Let `chatcli connect` dial a plaintext server when `--tls` is not given (read by the client only) | `false` |
+| `CHATCLI_TLS_CLIENT_CERT` | Client certificate `chatcli connect --tls` presents for mTLS | `""` |
+| `CHATCLI_TLS_CLIENT_KEY` | Key of that client certificate | `""` |
+| `CHATCLI_ENCRYPTION_KEY` | Opt-in encryption at rest for sessions, memory, contexts, transcripts, the CCR archive and costs (AES-256-GCM, HKDF-derived) | `""` (off) |
 | `CHATCLI_ENCRYPTION_KEY_PREVIOUS` | Retired keys still accepted on read during a rotation (comma-separated) | `""` |
 | `CHATCLI_KEYCHAIN_BACKEND` | Where the credential-encryption key lives: `auto`, `file`, `keychain`. A Go test binary never reaches the OS keychain on `auto` — only an explicit `keychain` does — so running the suite neither prompts for access nor rewrites the developer's key | `auto` |
 | `CHATCLI_DISABLE_HISTORY` | Disable conversation history recording | `false` |
 | `CHATCLI_SESSION_TTL` | Machine-session time-to-live, in days (`0` disables; user-named sessions never expire) | `90d` |
 | `CHATCLI_ENV_REDACT_MODE` | Secret redaction on the LLM path: `permissive`, `strict`, `off` | `permissive` |
-| `CHATCLI_REDACT_PATTERNS` | Custom redaction patterns (semicolon-separated regex) | `""` |
+| `CHATCLI_REDACT_PATTERNS` | Extra name fragments treated as sensitive (comma-separated, case-insensitive substring match) | `""` |
 
 ### Operator Security
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CHATCLI_OPERATOR_DEV_MODE` | Enable operator dev mode (relaxed security) | `false` |
-| `CHATCLI_AIOPS_TLS_CERT` | AIOps REST API TLS certificate | `""` |
-| `CHATCLI_AIOPS_TLS_KEY` | AIOps REST API TLS key | `""` |
-| `CHATCLI_GRPC_TLS_CERT` | gRPC TLS certificate | `""` |
-| `CHATCLI_GRPC_TLS_KEY` | gRPC TLS key | `""` |
-| `CHATCLI_GRPC_TLS_CA` | gRPC CA certificate for mTLS verification | `""` |
-| `CHATCLI_ALLOWED_RESOURCE_TYPES` | Allowed Kubernetes resource types (comma-separated) | 17 workload, networking and Istio types — see above |
-| `CHATCLI_LOG_SCRUB_PATTERNS` | Patterns to scrub from logs (semicolon-separated regex) | Built-in patterns |
+| `CHATCLI_OPERATOR_DEV_MODE` | With no API keys loaded, admit every REST caller as admin | `false` |
+| `CHATCLI_AIOPS_TLS_CERT` | REST API / dashboard TLS certificate (TLS 1.3 when set with the key) | `""` |
+| `CHATCLI_AIOPS_TLS_KEY` | REST API / dashboard TLS key | `""` |
+| `CHATCLI_GRPC_TLS_CERT` | Client certificate the operator presents to servers whose Instance names none | `""` |
+| `CHATCLI_GRPC_TLS_KEY` | Key of that client certificate | `""` |
+| `CHATCLI_GRPC_TLS_CA` | CA the operator trusts for servers whose TLS Secret has no `ca.crt` | `""` (system CAs) |
+| `CHATCLI_ALLOWED_RESOURCE_TYPES` | Extra kinds `ApplyManifest` may apply, added to the defaults (comma-separated) | 17 workload, networking and Istio types — see above |
+| `CHATCLI_LOG_SCRUB_PATTERNS` | Extra regexes scrubbed from the context sent to the LLM (comma-separated) | 18 built-in patterns |
+| `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` | Extra read-only commands the remediation engine may run (comma-separated, appended to the built-in list) | `""` |
 | `CHATCLI_CORS_ALLOWED_ORIGINS` | Origins allowed to call the operator REST API from a browser (comma-separated, or `*`) | `""` (deny all) |
 | `CHATCLI_CORS_ORIGIN` | A single allowed origin | `""` |
 | `CHATCLI_CORS_ALLOWED_METHODS` | Methods allowed cross-origin (comma-separated) | `GET,POST,PUT,DELETE,OPTIONS` |
@@ -1226,6 +1361,8 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     ```bash
     chatcli server --tls-cert cert.pem --tls-key key.pem
     ```
+
+    Under the operator this is not optional: it dials every Instance over TLS, so set `spec.server.tls.enabled: true` with a Secret holding `tls.crt`, `tls.key` and `ca.crt`.
   </Step>
   <Step title="Use strict agent security mode">
     ```bash
@@ -1274,13 +1411,19 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     ```
   </Step>
   <Step title="Keep gRPC reflection disabled">
-    Do not set `CHATCLI_GRPC_REFLECTION=true` in production. Use only for local debugging.
+    Do not pass `--enable-reflection` or set `CHATCLI_GRPC_REFLECTION=true` in production. Use only for local debugging.
   </Step>
-  <Step title="Use namespace-scoped RBAC">
-    Keep `rbac.clusterWide: false` (default) unless you need to monitor multiple namespaces.
+  <Step title="Use namespace-scoped RBAC for the server chart">
+    Keep `rbac.clusterWide: false` (default) unless you need to monitor multiple namespaces. The operator always needs its cluster-wide ClusterRole; review it before installing.
+  </Step>
+  <Step title="Fence the unauthenticated ports">
+    The metrics endpoints (server `9090`, operator `8080`) have no authentication. Enable `networkPolicy` in both charts, restrict `metricsIngressFrom` / `ingressFrom` to your monitoring namespace and `apiIngressFrom` to whatever fronts the dashboard, and write a NetworkPolicy for operator-managed Instance pods.
+  </Step>
+  <Step title="Manage dashboard API keys as Secrets">
+    Create `chatcli-operator-secrets` in the operator namespace with one key per team and the lowest role that works, generate keys with `openssl rand -hex 32`, and rotate by editing the Secret (a removed entry stops working within 30 seconds). Never run with `security.devMode: true`.
   </Step>
   <Step title="Set resource limits">
-    Always define CPU and memory limits to prevent excessive consumption:
+    Always define CPU and memory limits to prevent excessive consumption. The charts ship defaults; an operator-managed Instance gets none unless `spec.resources` sets them:
 
     ```yaml
     resources:
@@ -1303,6 +1446,18 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     ```
 
     Check `/config server` afterwards: it prints the backend that actually took effect, which is the file wherever no keychain is available.
+  </Step>
+  <Step title="Monitor the audit log">
+    ```bash
+    # gRPC calls authentication refused:
+    jq 'select(.kind == "grpc" and .result == "denied")' /var/log/chatcli/audit.json
+
+    # Check the integrity of the chain:
+    # /config security verify-audit /var/log/chatcli/audit.json
+
+    # Operator actions are AuditEvent resources, not lines in this file:
+    kubectl get auditevents -A
+    ```
   </Step>
   <Step title="Keep ChatCLI updated">
     The version check is enabled by default. If you disabled it with `CHATCLI_DISABLE_VERSION_CHECK`, check periodically:

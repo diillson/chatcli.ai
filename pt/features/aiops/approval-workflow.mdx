@@ -41,10 +41,10 @@ sequenceDiagram
     IR->>RR: RemediationPlan criado (estado Pending)
     RR->>AP: Primeira regra que casa no namespace do plano?
 
-    alt Nenhuma regra casa, ou a regra é mode auto
+    alt Nenhuma regra casa, ou regra auto sem autoApproveConditions
         RR->>RR: Gates de tier do cluster e decision engine (se habilitados)
         RR->>K8s: Executa as ações
-    else Regra manual ou quorum
+    else Regra manual, quorum, ou auto com autoApproveConditions
         RR->>AR: Cria ApprovalRequest "approval-<plano>"
         RR->>K8s: Anota o plano "approval-pending", estado WaitingApproval
         RR->>RR: Reverifica a cada 10s
@@ -110,7 +110,7 @@ spec:
 |-------|------|:-----------:|-----------|
 | `rules` | []ApprovalRule | **Sim** | Avaliadas de cima para baixo; vale a primeira regra que casar |
 | `enabled` | bool | Não (padrão `true`) | Policies desabilitadas são ignoradas |
-| `defaultMode` | string | Não (padrão `manual`) | Aparece no `kubectl get ap`, mas **não é lido pelo operator**: quando nenhuma regra casa, a policy não segura o plano |
+| `defaultMode` | string | Não (padrão `manual`) | Informativo: aparece no `kubectl get ap`, mas **não é aplicado pelo operator**. Quando nenhuma regra casa, a policy não segura o plano; termine as regras com uma regra pega-tudo (`match: {}`) para segurar todo o resto |
 
 #### ApprovalRule
 
@@ -121,10 +121,10 @@ Cada regra define um par **match + mode** com configurações específicas.
 | `name` | string | **Sim** | Nome da regra, copiado para a requisição em `spec.ruleName` |
 | `match` | ApprovalMatch | **Sim** | Critérios de matching |
 | `mode` | string | **Sim** (padrão `manual`) | `auto`, `manual`, `quorum` |
-| `requiredApprovers` | int | Não (padrão `1`) | Aprovações necessárias no modo `quorum` (ignorado no `manual`) |
-| `timeoutMinutes` | int | Não (padrão `30`) | Minutos desde a criação da requisição até ela expirar |
+| `requiredApprovers` | int | Não (padrão `1`) | Aprovadores distintos necessários no modo `quorum` (ignorado no `manual`) |
+| `timeoutMinutes` | int | Não (padrão `30`) | Minutos que a requisição pode esperar por uma decisão antes de expirar (com `changeWindow`, só conta o tempo com a janela aberta) |
 | `changeWindow` | ChangeWindowSpec | Não | Quando uma decisão sobre as requisições desta regra pode ser aplicada |
-| `autoApproveConditions` | AutoApproveConditions | Não | Veja a aba `auto` abaixo: hoje não tem efeito em planos criados pelo operator |
+| `autoApproveConditions` | AutoApproveConditions | Não | Só no modo `auto`: o plano espera e é aprovado automaticamente quando todas as condições valem (veja a aba `auto` abaixo) |
 
 #### ApprovalMatch
 
@@ -145,21 +145,28 @@ Não existe combinação do tipo "a regra mais restritiva prevalece". Dentro de 
 
 <Tabs>
   <Tab title="auto">
-    **Auto**: uma regra `auto` que casa significa "este plano não precisa de aprovação desta policy". Nenhum ApprovalRequest é criado e o plano segue (o tier do cluster e o decision engine, quando habilitados, ainda o avaliam).
+    **Auto**: uma regra `auto` **sem** `autoApproveConditions` que casa significa "este plano não precisa de aprovação desta policy". Nenhum ApprovalRequest é criado e o plano segue (o tier do cluster e o decision engine, quando habilitados, ainda o avaliam).
 
     Como vale a primeira regra que casar, uma regra `auto` também encobre todas as regras abaixo dela para os planos que ela casa.
 
-    O CRD aceita `autoApproveConditions`:
+    Com `autoApproveConditions`, a regra para o plano num ApprovalRequest, e o controller de aprovação o aprova automaticamente (`status.autoApproved: true`, decisão de `auto-policy`) só quando **todas** as condições valem. Caso contrário, a requisição espera uma decisão humana como numa regra `manual`, e continua expirando pelo `timeoutMinutes`:
 
     | Condição | Tipo | Descrição |
     |----------|------|-----------|
     | `minConfidence` | float64 | Confiança mínima do AIInsight (0.0-1.0) |
-    | `maxSeverity` | string | Severidade máxima |
+    | `maxSeverity` | string | Severidade máxima do Issue (`low` < `medium` < `high` < `critical`); um Issue cuja severidade não pode ser lida não atende |
     | `historicalSuccessRate` | float64 | Taxa mínima de sucesso dos mesmos tipos de ação neste namespace (0.0-1.0) |
 
-    <Warning>
-    As `autoApproveConditions` só são avaliadas pelo controller de aprovação sobre um ApprovalRequest já existente cuja regra seja `auto`, e o operator nunca cria uma requisição assim: a regra `auto` libera o plano antes de existir qualquer requisição. Na prática, hoje as condições **não têm efeito**; uma regra `auto` sempre deixa os planos que casam rodarem. Quando chegam a ser avaliadas, `maxSeverity` também não é respeitado (a comparação nunca enxerga a severidade do Issue). Use regras `manual`/`quorum`, ou o [decision engine](/pt/features/aiops/decision-engine), quando precisar de um gate baseado em confiança.
-    </Warning>
+    ```yaml
+    mode: auto
+    autoApproveConditions:
+      minConfidence: 0.85
+      maxSeverity: medium
+      historicalSuccessRate: 0.8
+    timeoutMinutes: 30
+    ```
+
+    A confiança vem do AIInsight do Issue; um AIInsight ausente conta como confiança `0`, então as condições não são atendidas e um humano decide.
   </Tab>
   <Tab title="manual">
     **Manual**: o plano espera até que **um** humano aprove ou rejeite, ou até a requisição expirar. `requiredApprovers` é ignorado neste modo: a primeira aprovação já aprova a requisição.
@@ -170,7 +177,7 @@ Não existe combinação do tipo "a regra mais restritiva prevalece". Dentro de 
     ```
   </Tab>
   <Tab title="quorum">
-    **Quorum**: exige `requiredApprovers` aprovações. Uma única rejeição já rejeita a requisição.
+    **Quorum**: exige `requiredApprovers` aprovações de aprovadores distintos. Uma única rejeição já rejeita a requisição.
 
     ```yaml
     mode: quorum
@@ -178,10 +185,10 @@ Não existe combinação do tipo "a regra mais restritiva prevalece". Dentro de 
     timeoutMinutes: 15
     ```
 
-    Neste exemplo, são necessárias duas decisões de aprovação para o plano rodar.
+    Neste exemplo, são necessárias duas aprovações de aprovadores diferentes para o plano rodar.
 
     <Warning>
-    Aprovadores não são deduplicados: toda decisão `approved` conta, mesmo duas com o mesmo nome. O nome na annotation é texto livre e não é conferido com o usuário do Kubernetes que a escreveu, então o controle real é quem tem RBAC para atualizar `approvalrequests`. Além disso, uma única aprovação pela API REST ou pelo dashboard já aprova uma requisição de quorum (veja [Via REST API](#via-rest-api)).
+    Cada aprovador conta uma vez. Aprovadores por annotation são contados pelo nome, sem diferenciar maiúsculas; o nome é texto livre e não é conferido com o usuário do Kubernetes que o escreveu, então o controle real é quem tem RBAC para atualizar `approvalrequests`. Aprovadores pela API REST e pelo dashboard são contados pela **API key**: uma chave compartilhada, ou o dev mode, não satisfaz `requiredApprovers: 2`, então dê a cada aprovador a sua própria chave (veja [Via REST API](#via-rest-api)).
     </Warning>
   </Tab>
 </Tabs>
@@ -199,8 +206,14 @@ A change window é definida **por regra** (`rules[].changeWindow`), não no nív
 
 Não existem datas de blackout nem exceção para severidade crítica.
 
+A janela controla quando uma aprovação **tem efeito**, venha a decisão de onde vier (annotation, API REST ou dashboard):
+
+- Decisões são registradas a qualquer hora, e uma rejeição tem efeito na hora.
+- O relógio do timeout só corre com a janela aberta, então uma requisição aberta de madrugada guarda o `timeoutMinutes` inteiro para quando os aprovadores puderem agir.
+- Uma requisição que já tem as aprovações necessárias e só espera a janela não expira. Ela recebe a condition `ChangeWindow=False` (reason `OutsideChangeWindow`) e vira `Approved` quando a janela abre (reverificado a cada minuto); aprovações dentro da janela gravam `ChangeWindow=True` (`WithinChangeWindow`).
+
 <Warning>
-Fora da janela, o controller de aprovação não processa a requisição: as annotations de aprovar/rejeitar ficam onde estão e são aplicadas quando a janela abrir (ele reverifica a cada minuto). O **timeout continua correndo** e é verificado antes da janela, então uma requisição cujo timeout vence fora da janela expira e o plano falha. Dimensione o `timeoutMinutes` para cobrir o intervalo até a próxima janela. Um `timezone` inválido é registrado no log e a janela é ignorada. Uma decisão tomada pela API REST ou pelo dashboard não é segurada pela janela.
+Uma janela que nunca abre (um `timezone` desconhecido, nenhum dia válido em `allowedDays`, ou `startHour` igual a `endHour`) é registrada no log, bloqueia a aprovação, e a requisição expira pelo relógio de parede.
 </Warning>
 
 
@@ -293,18 +306,19 @@ status:
 | Campo | Descrição |
 |-------|-----------|
 | `state` | `Pending`, `Approved`, `Rejected`, `Expired` |
-| `decisions[]` | `approver`, `decision` (`approved`/`rejected`), `reason`, `timestamp`, registrados nas decisões por annotation |
+| `decisions[]` | `approver`, `decision` (`approved`/`rejected`), `reason`, `timestamp`, registrados em toda decisão (annotation, API REST, dashboard, e `auto-policy` nas aprovações automáticas) |
 | `approvedAt`, `rejectedAt`, `expiredAt` | Momentos das transições |
 | `autoApproved` | `true` só quando as condições de uma regra `auto` aprovaram |
+| `conditions[]` | Condition `ChangeWindow` nas requisições cuja regra tem change window (`WithinChangeWindow` / `OutsideChangeWindow`) |
 
 #### Estados do ApprovalRequest
 
 ```mermaid
 stateDiagram-v2
     [*] --> Pending : ApprovalRequest criado
-    Pending --> Approved : 1 aprovação (manual) / requiredApprovers aprovações (quorum)
+    Pending --> Approved : 1 aprovação (manual) / requiredApprovers aprovações distintas (quorum), dentro da change window
     Pending --> Rejected : Qualquer aprovador rejeitou
-    Pending --> Expired : timeoutMinutes desde a criação
+    Pending --> Expired : timeoutMinutes de tempo de decisão sem aprovações suficientes
     Approved --> [*]
     Rejected --> [*]
     Expired --> [*]
@@ -342,7 +356,7 @@ Rodam dois cálculos, ambos informativos: nenhum deles bloqueia um plano sozinho
     Uma ação `RollbackDeployment` sobe `low` para `medium`. Uma ação `Custom` sobe `low` ou `medium` para `high`. Os demais tipos não mudam o nível. Ingresses e downtime estimado não são calculados.
   </Step>
   <Step title="Annotations de predição (controller de aprovação)">
-    Enquanto a requisição está `Pending`, o controller de aprovação roda o preditor de blast radius sobre a **primeira** ação do plano (checagens de PodDisruptionBudget, ResourceQuota, capacidade dos nodes e Services afetados) e grava o resultado em duas annotations do ApprovalRequest: `platform.chatcli.io/blast-radius` (resumo em texto) e `platform.chatcli.io/blast-risk-level`. Isso acontece uma vez por requisição.
+    Enquanto a requisição está `Pending`, o controller de aprovação roda o preditor de blast radius sobre a **primeira** ação do plano (checagens de PodDisruptionBudget, ResourceQuota, capacidade dos nodes e Services afetados) e grava o resultado em duas annotations do ApprovalRequest: `platform.chatcli.io/blast-radius` (resumo em texto) e `platform.chatcli.io/blast-risk-level`. Isso acontece uma vez por requisição. A API REST devolve as annotations da requisição, então o card de aprovação do dashboard mostra o nível de risco como um badge.
   </Step>
 </Steps>
 
@@ -364,10 +378,10 @@ sequenceDiagram
     participant K8s as Kubernetes API
 
     RR->>AP: Primeira policy/regra habilitada que casa
-    alt Regra manual ou quorum
+    alt Regra manual, quorum, ou auto com autoApproveConditions
         RR->>AReq: Cria approval-<plano> (policyRef = nome da policy)
         RR->>K8s: Anota o plano approval-pending, estado WaitingApproval
-    else Nenhuma regra casa, ou regra auto
+    else Nenhuma regra casa, ou regra auto sem condições
         RR->>CT: O tier de CHATCLI_OPERATOR_CLUSTER_NAME exige aprovação?
         alt sim
             RR->>AReq: Cria approval-<plano> (policyRef = cluster-tier)
@@ -394,11 +408,13 @@ sequenceDiagram
     end
 ```
 
-O gate **falha fechado** quando não consegue abrir a requisição: se a criação do ApprovalRequest ou a anotação do plano falhar, o plano continua `Pending` e é tentado de novo; ele nunca roda porque o gate deu erro. Um ApprovalRequest que já existe com o mesmo nome é reaproveitado, não ignorado.
+O gate **falha fechado**. Se o Issue, o AIInsight ou as ApprovalPolicies não puderem ser lidos, ou o decision engine devolver erro, o plano continua `Pending`, um Event de Warning `ApprovalGateUnavailable` é registrado nele e o reconcile é tentado de novo com backoff; o plano nunca roda porque um gate deu erro. Se a criação do ApprovalRequest ou a anotação do plano falhar, o plano também continua `Pending` e é tentado de novo. Um ApprovalRequest que já existe com o mesmo nome é reaproveitado, não ignorado.
 
-<Warning>
-Dois caminhos ainda deixam o plano passar sem aprovação: se a listagem das ApprovalPolicies falhar, o erro vai para o log e o plano segue para os gates de tier e decision engine; e se o Issue pai não puder ser lido, os três gates são pulados. Um nome de cluster desconhecido ou um erro do decision engine também cai para "só as policies".
-</Warning>
+Um plano cujo Issue pai não existe mais falha ("Parent issue not found; approval policies cannot be evaluated without it") em vez de rodar sem gate. Um AIInsight ausente não é erro: a evidência leva confiança `0`, o que só deixa as condições de auto-aprovação e o decision engine mais rígidos. Resta uma exceção: um `CHATCLI_OPERATOR_CLUSTER_NAME` que não casa com nenhuma ClusterRegistration vai para o log e o gate de tier do cluster é pulado, restando as policies e o decision engine.
+
+```bash
+kubectl -n production get events --field-selector reason=ApprovalGateUnavailable
+```
 
 ### Requisições sem ApprovalPolicy
 
@@ -422,6 +438,8 @@ metadata:
 ```
 
 A annotation é informativa. O gate é o estado `WaitingApproval` do plano mais o status do ApprovalRequest, que o reconciler sempre lê diretamente, então apagar a annotation não pula a aprovação. Na aprovação ou rejeição o controller de aprovação a remove; na rejeição ele também grava `platform.chatcli.io/rejection-reason` no plano.
+
+Uma requisição cuja ApprovalPolicy (ou regra) foi apagada nesse meio-tempo continua sendo avaliada, com o próprio `requiredApprovers` e `timeoutMinutes`, sem change window e sem aprovação automática: ela ainda precisa de um humano e ainda expira.
 
 
 
@@ -450,7 +468,7 @@ platform.chatcli.io/approve="<aprovador>:<motivo>"
 platform.chatcli.io/reject="<aprovador>:<motivo>"
 ```
 
-O controller de aprovação (que consulta as requisições pendentes a cada 15 segundos) registra a decisão em `status.decisions`, atualiza `status.state` e remove a annotation. Num quorum, cada aprovador adiciona a annotation depois que a anterior foi consumida; se duas pessoas anotarem antes de o controller rodar, a segunda precisa de `--overwrite` e substitui a primeira.
+O controller de aprovação (que consulta as requisições pendentes a cada 15 segundos) registra a decisão em `status.decisions`, depois remove a annotation (a decisão é gravada primeiro, então nunca se perde) e avalia a regra: quorum, change window, timeout. Uma segunda decisão do mesmo aprovador é ignorada. Num quorum, cada aprovador adiciona a annotation depois que a anterior foi consumida; se duas pessoas anotarem antes de o controller rodar, a segunda precisa de `--overwrite` e substitui a primeira.
 
 <Note>
 O `<aprovador>` é o texto que for escrito: o operator não o confere com a identidade do usuário do Kubernetes. Restrinja `update`/`patch` em `approvalrequests` via RBAC às pessoas que podem aprovar.
@@ -496,7 +514,13 @@ curl "http://localhost:8090/api/v1/approvals/approval-api-gateway-oom-kill-17712
 
 </CodeGroup>
 
-`approver` é obrigatório no corpo (senão, 400). **Resposta da API (exemplo):**
+A chamada registra uma decisão numa requisição `Pending`, exatamente como uma annotation: uma entrada em `status.decisions` com o aprovador, o motivo e um timestamp. Ela nunca define o estado por conta própria; o ApprovalReconciler avalia as decisões contra a regra (`requiredApprovers`, change window) e leva a requisição a `Approved` ou `Rejected`, então a resposta costuma ainda mostrar `Pending` e a nova entrada em `decisions`.
+
+- `approver` é obrigatório no corpo (`400` quando vazio). O aprovador registrado é `<nome digitado> (api-key: <identidade>)`, onde a identidade é o `name` da entrada da API key, senão o `description`, senão uma impressão digital `key-<hash>` (`dev-mode` no dev mode). Veja [Autenticação Fail-Closed](/pt/features/security#autenticação-fail-closed).
+- Um quorum conta API keys distintas: duas chamadas com a mesma chave contam uma vez, sejam quais forem os nomes digitados. Dê a cada aprovador a sua própria chave.
+- `409` quando a requisição não está mais `Pending`, ou quando a mesma chave já decidiu sobre ela. `404` quando a requisição não existe.
+
+**Resposta da API (exemplo):**
 
 ```json
 {
@@ -509,8 +533,19 @@ curl "http://localhost:8090/api/v1/approvals/approval-api-gateway-oom-kill-17712
     "action": "RollbackDeployment",
     "reason": "production-approval-policy",
     "requestedBy": "chatcli-operator",
-    "state": "Approved",
-    "creationTimestamp": "2026-03-19T14:30:00Z"
+    "state": "Pending",
+    "approvedBy": "alice (api-key: sre-alice)",
+    "decisionReason": "LGTM, blast radius aceitável.",
+    "creationTimestamp": "2026-03-19T14:30:00Z",
+    "requiredApprovers": 2,
+    "decisions": [
+      {
+        "approver": "alice (api-key: sre-alice)",
+        "decision": "approved",
+        "reason": "LGTM, blast radius aceitável.",
+        "timestamp": "2026-03-19T14:35:00Z"
+      }
+    ]
   },
   "resourceMeta": {
     "name": "approval-api-gateway-oom-kill-1771276354-plan-1",
@@ -519,17 +554,9 @@ curl "http://localhost:8090/api/v1/approvals/approval-api-gateway-oom-kill-17712
 }
 ```
 
-Nessa representação, `resource` é o nome do Issue, `action` é a primeira ação solicitada e `reason` é o nome da policy.
+Nessa representação, `resource` é o nome do Issue, `action` é a primeira ação solicitada e `reason` é o nome da policy. `approvedBy`, `rejectedBy` e `decisionReason` são derivados de `decisions`, e `decidedAt` é preenchido quando a requisição termina.
 
-<Warning>
-O approve/reject da API REST (usado também pelo dashboard web, que envia o aprovador `web-ui`) grava `status.state` diretamente. Ele não passa pelo controller de aprovação, então hoje ele:
-- aprova uma requisição de **quorum** com uma única chamada e ignora a change window;
-- não adiciona entrada em `status.decisions`, e os campos `approvedBy`/`rejectedBy`/`decisionReason` que ele grava não fazem parte do schema do CRD e são descartados pelo API server. Por isso o aprovador e o motivo se perdem: o resultado do plano fica "Approval rejected by unknown";
-- não verifica se a requisição ainda está `Pending`;
-- não incrementa `chatcli_operator_approvals_total`.
-
-Use a annotation via kubectl quando precisar de quorum, change window ou do aprovador registrado.
-</Warning>
+O [dashboard web](/pt/features/aiops/web-dashboard) usa os mesmos endpoints: ele pede o seu nome (lembrado no navegador) e mostra o progresso do quorum nas requisições que precisam de mais de um aprovador.
 
 ### Via Slack
 
@@ -674,7 +701,7 @@ kubectl get approvalrequests -n production \
 
 As colunas padrão do `kubectl get ar` são `Issue`, `Plan`, `State`, `Rule`, `Age`.
 
-O RemediationReconciler também grava CRs `AuditEvent` do ciclo de vida: `approval_requested` quando um plano é parado, e `approval_approved`, `approval_rejected` ou `approval_expired` quando ele age sobre o resultado (`correlationId` = nome do Issue). Veja [Auditoria e Compliance](/pt/features/aiops/audit-compliance).
+O RemediationReconciler também grava CRs `AuditEvent` do ciclo de vida: `approval_requested` quando um plano é parado, e `approval_approved`, `approval_rejected` ou `approval_expired` quando ele age sobre o resultado (`correlationId` = nome do Issue). Uma aprovação ou rejeição humana registra como actor do evento os aprovadores de `status.decisions` (`actor.type: user`, mais um detalhe `approvers`); uma auto-aprovação ou uma expiração é atribuída ao `ApprovalReconciler`. Veja [Auditoria e Compliance](/pt/features/aiops/audit-compliance).
 
 Os ApprovalRequests pertencem ao seu RemediationPlan e são apagados junto com ele, então exporte-os periodicamente se precisar de registros de longo prazo:
 
@@ -692,7 +719,7 @@ kubectl get approvalrequests -A -o json | jq '.items[] | {
 }' > approval-audit-$(date +%Y%m%d).json
 ```
 
-O status da ApprovalPolicy mantém `totalApproved`, `totalRejected`, `totalExpired` e `totalAutoApproved` (não mantidos para requisições sintéticas). Esses contadores são incrementados toda vez que o controller de aprovação reconcilia uma requisição finalizada, inclusive depois de um restart do operator, então podem contar a mais; use as métricas do Prometheus para taxas confiáveis.
+O status da ApprovalPolicy mantém `totalApproved`, `totalRejected`, `totalExpired` e `totalAutoApproved` (não mantidos para requisições sintéticas). Cada requisição finalizada é contada uma vez (a requisição é marcada com `platform.chatcli.io/policy-counted`), inclusive entre restarts do operator.
 
 
 
@@ -702,8 +729,8 @@ O sistema de aprovação expõe estas métricas no endpoint de métricas do oper
 
 | Métrica | Tipo | Labels | Descrição |
 |---------|------|--------|-----------|
-| `chatcli_operator_approvals_total` | Counter | `mode` (`auto`/`manual`/`quorum`), `result` (`approved`/`rejected`/`expired`) | Decisões aplicadas pelo controller de aprovação (decisões via REST não entram) |
-| `chatcli_operator_approval_duration_seconds` | Histogram | `mode` | Tempo da criação da requisição até a decisão ou expiração |
+| `chatcli_operator_approvals_total` | Counter | `mode` (`auto`/`manual`/`quorum`), `result` (`approved`/`rejected`/`expired`) | Requisições finalizadas, contadas uma vez quando o controller de aprovação leva a requisição ao estado final (venham as decisões de onde vierem) |
+| `chatcli_operator_approval_duration_seconds` | Histogram | `mode` | Tempo da criação da requisição até o estado final |
 | `chatcli_operator_decision_engine_evaluations_total` | Counter | `mode` (`auto`/`auto-notify`/`approval`/`manual`/`blocked`) | Vereditos do decision engine |
 | `chatcli_operator_decision_engine_circuit_breaker_state` | Gauge | `namespace` | `1` quando o circuit breaker do decision engine está aberto |
 

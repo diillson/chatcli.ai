@@ -1,765 +1,493 @@
 ---
 title: "Deploy com Docker e Kubernetes"
 sidebarTitle: "Docker & Kubernetes"
-description: "Como fazer deploy do ChatCLI como servidor usando Docker, Docker Compose ou Helm no Kubernetes."
+description: "Rode o servidor ChatCLI com Docker, Docker Compose ou o Helm chart: imagens, comandos que funcionam, credenciais, TLS, probes, logs, upgrades e solução de problemas."
 icon: "docker"
 ---
 
-O ChatCLI pode ser empacotado como container Docker e deployado no Kubernetes usando o Helm chart oficial. Esta página cobre todos os cenários de deployment.
+Esta página roda o [servidor ChatCLI](/pt/features/server-mode) em container e no Kubernetes com o Helm chart do servidor. Para servidores gerenciados pelo operator (recursos `Instance` e o pipeline de AIOps), veja [K8s Operator](/pt/features/k8s-operator).
 
----
+<Warning>
+Todas as receitas abaixo definem uma credencial. Um servidor que escuta além do loopback (qualquer container com porta publicada, todo pod no Kubernetes) **se recusa a subir** sem token compartilhado, material JWT ou CA de cliente e, por padrão, só avisa no arquivo de log. Veja [a regra da credencial](/pt/features/server-mode#endereço-de-bind-e-a-regra-da-credencial).
+</Warning>
 
-## Imagens Oficiais (GHCR)
+## Imagens
 
-As imagens Docker oficiais são publicadas automaticamente no GitHub Container Registry a cada release:
-
-<CardGroup cols={2}>
-  <Card title="Servidor ChatCLI" icon="server">
-    **Última versão: 1.211.2** <br />
-    `ghcr.io/diillson/chatcli:1.211.2`
-  </Card>
-  <Card title="Kubernetes Operator" icon="dharmachakra">
-    **Última versão: 1.211.2** <br />
-    `ghcr.io/diillson/chatcli-operator:1.211.2`
-  </Card>
-</CardGroup>
+| Imagem | Tags | Runtime |
+|---|---|---|
+| `ghcr.io/diillson/chatcli` | `<versão>` (sem `v`, ex.: `1.211.2`) e `latest` | `gcr.io/distroless/static-debian12:nonroot`, UID 65532, sem shell |
+| `ghcr.io/diillson/chatcli-operator` | `<versão>` e `latest` | Alpine (o `SourceRepository` precisa de git), UID 65532 |
 
 ```bash
-# Puxar a imagem do servidor (versão específica — recomendado)
 docker pull ghcr.io/diillson/chatcli:1.211.2
-
-# Ou a última versão disponível
-docker pull ghcr.io/diillson/chatcli:latest
-
-# Puxar a imagem do operator
 docker pull ghcr.io/diillson/chatcli-operator:1.211.2
 ```
 
-<Info>
-As imagens suportam **multi-arch** (`linux/amd64` e `linux/arm64`).
-</Info>
+As duas são multi-arch (`linux/amd64`, `linux/arm64`), trazem atestados de SBOM e proveniência e são assinadas com cosign (keyless):
 
----
+```bash
+cosign verify ghcr.io/diillson/chatcli:1.211.2 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github.com/diillson/chatcli/'
+```
+
+A imagem do servidor contém `/usr/local/bin/chatcli` (carimbado com a versão do release, que o `GetServerInfo` e o operator informam), `/usr/local/bin/grpc-health-probe`, `ENTRYPOINT ["chatcli", "server"]`, `EXPOSE 50051` e um `HEALTHCHECK` que roda `grpc-health-probe -addr=:50051` em texto puro a cada 30 segundos. Argumentos depois do nome da imagem são flags do `chatcli server`. O Devin CLI não está na imagem, então `DEVIN` não é provedor do servidor.
+
+### Build local
+
+```bash
+# Imagem do servidor (a partir da raiz do repositório)
+docker build -t chatcli:dev --build-arg VERSION=dev .
+
+# Imagem do operator: também da raiz (o operator/go.mod substitui o módulo raiz por ../)
+docker build -f operator/Dockerfile -t chatcli-operator:dev .
+```
+
+Sem `--build-arg VERSION=…` o binário informa a versão `dev`.
 
 ## Docker
 
-### Build da Imagem (Local)
+Fora do Kubernetes o servidor faz bind em `127.0.0.1`, o que dentro de um container significa que nada de fora o alcança. Publicar uma porta, portanto, exige `CHATCLI_BIND_ADDRESS=0.0.0.0`, e esse bind exige uma credencial.
 
 ```bash
-# Na raiz do projeto
-docker build -t chatcli .
+export CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)"
+export ANTHROPIC_API_KEY=sk-ant-xxx
+
+docker run -d --name chatcli \
+  -p 50051:50051 -p 9090:9090 \
+  -e CHATCLI_BIND_ADDRESS=0.0.0.0 \
+  -e CHATCLI_SERVER_TOKEN \
+  -e LLM_PROVIDER=CLAUDEAI \
+  -e ANTHROPIC_API_KEY \
+  -v chatcli-home:/home/nonroot \
+  ghcr.io/diillson/chatcli:1.211.2
 ```
 
-O Dockerfile usa multi-stage build para produzir uma imagem mínima (~20MB):
-- **Build stage**: `golang:1.25-alpine` compila o binário
-- **Runtime stage**: `alpine:3.21` com usuário não-root, health check integrado
+| Configuração | Por quê |
+|---|---|
+| `CHATCLI_BIND_ADDRESS=0.0.0.0` | escutar na interface do container para a porta publicada funcionar |
+| `CHATCLI_SERVER_TOKEN` | a credencial que esse bind exige (ou `CHATCLI_JWT_SECRET` / `CHATCLI_JWT_PUBLIC_KEY`) |
+| `-v chatcli-home:/home/nonroot` | manter o `~/.chatcli` (sessões, hub de conversas, memória, plugins, arquivo de log) entre restarts; o home da imagem é `/home/nonroot`, e um volume nomeado ali herda o dono do diretório |
+| `-p 9090:9090` | opcional: `/metrics` e `/healthz` |
 
-### Build da Imagem do Operator (Local)
+Num container o servidor escreve o log no stderr em linhas JSON, então o `docker logs` carrega os erros de inicialização e tudo o que vem depois sem configuração extra (`CHATCLI_ENV=dev` troca para o console colorido de desenvolvimento). Confira e conecte (o listener é texto puro, então o cliente precisa de `CHATCLI_ALLOW_INSECURE=true`):
 
 ```bash
-# IMPORTANTE: deve ser construído a partir da raiz do repositório
-# (go.mod do operator usa replace directive apontando para ../)
-docker build -f operator/Dockerfile -t ghcr.io/diillson/chatcli-operator:latest .
+docker logs chatcli | grep listening          # 🚀 ChatCLI server listening on 0.0.0.0:50051
+docker inspect --format '{{.State.Health.Status}}' chatcli   # healthy
+curl -s localhost:9090/healthz                 # ok
+
+CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$CHATCLI_SERVER_TOKEN"
 ```
 
-O Dockerfile do operator usa:
-- **Build stage**: `golang:1.25` com suporte multi-arch (`TARGETARCH`)
-- **Runtime stage**: `gcr.io/distroless/static:nonroot` (segurança máxima, sem shell)
+Para um teste rápido sem credencial, deixe o servidor no loopback dentro do container e use-o só de lá: omita `CHATCLI_BIND_ADDRESS` e as flags `-p`.
 
-### Rodar com Docker
+### TLS no Docker
 
-<Warning>
-**Duas configurações das quais a porta publicada depende.** A porta mapeada
-de um container só alcança um servidor que escute na interface do
-container, então sem `CHATCLI_BIND_ADDRESS=0.0.0.0` o servidor escuta em
-loopback *dentro* do container: o health check continua passando, porque
-roda lá dentro, enquanto nada de fora conecta.
+```bash
+# tls/ contém server.crt, server.key e ca.crt, legíveis pelo UID 65532
+docker run -d --name chatcli -p 50051:50051 \
+  -e CHATCLI_BIND_ADDRESS=0.0.0.0 -e CHATCLI_SERVER_TOKEN \
+  -e LLM_PROVIDER=CLAUDEAI -e ANTHROPIC_API_KEY \
+  -e CHATCLI_SERVER_TLS_CERT=/etc/chatcli/tls/server.crt \
+  -e CHATCLI_SERVER_TLS_KEY=/etc/chatcli/tls/server.key \
+  -v "$PWD/tls:/etc/chatcli/tls:ro" \
+  -v chatcli-home:/home/nonroot \
+  --no-healthcheck \
+  ghcr.io/diillson/chatcli:1.211.2
 
-E um servidor alcançável de fora do container precisa de credencial — ele
-recusa subir sem uma, porque senão admitiria todo chamador como
-administrador. Para rodar sem token, mantenha o servidor dentro do
-container com `CHATCLI_BIND_ADDRESS=127.0.0.1` e use `docker exec`.
-</Warning>
+chatcli connect localhost:50051 --tls --ca-cert tls/ca.crt --token "$CHATCLI_SERVER_TOKEN"
+```
 
-<Tabs>
-  <Tab title="Básico">
-    ```bash
-    docker run -p 50051:50051 \
-      -e CHATCLI_BIND_ADDRESS=0.0.0.0 \
-      -e CHATCLI_SERVER_TOKEN=meu-token \
-      -e LLM_PROVIDER=OPENAI \
-      -e OPENAI_API_KEY=sk-xxx \
-      chatcli
-    ```
-  </Tab>
-  <Tab title="Com Auth">
-    ```bash
-    docker run -p 50051:50051 \
-      -e CHATCLI_BIND_ADDRESS=0.0.0.0 \
-      -e CHATCLI_SERVER_TOKEN=meu-token \
-      -e LLM_PROVIDER=CLAUDEAI \
-      -e ANTHROPIC_API_KEY=sk-ant-xxx \
-      chatcli
-    ```
-  </Tab>
-  <Tab title="Com Persistência">
-    ```bash
-    docker run -p 50051:50051 \
-      -e CHATCLI_BIND_ADDRESS=0.0.0.0 \
-      -e CHATCLI_SERVER_TOKEN=meu-token \
-      -v chatcli-sessions:/home/chatcli/.chatcli/sessions \
-      -e LLM_PROVIDER=OPENAI \
-      -e OPENAI_API_KEY=sk-xxx \
-      chatcli
-    ```
-  </Tab>
-</Tabs>
+O `HEALTHCHECK` embutido testa texto puro, então com TLS ele reporta `unhealthy`. A imagem não tem shell e o `docker run --health-cmd` sempre passa por um, então desligue (`--no-healthcheck`) ou use uma checagem em forma exec no Compose (abaixo). O certificado do servidor precisa de `localhost` nos SANs para o cliente acima; veja [TLS](/pt/features/server-mode#tls) para uma receita de certificado.
 
 ### Docker Compose
 
-O projeto inclui um `docker-compose.yml` pronto para desenvolvimento:
+O `docker-compose.yml` do repositório faz o build da imagem a partir do código e roda endurecido (sistema de arquivos raiz somente leitura, `no-new-privileges`, tmpfs de 100 MB em `/tmp`, 2 CPUs / 1 GB). Ele faz bind em `0.0.0.0` e lê todas as variáveis de provedor do seu shell, então exporte uma credencial antes:
 
-<Steps>
-  <Step title="Defina as variáveis">
-    ```bash
-    export LLM_PROVIDER=OPENAI
-    export OPENAI_API_KEY=sk-xxx
-    ```
-  </Step>
-  <Step title="Inicie o container">
-    ```bash
-    docker compose up -d
-    ```
-  </Step>
-  <Step title="Conecte do seu terminal">
-    ```bash
-    chatcli connect localhost:50051
-    ```
-  </Step>
-</Steps>
+```bash
+git clone https://github.com/diillson/chatcli.git && cd chatcli
+export CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)"
+export LLM_PROVIDER=CLAUDEAI ANTHROPIC_API_KEY=sk-ant-xxx
+docker compose up -d --build
 
-O Docker Compose configura:
-- Porta 50051 exposta
-- Volumes persistentes para sessões e plugins
-- Restart automático (`unless-stopped`)
-- Todas as variáveis de LLM via environment
-- **Hardening de segurança**: filesystem read-only, `no-new-privileges`, limites de CPU/memória, tmpfs para `/tmp`
-
-#### Arquivo `docker-compose.yml`
-
-```yaml
-services:
-  chatcli-server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: chatcli-server
-    ports:
-      - "50051:50051"
-    environment:
-      CHATCLI_SERVER_PORT: "50051"
-      # A porta publicada só chega a um servidor que escute na interface do container.
-      CHATCLI_BIND_ADDRESS: "${CHATCLI_BIND_ADDRESS:-0.0.0.0}"
-      # Obrigatório com o bind acima: um servidor alcançável recusa subir sem credencial.
-      CHATCLI_SERVER_TOKEN: "${CHATCLI_SERVER_TOKEN:-}"
-
-      # JWTs por usuário em vez do (ou junto com o) token compartilhado:
-      # segredo HS256, ou chave pública RS256 (PEM) via CHATCLI_JWT_PUBLIC_KEY.
-      CHATCLI_JWT_SECRET: "${CHATCLI_JWT_SECRET:-}"
-      CHATCLI_JWT_PUBLIC_KEY: "${CHATCLI_JWT_PUBLIC_KEY:-}"
-      CHATCLI_JWT_ISSUER: "${CHATCLI_JWT_ISSUER:-}"
-      CHATCLI_JWT_AUDIENCE: "${CHATCLI_JWT_AUDIENCE:-}"
-
-      # Provedor de LLM (configure pelo menos um)
-      LLM_PROVIDER: "${LLM_PROVIDER:-}"
-      LLM_MODEL: "${LLM_MODEL:-}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      OPENAI_MODEL: "${OPENAI_MODEL:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-}"
-      GOOGLEAI_API_KEY: "${GOOGLEAI_API_KEY:-}"
-      GOOGLEAI_MODEL: "${GOOGLEAI_MODEL:-}"
-      XAI_API_KEY: "${XAI_API_KEY:-}"
-      XAI_MODEL: "${XAI_MODEL:-}"
-      ZAI_API_KEY: "${ZAI_API_KEY:-}"
-      ZAI_MODEL: "${ZAI_MODEL:-}"
-      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
-      MINIMAX_MODEL: "${MINIMAX_MODEL:-}"
-      MINIMAX_API_COMPAT: "${MINIMAX_API_COMPAT:-}"
-      MOONSHOT_API_KEY: "${MOONSHOT_API_KEY:-}"
-      MOONSHOT_MODEL: "${MOONSHOT_MODEL:-}"
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      OPENROUTER_MODEL: "${OPENROUTER_MODEL:-}"
-      OLLAMA_ENABLED: "${OLLAMA_ENABLED:-}"
-      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-}"
-      OLLAMA_MODEL: "${OLLAMA_MODEL:-}"
-
-      # AWS Bedrock (chaves estáticas; prefira instance role ou SSO em hosts reais)
-      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
-      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
-      BEDROCK_REGION: "${BEDROCK_REGION:-}"
-      BEDROCK_MODEL: "${BEDROCK_MODEL:-}"
-
-      # StackSpot
-      CLIENT_ID: "${CLIENT_ID:-}"
-      CLIENT_KEY: "${CLIENT_KEY:-}"
-      STACKSPOT_REALM: "${STACKSPOT_REALM:-}"
-      STACKSPOT_AGENT_ID: "${STACKSPOT_AGENT_ID:-}"
-
-      # GitHub Copilot
-      GITHUB_COPILOT_TOKEN: "${GITHUB_COPILOT_TOKEN:-}"
-      COPILOT_MODEL: "${COPILOT_MODEL:-}"
-
-      # Bundle de CA corporativa para toda conexão TLS de saída (caminho PEM dentro do container)
-      CHATCLI_CA_BUNDLE: "${CHATCLI_CA_BUNDLE:-}"
-
-      # Cadeia de fallback de provedores (separados por vírgula, ex.: "OPENAI,CLAUDEAI,GOOGLEAI")
-      CHATCLI_FALLBACK_ENABLED: "${CHATCLI_FALLBACK_ENABLED:-}"
-      CHATCLI_FALLBACK_PROVIDERS: "${CHATCLI_FALLBACK_PROVIDERS:-}"
-      CHATCLI_FALLBACK_MAX_RETRIES: "${CHATCLI_FALLBACK_MAX_RETRIES:-2}"
-
-      # MCP (Model Context Protocol)
-      CHATCLI_MCP_ENABLED: "${CHATCLI_MCP_ENABLED:-}"
-      CHATCLI_MCP_CONFIG: "${CHATCLI_MCP_CONFIG:-}"
-
-      # Memória e bootstrap
-      CHATCLI_MEMORY_ENABLED: "${CHATCLI_MEMORY_ENABLED:-}"
-      CHATCLI_BOOTSTRAP_ENABLED: "${CHATCLI_BOOTSTRAP_ENABLED:-}"
-
-      LOG_LEVEL: "${LOG_LEVEL:-info}"
-    volumes:
-      - chatcli-sessions:/home/chatcli/.chatcli/sessions
-      - chatcli-plugins:/home/chatcli/.chatcli/plugins
-      - chatcli-memory:/home/chatcli/.chatcli/memory
-    restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp:size=100M
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 1G
-
-volumes:
-  chatcli-sessions:
-  chatcli-plugins:
-  chatcli-memory:
+CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$CHATCLI_SERVER_TOKEN"
 ```
 
-> O container roda com filesystem **read-only** e `no-new-privileges` por padrão. O diretório `/tmp` usa tmpfs em memória (limitado a 100MB). Os volumes nomeados (`chatcli-sessions`, `chatcli-plugins`) são os únicos pontos graváveis. Veja a [documentação de segurança](/pt/features/security) para detalhes.
+O compose define `HOME=/home/nonroot` e mantém o home inteiro num volume nomeado, `chatcli-home`, montado em `/home/nonroot`: o `~/.chatcli` (sessões, o hub de conversas, memória, plugins, o arquivo de log) sobrevive a restarts, e o volume é gravável com a raiz somente leitura porque o Docker o inicializa com o dono do home da imagem. Coloque binários de plugin em `~/.chatcli/plugins` dentro desse volume.
 
----
+O `HEALTHCHECK` da imagem checa em texto puro. Com TLS no servidor, troque-o num override; o Compose mescla o `docker-compose.override.yml` automaticamente:
+
+```yaml
+# docker-compose.override.yml
+services:
+  chatcli-server:
+    # Forma exec, sem shell:
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc-health-probe", "-addr=:50051", "-tls",
+             "-tls-ca-cert", "/etc/chatcli/tls/ca.crt", "-tls-server-name", "localhost"]
+```
+
+Só `CHATCLI_FALLBACK_PROVIDERS` liga a [cadeia de fallback](/pt/features/server-mode#cadeia-de-fallback) (não existe chave separada para ligar), e ela precisa listar o provedor primário primeiro. O compose também repassa do seu shell `CHATCLI_FALLBACK_MAX_RETRIES` (padrão `2`), `CHATCLI_FALLBACK_COOLDOWN_BASE` (`30s`) e `CHATCLI_FALLBACK_COOLDOWN_MAX` (`5m`).
 
 ## Kubernetes (Helm)
 
-Os Helm charts do ChatCLI estão disponíveis como **artefatos OCI no GHCR** — não é necessário clonar o repositório.
+O chart do servidor é publicado como artefato OCI em `oci://ghcr.io/diillson/charts/chatcli`. A versão do chart e a da imagem do servidor são o mesmo número, e o `appVersion` do chart fixa a imagem.
 
 ### Pré-requisitos
 
-- Cluster Kubernetes (kind, minikube, EKS, GKE, AKS, etc.)
-- Helm 3.8+ instalado (suporte a OCI)
-- `kubectl` configurado para o cluster
+- Kubernetes 1.30+, `kubectl` apontando para o cluster
+- Helm 3.10+ (suporte a OCI)
+- Uma chave de provedor LLM (ou IRSA / Workload Identity para Bedrock)
 
-### Instalação Básica
+### Instalação
 
-<Tabs>
-  <Tab title="OpenAI">
+
+<Steps>
+  <Step title="Instale com uma credencial">
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --set llm.provider=OPENAI \
-      --set secrets.openaiApiKey=sk-xxx
-    ```
-  </Tab>
-  <Tab title="Anthropic (com Auth)">
-    ```bash
-    helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
+      --version 1.211.2 \
+      --namespace chatcli --create-namespace \
       --set llm.provider=CLAUDEAI \
-      --set secrets.anthropicApiKey=sk-ant-xxx \
-      --set server.token=meu-token-secreto
+      --set secrets.anthropicApiKey="$ANTHROPIC_API_KEY" \
+      --set server.token="$(openssl rand -hex 32)"
     ```
-  </Tab>
-</Tabs>
 
-<Note>
-Se preferir usar o chart local (após clonar o repo), substitua `oci://ghcr.io/diillson/charts/chatcli` por `./deploy/helm/chatcli/` em todos os comandos abaixo.
-</Note>
+    Dentro de um pod o servidor faz bind em `0.0.0.0`, então `server.token` (ou JWT / mTLS, abaixo) é obrigatório. O chart guarda o token no próprio Secret e o entrega como `CHATCLI_SERVER_TOKEN` via `secretKeyRef`, nunca como argumento de linha de comando. Num pod o servidor também escreve o log no stderr, então o `kubectl logs` o mostra.
+  </Step>
+  <Step title="Espere subir">
+    ```bash
+    kubectl -n chatcli rollout status deploy/chatcli
+    kubectl -n chatcli logs deploy/chatcli | grep listening
+    # 🚀 ChatCLI server listening on 0.0.0.0:50051
+    ```
+  </Step>
+  <Step title="Conecte">
+    ```bash
+    export CHATCLI_REMOTE_TOKEN="$(kubectl -n chatcli get secret chatcli \
+      -o jsonpath='{.data.CHATCLI_SERVER_TOKEN}' | base64 -d)"
 
-### Instalação com Segurança (Helm)
+    kubectl -n chatcli port-forward svc/chatcli 50051:50051 &
+    CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$CHATCLI_REMOTE_TOKEN"
+    ```
 
-Para deployments com segurança completa, incluindo rate limiting, autenticação JWT e modo agente seguro:
+    Os nomes dos objetos seguem o release: um release com nome diferente de `chatcli` gera `<release>-chatcli` (Deployment, Service e Secret). O `helm install` imprime os comandos exatos nas notas e avisa quando não há credencial.
+  </Step>
+</Steps>
+
+O que o chart cria: um Deployment (UID 1000 não root, raiz somente leitura, todas as capabilities removidas, seccomp `RuntimeDefault`), um Service, um ConfigMap e um Secret carregados com `envFrom`, um ServiceAccount e RBAC para o watcher, um PVC de 1 Gi para sessões (`persistence.enabled`, ligado por padrão), os 17 CRDs de AIOps mais um hook pre-install/pre-upgrade que os reaplica (`crdUpgrade.enabled`) e, opcionalmente, Ingress, HPA, PDB, NetworkPolicy e ServiceMonitor.
+
+### Probes
+
+Probe `grpc` do kubelet não faz TLS, então o chart usa:
+
+| Probe | Checagem | Tempo |
+|---|---|---|
+| startup | `GET /healthz` na porta `metrics` | a cada 5 s, até 30 falhas |
+| liveness | `GET /healthz` na porta `metrics` | a cada 20 s, 3 falhas |
+| readiness | conexão TCP na porta `grpc` | a cada 10 s, 3 falhas |
+
+Com `server.metricsPort: 0`, startup e liveness caem para uma checagem TCP na porta gRPC. Esses probes funcionam com e sem TLS.
+
+### Credenciais
+
+| Opção | Valores | Observações |
+|---|---|---|
+| Token compartilhado | `server.token`, ou `CHATCLI_SERVER_TOKEN` em `secrets.existingSecret` | role `admin` para todo chamador |
+| JWTs HS256 | `security.jwtSecretRef: {name, key}` (ou inline `security.jwtSecret`) | tokens precisam de `exp`; veja [JWT](/pt/features/server-mode#autenticação-do-servidor) |
+| JWTs RS256 | `security.jwtPublicKeyRef: {name, key}` (ou inline `security.jwtPublicKey`) | várias chaves PEM podem ser listadas, para rotação |
+| TLS mútuo | `tls.*` mais `security.tlsClientCA` (caminho dentro do pod) | toda conexão precisa de certificado de cliente |
+| Nenhuma | `security.bindAddress: "127.0.0.1"` | acessível só de dentro do pod |
+
+`security.jwtIssuer` / `security.jwtAudience` adicionam checagem de `iss` / `aud`; `security.mtlsRole` define a role de quem se identifica só por certificado (`viewer`/`readonly`, `user`/`operator`, `admin`; padrão `user`). Prefira os valores `*Ref`: os inline vão parar no ambiente do Deployment.
 
 ```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --set security.rateLimitRps=20 \
-  --set security.agentSecurityMode=strict \
-  --set security.jwtSecretRef.name=chatcli-jwt \
-  --set security.jwtSecretRef.key=secret
+kubectl -n chatcli create secret generic chatcli-jwt --from-literal=secret="$(openssl rand -hex 32)"
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.211.2 -n chatcli \
+  --reuse-values --set security.jwtSecretRef.name=chatcli-jwt --set security.jwtSecretRef.key=secret
 ```
 
-### Instalação com K8s Watcher (Single-Target)
-
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --set llm.provider=OPENAI \
-  --set secrets.openaiApiKey=sk-xxx \
-  --set watcher.enabled=true \
-  --set watcher.deployment=myapp \
-  --set watcher.namespace=production
-```
-
-### Instalação com Multi-Target + Prometheus
-
-Para monitorar múltiplos deployments com métricas Prometheus, use um `values.yaml`:
+### TLS
 
 ```yaml
-# values-multi.yaml
+# values-tls.yaml
+tls:
+  enabled: true
+  existingSecret: chatcli-tls              # Secret kubernetes.io/tls, montado em /etc/chatcli/tls
+```
+
+Com `tls.existingSecret`, `certFile` e `keyFile` assumem `/etc/chatcli/tls/tls.crt` e `/etc/chatcli/tls/tls.key`; defina-os só quando os arquivos do seu Secret tiverem outros nomes. Sem Secret, defina os dois caminhos (para arquivos que você monta com `extraVolumes` / `extraVolumeMounts`).
+
+<Warning>
+`tls.enabled: true` sem `tls.existingSecret` e sem `certFile` e `keyFile` juntos faz o `helm install` / `helm upgrade` falhar (`tls.enabled=true needs tls.existingSecret ... or both tls.certFile and tls.keyFile`), em vez de subir um servidor que escutaria em texto puro.
+</Warning>
+
+Para mTLS com uma CA de cliente no mesmo Secret use `security.tlsClientCA: /etc/chatcli/tls/ca.crt`; para um Secret de CA separado, monte-o com `extraVolumes` / `extraVolumeMounts` (exemplo em [Valores de segurança](#segurança)). Pelo `kubectl port-forward` o certificado precisa de `localhost` nos SANs.
+
+### Referência de valores
+
+#### Servidor
+
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `replicaCount` | `1` | Réplicas (ignorado com `autoscaling.enabled`) |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/diillson/chatcli` / `appVersion` do chart / `IfNotPresent` | Imagem do servidor |
+| `imagePullSecrets` | `[]` | Pull secrets |
+| `server.port` | `50051` | Porta gRPC |
+| `server.metricsPort` | `9090` | `/metrics` e `/healthz`; `0` desliga os dois |
+| `server.token` | `""` | Token compartilhado (obrigatório sem JWT ou mTLS) |
+| `server.grpcReflection` | `false` | Define `CHATCLI_GRPC_REFLECTION=true`, que registra o reflection gRPC do servidor; as chamadas de reflection continuam exigindo a credencial do servidor. Deixe desligado em produção |
+| `extraEnv` | `[]` | Variáveis extras (por exemplo `LOG_LEVEL=debug`) |
+| `extraVolumes` / `extraVolumeMounts` | `[]` | Volumes extras para o container do servidor |
+
+#### LLM
+
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `llm.provider` | `""` (primeiro provedor com credenciais) | `OPENAI`, `OPENAI_ASSISTANT`, `CLAUDEAI`, `BEDROCK`, `GOOGLEAI`, `XAI`, `ZAI`, `MINIMAX`, `MOONSHOT`, `STACKSPOT`, `OLLAMA`, `COPILOT`, `OPENROUTER` |
+| `llm.model` | `""` | Modelo padrão |
+| `secrets.existingSecret` | `""` | Seu Secret, carregado com `envFrom` (chaves são nomes de variáveis) no lugar do Secret do chart |
+| `secrets.openaiApiKey`, `anthropicApiKey`, `googleaiApiKey`, `xaiApiKey`, `zaiApiKey`, `minimaxApiKey`, `moonshotApiKey`, `openrouterApiKey`, `githubCopilotToken` | `""` | Chaves dos provedores → `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLEAI_API_KEY`, `XAI_API_KEY`, `ZAI_API_KEY`, `MINIMAX_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY`, `GITHUB_COPILOT_TOKEN` |
+| `secrets.minimaxApiCompat` | `""` | `anthropic` = compatibilidade com a Messages API da Anthropic |
+| `secrets.stackspotClientId`, `stackspotClientKey`, `stackspotRealm`, `stackspotAgentId` | `""` | StackSpot (`CLIENT_ID`, `CLIENT_KEY`, `STACKSPOT_REALM`, `STACKSPOT_AGENT_ID`) |
+| `secrets.awsAccessKeyId`, `awsSecretAccessKey`, `awsSessionToken`, `bedrockRegion`, `awsRegion` | `""` | Bedrock; deixe as chaves vazias para IRSA (`serviceAccount.annotations`) |
+| `secrets.chatcliBedrockCaBundle`, `chatcliBedrockInsecureSkipVerify` | `""` | Caminho do CA bundle do Bedrock / pular verificação (só para diagnóstico) |
+| `copilot.model`, `copilot.maxTokens`, `copilot.apiBaseUrl` | `""` | `COPILOT_MODEL`, `COPILOT_MAX_TOKENS`, `COPILOT_API_BASE_URL` |
+| `ollama.enabled`, `ollama.baseUrl`, `ollama.model` | `false`, `http://ollama:11434`, `""` | Ollama do lado do servidor (não passa pela checagem de SSRF) |
+
+Com `secrets.existingSecret`, crie o Secret com nomes de variáveis como chaves, a credencial inclusive:
+
+```bash
+kubectl -n chatcli create secret generic chatcli-llm-keys \
+  --from-literal=CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+helm install chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.211.2 -n chatcli \
+  --set llm.provider=CLAUDEAI --set secrets.existingSecret=chatcli-llm-keys
+```
+
+#### Fallback de provedor
+
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `fallback.enabled` | `false` | Liga a cadeia |
+| `fallback.providers` | `[]` | Provedores depois do `llm.provider`, cada um `{name, model}` |
+| `fallback.maxRetries` | `2` | Tentativas por provedor |
+| `fallback.cooldownBase` / `fallback.cooldownMax` | `30s` / `5m` | Cooldown depois de falha / teto |
+
+O chart coloca o `llm.provider` (com `llm.model`) na frente, a menos que você mesmo o liste, porque o servidor monta a cadeia só a partir da lista e só a instala com dois ou mais provedores funcionando. Coloque a chave de cada provedor no Secret.
+
+```yaml
 llm:
   provider: CLAUDEAI
-secrets:
-  anthropicApiKey: sk-ant-xxx
+  model: claude-sonnet-5
+fallback:
+  enabled: true
+  providers:                    # cadeia efetiva: CLAUDEAI -> OPENAI -> GOOGLEAI
+    - name: OPENAI
+      model: gpt-6-sol
+    - name: GOOGLEAI
+      model: gemini-3.8-flash
+```
+
+#### MCP
+
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `mcp.enabled` | `false` | Liga o MCP |
+| `mcp.servers` | `[]` | Servidores inline: `name`, `transport` (`stdio`/`sse`), `command`, `args`, `url`, `env`, `enabled`, `overrides` |
+| `mcp.existingConfigMap` | `""` | Seu ConfigMap com a chave `mcp_servers.json`, montado em `/etc/chatcli/mcp` (vence `servers`) |
+
+#### K8s watcher
+
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `watcher.enabled` | `false` | Liga o watcher |
+| `watcher.targets` | `[]` | Lista multi-target de `{deployment, kind, namespace, metricsPort, metricsPath, metricsFilter}`; `deployment` é o nome do recurso e `kind` é `Deployment` (padrão), `StatefulSet`, `DaemonSet`, `Job` ou `CronJob` |
+| `watcher.deployment` / `watcher.namespace` | `""` | Modo de alvo único (usado quando `targets` está vazio), observa um Deployment; namespace vazio significa o namespace chamado `default` |
+| `watcher.interval` / `watcher.window` | `30s` / `2h` | Intervalo de coleta / retenção |
+| `watcher.maxLogLines` / `watcher.maxContextChars` | `100` / `32000` | Linhas de log por pod / orçamento de contexto do LLM |
+
+Um alvo sem `kind` é um Deployment; um alvo sem namespace observa o `default`. Alvos fora do namespace do release, ou em vários namespaces, mudam o RBAC do chart para ClusterRole automaticamente, e o mesmo vale para um `watcher.namespace` de alvo único diferente do namespace do release (vazio conta como `default`).
+
+```yaml
 watcher:
   enabled: true
   interval: "15s"
-  maxContextChars: 32000
   targets:
     - deployment: api-gateway
       namespace: production
       metricsPort: 9090
       metricsFilter: ["http_requests_*", "http_request_duration_*"]
-    - deployment: auth-service
+    - deployment: postgres
+      kind: StatefulSet
       namespace: production
-      metricsPort: 9090
-    - deployment: worker
+    - deployment: nightly-report
+      kind: CronJob
       namespace: batch
 ```
 
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli -f values-multi.yaml
-```
+#### Armazenamento, memória, pipeline e recursos
 
-O chart automaticamente:
-- Cria ServiceAccount com RBAC para o watcher ler pods, eventos, logs
-- **Auto-detecta multi-namespace**: se targets estão em namespaces diferentes, usa `ClusterRole` em vez de `Role`
-- Gera ConfigMap `<name>-watch-config` com o YAML multi-target
-- Monta o config como volume e passa `--watch-config` ao container
-- Passa corretamente as flags `--token`, `--model` e `--mcp-config` ao servidor
-- Usa **health probes gRPC nativas** (liveness, readiness e startup) em vez de `pidof`
-- Inclui todos os **17 CRDs do operator** no diretório `crds/`
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `persistence.enabled` | `true` | PVC `<fullname>-sessions` para as sessões |
+| `persistence.storageClass` / `accessModes` / `size` | `""` / `[ReadWriteOnce]` / `1Gi` | `-` = `storageClassName: ""` |
+| `memory.enabled` | `false` | Memória de longo prazo em `~/.chatcli/memory` (no PVC de sessões quando a persistência está ligada) |
+| `pipeline.enabled` | `false` | [RPCs de pipeline](/pt/features/server-mode#rpcs-de-pipeline) (`CHATCLI_SERVER_PIPELINE`) |
+| `agents.*`, `skills.*`, `bootstrap.*` | desligados | `enabled`, `definitions` (arquivos inline), `existingConfigMap` |
+| `skillRegistry.enabled`, `registryUrls`, `registryDisable`, `installDir` | `false`, `""` | Configuração dos registries de skills |
+| `plugins.enabled`, `initImage`, `existingPVC` | `false`, `""` | Diretório de plugins, preenchido por uma init image ou por um PVC |
+| `resources` | requests `100m`/`128Mi`, limits `500m`/`512Mi` | Recursos do container |
+| `podSecurityContext` / `securityContext` | UID/GID/fsGroup 1000, não root, `RuntimeDefault`; sem escalonamento de privilégio, raiz somente leitura, drop `ALL` | Segurança do pod e do container |
+| `nodeSelector`, `tolerations`, `affinity` | vazios | Agendamento |
 
-### Valores do Helm Chart
-
-#### Servidor
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `replicaCount` | Número de réplicas | `1` |
-| `image.repository` | Repositório da imagem | `ghcr.io/diillson/chatcli` |
-| `image.tag` | Tag da imagem | `latest` |
-| `server.port` | Porta gRPC | `50051` |
-| `server.metricsPort` | Porta HTTP para Prometheus metrics (0 = desabilitado) | `9090` |
-| `server.token` | Token de autenticação | `""` |
-| `server.grpcReflection` | Habilitar gRPC reflection (debugging) | `false` |
-| `serviceMonitor.enabled` | Criar ServiceMonitor (requer Prometheus Operator) | `false` |
-| `serviceMonitor.interval` | Intervalo de scrape do Prometheus | `30s` |
-| `prometheusUrl` | Deprecado: lido só pelo operator AIOps, o servidor ignora. Defina `prometheusUrl` no chart `chatcli-operator` | `""` |
-
-#### TLS
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `tls.enabled` | Habilitar TLS | `false` |
-| `tls.certFile` | Caminho do certificado | `""` |
-| `tls.keyFile` | Caminho da chave | `""` |
-| `tls.existingSecret` | Secret existente com certs | `""` |
-
-#### LLM
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `llm.provider` | Provedor padrão: `OPENAI`, `OPENAI_ASSISTANT`, `CLAUDEAI`, `BEDROCK`, `GOOGLEAI`, `XAI`, `ZAI`, `MINIMAX`, `MOONSHOT`, `STACKSPOT`, `OLLAMA`, `COPILOT`, `OPENROUTER` (`DEVIN` é um transporte de CLI local e não está disponível na imagem do servidor) | `""` |
-| `llm.model` | Modelo padrão | `""` |
-
-#### Secrets (API Keys)
-
-| Valor | Descrição |
-|-------|-----------|
-| `secrets.existingSecret` | Secret existente (em vez de criar um novo) |
-| `secrets.openaiApiKey` | Chave da OpenAI |
-| `secrets.anthropicApiKey` | Chave da Anthropic |
-| `secrets.googleaiApiKey` | Chave do Google AI |
-| `secrets.xaiApiKey` | Chave da xAI |
-| `secrets.openrouterApiKey` | Chave do OpenRouter |
-| `secrets.moonshotApiKey` | Chave da Moonshot (Kimi) |
-| `secrets.stackspotClientId` | StackSpot Client ID |
-| `secrets.stackspotClientKey` | StackSpot Client Key |
-| `secrets.stackspotRealm` | StackSpot Realm |
-| `secrets.stackspotAgentId` | StackSpot Agent ID |
-| `secrets.githubCopilotToken` | Token OAuth do GitHub Copilot |
-
-#### GitHub Copilot
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `copilot.model` | Modelo padrão do Copilot (ex: `gpt-6-astra`, `gpt-4o`, `claude-sonnet-4-6`, `gemini-2.5-flash`); renderizado como `COPILOT_MODEL` | `""` |
-| `copilot.maxTokens` | Máximo de tokens para resposta; renderizado como `COPILOT_MAX_TOKENS` | `""` (limite do provedor) |
-| `copilot.apiBaseUrl` | Override da URL base da API para ambientes enterprise; renderizado como `COPILOT_API_BASE_URL` | `""` (`https://api.githubcopilot.com`) |
-
-> Para autenticação, use `secrets.githubCopilotToken` com um token obtido via `/auth login github-copilot`, ou defina `GITHUB_COPILOT_TOKEN` como variável de ambiente.
-
-#### Ollama
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `ollama.enabled` | Habilitar Ollama | `false` |
-| `ollama.baseUrl` | URL base do Ollama | `http://ollama:11434` |
-| `ollama.model` | Modelo Ollama | `""` |
-
-#### K8s Watcher
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `watcher.enabled` | Habilitar o watcher | `false` |
-| `watcher.targets` | Lista de targets multi-deployment (ver abaixo) | `[]` |
-| `watcher.deployment` | Deployment único - legado | `""` |
-| `watcher.namespace` | Namespace do deployment - legado | `""` |
-| `watcher.interval` | Intervalo de coleta | `30s` |
-| `watcher.window` | Janela de observação | `2h` |
-| `watcher.maxLogLines` | Linhas de log por pod | `100` |
-| `watcher.maxContextChars` | Budget de contexto LLM | `32000` |
-
-**Campos de cada target** (`watcher.targets[].`):
-
-| Campo | Descrição | Obrigatório |
-|-------|-----------|:-----------:|
-| `deployment` | Nome do deployment | Sim |
-| `namespace` | Namespace (padrão: `default`) | Não |
-| `metricsPort` | Porta Prometheus (0 = desabilitado) | Não |
-| `metricsPath` | Path HTTP das métricas | Não (`/metrics`) |
-| `metricsFilter` | Filtros glob para métricas | Não |
-
-#### Fallback de Provedores
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `fallback.enabled` | Habilitar cadeia de failover automático | `false` |
-| `fallback.providers` | Lista ordenada de provedores `[{name, model}]` | `[]` |
-| `fallback.maxRetries` | Tentativas por provedor antes de avançar | `2` |
-| `fallback.cooldownBase` | Cooldown base após falha | `30s` |
-| `fallback.cooldownMax` | Cooldown máximo (backoff exponencial) | `5m` |
-
-#### MCP (Model Context Protocol)
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `mcp.enabled` | Habilitar integração MCP | `false` |
-| `mcp.servers` | Lista de servidores MCP `[{name, transport, command, args, url, enabled}]` | `[]` |
-| `mcp.existingConfigMap` | ConfigMap existente com `mcp_servers.json` | `""` |
-
-#### Bootstrap e Memória
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `bootstrap.enabled` | Carregar arquivos bootstrap (SOUL.md, USER.md, etc.) | `false` |
-| `bootstrap.definitions` | Definições inline de arquivos bootstrap | `{}` |
-| `bootstrap.existingConfigMap` | ConfigMap existente com arquivos bootstrap | `""` |
-| `memory.enabled` | Habilitar memória persistente | `false` |
-| `safety.enabled` | Habilitar regras de segurança configuráveis | `false` |
-
-#### Skill Registry
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `skillRegistry.enabled` | Habilitar variáveis de ambiente para skill registry | `false` |
-| `skillRegistry.registryUrls` | URLs adicionais de registries (separadas por vírgula) | `""` |
-| `skillRegistry.registryDisable` | Nomes de registries a desabilitar (separados por vírgula) | `""` |
-| `skillRegistry.installDir` | Diretório de instalação de skills dentro do container | `""` |
-
-> Quando habilitado, os valores são passados como variáveis `CHATCLI_REGISTRY_*` no ConfigMap. O container ChatCLI cria automaticamente `~/.chatcli/registries.yaml` com os registries padrão (chatcli, clawhub). Use `/skill search` e `/skill install` para gerenciar skills via registries.
-
-#### Persistência
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `persistence.enabled` | Persistir sessões em PVC | `true` |
-| `persistence.storageClass` | Storage class | `""` |
-| `persistence.size` | Tamanho do volume | `1Gi` |
+O chart monta um emptyDir em `/home/chatcli/.chatcli` e `/tmp` e define `HOME=/home/chatcli`, então a raiz somente leitura funciona. Com o PVC `ReadWriteOnce` padrão, mais de uma réplica exige uma storage class `ReadWriteMany`.
 
 #### Segurança
 
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `podSecurityContext.runAsNonRoot` | Obriga execução como não-root | `true` |
-| `podSecurityContext.runAsUser` | UID do processo | `1000` |
-| `podSecurityContext.seccompProfile.type` | Perfil seccomp | `RuntimeDefault` |
-| `securityContext.allowPrivilegeEscalation` | Permite escalação de privilégios | `false` |
-| `securityContext.readOnlyRootFilesystem` | Filesystem somente-leitura | `true` |
-| `securityContext.capabilities.drop` | Capabilities removidas | `ALL` |
-| `rbac.clusterWide` | Usa ClusterRole em vez de Role namespace-scoped | `false` |
-
-> Quando `readOnlyRootFilesystem` está `true`, o chart monta automaticamente um tmpfs em `/tmp` e um emptyDir em `/home/chatcli/.chatcli` (200Mi) para dados de runtime. A variável `HOME=/home/chatcli` é definida automaticamente. Para monitorar múltiplos namespaces, habilite `rbac.clusterWide: true`. Veja a [documentação de segurança](/pt/features/security) para detalhes.
->
-> **Nota**: O ConfigMap e o Secret referenciados via `envFrom` são marcados como `optional: true`, permitindo criar o Instance/Deployment antes dos recursos dependentes. O operator observa Secrets automaticamente e dispara rolling updates quando são criados ou atualizados.
-
-#### Autoscaling (HPA)
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `autoscaling.enabled` | Habilitar HorizontalPodAutoscaler | `false` |
-| `autoscaling.minReplicas` | Mínimo de réplicas | `1` |
-| `autoscaling.maxReplicas` | Máximo de réplicas | `10` |
-| `autoscaling.targetCPUUtilizationPercentage` | Meta de uso de CPU (%) | `80` |
-| `autoscaling.targetMemoryUtilizationPercentage` | Meta de uso de memória (%) | `""` |
-
-> Quando `autoscaling.enabled` é `true`, o `replicaCount` é ignorado e o HPA controla o número de réplicas automaticamente.
-
-#### Pod Disruption Budget
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `podDisruptionBudget.enabled` | Criar PodDisruptionBudget | `false` |
-| `podDisruptionBudget.minAvailable` | Mínimo de pods disponíveis durante disruptions | `1` |
-| `podDisruptionBudget.maxUnavailable` | Máximo de pods indisponíveis (alternativa a minAvailable) | `""` |
-
-> O PDB garante alta disponibilidade durante upgrades de nó, drain e manutenção do cluster.
-
-#### Network Policy
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `networkPolicy.enabled` | Criar NetworkPolicy | `false` |
-| `networkPolicy.allowIngressFrom` | Regras de ingress permitidas | `[]` |
-| `networkPolicy.allowEgressTo` | Regras de egress permitidas | `[]` |
-
-> A NetworkPolicy restringe tráfego de rede no nível do pod. Requer um CNI com suporte a NetworkPolicy (Calico, Cilium, etc.).
-
-#### Rede
-
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `service.type` | Tipo do Service | `ClusterIP` |
-| `service.port` | Porta do Service | `50051` |
-| `service.headless` | Habilita Service headless para balanceamento gRPC client-side (recomendado quando `replicaCount > 1`) | `false` |
-| `ingress.enabled` | Habilitar Ingress | `false` |
-
-> **gRPC e múltiplas réplicas**: O gRPC usa conexões HTTP/2 persistentes que fixam em um único pod. Para `replicaCount > 1`, habilite `service.headless: true` para ativar balanceamento round-robin via DNS. O client já possui keepalive e round-robin integrados.
->
-> **Ingress gRPC**: Quando o Ingress está habilitado com `className: nginx`, o chart adiciona automaticamente a annotation `nginx.ingress.kubernetes.io/backend-protocol: "GRPC"` para rotear tráfego gRPC corretamente.
-
-### Usando Secret Existente
-
-Se você já tem um Secret com as API keys:
-
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --set llm.provider=OPENAI \
-  --set secrets.existingSecret=my-llm-keys
-```
-
-O Secret deve conter as chaves esperadas:
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `security.jwtSecret` / `jwtSecretRef` | `""` / `{}` | Segredo HS256, inline / de um Secret |
+| `security.jwtPublicKey` / `jwtPublicKeyRef` | `""` / `{}` | Chave(s) pública(s) RS256, PEM inline ou caminho / de um Secret |
+| `security.jwtIssuer` / `jwtAudience` | `""` | `iss` / `aud` exigidos |
+| `security.tlsClientCA` | `""` | Caminho do bundle de CA para mTLS (exige `tls.*`) |
+| `security.mtlsRole` | `""` (`user`) | Role de quem se identifica só por certificado |
+| `security.rateLimitRps` / `rateLimitBurst` | `""` (10 / 20) | Rate limit por chamador |
+| `security.maxRecvMsgSize` / `maxSendMsgSize` / `maxConcurrentStreams` | `""` (50 MB / 50 MB / 100) | Limites gRPC |
+| `security.bindAddress` | `""` (`0.0.0.0` no Kubernetes) | Endereço de escuta |
+| `security.auditLogPath` | `""` | Caminho absoluto e gravável da trilha de auditoria (monte um volume) |
+| `security.debug` | `false` | Stack traces nos logs de erro |
+| `security.agentSecurityMode` | `""` (strict) | `strict` ou `permissive` |
+| `security.sessionTTL` | `""` (90 dias) | Expiração das sessões em dias |
+| `security.envRedactMode` | `""` (permissive) | `strict` ou `permissive` |
+| `security.allowUnsignedPlugins` | `false` | Permite plugins não assinados (só desenvolvimento) |
+| `security.allowInsecure` | `false` | Define `CHATCLI_ALLOW_INSECURE`, que só o cliente lê; não afeta o servidor |
+| `security.encryptionKey` | `""` | Chave de criptografia das sessões, inline (prefira `extraEnv` com `secretKeyRef`) |
 
 ```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: my-llm-keys
-type: Opaque
-stringData:
-  OPENAI_API_KEY: "sk-xxx"
-  ANTHROPIC_API_KEY: "sk-ant-xxx"
-  OPENROUTER_API_KEY: "sk-or-xxx"  # opcional
-  MOONSHOT_API_KEY: "sk-xxx"       # opcional
-  GITHUB_COPILOT_TOKEN: "ghu_xxx"  # opcional
+# JWT de um Secret, mTLS com CA de cliente separada, log de auditoria num volume
+tls:
+  enabled: true
+  existingSecret: chatcli-tls                 # caminhos assumem /etc/chatcli/tls/tls.crt e tls.key
+security:
+  jwtSecretRef: {name: chatcli-jwt, key: secret}
+  tlsClientCA: /etc/chatcli/client-ca/ca.crt
+  mtlsRole: viewer
+  auditLogPath: /var/log/chatcli/audit.jsonl
+extraVolumes:
+  - name: client-ca
+    secret: {secretName: chatcli-client-ca}
+  - name: audit
+    emptyDir: {}
+extraVolumeMounts:
+  - {name: client-ca, mountPath: /etc/chatcli/client-ca, readOnly: true}
+  - {name: audit, mountPath: /var/log/chatcli}
 ```
 
-### Acessar o Servidor
+#### Service, ingress, network policy
 
-<Tabs>
-  <Tab title="Port Forward (Dev)">
-    ```bash
-    kubectl port-forward svc/chatcli 50051:50051
-    chatcli connect localhost:50051
-    ```
-  </Tab>
-  <Tab title="NodePort">
-    ```bash
-    helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --set service.type=NodePort
-    chatcli connect <node-ip>:<node-port>
-    ```
-  </Tab>
-  <Tab title="LoadBalancer">
-    ```bash
-    helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --set service.type=LoadBalancer
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `service.type` / `service.port` | `ClusterIP` / `50051` | Service |
+| `service.headless` | `false` | Service headless para balanceamento no cliente; use com mais de uma réplica |
+| `ingress.enabled`, `className`, `annotations`, `hosts`, `tls` | desligado | Ingress; `className: nginx` adiciona `backend-protocol: GRPC` e `ssl-redirect: "true"`, e as mesmas chaves em `annotations` substituem esses padrões |
+| `networkPolicy.enabled` | `false` | Ingress para as portas gRPC e de métricas |
+| `networkPolicy.ingressFrom` | ausente (qualquer origem) | Peers permitidos |
+| `networkPolicy.egress` | `allowAll` | `restricted` = DNS, 443, `kubernetesApiPort` (6443), `egressExtraPorts` |
 
-    # Aguarde o IP externo
-    kubectl get svc chatcli -w
-    chatcli connect <external-ip>:50051
-    ```
-  </Tab>
-</Tabs>
+#### Escala e monitoramento
 
-#### Ingress (com TLS)
+| Valor | Padrão | Descrição |
+|---|---|---|
+| `autoscaling.enabled`, `minReplicas`, `maxReplicas`, `targetCPUUtilizationPercentage`, `targetMemoryUtilizationPercentage` | `false`, `1`, `5`, `80`, ausente | HPA |
+| `podDisruptionBudget.enabled`, `minAvailable`, `maxUnavailable` | `false`, `1`, ausente | PDB, renderizado só com `replicaCount > 1` |
+| `serviceMonitor.enabled`, `interval`, `scrapeTimeout`, `labels` | `false`, `30s` | ServiceMonitor do Prometheus Operator na porta de métricas |
+| `serviceAccount.create`, `name`, `annotations` | `true` | Anotações de IRSA / Workload Identity vão aqui |
+| `rbac.create`, `clusterWide`, `additionalRules` | `true`, `false`, `[]` | RBAC do watcher e da remediação. Não dá acesso a Secrets (o servidor nunca lê um pela API); adicione em `additionalRules` uma regra restrita com `resourceNames` só para um plugin que precise |
+| `crdUpgrade.enabled` | `true` | Hook que reaplica os CRDs (imagem kubectl `registry.k8s.io/kubectl:v1.31.10`) |
+| `prometheusUrl` | `""` | Obsoleto, ignorado pelo servidor (defina no chart do operator) |
+
+O schema de valores rejeita chaves desconhecidas, então um valor com erro de digitação falha a instalação em vez de ser ignorado.
+
+### Expondo o servidor
+
+| Forma | Como | Cliente |
+|---|---|---|
+| Port-forward (desenvolvimento) | `kubectl -n chatcli port-forward svc/chatcli 50051:50051` | `CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token …` (ou `--tls --ca-cert` com TLS) |
+| Ingress, TLS no ingress | `ingress.className: nginx`, `ingress.tls`, servidor em texto puro | `chatcli connect chatcli.example.com:443 --tls --token …` |
+| LoadBalancer / NodePort | `service.type`, com `tls.*` ligado | `chatcli connect <endereço>:50051 --tls --ca-cert ca.crt --token …` |
 
 ```yaml
-# values-prod.yaml
+# values-ingress.yaml: TLS termina no ingress-nginx, gRPC até o pod
 ingress:
   enabled: true
   className: nginx
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
-    - host: chatcli.meudominio.com
+    - host: chatcli.example.com
       paths:
         - path: /
           pathType: ImplementationSpecific
   tls:
-    - secretName: chatcli-tls
-      hosts:
-        - chatcli.meudominio.com
+    - secretName: chatcli-ingress-tls
+      hosts: [chatcli.example.com]
 ```
+
+Com `className: nginx` o chart define como padrão `backend-protocol: GRPC` (texto puro até o pod) e `ssl-redirect: "true"`. Uma chave que você define em `ingress.annotations` substitui o padrão em vez de ser renderizada duas vezes, então para TLS de ponta a ponta pelo nginx (com `tls.*` no servidor) adicione `nginx.ingress.kubernetes.io/backend-protocol: GRPCS`.
+
+### Logs, health e métricas
 
 ```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli -f values-prod.yaml
+kubectl -n chatcli logs deploy/chatcli -f            # o banner e, depois, o log em linhas JSON
+kubectl -n chatcli port-forward deploy/chatcli 9090:9090 &
+curl -s localhost:9090/healthz                       # ok
+curl -s localhost:9090/metrics | grep '^chatcli_server_info'
 ```
 
-### Upgrade e Rollback
+Num pod o servidor escreve toda entrada de log no stderr, em linhas JSON, que é o que o `kubectl logs` e o seu coletor de logs leem; o arquivo rotativo em `/home/chatcli/.chatcli/app.log` (um emptyDir, sem shell para ler) é uma cópia que morre com o pod. `CHATCLI_LOG_STDERR=false` no `extraEnv` desliga a cópia no stderr. A porta de métricas não tem autenticação; restrinja com `networkPolicy.ingressFrom` onde isso importar.
+
+### Upgrade, rollback, desinstalação
 
 ```bash
-# Atualizar
-helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --set llm.model=gpt-6-astra
-
-# Rollback
-helm rollback chatcli 1
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.211.2 \
+  -n chatcli --reuse-values
+helm history chatcli -n chatcli
+helm rollback chatcli <revisão> -n chatcli
+helm uninstall chatcli -n chatcli
 ```
 
----
+- Uma mudança no Secret ou ConfigMap gerenciado pelo chart recria os pods (anotações de checksum). Uma mudança no `secrets.existingSecret` não: rode `kubectl -n chatcli rollout restart deploy/chatcli`.
+- Se o chart do servidor e o chart `chatcli-operator` estiverem instalados, mantenha os dois na mesma versão: cada um reaplica a própria cópia dos CRDs.
+- O `helm uninstall` apaga o PVC de sessões; faça backup antes. Os CRDs ficam; apagá-los apaga todos os recursos daqueles tipos.
 
-## Configuração de Segurança
+### Solução de problemas
 
-O Helm chart suporta configuração de segurança avançada para ambientes de produção:
+| Sintoma | Causa | Correção |
+|---|---|---|
+| Pod em `CrashLoopBackOff`; o `kubectl logs --previous` termina com `refusing to serve an unauthenticated API on 0.0.0.0` | Sem credencial num bind acessível | Defina `server.token` ou JWT |
+| As notas do `helm install` mostram `WARNING: no credential is configured` | Sem token, JWT ou CA de cliente nos valores | Defina `server.token` ou `security.jwtSecretRef` |
+| Cliente: `tls: first record does not look like a TLS handshake` | Servidor em texto puro (`tls.enabled=false`) | `CHATCLI_ALLOW_INSECURE=true`, ou ligue o TLS |
+| `helm install` falha com `tls.enabled=true needs tls.existingSecret` | TLS ligado sem material de certificado | Defina `tls.existingSecret`, ou `tls.certFile` e `tls.keyFile` juntos |
+| Cliente: `x509: certificate is valid for …, not localhost` | O port-forward disca `localhost` | Adicione SANs `localhost`/`127.0.0.1`, ou conecte pelo nome do certificado |
+| `Error: values don't meet the specifications of the schema(s)` | Valor desconhecido ou com erro de digitação | Confira a chave nas tabelas acima |
+| O watcher não traz nada de um namespace | RBAC: o chart criou uma Role e o alvo está em outro lugar | Defina o namespace do alvo em `watcher.targets` ou `watcher.namespace` (ClusterRole automática), ou use `rbac.clusterWide: true` |
+| Sessões somem no restart | `persistence.enabled: false` | Ligue |
+| Duas réplicas, uma recebe todo o tráfego | O ClusterIP prende as conexões HTTP/2 | `service.headless: true` |
 
-| Valor | Descrição | Padrão |
-|-------|-----------|--------|
-| `security.rateLimitRps` | Limite de requisições por segundo (rate limiting) | `0` (desabilitado) |
-| `security.bindAddress` | Endereço de bind do servidor. Auto-detecta `0.0.0.0` em Kubernetes via `KUBERNETES_SERVICE_HOST`. | `127.0.0.1` / `0.0.0.0` (K8s) |
-| `security.agentSecurityMode` | Modo de segurança do agente (`strict` ou `permissive`) | `strict` |
-| `security.jwtSecretRef.name` | Nome do Secret Kubernetes contendo o segredo JWT | `""` |
-| `security.jwtSecretRef.key` | Chave dentro do Secret com o valor do segredo JWT | `""` |
-| `security.jwtPublicKey` | Chave pública RSA (PEM ou caminho) para JWTs RS256; prevalece sobre o segredo HS256 | `""` |
-| `security.tlsClientCA` | Caminho do bundle de CA contra o qual certificados de cliente são verificados (TLS mútuo); exige cert e key TLS | `""` |
-| `security.mtlsRole` | Papel de chamadores identificados só pelo certificado de cliente (`viewer`, `user`, `admin`); renderizado como `CHATCLI_MTLS_ROLE` | `""` (user) |
-| `security.auditLog` | Habilitar log de auditoria de segurança | `false` |
+Veja também a [tabela de problemas do servidor](/pt/features/server-mode#solução-de-problemas).
 
-```yaml
-# values-security.yaml
-security:
-  rateLimitRps: 20
-  # bindAddress: "0.0.0.0"  # Em branco significa toda interface no Kubernetes — não loopback
-  agentSecurityMode: strict
-  auditLog: true
-  sessionEncryption: true
-  jwtSecretRef:
-    name: chatcli-jwt
-    key: secret
-```
-
-<Note>
-Em Kubernetes, o `bindAddress` é automaticamente detectado como `0.0.0.0` via a variável de ambiente `KUBERNETES_SERVICE_HOST`. Não é necessário configurar manualmente.
-</Note>
-
-<Warning>
-Em produção, sempre configure `security.jwtSecretRef` (HS256) ou `security.jwtPublicKey` (RS256) para habilitar autenticação JWT. Um servidor escutando em toda interface recusa subir sem credencial — um `server.token` compartilhado, um segredo ou chave pública JWT, ou uma CA de cliente (`security.tlsClientCA`).
-</Warning>
-
----
-
-## Exemplo Completo: Produção
-
-### Single-Target (Legado)
-
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --namespace chatcli --create-namespace \
-  --set llm.provider=CLAUDEAI \
-  --set secrets.anthropicApiKey=sk-ant-xxx \
-  --set server.token=super-secret-token \
-  --set tls.enabled=true \
-  --set tls.existingSecret=chatcli-tls-certs \
-  --set watcher.enabled=true \
-  --set watcher.deployment=production-app \
-  --set watcher.namespace=production \
-  --set persistence.enabled=true \
-  --set persistence.size=5Gi \
-  --set resources.requests.memory=256Mi \
-  --set resources.limits.memory=1Gi
-```
-
-### Multi-Target com Prometheus (Recomendado)
-
-```yaml
-# values-prod.yaml
-llm:
-  provider: CLAUDEAI
-secrets:
-  existingSecret: chatcli-llm-keys
-server:
-  token: super-secret-token
-tls:
-  enabled: true
-  existingSecret: chatcli-tls-certs
-watcher:
-  enabled: true
-  interval: "15s"
-  maxContextChars: 10000
-  targets:
-    - deployment: api-gateway
-      namespace: production
-      metricsPort: 9090
-      metricsFilter: ["http_requests_*", "http_request_duration_*"]
-    - deployment: auth-service
-      namespace: production
-      metricsPort: 9090
-    - deployment: payment-service
-      namespace: production
-      metricsPort: 9090
-      metricsFilter: ["payment_*", "stripe_*"]
-    - deployment: worker
-      namespace: batch
-persistence:
-  enabled: true
-  size: 5Gi
-resources:
-  requests:
-    memory: 256Mi
-  limits:
-    memory: 1Gi
-```
-
-```bash
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --namespace chatcli --create-namespace \
-  -f values-prod.yaml
-```
-
-> Quando targets estão em namespaces diferentes (ex: `production` e `batch`), o chart cria automaticamente um `ClusterRole` em vez de `Role` namespace-scoped.
-
----
-
-## Próximos Passos
+## Próximos passos
 
 <CardGroup cols={3}>
-  <Card title="Servidor" icon="server" href="/pt/features/server-mode">
-    Configurar o servidor gRPC
+  <Card title="Modo Servidor" icon="server" href="/pt/features/server-mode">
+    Flags, auth, limites, operação
   </Card>
   <Card title="Conexão Remota" icon="plug" href="/pt/features/remote-connect">
-    Conectar ao servidor
+    Conecte ao servidor
   </Card>
-  <Card title="K8s Watcher" icon="dharmachakra" href="/pt/features/k8s-watcher">
-    Monitorar Kubernetes
+  <Card title="K8s Watcher" icon="binoculars" href="/pt/features/k8s-watcher">
+    Monitore workloads
   </Card>
 </CardGroup>

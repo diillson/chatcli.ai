@@ -59,7 +59,7 @@ Outros eventos só chegam a um canal se virarem uma mudança de estado de Issue:
 | **ApprovalRequest criado** | **Nenhuma notificação.** Aprovações pendentes aparecem no dashboard, na API REST e em `kubectl get approvalrequests`. |
 
 <Warning>
-`IncidentSLA.spec.notificationPolicyRef`, `IncidentSLA.spec.escalationPolicyRef` e `ServiceLevelObjective.spec.alertPolicy.notificationPolicyRef` existem nos CRDs, mas nenhum controller os lê. O roteamento é decidido apenas pelas `rules` das suas NotificationPolicies. Para rotear alertas de SLO, filtre por `signalTypes: [slo_violation]`.
+`IncidentSLA.spec.notificationPolicyRef`, `IncidentSLA.spec.escalationPolicyRef` e `ServiceLevelObjective.spec.alertPolicy.notificationPolicyRef` são reservados: os CRDs os aceitam, mas nenhum controller os lê ainda. O roteamento é decidido apenas pelas `rules` das suas NotificationPolicies. Para rotear alertas de SLO, filtre por `signalTypes: [slo_violation]`.
 </Warning>
 
 <Note>
@@ -218,14 +218,16 @@ Sempre defina `states`. Sem ele, toda transição da Issue (`Detected` → `Anal
 |-------|------|--------|--------------------|
 | `deduplicationWindow` | string de duração | `5m` | Depois de um envio bem-sucedido, novos envios **da mesma Issue para o mesmo nome de canal** são descartados até a janela passar. Interpretado com `time.ParseDuration` do Go (`30s`, `5m`, `2h`). Um valor inválido como `1d` cai silenciosamente para `5m`. |
 | `maxPerHour` | int | `10` | No máximo esta quantidade de envios bem-sucedidos **por Issue, por nome de canal, por hora cheia**. `0` ou valor negativo equivale a `10`. |
-| `groupingWindow` | string de duração | `1m` | **Não implementado.** Aceito pelo CRD e ignorado pelo controller. Não existe agrupamento nem digest. |
+| `groupingWindow` | string de duração | `1m` | **Reservado.** Aceito pelo CRD e ignorado pelo controller. Não existe agrupamento nem digest: cada mudança de estado que casa é entregue sozinha, sujeita a `deduplicationWindow` e `maxPerHour`. |
 
 ```text
 Chave do throttle = <namespace da issue>/<nome da issue>/<nome do canal>
 ```
 
 <Warning>
-Notificações barradas pelo throttle são **descartadas, não enfileiradas**, e o estado mesmo assim é marcado como tratado, então ele nunca é enviado depois. Com a janela padrão de `5m`, uma Issue que passa por `Detected` → `Analyzing` → `Remediating` → `Resolved` em menos de cinco minutos envia **apenas o primeiro estado que casar** para cada canal. No PagerDuty e no OpsGenie, isso pode significar que o evento `Resolved` (resolve/close) é descartado e o alerta fica aberto. Para canais que precisam ver toda transição, use uma janela curta, como `30s`.
+Notificações barradas pelo throttle são **descartadas, não enfileiradas**, e o estado mesmo assim é marcado como tratado, então ele nunca é enviado depois. Com a janela padrão de `5m`, uma Issue que passa por `Detected` → `Analyzing` → `Remediating` → `Resolved` em menos de cinco minutos envia **apenas o primeiro estado que casar** para canais de Slack, email, webhook e Teams. Para canais que precisam ver toda transição, use uma janela curta, como `30s`.
+
+Uma exceção: uma notificação de `Resolved` para um canal de **PagerDuty ou OpsGenie** nunca é barrada, nem por `deduplicationWindow` nem por `maxPerHour`, porque é ela que resolve o evento ou fecha o alerta do lado deles.
 
 O estado do throttle fica **na memória do operator**: ele é zerado quando o operator reinicia. A janela é contada por **nome** de canal, então duas policies que usam o mesmo nome de canal a compartilham.
 </Warning>
@@ -270,14 +272,10 @@ Notificações de escalação não entram nesse status. Toda tentativa de entreg
 
 ```bash
 kubectl get np -A
-# NAME                ENABLED   CHANNELS   SENT   FAILED   AGE
-# production-alerts   true      <none>     42     1        3d
+# NAME                ENABLED   SENT   FAILED   AGE
+# production-alerts   true      42     1        3d
 kubectl get np production-alerts -n chatcli-system -o jsonpath='{.status.recentDeliveries}'
 ```
-
-<Note>
-A coluna `CHANNELS` sempre mostra `<none>`: ela aponta para o array `spec.channels`, mas foi declarada como coluna inteira, que o Kubernetes não consegue exibir.
-</Note>
 
 ## Canais de Notificação
 
@@ -388,7 +386,7 @@ Nenhuma outra chave é lida. O mapeamento de severidade e a dedup key são fixos
 }
 ```
 
-**Resolução automática:** quando uma notificação é enviada para o estado `Resolved`, o evento usa `event_action: resolve` com o mesmo `dedup_key`. Isso só acontece se alguma regra enviar `Resolved` para este canal e o envio não for barrado pelo throttle (veja o aviso sobre throttle acima).
+**Resolução automática:** quando uma notificação é enviada para o estado `Resolved`, o evento usa `event_action: resolve` com o mesmo `dedup_key`. Isso acontece sempre que alguma regra envia `Resolved` para este canal: resolves para o PagerDuty nunca são barrados pelo throttle.
 
 </Accordion>
 
@@ -433,16 +431,18 @@ Envia um email HTML via SMTP.
 | `to` | **Sim** | Destinatários separados por vírgula |
 | `smtp_user` | Não | Habilita autenticação SMTP `PLAIN` |
 | `smtp_password` | Não | Senha do `smtp_user` (mantenha no Secret) |
-| `tls_skip_verify` | Não | `"true"` pula a verificação do certificado no STARTTLS |
+| `tls_skip_verify` | Não | `"true"` pula a verificação do certificado (STARTTLS ou TLS implícito) |
+| `smtp_tls` | Não | `implicit` (também `tls` ou `smtps`) abre uma conexão TLS desde o primeiro byte; `starttls` mantém a conexão em texto puro e a eleva com STARTTLS. Sem ele, a porta `465` usa TLS implícito e qualquer outra porta usa STARTTLS. |
+| `smtp_timeout` | Não | Duração Go que limita toda a conversa SMTP, conexão inclusa (padrão `30s`) |
 
 Não existem opções de `cc`, `bcc`, assunto ou template HTML. O assunto é sempre `[<SEVERIDADE>] <título>` e o corpo é um layout HTML fixo com a tabela de campos.
 
 **Comportamento de TLS:**
 
-- A conexão começa em texto puro. O STARTTLS é usado **apenas se o servidor anunciá-lo**.
-- TLS implícito (porta `465`) **não é suportado**.
-- Se o servidor não oferecer STARTTLS e `smtp_user` estiver definido, a autenticação falha (o Go se recusa a enviar credenciais `PLAIN` por conexão sem criptografia, exceto para `localhost`).
-- A conexão SMTP não tem timeout próprio, então um servidor inacessível pode segurar o reconcile até o timeout de TCP do sistema operacional.
+- **TLS implícito** (SMTPS) é usado na porta `465`, ou em qualquer porta com `smtp_tls: implicit`: a conexão é criptografada desde o primeiro byte.
+- Nos demais casos, a conexão começa em texto puro e é elevada com STARTTLS **quando o servidor o anuncia**. `smtp_tls: starttls` força esse modo mesmo na porta `465`.
+- Se a conexão não estiver criptografada e `smtp_user` estiver definido, a autenticação falha (o Go se recusa a enviar credenciais `PLAIN` por conexão sem criptografia, exceto para `localhost`).
+- Toda a conversa, conexão inclusa, é limitada por `smtp_timeout` (padrão `30s`), então um servidor inacessível ou mudo faz o envio falhar em vez de segurar o reconcile.
 
 **Exemplo:**
 
@@ -601,7 +601,7 @@ spec:
 | `timeoutMinutes` | int | **Sim** | `15` | Minutos neste nível antes de passar para o próximo |
 | `targets` | []EscalationTarget | **Sim** | | Quem é responsável neste nível |
 | `notifyChannels` | []string | Não | | **Nomes** de canais das NotificationPolicies. É a única forma de um nível entregar alguma coisa. |
-| `repeatIntervalMinutes` | int | Não | `0` | **Não implementado.** Aceito e nunca lido. Os níveis não são renotificados. |
+| `repeatIntervalMinutes` | int | Não | `0` | Reenvia a mensagem deste nível neste intervalo até a Issue ser reconhecida, passar para o próximo nível ou ser resolvida. O último nível continua repetindo depois do timeout. Uma Issue em snooze não repete. `0` = sem repetição. |
 
 #### EscalationTarget
 
@@ -618,9 +618,9 @@ spec:
 
 1. **Início.** Quando uma Issue muda para `Escalated` (e não foi induzida por chaos), o controller escolhe uma policy: a **primeira policy habilitada, de qualquer namespace**, cujo `severities` contém a severidade da Issue, ou que não tem `severities`. Uma policy com `defaultPolicy: true` só é usada quando nenhuma casou. Se nada for encontrado, não há escalação (linha de log `no escalation policy found for issue`).
 2. **Nível 1** é notificado na hora. A Issue recebe as annotations abaixo e o status da policy ganha uma entrada em `activeEscalations`.
-3. **Avanço.** Quando o `timeoutMinutes` do nível atual passa, o próximo nível é notificado com o título `<emoji> ESCALATION [<SEVERIDADE>] <issue> — Level <n>: <nome do nível>`.
-4. **Último nível.** A cadeia para ali. Nada é repetido.
-5. **Fim.** A escalação só termina quando a Issue chega a `Resolved`: as três annotations são removidas. Não existe etapa de reconhecimento (veja abaixo).
+3. **Avanço.** Quando o `timeoutMinutes` do nível atual passa, o próximo nível é notificado com o título `<emoji> ESCALATION [<SEVERIDADE>] <issue> — Level <n>: <nome do nível>`. O novo nível e o horário em que começou ficam salvos na Issue, então a cadeia avança nível a nível (L1 → L2 → L3) e cada nível é notificado uma vez, mais as repetições (`repeatIntervalMinutes`).
+4. **Último nível.** A cadeia para ali. O último nível só é reenviado se tiver `repeatIntervalMinutes`.
+5. **Fim.** Um **reconhecimento** (acknowledge) congela a cadeia no nível atual: nenhum nível a mais e nenhuma repetição (veja abaixo). A escalação termina quando a Issue chega a `Resolved`: as annotations de escalação são removidas e a entrada da Issue sai de `status.activeEscalations`.
 
 As mensagens de escalação são enviadas para todo canal, em qualquer NotificationPolicy habilitada, cujo nome esteja em `notifyChannels` (os Secrets são lidos do namespace dessa policy). Elas não passam pelas regras, pelo throttle nem pelos templates.
 
@@ -637,7 +637,7 @@ sequenceDiagram
     Note over NC: annotations: nível 0, horário, policy
     NC->>NC: requeue após timeoutMinutes
     NC->>CH: mensagem do Nível 2
-    Note over NC,CH: ...até o último nível
+    Note over NC,CH: ...até o último nível, ou até o reconhecimento
     IC->>NC: estado da Issue → Resolved
     NC->>NC: annotations de escalação removidas
 ```
@@ -649,28 +649,27 @@ sequenceDiagram
 | `platform.chatcli.io/escalation-level` | Índice do nível atual (`0` = primeiro nível) |
 | `platform.chatcli.io/escalation-time` | Horário RFC 3339 em que o nível atual foi atingido |
 | `platform.chatcli.io/escalation-policy` | Nome da EscalationPolicy em uso |
+| `platform.chatcli.io/escalation-notified-at` | Horário RFC 3339 da última notificação do nível atual; o `repeatIntervalMinutes` conta a partir dele |
+| `platform.chatcli.io/escalation-pending-notify` | `true` enquanto uma mensagem de nível está retida por um snooze; ela é enviada quando o snooze termina |
 
 ```bash
 kubectl get issue <nome> -n <namespace> -o jsonpath='{.metadata.annotations}'
-kubectl get ep -A
-kubectl get ep production-escalation -n chatcli-system -o jsonpath='{.status.activeEscalations}'
+kubectl get escalationpolicies -A
+kubectl get escalationpolicies production-escalation -n chatcli-system -o jsonpath='{.status.activeEscalations}'
 ```
 
-A coluna `LEVELS` do `kubectl get ep` sempre mostra `<none>`, pelo mesmo motivo da coluna `CHANNELS` da NotificationPolicy. As entradas de `status.activeEscalations` nunca são removidas quando a Issue é resolvida, e `acknowledgedAt`/`acknowledgedBy` nunca são preenchidos.
+Cada entrada de `status.activeEscalations` traz `issueName`, `currentLevel` (a partir de 0), `escalatedAt` e, depois que a Issue é reconhecida, `acknowledgedAt` e `acknowledgedBy`. A entrada é removida quando a Issue é resolvida; `status.totalEscalations` conta toda escalação iniciada.
 
 ### Reconhecimento e como encerrar uma escalação
 
-**Não existe mecanismo de reconhecimento** que interrompa a cadeia:
+As duas ações passam pela API REST (role operator, header `X-API-Key`) ou pelo dashboard:
 
-- `POST /api/v1/incidents/{name}/acknowledge` (role operator, header `X-API-Key`) apenas adiciona as annotations `aiops.chatcli.io/acknowledged`, `aiops.chatcli.io/acknowledged-at` e `aiops.chatcli.io/acknowledged-by` (a role de quem chamou). A lógica de escalação não as lê.
-- `POST /api/v1/incidents/{name}/snooze` apenas registra `aiops.chatcli.io/snoozed-until`. Notificações e escalação o ignoram.
+- **Acknowledge.** `POST /api/v1/incidents/{name}/acknowledge` adiciona as annotations `aiops.chatcli.io/acknowledged`, `aiops.chatcli.io/acknowledged-at` e `aiops.chatcli.io/acknowledged-by` (a role de quem chamou). A escalação **para no nível atual**: nenhum nível a mais é alcançado e nenhuma repetição é enviada. O reconhecimento é registrado na entrada de `status.activeEscalations` da policy (`acknowledgedAt`, `acknowledgedBy`). Uma Issue reconhecida antes de chegar a `Escalated` nunca inicia uma escalação. As notificações de mudança de estado continuam saindo.
+- **Snooze.** `POST /api/v1/incidents/{name}/snooze` com um corpo como `{"duration": "30m"}` registra `aiops.chatcli.io/snoozed-until` e `aiops.chatcli.io/snoozed-by`. Uma duração zero ou negativa é recusada com `400`. Até o snooze terminar, a Issue **não envia nenhuma notificação exceto `Resolved`** (uma mudança de estado que acontece durante o snooze não é enviada depois), e a escalação segura o nível: sem avanço e sem repetição. Uma mensagem de nível que cai dentro do snooze fica retida (`escalation-pending-notify`) e é enviada quando o snooze termina, e o timer do nível recomeça nesse momento.
 - Reconhecer no PagerDuty ou no OpsGenie não tem efeito no cluster: não existe webhook de retorno.
 
 Para encerrar uma escalação, **resolva a Issue**, por exemplo com `POST /api/v1/incidents/{name}/resolve` (role operator) ou pelo dashboard. Isso também envia as notificações de `Resolved` que resolvem o evento no PagerDuty e fecham o alerta no OpsGenie.
 
-<Warning>
-**Limitação conhecida: a mudança de nível não é salva.** Quando um nível expira, o controller envia a mensagem do próximo nível, mas não persiste as novas annotations `escalation-level` / `escalation-time`, a menos que o estado da Issue mude no mesmo momento. Na prática, depois do primeiro timeout **a mensagem do segundo nível é reenviada sempre que o `timeoutMinutes` desse nível passa** (e também em outras atualizações da Issue), e os níveis além do segundo não são alcançados. Até isso ser corrigido, desenhe policies com dois níveis e coloque todos que precisam ser acionados nos `notifyChannels` do segundo nível. A métrica `escalation_level_reached` conta cada reenvio.
-</Warning>
 
 ## Exemplos Completos
 
@@ -717,7 +716,7 @@ spec:
     maxPerHour: 20
 ```
 
-A janela curta de `30s` torna bem menos provável que o evento `Resolved` (que resolve o incidente no PagerDuty) seja descartado depois de uma recuperação rápida.
+A janela curta de `30s` deixa os canais de Slack verem cada transição de uma recuperação rápida. O evento `Resolved` que resolve o incidente no PagerDuty nunca é barrado pelo throttle, qualquer que seja a janela.
 
 ### Escalation Policy com dois níveis
 
@@ -763,7 +762,7 @@ spec:
       notifyChannels: [slack-incidents]
 ```
 
-`email-leadership` precisa ser um canal definido em alguma NotificationPolicy. Por causa da limitação acima, a mensagem do segundo nível se repete a cada 15 minutos até a Issue ser resolvida.
+`email-leadership` precisa ser um canal definido em alguma NotificationPolicy. Depois que o segundo nível é alcançado, nada mais é enviado até a Issue ser resolvida; adicione `repeatIntervalMinutes` ao segundo nível para continuar lembrando até alguém reconhecer.
 
 ### Alertas de violação de SLO
 
@@ -854,7 +853,7 @@ spec:
   <Accordion title="PagerDuty não cria ou não resolve incidentes">
     - Confirme que o `routing_key` é uma Integration Key da Events API v2 (não uma chave da REST API)
     - Confirme que o serviço no PagerDuty está ativo e confira o payload no PagerDuty Event Debugger
-    - Se os incidentes nunca são resolvidos, garanta que alguma regra envia `Resolved` para o canal e que o throttle não o descartou (use um `deduplicationWindow` curto)
+    - Se os incidentes nunca são resolvidos, garanta que alguma regra envia `Resolved` para o canal (resolves para o PagerDuty nunca são barrados pelo throttle)
   </Accordion>
 
   <Accordion title="Emails não chegam">
@@ -863,7 +862,8 @@ spec:
     kubectl run smtp-check -n chatcli-system --rm -it --restart=Never \
       --image=curlimages/curl -- curl -v --max-time 5 telnet://smtp.example.com:587
     ```
-    - Use uma porta que ofereça STARTTLS (`587`, `25`); TLS implícito na `465` não é suportado
+    - Na porta `465` o canal usa TLS implícito; na `587` ou na `25` ele eleva com STARTTLS. Defina `smtp_tls` se o seu servidor usa uma porta fora do padrão.
+    - Um envio que falha por timeout atingiu o `smtp_timeout` (padrão `30s`)
     - Confirme que o Secret tem as chaves `smtp_user` e `smtp_password` (e não `username`/`password`)
     - Cheque a pasta de spam dos destinatários
   </Accordion>
@@ -874,7 +874,7 @@ spec:
     - Verifique as annotations `platform.chatcli.io/escalation-level`, `escalation-time` e `escalation-policy`.
     - Garanta que cada nível tenha `notifyChannels` com nomes que existem em uma NotificationPolicy habilitada.
     - Procure `escalation initiated`, `escalation advanced` e `no escalation policy found for issue` nos logs do operator.
-    - Níveis além do segundo não são alcançados (veja a limitação conhecida acima).
+    - Uma Issue reconhecida não avança, e uma em snooze segura o nível até `aiops.chatcli.io/snoozed-until`.
   </Accordion>
 
   <Accordion title="Webhook retorna erro de assinatura">
@@ -893,9 +893,10 @@ O operator expõe estas métricas no seu endpoint de métricas (porta `8080`, ca
 |---------|------|--------|-----------|
 | `chatcli_operator_notifications_sent_total` | Counter | `channel_type`, `severity`, `result` | Tentativas de envio, com `result` = `success` ou `failure` |
 | `chatcli_operator_notifications_failed_total` | Counter | `channel_type`, `reason` | Falhas, com `reason` = `config_resolve` (Secret ilegível), `sender_create` (tipo desconhecido) ou `send` |
-| `chatcli_operator_escalation_level_reached` | Counter | `policy`, `level` | Incrementa toda vez que um nível de escalação é notificado; `level` é o **nome** do nível |
+| `chatcli_operator_escalation_level_reached` | Counter | `policy`, `level` | Incrementa uma vez a cada nível que uma escalação alcança (repetições não contam); `level` é o **nome** do nível |
+| `chatcli_operator_notification_duration_seconds` | Histogram | `channel_type` | Tempo gasto para entregar uma notificação, com sucesso ou não, incluindo envios de escalação |
 
-Não há métricas de notificações barradas pelo throttle nem de latência de envio. O throttle só aparece nos logs (`notification throttled`).
+Não há métrica de notificações barradas pelo throttle. O throttle só aparece nos logs (`notification throttled`).
 
 **Alertas Prometheus recomendados:**
 

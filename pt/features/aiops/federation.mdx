@@ -105,7 +105,7 @@ status:
 | `labels` | map | Não | Metadados livres (informativo) |
 | `healthCheckInterval` | duration | Não | Intervalo do health check (padrão `30s`; um valor inválido volta para `30s`) |
 | `capabilities` | []string | Não | Lista livre de recursos do cluster, por exemplo `metrics-server`, `prometheus`, `istio`. Só é armazenada; nenhum código a lê |
-| `maxConcurrentRemediations` | int | Não | Padrão `3`. Só é armazenado; o operator não o aplica nas versões atuais |
+| `maxConcurrentRemediations` | int | Não | Padrão `3`. Só é armazenado; o operator não o aplica |
 
 ### Campos do Status
 
@@ -118,7 +118,7 @@ status:
 | `namespaceCount` | int | Número de namespaces |
 | `activeIssues` | int | Issues não terminais no cluster remoto (0 quando as CRDs não estão instaladas lá) |
 | `activeRemediations` | int | RemediationPlans em `Pending`, `Executing` ou `Verifying` no cluster remoto |
-| `conditions` | []Condition | Definido no schema; o controller não preenche nenhuma |
+| `conditions` | []Condition | `Connected` (`True`/`HealthCheckPassed` enquanto o health check passa; `False` com reason `KubeconfigUnusable`, `NodeListFailed` ou `NamespaceListFailed` e o erro) e `Degraded` (`True`/`NodesNotReady` quando o cluster responde mas alguns nodes não estão Ready, `False`/`AllNodesReady`, `Unknown`/`Disconnected` enquanto ele está inacessível) |
 
 
 
@@ -143,7 +143,7 @@ A identidade do kubeconfig precisa, no cluster remoto: `list` em nodes e namespa
     Lista Issues e RemediationPlans remotos, quando essas CRDs existem lá, para preencher `activeIssues` e `activeRemediations`.
   </Step>
   <Step title="Atualizar Status">
-    Grava `connected`, `lastHealthCheck`, `kubernetesVersion`, `nodeCount`, `namespaceCount`, `activeIssues` e `activeRemediations` e agenda o próximo ciclo após `healthCheckInterval`. Uma falha em qualquer passo anterior define `connected: false` e só atualiza `lastHealthCheck`.
+    Grava `connected`, `lastHealthCheck`, `kubernetesVersion`, `nodeCount`, `namespaceCount`, `activeIssues`, `activeRemediations` e as conditions `Connected`/`Degraded`, atualiza o gauge `chatcli_operator_federation_clusters_total` e agenda o próximo ciclo após `healthCheckInterval`. Uma falha em qualquer passo anterior define `connected: false`, atualiza `lastHealthCheck` e registra a falha na condition `Connected`.
   </Step>
 </Steps>
 
@@ -188,7 +188,7 @@ spec:
   signalType: error_rate
 ```
 
-O contador `chatcli_operator_federation_cross_cluster_issues_total` incrementa uma vez por correlação. Uma Issue que mudou por baixo do update (conflito) é pulada e não há nova tentativa; uma correlação posterior, disparada por outra Issue nova com o mesmo sinal, a anota de novo com um novo id.
+Uma Issue elevada a `critical` também recebe `platform.chatcli.io/elevated-severity: "true"`. Uma correlação mantém **um id**: quando chega uma Issue nova que casa e uma das Issues do grupo já traz um id de correlação, o grupo o reutiliza em vez de rerotular tudo, e `affected-clusters` é atualizado. O contador `chatcli_operator_federation_cross_cluster_issues_total` incrementa uma vez por id de correlação novo. Uma Issue que mudou por baixo do update (conflito) é pulada e não há nova tentativa; a próxima correlação do grupo a anota.
 
 <Note>
   O id de correlação é uma annotation, então encontre as Issues relacionadas com:
@@ -199,9 +199,7 @@ O contador `chatcli_operator_federation_cross_cluster_issues_total` incrementa u
   ```
 </Note>
 
-<Warning>
-  `GET /api/v1/federation/correlations` não mostra essas correlações nas versões atuais: ele lê as annotations `platform.chatcli.io/correlation-id`, `correlated-clusters` e `elevated-severity`, que nada escreve, e pula Issues sem `correlation-id`, então devolve uma lista vazia. Use a consulta `kubectl` acima até as chaves serem alinhadas.
-</Warning>
+`GET /api/v1/federation/correlations` lista as correlações a partir das Issues locais, uma entrada por id de correlação, com `correlationId`, `issue`, `namespace`, `severity`, `signalType`, `correlatedClusters` (de `affected-clusters`), `elevated` (de `elevated-severity`) e `cascade`. Ele também lê as chaves antigas `platform.chatcli.io/correlation-id` / `correlated-clusters`, então Issues anotadas com elas continuam aparecendo.
 
 ## Detecção de Cascata
 
@@ -231,10 +229,10 @@ Não existe CRD de status da federação. A visão agregada é calculada sob dem
 
 | Endpoint | Retorna |
 |----------|---------|
-| `GET /api/v1/federation/status` (também `GET /api/v1/federation`) | `totalClusters`, `connectedClusters`, `disconnectedClusters` e `totalActiveIssues` (Issues locais que não estão `Resolved` nem `Failed`) |
+| `GET /api/v1/federation/status` (também `GET /api/v1/federation`) | `totalClusters`, `connectedClusters` (inclui os degradados), `degradedClusters`, `disconnectedClusters` e `totalActiveIssues` (Issues locais que não estão `Resolved` nem `Failed`) |
 | `GET /api/v1/federation/clusters?tier=critical` | Os registros, opcionalmente filtrados por tier |
-| `GET /api/v1/clusters/global-status` | `totalClusters`, `healthyClusters` (conectados), `offlineClusters`, `degradedClusters` (sempre `0` nas versões atuais) e a lista de clusters |
-| `GET /api/v1/federation/correlations` | Correlações cross-cluster (veja o aviso acima: vazio nas versões atuais) |
+| `GET /api/v1/clusters/global-status` | `totalClusters`, `healthyClusters` (conectados, todos os nodes Ready), `degradedClusters` (conectados, com a condition `Degraded`), `offlineClusters` e a lista de clusters (cada um com `connected` e `degraded`) |
+| `GET /api/v1/federation/correlations` | Correlações cross-cluster (veja [acima](#elevação-automática-de-severidade)) |
 
 ```json
 {
@@ -243,6 +241,7 @@ Não existe CRD de status da federação. A visão agregada é calculada sob dem
   "spec": {
     "totalClusters": 5,
     "connectedClusters": 4,
+    "degradedClusters": 1,
     "disconnectedClusters": 1,
     "totalActiveIssues": 12
   }
@@ -448,13 +447,13 @@ Servidas na porta de métricas do operator (8080, `/metrics`):
 
 | Métrica | Tipo | Labels | Descrição |
 |--------|------|--------|-------------|
-| `chatcli_operator_federation_clusters_total` | Gauge | `status` (`connected`, `disconnected`) | Incrementada uma vez por resultado de health check |
-| `chatcli_operator_federation_cross_cluster_issues_total` | Counter | - | Correlações cross-cluster levantadas |
+| `chatcli_operator_federation_clusters_total` | Gauge | `status` (`connected`, `degraded`, `disconnected`) | Número de clusters registrados em cada estado. Definido para todos os estados a partir das ClusterRegistrations que existem, então um cluster que muda de estado ou é apagado passa de uma série para outra |
+| `chatcli_operator_federation_cross_cluster_issues_total` | Counter | - | Correlações cross-cluster levantadas (uma por id de correlação novo) |
 | `chatcli_operator_federation_cascade_detected_total` | Counter | - | Cascatas de staging para produção detectadas |
 
-<Warning>
-  `chatcli_operator_federation_clusters_total` é declarada como gauge, mas o controller só a incrementa (uma vez por health check, por resultado) e nunca a define nem zera, então ela cresce a cada verificação em vez de informar o número atual de clusters. Trate-a como um contador de resultados de health check e use `rate()`/`increase()` sobre ela, ou leia `status.connected` das ClusterRegistrations para o estado atual.
-</Warning>
+<Note>
+  Os três estados são exclusivos: `degraded` é um cluster que responde ao health check com alguns nodes não Ready; no gauge ele não conta como `connected` (o `connectedClusters` da REST o inclui).
+</Note>
 
 ### Dashboards Recomendados
 
@@ -463,10 +462,10 @@ Servidas na porta de métricas do operator (8080, `/metrics`):
   {
     "panels": [
       {
-        "title": "Health Checks com Falha (5m)",
+        "title": "Clusters Desconectados",
         "type": "stat",
         "targets": [{
-          "expr": "increase(chatcli_operator_federation_clusters_total{status='disconnected'}[5m])"
+          "expr": "chatcli_operator_federation_clusters_total{status='disconnected'}"
         }]
       },
       {
@@ -495,15 +494,15 @@ groups:
   - name: federation
     rules:
       - alert: ClusterHealthCheckFailing
-        expr: increase(chatcli_operator_federation_clusters_total{status="disconnected"}[5m]) > 0
+        expr: chatcli_operator_federation_clusters_total{status="disconnected"} > 0
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Health checks de cluster federado falhando"
           description: >
-            Pelo menos uma ClusterRegistration falhou no health check nos
-            últimos 5 minutos. Verifique a conectividade de rede e o Secret do kubeconfig.
+            Pelo menos uma ClusterRegistration está falhando no health check
+            há 5 minutos. Verifique a conectividade de rede e o Secret do kubeconfig.
 
       - alert: CrossClusterIncident
         expr: increase(chatcli_operator_federation_cross_cluster_issues_total[10m]) > 0

@@ -48,7 +48,7 @@ The port comes from the chart value `api.port` (default `8090`), which sets the 
 </Info>
 
 <Note>
-**Multiple operator replicas.** In 1.211.2 and earlier the REST API and dashboard run only on the **leader** replica: the other replicas pass their readiness probe (which is on port 8081) but do not listen on 8090, so a Service with several replicas can route requests to a pod that refuses the connection. Keep `replicaCount: 1` or port-forward to the leader. Starting with the release after 1.211.2, every replica serves the API and the dashboard.
+**Multiple operator replicas.** Every replica serves the REST API and the dashboard on 8090, so a Service with several replicas can route a request to any pod. Reads are answered by any replica; a manual resolve accepted by a replica that is not the leader is completed by the leader's Issue reconciler.
 </Note>
 
 ---
@@ -59,7 +59,7 @@ The port comes from the chart value `api.port` (default `8090`), which sets the 
 flowchart LR
   Client[Client<br/>curl / SDK / CI] --> CORS{CORS<br/>policy}
   CORS -->|allowed preflight| P204[204 No Content]
-  CORS --> Rate{Rate limiter<br/>per client address}
+  CORS --> Rate{Rate limiter<br/>per key, or per client host}
   Rate -->|exceeded| E429[429 Too Many Requests]
   Rate -->|ok| Auth{X-API-Key<br/>check}
   Auth -->|missing / invalid| E401[401 Unauthorized]
@@ -141,7 +141,7 @@ Keys are read from the **operator namespace** (`chatcli-system` by default), in 
 1. Secret **`chatcli-operator-secrets`**, key **`api-keys`** (recommended)
 2. ConfigMap **`chatcli-operator-config`**, key **`api-keys`** (fallback, used only when the Secret does not exist)
 
-The value is a YAML list of `{key, role, description}` entries. **No chart or manifest creates this object** — you create it:
+The value is a YAML list of `{key, role, name, description}` entries. `name` is optional: it is the identity recorded on the approval decisions the key takes (falling back to `description`, then to a `key-<hash>` fingerprint), and a quorum counts each key once, so give each approver their own key. The operator chart renders the Secret only with `apiKeys.create: true` (the keys are then stored in the Helm release); otherwise you create it:
 
 ```yaml
 apiVersion: v1
@@ -157,6 +157,7 @@ stringData:
       description: "CI/CD pipeline"
     - key: "<random-operator-key>"
       role: operator
+      name: "oncall-sre"
       description: "On-call team"
     - key: "<random-viewer-key>"
       role: viewer
@@ -173,7 +174,7 @@ The operator polls the Secret and ConfigMap every **30 seconds** and hot-reloads
 <Warning>
 **No keys configured = every `/api/` call returns `401`.** If neither object holds a valid key, the API is closed (fail-closed). Setting `CHATCLI_OPERATOR_DEV_MODE=true` on the operator (chart: `security.devMode: true`) instead lets every request through **as `admin` without a key** — for local development only, **never in production**.
 
-Deleting both the Secret and the ConfigMap does not clear keys that are already loaded (outside dev mode they stay valid until the operator restarts). To revoke keys, edit the list in place.
+Keys follow their source: an empty list or YAML that does not parse leaves no valid key, and deleting both the Secret and the ConfigMap revokes every loaded key on the next poll (within about 30 s, `401` from then on). A read error other than not found keeps the keys in force, so an API server hiccup does not lock everyone out.
 </Warning>
 
 <Tip>
@@ -184,9 +185,9 @@ Deleting both the Secret and the ConfigMap does not clear keys that are already 
 
 ## Rate limiting
 
-The API allows **30 requests per minute per client address** (token bucket, bursts of up to 30, refilled continuously at 0.5 req/s). The limit is the same for every role and every key.
+The API allows **30 requests per minute per client host** for requests that carry no valid API key (token bucket, bursts of up to 30, refilled continuously at 0.5 req/s), and **600 requests per minute per valid API key** (bursts of up to 600, refilled at 10 req/s), keyed by a digest of the key. The limit runs before authentication; the per-key limit is the same for every role. Forwarding headers are not honored, so behind a proxy every unauthenticated caller shares the proxy's host bucket. Idle buckets are evicted after 10 minutes.
 
-When it is exceeded the operator returns `429 Too Many Requests` with the header `Retry-After: 60` and the standard error envelope. No `X-RateLimit-*` headers are sent. Implement backoff in production clients, and keep dashboards or scrapers that poll many endpoints within the budget.
+When it is exceeded the operator returns `429 Too Many Requests` with the standard error envelope (`rate limit exceeded: N requests per minute`) and a `Retry-After` header with the seconds until the bucket holds a token again (2 for the host limit, 1 for the key limit). No `X-RateLimit-*` headers are sent. Implement backoff in production clients, and keep dashboards or scrapers that poll many endpoints within the budget.
 
 ---
 
@@ -267,10 +268,11 @@ All responses follow a **Kubernetes-like** pattern:
 |:-----|:--------|:----------------|
 | `400` | Bad Request | Malformed JSON body or invalid/missing body field |
 | `401` | Unauthorized | `X-API-Key` missing or invalid, or no keys configured |
-| `403` | Forbidden | Role below the endpoint's minimum, or an unknown role |
+| `403` | Forbidden | Role below the endpoint's minimum, an unknown role, or the operator's RBAC does not allow creating the runbook |
 | `404` | Not Found | Resource does not exist, or unknown path/method combination |
 | `405` | Method Not Allowed | Non-GET request to a read-only group (`analytics`, `clusters`, `policies`, `audit`, `federation`) |
-| `409` | Conflict | Invalid state for the operation (for example resolving an already resolved incident), a concurrent modification, or runbook creation failure |
+| `409` | Conflict | Invalid state for the operation (for example resolving an already resolved incident, or deciding on an approval request that is no longer `Pending` or that the same API key already decided), a concurrent modification, or creating a runbook whose name already exists |
+| `422` | Unprocessable Entity | The Kubernetes API server rejected a runbook being created (for example a value outside the CRD enums) |
 | `429` | Too Many Requests | Rate limit exceeded — see `Retry-After` |
 | `500` | Internal Server Error | Kubernetes API failure — inspect the operator logs |
 

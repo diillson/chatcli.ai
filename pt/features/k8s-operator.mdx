@@ -1,313 +1,508 @@
 ---
 title: "Kubernetes Operator (AIOps)"
 sidebarTitle: "K8s Operator"
-description: "Gerencie instâncias ChatCLI e uma plataforma AIOps autônoma no Kubernetes com 17 CRDs, 54 tipos de remediação, análise de logs/métricas, integração GitOps e diagnóstico code-aware."
+description: "Instale o operator do ChatCLI, suba um servidor ChatCLI como Instance com TLS e credencial, conecte a CLI e o dashboard e rode em produção."
 icon: "dharmachakra"
 ---
 
-O **ChatCLI Operator** vai além do gerenciamento de instâncias. Ele implementa uma **plataforma AIOps completa** que detecta anomalias autônomamente, correlaciona sinais, solicita análise de IA e executa remediação — tudo sem dependências externas além do provedor LLM.
-
-A plataforma suporta **Deployments, StatefulSets, DaemonSets, Jobs e CronJobs**, integra-se com **Helm, ArgoCD e Flux** para remediação GitOps-aware, analisa **logs de aplicação com extração de stack traces** (Java, Go, Python, Node.js), correlaciona **métricas Prometheus** com incidentes, e permite vincular **repositórios de código-fonte** para diagnóstico code-aware.
-
-
-
-## API Group e CRDs
-
-O operator usa o API group `platform.chatcli.io/v1alpha1` com 17 Custom Resource Definitions:
-
-| CRD | Short Name | Descrição |
-|-----|-----------|-----------|
-| **Instance** | `inst` | Instância do servidor ChatCLI (Deployment, Service, RBAC, PVC) |
-| **Anomaly** | `anom` | Sinal bruto do K8s Watcher (restarts, OOM, falhas de deploy, etc.) |
-| **Issue** | `iss` | Incidente correlacionado agrupando múltiplas anomalias |
-| **AIInsight** | `ai` | Análise de causa raiz gerada por IA com contexto enriquecido (logs, métricas, código, GitOps) |
-| **RemediationPlan** | `rp` | Ações concretas para resolver o problema (runbook ou IA agêntica) |
-| **Runbook** | `rb` | Procedimentos operacionais manuais (opcional) |
-| **PostMortem** | `pm` | Relatório de incidente auto-gerado após resolução (todos os modos) |
-| **SourceRepository** | `srcrepo` | Vincula workloads a repositórios git para diagnóstico code-aware |
-| **NotificationPolicy** | `np` | Política de notificações multi-canal com throttling e templates |
-| **EscalationPolicy** | `ep` | Cadeia de escalação com níveis e timeouts (L1→L2→L3) |
-| **ServiceLevelObjective** | `slo` | SLO com burn rate alerting multi-janela (modelo Google SRE) |
-| **IncidentSLA** | `sla` | SLA de resposta/resolução por severidade com business hours |
-| **ApprovalPolicy** | `ap` | Política de aprovação auto/manual/quorum com change windows |
-| **ApprovalRequest** | `ar` | Workflow de aprovação com blast radius e evidências |
-| **ClusterRegistration** | `cr` | Federação multi-cluster com kubeconfig e health check |
-| **AuditEvent** | `ae` | Trilha de auditoria imutável (append-only) |
-| **ChaosExperiment** | `chaos` | Experimentos de chaos engineering com 7 tipos e safety checks |
+O **ChatCLI Operator** roda servidores ChatCLI no Kubernetes como recursos `Instance` e, em cima deles, um pipeline de AIOps que transforma alertas do watcher em incidentes, pede ao LLM a causa raiz e executa a remediação. Esta página é a jornada de quem opera: instalar, subir a primeira Instance de ponta a ponta, conectar, abrir o dashboard e endurecer tudo para produção.
 
 <Info>
-Para documentação detalhada de cada componente da plataforma AIOps, consulte as páginas dedicadas em [AIOps Platform](/pt/features/aiops/notifications).
+Os detalhes internos do pipeline de AIOps (correlação, análise, ações de remediação, post-mortems) estão em [AIOps Platform](/pt/features/aiops-platform) e [Ciclo de vida do incidente](/pt/features/aiops/incident-lifecycle). Esta página cobre tudo o que você precisa para operá-lo.
 </Info>
 
+## Como as peças se encaixam
 
+```mermaid
+flowchart LR
+    subgraph sys["namespace chatcli-system"]
+        OP["chatcli-operator<br/>controllers + WatcherBridge (só no líder)<br/>API REST + dashboard :8090 (toda réplica)"]
+    end
+    subgraph app["seu namespace"]
+        CR["Instance CR"]
+        POD["pod do servidor ChatCLI<br/>gRPC :50051<br/>métricas + /healthz :9090"]
+        CR -. "reconciliada em" .-> POD
+    end
+    OP -- "gRPC, sempre TLS 1.3" --> POD
+    CLI["chatcli connect"] -- "gRPC sobre TLS" --> POD
+    WEB["Navegador ou curl<br/>X-API-Key"] -- "HTTP :8090" --> OP
+    POD -- "HTTPS" --> LLM["Provedor LLM"]
+    POD -- "pods, logs, eventos" --> API["API do Kubernetes"]
+```
 
-## Instalação do Operator
+O que você precisa saber antes de começar:
 
-Um único comando instala tudo: **17 CRDs + RBAC + Deployment + Service + Dashboard**.
+- **Uma `Instance` é um servidor gRPC do ChatCLI** (`chatcli server`) que o operator implanta e mantém em ordem: um Deployment, um Service, ConfigMaps, uma ServiceAccount e, opcionalmente, um PVC e RBAC do watcher.
+- **O operator sempre conecta no servidor com TLS 1.3.** Não existe caminho em texto puro do operator até uma Instance. O endereço discado é `<name>.<namespace>.svc.cluster.local:<port>`, então o certificado do servidor precisa valer para esse nome.
+- **Toda Instance precisa de uma credencial.** Dentro do cluster o servidor escuta em todas as interfaces e se recusa a subir sem token compartilhado, material JWT ou CA de cliente. O operator confere isso antes e não cria o Deployment quando o spec não tem nenhum.
+- **Uma Instance por cluster conduz o AIOps.** O WatcherBridge lista todas as Instances do cluster e se conecta à primeira pronta que encontrar. Você pode rodar outras Instances para chat, mas só uma alimenta o pipeline de incidentes, e qual delas não é algo em que se possa confiar.
+- **A API REST e o dashboard web são servidos pelo operator**, não pela Instance: Service `chatcli-operator`, porta `8090`, autenticados por API key.
+
+### API group e CRDs
+
+Todos os recursos são namespaced e ficam em `platform.chatcli.io/v1alpha1`. O operator traz 17 CRDs:
+
+| Kind | Short name | O que é |
+|------|-----------|---------|
+| **Instance** | `inst` | Um servidor ChatCLI gerenciado pelo operator (esta página) |
+| **Anomaly** | `anom` | Um sinal bruto do watcher do servidor |
+| **Issue** | `iss` | Um incidente correlacionado que agrupa anomalias |
+| **AIInsight** | `ai` | A análise de causa raiz do LLM e as ações sugeridas para uma Issue |
+| **RemediationPlan** | `rp` | As ações executadas para uma Issue (runbook, gerado por IA ou agêntico) |
+| **Runbook** | `rb` | Um procedimento reutilizável, escrito por você ou gerado a partir de uma remediação bem-sucedida |
+| **PostMortem** | `pm` | O relatório do incidente gerado após a resolução |
+| **SourceRepository** | `srcrepo` | Liga um workload ao seu repositório git para análise ciente do código |
+| **NotificationPolicy** | `np` | Roteamento de notificações para canais |
+| **EscalationPolicy** | `ep` | Níveis de escalação e timeouts |
+| **ServiceLevelObjective** | `slo` | Um SLO com alerta por burn rate |
+| **IncidentSLA** | `sla` | Metas de resposta e resolução por severidade |
+| **ApprovalPolicy** | `ap` | Quando uma remediação exige aprovação humana |
+| **ApprovalRequest** | `ar` | Uma aprovação pendente para uma remediação |
+| **ClusterRegistration** | `cr` | Um cluster numa federação |
+| **AuditEvent** | `ae` | Um registro de auditoria que o operator grava sobre as próprias ações |
+| **ChaosExperiment** | `chaos` | Um experimento de caos (5 tipos que funcionam; `network_delay`, `network_loss` e `spec.schedule` falham como não suportados) |
+
+Cada kind de AIOps tem sua página em **AIOps Platform** na barra lateral, por exemplo [Notificações e escalação](/pt/features/aiops/notifications), [SLOs e SLAs](/pt/features/aiops/slo-sla) e [Fluxo de aprovação](/pt/features/aiops/approval-workflow).
+
+## Pré-requisitos
+
+| Requisito | Detalhes |
+|-----------|----------|
+| Kubernetes | O operator é compilado com `k8s.io` v0.37 e controller-runtime v0.25, e a suíte de integração roda contra Kubernetes 1.37 (envtest). Ele usa só APIs GA (`apps/v1`, `rbac.authorization.k8s.io/v1`, `networking.k8s.io/v1`, `coordination.k8s.io/v1`, `apiextensions.k8s.io/v1`); o chart não declara restrição de `kubeVersion`. Use uma versão do Kubernetes ainda suportada upstream. |
+| Permissões | Cluster-admin para a instalação: ela cria CRDs, ClusterRoles e ClusterRoleBindings. |
+| Helm | Helm 3.8 ou mais novo (suporte a registry OCI). O caminho por manifestos crus precisa só de `kubectl` e `make`. |
+| Certificados | `openssl`, ou o [cert-manager](https://cert-manager.io) no cluster, para emitir o certificado TLS da Instance. |
+| Credenciais de LLM | Uma API key de pelo menos um provedor (ou IAM, no caso do Bedrock). |
+| Opcional | Prometheus Operator (para `ServiceMonitor`), uma URL de Prometheus (métricas na análise de incidentes), um CNI que aplique NetworkPolicy. |
+
+## Instalar o operator
+
 
 <Tabs>
-  <Tab title="Via OCI Registry (recomendado)">
-    Instala direto do GHCR — **não precisa clonar o repositório**:
+  <Tab title="Helm (recomendado)">
+    O chart é publicado como artefato OCI no GHCR; não é preciso clonar o repositório:
+
     ```bash
-    helm install chatcli-operator \
-      oci://ghcr.io/diillson/charts/chatcli-operator \
-      --namespace chatcli-system \
-      --create-namespace
+    helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
+      --version 1.211.2 \
+      -n chatcli-system --create-namespace
     ```
 
-    Para fixar uma versão específica:
-    ```bash
-    helm install chatcli-operator \
-      oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.211.2 \
-      --namespace chatcli-system \
-      --create-namespace
-    ```
+    O que é instalado: os 17 CRDs, o Deployment do operator (imagem `ghcr.io/diillson/chatcli-operator`, tag = `appVersion` do chart), o Service `chatcli-operator` (portas `metrics` 8080, `health` 8081, `api` 8090), a ClusterRole do operator com seu binding e as ClusterRoles pré-provisionadas `chatcli-watcher` e `chatcli-role-{viewer,operator,admin,superadmin}`.
+
+    **CRDs no upgrade.** O Helm só instala os arquivos de `crds/` na primeira instalação e nunca os atualiza. Por isso o chart roda um Job de hook pre-install/pre-upgrade (`crdUpgrade.enabled: true`, imagem `registry.k8s.io/kubectl:v1.31.10`) que reaplica todos os CRDs, mantendo o schema sempre alinhado com o controller. Desligue só se você gerencia CRDs por fora; nesse caso aplique o `crds/` do chart novo antes do upgrade.
+
+    <Note>
+    O nome do Service segue o nome do release do Helm: com o release `chatcli-operator` ele é `chatcli-operator`. Outro nome, por exemplo `aiops`, gera `aiops-chatcli-operator`. Os comandos desta página assumem o release `chatcli-operator` em `chatcli-system`.
+    </Note>
   </Tab>
-  <Tab title="Via path local (se clonou o repo)">
+  <Tab title="Manifestos crus (make deploy)">
+    A partir de um clone do repositório:
+
     ```bash
-    helm install chatcli-operator ./deploy/helm/chatcli-operator/ \
-      --namespace chatcli-system \
-      --create-namespace
+    cd operator
+    make deploy
     ```
+
+    O `make deploy` roda `kubectl apply` em `config/crd/bases/` (os 17 CRDs), depois em `config/rbac/role.yaml` (cria o Namespace `chatcli-system`, a ServiceAccount, a ClusterRole do operator com binding e as ClusterRoles compartilhadas) e por fim em `config/manager/manager.yaml` (o Service e o Deployment `chatcli-operator`).
+
+    - A imagem do `manager.yaml` é fixada na release (`ghcr.io/diillson/chatcli-operator:1.211.2` nesta release) e o `make deploy` a mantém. Ela só é trocada quando você passa `IMG` explicitamente: `make deploy IMG=registry.example.com/chatcli-operator:dev`.
+    - O `manager.yaml` define `CHATCLI_OPERATOR_APP_VERSION` com a mesma release, então Instances sem `spec.image.tag` rodam a imagem de servidor correspondente. Passar `IMG` não altera esse valor.
+    - `make deploy-network-policy` aplica a NetworkPolicy opcional de `config/network-policy/` (remova com `make undeploy-network-policy`).
+    - `make undeploy` apaga o manager, o RBAC (inclusive o Namespace `chatcli-system` que o `role.yaml` declara) e os CRDs, e com eles todos os recursos customizados.
+    - Nada aqui cria o Secret de API keys do dashboard; veja [Dashboard e API REST](#dashboard-e-api-rest).
   </Tab>
 </Tabs>
 
-<Tip>
-O chart do **operator** (`chatcli-operator`) é separado do chart do **server** (`chatcli`). O operator gerencia os controllers e o dashboard AIOps. O server é deployado via Instance CR ou pelo chart `chatcli` com watcher habilitado.
-</Tip>
+### Verificar a instalação
 
-<Accordion title="Valores configuráveis">
-  ```bash
-  # Com Prometheus para métricas de incidentes
-  helm install chatcli-operator \
-    oci://ghcr.io/diillson/charts/chatcli-operator \
-    --namespace chatcli-system --create-namespace \
-    --set prometheusUrl="http://prometheus-server.monitoring.svc:9090"
+```bash
+kubectl get crd -o name | grep -c 'platform.chatcli.io'   # 17
+kubectl -n chatcli-system get deploy,svc,pods
+kubectl -n chatcli-system logs deploy/chatcli-operator | grep -E 'starting manager|REST|allowlist'
+```
 
-  # Com imagem customizada
-  helm install chatcli-operator \
-    oci://ghcr.io/diillson/charts/chatcli-operator \
-    --namespace chatcli-system --create-namespace \
-    --set image.repository=myregistry/chatcli-operator \
-    --set image.tag=1.211.2
+O pod do operator fica Ready quando o `/readyz` (porta 8081) responde. Até você criar API keys, o log mostra `SECURITY: no API keys ConfigMap found and CHATCLI_OPERATOR_DEV_MODE is not set` e toda chamada ao dashboard é recusada: é o esperado.
 
-  # Com ServiceMonitor para Prometheus Operator
-  helm install chatcli-operator \
-    oci://ghcr.io/diillson/charts/chatcli-operator \
-    --namespace chatcli-system --create-namespace \
-    --set serviceMonitor.enabled=true
-  ```
-
-  | Valor | Padrão | Descrição |
+<Accordion title="Values do chart do operator">
+  | Value | Padrão | O que faz |
   |-------|--------|-----------|
-  | `image.repository` | `ghcr.io/diillson/chatcli-operator` | Imagem do operator |
-  | `image.tag` | `latest` | Tag da imagem |
-  | `replicaCount` | `1` | Réplicas (leader election ativo por padrão) |
-  | `api.port` | `8090` | Porta do dashboard web e REST API |
-  | `prometheusUrl` | `""` | URL do Prometheus para coleta de métricas (defina aqui, não no chart do servidor, onde está deprecado) |
-  | `security.allowedDiagnosticCommands` | `""` | Comandos de diagnóstico read-only extras para o `ExecDiagnostic` (separados por vírgula, somados à allowlist embutida); renderizado como `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` no pod do operator |
-  | `leaderElect` | `true` | Leader election para HA |
-  | `serviceMonitor.enabled` | `false` | Criar ServiceMonitor para Prometheus Operator |
+  | `replicaCount` | `1` | Réplicas do operator. Com mais de uma, o leader election mantém um único conjunto de controllers ativo |
+  | `leaderElect` | `true` | Passa `--leader-elect` (lease `chatcli-operator-lock`). No binário o padrão é desligado |
+  | `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/diillson/chatcli-operator` / `appVersion` do chart / `IfNotPresent` | Imagem do operator |
+  | `api.port` / `metrics.port` / `health.port` | `8090` / `8080` / `8081` | REST+dashboard, métricas Prometheus, probes |
+  | `service.type` | `ClusterIP` | Tipo do Service `chatcli-operator` |
+  | `prometheusUrl` | `""` | Prometheus que o operator consulta durante a análise de incidentes (`PROMETHEUS_URL`) |
+  | `alertTransport` | `stream` | `stream` (StreamAlerts, cai para polling em servidores sem essa RPC) ou `poll` (GetAlerts a cada 30s) |
+  | `decisionEngine.enabled` | `false` | Filtro de confiança e circuit breaker antes de um plano executar ([Decision Engine](/pt/features/aiops/decision-engine)) |
+  | `clusterName` | `""` | Nome do ClusterRegistration deste cluster; o tier dele decide quais severidades esperam um humano |
+  | `apiKeys.create` / `apiKeys.entries` | `false` / `[]` | Gera o Secret de keys do dashboard `chatcli-operator-secrets` a partir de entradas `{key, role, description}` |
+  | `security.devMode` | `false` | Sem keys configuradas, aceita toda chamada REST como admin. Nunca em produção |
+  | `security.apiTLS.certFile` / `keyFile` | `""` | TLS 1.3 para a API REST e o dashboard (caminhos dentro do pod; monte com `extraVolumes`) |
+  | `security.grpcTLS.certFile` / `keyFile` / `caFile` | `""` | Certificado de cliente e raiz de confiança globais do operator para discar nas Instances. A configuração por Instance prevalece |
+  | `security.allowedResourceTypes` | `""` | Kinds extras que o `ApplyManifest` pode criar ou atualizar, somados aos 17 embutidos |
+  | `security.allowedDiagnosticCommands` | `""` | Comandos extras do `ExecDiagnostic` (veja [ExecDiagnostic Allowlist](#execdiagnostic-allowlist)) |
+  | `security.logScrubPatterns` | `""` | Regexes extras removidas dos logs antes de chegarem ao LLM |
+  | `security.corsAllowedOrigins` / `corsOrigin` / `corsAllowedMethods` / `corsAllowCredentials` | nega tudo | CORS da API REST |
+  | `security.auditLogPath` | `""` | Obsoleto e ignorado: o operator registra suas ações como recursos AuditEvent |
+  | `networkPolicy.enabled` | `false` | NetworkPolicy opcional para o pod do operator (veja [Políticas de rede](#políticas-de-rede)) |
+  | `extraEnv` / `extraVolumes` / `extraVolumeMounts` | `[]` | Ambiente, volumes e mounts extras no container do operator |
+  | `serviceMonitor.enabled` | `false` | ServiceMonitor do Prometheus Operator para as métricas do operator |
+  | `crdUpgrade.*` | ligado, `registry.k8s.io/kubectl:v1.31.10` | O hook que reaplica os CRDs |
+  | `resources` | requests 100m/128Mi, limits 500m/256Mi | Recursos do container do operator |
 </Accordion>
 
-<Accordion title="Instalação manual via kubectl (alternativa)">
-  ```bash
-  kubectl apply -f operator/config/crd/bases/
-  kubectl apply -f operator/config/rbac/role.yaml
-  kubectl apply -f operator/config/manager/manager.yaml
-  ```
-</Accordion>
+## Sua primeira Instance
 
-<Accordion title="Build via Docker (opcional)">
-  ```bash
-  # Build a partir da raiz do repositório
-  docker build -f operator/Dockerfile -t myregistry/chatcli-operator:dev .
+O passo a passo cria uma Instance chamada `chatcli` no namespace `chatcli`. O operator vai discar em `chatcli.chatcli.svc.cluster.local:50051`; se escolher outros nomes, troque em todos os lugares, inclusive no certificado.
 
-  # Ou via Make
-  cd operator
-  make docker-build IMG=myregistry/chatcli-operator:dev
-  make docker-push IMG=myregistry/chatcli-operator:dev
-  ```
-</Accordion>
+<Steps>
+  <Step title="Crie o namespace">
+    ```bash
+    kubectl create namespace chatcli
+    ```
+  </Step>
+  <Step title="Guarde a API key do LLM">
+    O Secret inteiro é carregado no container do servidor (`envFrom`), então suas chaves são as variáveis do provedor:
 
+    ```bash
+    kubectl -n chatcli create secret generic chatcli-api-keys \
+      --from-literal=ANTHROPIC_API_KEY='<sua-chave-anthropic>'
+    ```
 
+    Os outros provedores leem `OPENAI_API_KEY`, `GOOGLEAI_API_KEY`, `XAI_API_KEY`, `ZAI_API_KEY`, `MINIMAX_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY` ou `GITHUB_COPILOT_TOKEN`. O Bedrock usa `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (e, opcionalmente, `AWS_SESSION_TOKEN`) mais `AWS_REGION` ou `BEDROCK_REGION`, ou nenhuma chave com IRSA (veja `serviceAccount.annotations`). Coloque neste Secret a chave de **todos** os provedores de uma cadeia de fallback.
 
-## Arquitetura da Plataforma AIOps
+    <Note>
+    Este não é o Secret de keys do dashboard. O `chatcli-api-keys` (qualquer nome, referenciado por `spec.apiKeys.name`) fica ao lado da Instance e guarda chaves de LLM; o `chatcli-operator-secrets` fica no namespace do operator e guarda as API keys do dashboard.
+    </Note>
+  </Step>
+  <Step title="Crie o token do servidor">
+    ```bash
+    kubectl -n chatcli create secret generic chatcli-server-token \
+      --from-literal=token="$(openssl rand -hex 32)"
+    ```
 
-```mermaid
-graph TD
-    subgraph "ChatCLI Server"
-        W[K8s Watcher<br/>collectors] --> GA[StreamAlerts RPC<br/>fallback GetAlerts]
-        AI_RPC[AnalyzeIssue RPC<br/>LLM call]
-        AG_RPC[AgenticStep RPC<br/>observe-decide-act]
-    end
+    Clientes e o operator o apresentam como `authorization: Bearer <token>`; quem tem o token compartilhado é administrador no servidor. As outras opções de credencial estão em [Opções de autenticação](#opções-de-autenticação).
+  </Step>
+  <Step title="Emita o certificado TLS">
+    O certificado precisa valer para o nome que o operator disca. Inclua os nomes curtos para clientes dentro do cluster e `localhost` / `127.0.0.1` para o `chatcli connect` funcionar via `kubectl port-forward` (a CLI não tem como sobrescrever o nome do servidor). Acrescente seu nome DNS externo se for expor o servidor para fora do cluster.
 
-    subgraph "Operator"
-        WB[WatcherBridge<br/>stream aberto] -->|gRPC| GA
-        WB -->|cria| ANOM[Anomaly CR]
-        ANOM -->|AnomalyReconciler<br/>correlação| ISS[Issue CR]
-        ISS -->|IssueReconciler<br/>cria| INSIGHT[AIInsight CR]
-        INSIGHT -->|AIInsightReconciler<br/>gRPC| AI_RPC
-        AI_RPC -->|análise + ações| INSIGHT
-        ISS -->|cria| PLAN[RemediationPlan CR]
-        PLAN -->|RemediationReconciler<br/>executa| ACTIONS[54 action types:<br/>Scale / Restart / Rollback / Patch<br/>HelmRollback / ArgoSync / AdjustHPA<br/>CordonNode / DrainNode / ResizePVC...]
-        PLAN -->|modo agêntico<br/>gRPC loop| AG_RPC
-        AG_RPC -->|next action| PLAN
-        ACTIONS -->|sucesso| RESOLVED[Issue Resolved]
-        ACTIONS -->|falha| RETRY[Retry ou Escalate]
-        RESOLVED -->|agêntico| PM[PostMortem CR]
-    end
+    <Tabs>
+      <Tab title="openssl (CA privada)">
+        ```bash
+        NAME=chatcli NS=chatcli
 
-    style ANOM fill:#f9e2af,color:#000
-    style ISS fill:#fab387,color:#000
-    style INSIGHT fill:#89b4fa,color:#000
-    style PLAN fill:#a6e3a1,color:#000
-    style RESOLVED fill:#a6e3a1,color:#000
-    style RETRY fill:#f38ba8,color:#000
-    style PM fill:#cba6f7,color:#000
+        cat > ca.cnf <<EOF
+        [req]
+        distinguished_name = dn
+        prompt = no
+        x509_extensions = v3_ca
+        [dn]
+        CN = chatcli-internal-ca
+        [v3_ca]
+        basicConstraints = critical, CA:TRUE
+        keyUsage = critical, keyCertSign, cRLSign
+        subjectKeyIdentifier = hash
+        EOF
+
+        cat > server.cnf <<EOF
+        [req]
+        distinguished_name = dn
+        prompt = no
+        req_extensions = v3_req
+        [dn]
+        CN = ${NAME}.${NS}.svc.cluster.local
+        [v3_req]
+        basicConstraints = critical, CA:FALSE
+        keyUsage = critical, digitalSignature, keyEncipherment
+        extendedKeyUsage = serverAuth
+        subjectAltName = @alt_names
+        [alt_names]
+        DNS.1 = ${NAME}.${NS}.svc.cluster.local
+        DNS.2 = ${NAME}.${NS}.svc
+        DNS.3 = ${NAME}.${NS}
+        DNS.4 = ${NAME}
+        DNS.5 = localhost
+        IP.1  = 127.0.0.1
+        EOF
+
+        # 1. A CA (guarde bem o ca.key: ele assina todo certificado em que você confia)
+        openssl req -x509 -new -nodes -newkey rsa:4096 -sha256 -days 1825 \
+          -keyout ca.key -out ca.crt -config ca.cnf
+
+        # 2. Chave, CSR e certificado do servidor assinado pela CA
+        openssl req -new -nodes -newkey rsa:2048 \
+          -keyout tls.key -out tls.csr -config server.cnf
+        openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+          -out tls.crt -days 825 -sha256 -extfile server.cnf -extensions v3_req
+
+        # 3. Confira os SANs
+        openssl x509 -in tls.crt -noout -ext subjectAltName
+
+        # 4. O Secret: tls.crt e tls.key para o servidor, ca.crt para o operator
+        kubectl -n chatcli create secret generic chatcli-tls \
+          --from-file=tls.crt --from-file=tls.key --from-file=ca.crt
+        ```
+
+        O `ca.crt` é a raiz de confiança que o operator usa para esta Instance. Sem ele o operator recorre às CAs do sistema (ou a `security.grpcTLS.caFile`), o que só funciona com certificado de uma CA publicamente confiável.
+      </Tab>
+      <Tab title="cert-manager">
+        Um issuer self-signed cria uma CA privada, e o issuer dessa CA assina o certificado do servidor. O cert-manager grava `tls.crt`, `tls.key` e `ca.crt` no Secret e o renova; o operator reinicia os pods quando ele muda.
+
+        ```yaml
+        apiVersion: cert-manager.io/v1
+        kind: Issuer
+        metadata:
+          name: chatcli-selfsigned
+          namespace: chatcli
+        spec:
+          selfSigned: {}
+        ---
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata:
+          name: chatcli-ca
+          namespace: chatcli
+        spec:
+          isCA: true
+          commonName: chatcli-internal-ca
+          secretName: chatcli-ca
+          duration: 43800h   # 5 anos
+          privateKey:
+            algorithm: ECDSA
+            size: 256
+          issuerRef:
+            name: chatcli-selfsigned
+            kind: Issuer
+        ---
+        apiVersion: cert-manager.io/v1
+        kind: Issuer
+        metadata:
+          name: chatcli-ca
+          namespace: chatcli
+        spec:
+          ca:
+            secretName: chatcli-ca
+        ---
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata:
+          name: chatcli-tls
+          namespace: chatcli
+        spec:
+          secretName: chatcli-tls
+          duration: 2160h     # 90 dias
+          renewBefore: 360h   # 15 dias
+          usages: ["digital signature", "key encipherment", "server auth"]
+          dnsNames:
+            - chatcli.chatcli.svc.cluster.local
+            - chatcli.chatcli.svc
+            - chatcli.chatcli
+            - chatcli
+            - localhost
+          ipAddresses:
+            - 127.0.0.1
+          issuerRef:
+            name: chatcli-ca
+            kind: Issuer
+        ```
+
+        Extraia a CA para a CLI com `kubectl -n chatcli get secret chatcli-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt`.
+      </Tab>
+    </Tabs>
+  </Step>
+  <Step title="Crie a Instance">
+    ```yaml
+    apiVersion: platform.chatcli.io/v1alpha1
+    kind: Instance
+    metadata:
+      name: chatcli
+      namespace: chatcli
+    spec:
+      provider: CLAUDEAI
+      model: claude-sonnet-5
+      apiKeys:
+        name: chatcli-api-keys
+      server:
+        token:
+          name: chatcli-server-token
+          key: token
+        tls:
+          enabled: true
+          secretName: chatcli-tls
+      resources:            # o operator não aplica nenhum por padrão
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+    ```
+
+    ```bash
+    kubectl apply -f instance.yaml
+    ```
+
+    O `spec.image.tag` fica de fora de propósito: o operator roda a imagem de servidor da mesma release que ele (`ghcr.io/diillson/chatcli:1.211.2`).
+  </Step>
+  <Step title="Confira se subiu e está alcançável">
+    ```bash
+    kubectl -n chatcli get instance chatcli
+    ```
+
+    ```text
+    NAME      READY   REPLICAS   PROVIDER   VERSION             AGE
+    chatcli   true    1          CLAUDEAI   v1.211.2   2m
+    ```
+
+    `READY` significa que o Deployment está com todas as réplicas prontas. `VERSION` é o que o servidor em execução informou à sonda do próprio operator: só aparece depois que o operator alcançou o servidor via TLS com a sua credencial. Leia todas as conditions de uma vez:
+
+    ```bash
+    kubectl -n chatcli get instance chatcli \
+      -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+    ```
+
+    ```text
+    TLSConfigured=True SecretConfigured: server certificate from Secret chatcli-tls
+    AuthenticationConfigured=True CredentialConfigured: server has a credential, or binds loopback only
+    OperatorCredentialConfigured=True CredentialAvailable: operator authenticates with spec.server.token
+    Available=True DeploymentReady: All replicas are ready
+    ServerReachable=True Serving: server v1.211.2 serving (CLAUDEAI/claude-sonnet-5)
+    ```
+  </Step>
+</Steps>
+
+### Condições da Instance
+
+| Condition | Status / reason | Significado | O que fazer |
+|-----------|-----------------|-------------|-------------|
+| `TLSConfigured` (só enquanto `tls.enabled`) | `True` / `SecretConfigured` | O servidor tem um Secret de certificado | — |
+| | `False` / `SecretNameMissing` | `tls.enabled: true` sem `tls.secretName`. **O Deployment não é criado** | Defina `spec.server.tls.secretName`, ou desligue o TLS (e aí o operator não alcança o servidor) |
+| `AuthenticationConfigured` | `True` / `CredentialConfigured` | Há credencial configurada, ou o servidor escuta só em loopback | — |
+| | `False` / `CredentialMissing` | Bind alcançável sem credencial; o servidor se recusaria a subir. **O Deployment não é criado** | Defina `server.token`, `security.jwtSecretRef`, `security.jwtPublicKeyRef` ou `tls.clientCASecretName` |
+| `OperatorCredentialConfigured` | `True` / `CredentialAvailable` | A mensagem diz o que o operator apresenta (`spec.server.token`, `operatorTokenRef`, tokens HS256 emitidos por ele, certificado de cliente, ou `none required`) | — |
+| | `False` / `CredentialMissing` | O servidor exige uma credencial que o operator não consegue apresentar (só chave RS256, só CA de cliente, ou credencial passada apenas por `extraEnv`). Informativa: a Instance é provisionada, mas as RPCs de AIOps serão recusadas | Defina `security.operatorTokenRef` ou `security.operatorClientCertSecretName` |
+| `Available` | `True` / `DeploymentReady` | Todas as réplicas prontas | — |
+| | `False` / `DeploymentNotReady` | `N/M replicas ready` | Olhe os pods (abaixo) |
+| `ServerReachable` | `True` / `Serving` | O operator discou o servidor via TLS, o `Health` respondeu e o `GetServerInfo` aceitou a credencial | — |
+| | `False` / `ProbeFailed` | A mensagem é o erro: falha de TLS (nome do certificado, autoridade desconhecida, servidor em texto puro), credencial recusada (`server info (credential check): ...`) ou Secret ausente | Veja [Solução de problemas](#solução-de-problemas) |
+| | `False` / `NotServing` | O `Health` respondeu `NOT_SERVING` (servidor desligando) | Normalmente passageiro durante um rollout |
+| | `Unknown` / `DeploymentNotReady` | Nenhuma réplica pronta, nada foi sondado | Espere os pods, ou investigue-os |
+
+Uma Instance pronta é sondada de novo a cada cinco minutos, então `ServerReachable` e `VERSION` acompanham um servidor que foi atualizado, reiniciado ou perdeu a credencial. O `status.serverProbeTime` muda quando o resultado muda e, fora isso, no máximo uma vez por intervalo (sem loop de escrita de status).
+
+### Logs que valem a leitura
+
+```bash
+# O servidor: endereço de bind, TLS, modo de autenticação, recusas na subida
+kubectl -n chatcli logs deploy/chatcli
+
+# Os pods: falhas de probe, pull de imagem, volumes de Secret ausentes
+kubectl -n chatcli describe pod -l app.kubernetes.io/instance=chatcli
+
+# O operator: "instance not provisioned: ...", "Connected to Instance", estado do stream de alertas
+kubectl -n chatcli-system logs deploy/chatcli-operator
 ```
 
-### O que o Operator Gerencia
+## Conectar a CLI
 
-Além dos CRDs e reconcilers, o operator provê:
+O Service da Instance é `ClusterIP` (headless com mais de uma réplica). De uma estação de trabalho, faça o port-forward e conecte com TLS:
 
-- **REST API Gateway** (`:8090`) com 30+ endpoints para incidents, SLOs, approvals, analytics, clusters e audit
-- **Web Dashboard embutido** acessível em `http://operator:8090/`
-- **Grafana dashboards pré-configurados** disponíveis em `deploy/grafana/` para importação automática via sidecar
-- **20+ métricas Prometheus** cobrindo issues, remediações, SLOs, notificações e aprovações
+```bash
+kubectl -n chatcli port-forward svc/chatcli 50051:50051
 
-### Pipeline Autônomo
+TOKEN=$(kubectl -n chatcli get secret chatcli-server-token -o jsonpath='{.data.token}' | base64 -d)
+chatcli connect localhost:50051 --tls --ca-cert ca.crt --token "$TOKEN"
 
-| Fase | Componente | O que Faz |
-|------|-----------|-----------|
-| **1. Detecção** | WatcherBridge | Recebe alertas pelo stream `StreamAlerts` do servidor (só consulta `GetAlerts` a cada 30s num servidor sem ele). Cria Anomaly CRs (dedup SHA256). Invalida dedup quando Issue atinge estado terminal. |
-| **2. Correlação** | AnomalyReconciler + CorrelationEngine | Agrupa anomalias por recurso + janela temporal. Calcula risk score e severidade. Cria/atualiza Issue CRs com `signalType`. |
-| **3. Análise** | AIInsightReconciler + 6 enrichers | Coleta contexto K8s (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, HPAs), **análise avançada de logs** (stack traces Java/Go/Python/Node.js, 24+ error patterns), **métricas Prometheus** (CPU/mem/latency trends), **GitOps** (Helm/ArgoCD/Flux status), **código-fonte** (correlação commit↔incidente), **cascade analysis** (cross-service). |
-| **4. Remediação** | IssueReconciler | Selecao de runbook validada por IA: **(a)** encontra TODOS os runbooks candidatos (multi-runbook por trigger), **(b)** IA válida cada um contra a causa raiz (`RUNBOOK_APPROVED: nome` ou `RUNBOOK_REJECTED`), **(c)** se rejeitado ou sem candidatos, gera novo runbook das sugestões da IA (com hash único por causa raiz), ou **(d)** remediação agentica (IA atua step-by-step). |
-| **5. Execução** | RemediationReconciler | **54 tipos de ação**: workload (Scale, Restart, Rollback, AdjustResources, DeletePod, RestartStatefulSetPod), StatefulSet (ScaleStatefulSet, RestartStatefulSet, RollbackStatefulSet, AdjustStatefulSetResources, DeleteStatefulSetPod, ForceDeleteStatefulSetPod, UpdateStatefulSetStrategy, RecreateStatefulSetPVC, PartitionStatefulSetUpdate), DaemonSet (RestartDaemonSet, RollbackDaemonSet, AdjustDaemonSetResources, DeleteDaemonSetPod, UpdateDaemonSetStrategy, PauseDaemonSetRollout, CordonAndDeleteDaemonSetPod), Job (RetryJob, AdjustJobResources, DeleteFailedJob, SuspendJob, ResumeJob, AdjustJobParallelism, AdjustJobDeadline, AdjustJobBackoffLimit, ForceDeleteJobPods), CronJob (SuspendCronJob, ResumeCronJob, TriggerCronJob, AdjustCronJobResources, AdjustCronJobSchedule, AdjustCronJobDeadline, AdjustCronJobHistory, AdjustCronJobConcurrency, DeleteCronJobActiveJobs, ReplaceCronJobTemplate), GitOps (HelmRollback, ArgoSyncApp), autoscaling (AdjustHPA), infra (CordonNode, DrainNode), storage (ResizePVC), security (RotateSecret), networking (UpdateIngress, PatchNetworkPolicy), advanced (ApplyManifest, ExecDiagnostic). **Blast radius prediction** antes da execução. |
-| **6. Resolução** | IssueReconciler | Sucesso → Resolved (invalida dedup). Falha → re-análise com contexto de falha (estratégia diferente) → até maxAttempts → Escalated. |
-| **7. PostMortem** | IssueReconciler | **Todas as remediações** (não apenas agênticas) geram PostMortem CR com timeline, causa raiz, lições, **métricas**, **correlação git**, **cascade chain**, **trending** (incidentes recorrentes), **feedback do dev**. Remediações bem-sucedidas também geram Runbooks reutilizáveis (um por causa raiz, nomes com hash). |
-| **8. Notificação** | NotificationReconciler | Envia notificações multi-canal (Slack, PagerDuty, OpsGenie, Email, Webhook, Teams) com throttling e templates. Escalação automática L1→L2→L3. |
-| **9. Aprovação** | ApprovalReconciler | Workflow de aprovação auto/manual/quorum com blast radius, change windows e integração com Decision Engine. |
-| **10. SLO Monitoring** | SLOReconciler | Burn rate alerting multi-janela (modelo Google SRE), error budget tracking, business hours com timezone. |
-
-### Máquina de Estados do Issue
-
-```mermaid
-stateDiagram-v2
-    [*] --> Detected
-    Detected --> Analyzing : AIInsight criado
-    Analyzing --> Remediating : Via Runbook (manual ou auto-gerado)
-    Analyzing --> Remediating : Via modo agêntico (sem Runbook/AI actions)
-    Remediating --> Resolved : Remediação bem-sucedida (invalida dedup)
-    Remediating --> Analyzing : Retry (re-análise com failure context)
-    Remediating --> Escalated : Max tentativas (invalida dedup)
-    Resolved --> [*]
-    Escalated --> [*]
-
-    note right of Resolved : Toda resolução gera PostMortem CR\nResolução agêntica também gera Runbook
+# One-shot
+chatcli connect localhost:50051 --tls --ca-cert ca.crt --token "$TOKEN" -p "resuma o último deploy"
 ```
 
+| Flag | Env | Significado |
+|------|-----|-------------|
+| `[address]` ou `--addr` | `CHATCLI_REMOTE_ADDR` | `host:port` do servidor |
+| `--token` | `CHATCLI_REMOTE_TOKEN` | Enviado como `authorization: Bearer <token>`: o token compartilhado ou um JWT |
+| `--tls` | — | TLS 1.3 até o servidor |
+| `--ca-cert` | — | Arquivo de CA que valida o certificado do servidor (o `ca.crt` acima) |
+| `--provider`, `--model` | — | Sobrescreve o provedor e o modelo padrão do servidor |
+| `--llm-key`, `--use-local-auth` | `CHATCLI_CLIENT_API_KEY` | Usa a sua própria credencial de LLM em vez da do servidor |
+| `-p`, `--raw`, `--max-tokens` | — | Prompt one-shot e opções de saída |
 
+- **Certificado de cliente (mTLS):** não há flag. Defina `CHATCLI_TLS_CLIENT_CERT` e `CHATCLI_TLS_CLIENT_KEY`; elas só são usadas junto com `--tls`.
+- **Texto puro:** sem `--tls` a CLI continua discando TLS com as CAs do sistema, a menos que `CHATCLI_ALLOW_INSECURE=true` esteja definida. Servidor em texto puro só serve para desenvolvimento local; o operator não o alcança.
+- A referência completa do cliente está em [Remote Connect](/pt/features/remote-connect).
 
-## Criar Secret com API Keys
+### Expor o servidor fora do cluster
 
-Antes de criar um Instance, você precisa de um Secret com as API keys do provedor LLM. O Instance referência este Secret via `apiKeys.name` — **sem ele, o servidor não consegue chamar a IA**.
+O operator cria só o Service ClusterIP. Para expor uma Instance, coloque um recurso seu na frente e inclua o nome DNS externo nos SANs do certificado:
+
+- **Load balancer L4 (por exemplo um NLB da AWS):** crie um `Service` do tipo `LoadBalancer` selecionando `app.kubernetes.io/name: chatcli` e `app.kubernetes.io/instance: chatcli`, porta 50051 para `targetPort: grpc`, em passthrough TCP. O TLS fica de ponta a ponta, que também é o único jeito de certificados de cliente (mTLS) chegarem ao servidor.
+- **ingress-nginx:** o backend fala TLS, então use `nginx.ingress.kubernetes.io/backend-protocol: "GRPCS"`, ou TLS passthrough (`nginx.ingress.kubernetes.io/ssl-passthrough: "true"`, que exige a flag `--enable-ssl-passthrough` no controller). Um ingress que termina o TLS não consegue levar certificados de cliente mTLS até o servidor.
+- Os clientes então conectam com `chatcli connect chatcli.example.com:443 --tls --token "$TOKEN"` (acrescente `--ca-cert` para uma CA privada).
+
+## Dashboard e API REST
+
+O operator serve o dashboard web em `/` e a API REST em `/api/v1/` na porta 8090 de toda réplica. A API exige o header `X-API-Key`. As keys são lidas do Secret **`chatcli-operator-secrets`** (chave `api-keys`) no namespace do operator, com o ConfigMap `chatcli-operator-config` (mesma chave) como alternativa, e relidas a cada 30 segundos: incluir, trocar ou remover uma key não exige restart.
 
 <Tabs>
-  <Tab title="OpenAI">
+  <Tab title="kubectl">
     ```bash
-    kubectl create secret generic chatcli-api-keys \
-      --namespace chatcli-system \
-      --from-literal=OPENAI_API_KEY="sk-sua-chave-aqui"
+    KEY=$(openssl rand -hex 32)
+    kubectl -n chatcli-system create secret generic chatcli-operator-secrets \
+      --from-literal=api-keys="$(printf -- '- key: "%s"\n  role: admin\n  description: time de plataforma\n' "$KEY")"
     ```
   </Tab>
-  <Tab title="Anthropic (Claude)">
-    ```bash
-    kubectl create secret generic chatcli-api-keys \
-      --namespace chatcli-system \
-      --from-literal=ANTHROPIC_API_KEY="sk-ant-sua-chave-aqui"
-    ```
-  </Tab>
-  <Tab title="Google AI">
-    ```bash
-    kubectl create secret generic chatcli-api-keys \
-      --namespace chatcli-system \
-      --from-literal=GOOGLEAI_API_KEY="sua-chave-aqui"
-    ```
-  </Tab>
-  <Tab title="OpenRouter">
-    ```bash
-    kubectl create secret generic chatcli-api-keys \
-      --namespace chatcli-system \
-      --from-literal=OPENROUTER_API_KEY="sk-or-sua-chave-aqui"
-    ```
-  </Tab>
-  <Tab title="Múltiplos provedores">
-    ```bash
-    kubectl create secret generic chatcli-api-keys \
-      --namespace chatcli-system \
-      --from-literal=OPENAI_API_KEY="sk-xxx" \
-      --from-literal=ANTHROPIC_API_KEY="sk-ant-xxx" \
-      --from-literal=GOOGLEAI_API_KEY="xxx" \
-      --from-literal=OPENROUTER_API_KEY="sk-or-xxx"
-    ```
-  </Tab>
-  <Tab title="Via YAML">
+  <Tab title="YAML">
     ```yaml
     apiVersion: v1
     kind: Secret
     metadata:
-      name: chatcli-api-keys
-      namespace: chatcli-system
+      name: chatcli-operator-secrets   # nome fixo
+      namespace: chatcli-system        # o namespace do operator
     type: Opaque
     stringData:
-      OPENAI_API_KEY: "sk-sua-chave-aqui"
-      # ANTHROPIC_API_KEY: "sk-ant-xxx"
-      # GOOGLEAI_API_KEY: "xxx"
-      # OPENROUTER_API_KEY: "sk-or-xxx"
+      api-keys: |
+        - key: "<openssl rand -hex 32>"
+          role: admin
+          description: time de plataforma
+        - key: "<openssl rand -hex 32>"
+          role: viewer
+          description: painel somente leitura
     ```
+  </Tab>
+  <Tab title="Values do Helm">
+    ```yaml
+    apiKeys:
+      create: true
+      entries:
+        - key: "<openssl rand -hex 32>"
+          role: admin
+          description: time de plataforma
+    ```
+
+    O chart gera o `chatcli-operator-secrets`. As keys passam a ficar guardadas no release do Helm; deixe `create: false` para gerenciar o Secret por conta própria (External Secrets, Vault). Não faça os dois: o chart seria dono de um Secret que você também edita à mão.
   </Tab>
 </Tabs>
 
-<Warning>
-O Secret **deve existir no mesmo namespace** do Instance CR. O nome do Secret deve corresponder ao campo `apiKeys.name` na spec do Instance. Sem esse Secret, o servidor inicia mas não consegue executar análises de IA nem remediações agênticas.
-</Warning>
+Papéis: `viewer` (lê tudo), `operator` (reconhece, adia, resolve, aprova, revisa post-mortems, escreve runbooks), `admin` (tudo, inclusive apagar runbooks). Qualquer outro nome de papel não dá acesso a nada. Um `name` opcional numa entrada é a identidade registrada nas decisões de aprovação tomadas com aquela chave; um quorum conta cada chave uma vez, então dê a cada aprovador a sua própria chave. Apagar o Secret e também o ConfigMap `chatcli-operator-config` revoga todas as chaves em cerca de 30 segundos.
 
----
+```bash
+kubectl -n chatcli-system port-forward svc/chatcli-operator 8090:8090
+# Dashboard: http://127.0.0.1:8090/  (cole a key; o navegador a guarda no local storage)
+curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8090/api/v1/incidents
+```
 
-## CRD: Instance
+- **Rate limit:** 30 requisições por minuto por host de cliente para requisições sem key válida (o que limita adivinhação de keys) e 600 por minuto por key válida. Passar disso devolve `429` com `Retry-After`.
+- **TLS:** defina `security.apiTLS.certFile`/`keyFile` e monte o Secret com `extraVolumes`/`extraVolumeMounts`; a API passa a servir HTTPS só com TLS 1.3.
+- **Dev mode:** `security.devMode: true` aceita toda chamada como admin **quando não há keys configuradas**. Existe para experimentos locais; nunca ligue em cluster compartilhado.
+- Endpoints, códigos de erro e paginação: [Referência da API REST](/pt/reference/api/overview). Tour do dashboard: [Web Dashboard](/pt/features/aiops/web-dashboard).
 
-O `Instance` gerencia instâncias do servidor ChatCLI no cluster.
+## Ligar o AIOps
 
-### Especificação Completa
+O watcher roda dentro do pod da Instance: coleta status dos pods, eventos, logs e, opcionalmente, métricas Prometheus dos alvos que você listar, e gera alertas. O WatcherBridge do operator transforma esses alertas no pipeline de incidentes.
 
 ```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: Instance
-metadata:
-  name: chatcli-prod
-  namespace: chatcli          # O namespace deve existir antes de criar o Instance
 spec:
-  replicas: 1
-  provider: CLAUDEAI       # OPENAI, OPENAI_ASSISTANT, CLAUDEAI, BEDROCK, GOOGLEAI, XAI, ZAI, MINIMAX, MOONSHOT, OPENROUTER, STACKSPOT, OLLAMA, COPILOT, DEVIN
-  model: claude-sonnet-4-6
-
-  image:
-    repository: ghcr.io/diillson/chatcli
-    tag: latest
-    pullPolicy: IfNotPresent
-
-  server:
-    port: 50051
-    tls:
-      enabled: true
-      secretName: chatcli-tls   # Deve conter tls.crt, tls.key E ca.crt (em self-signed, ca.crt=tls.crt) — ver cookbook §2.1
-    token:
-      name: chatcli-auth
-      key: token
-
   watcher:
     enabled: true
     interval: "30s"
@@ -315,1857 +510,537 @@ spec:
     maxLogLines: 100
     maxContextChars: 32000
     targets:
-      - name: api-gateway
+      - name: api-gateway            # kind padrão: Deployment
         namespace: production
         metricsPort: 9090
         metricsFilter: ["http_requests_*", "http_request_duration_*"]
-      - name: auth-service
-        namespace: production
-        metricsPort: 9090
-      - name: worker
-        namespace: batch
-      - name: postgres                  # Monitorar StatefulSet
+      - name: postgres
         kind: StatefulSet
         namespace: production
-      - name: fluentd-agent             # Monitorar DaemonSet
+      - name: fluentd
         kind: DaemonSet
         namespace: logging
-      - name: etl-pipeline              # Monitorar CronJob
+      - name: nightly-etl
         kind: CronJob
         namespace: data
-
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi
-
-  persistence:
-    enabled: true
-    size: 1Gi
-    storageClassName: standard
-
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    seccompProfile:
-      type: RuntimeDefault
-
-  apiKeys:
-    name: chatcli-api-keys
-
-  server:
-    security:
-      jwtSecretRef:                 # HS256: o operator emite os próprios tokens a partir dele
-        name: chatcli-jwt
-        key: secret
-      # jwtPublicKeyRef:            # RS256 em vez disso: chave pública PEM com que o servidor verifica
-      #   name: chatcli-jwt
-      #   key: public.pem
-      # jwtIssuer: "meu-idp"        # claims iss / aud exigidos, quando seu emissor os define
-      # jwtAudience: "chatcli"
-      # operatorTokenRef:           # credencial que o operator apresenta (necessária com RS256)
-      #   name: chatcli-operator-jwt
-      #   key: token
-      rateLimitRps: 20
-      # bindAddress: "0.0.0.0"  # Em branco significa toda interface no Kubernetes — não loopback
-
-  extraEnv:
-    - name: CHATCLI_AGENT_SECURITY_MODE
-      value: "strict"
-    - name: CHATCLI_AUDIT_LOG_PATH
-      value: "/var/log/chatcli/audit.jsonl"
 ```
+
+O que acontece em seguida:
+
+1. **Detecção.** O WatcherBridge (no líder do operator) mantém aberto o stream `StreamAlerts` do servidor (heartbeat a cada 15s; um servidor sem essa RPC é consultado com `GetAlerts` a cada 30s; `alertTransport: poll` força o polling) e cria recursos `Anomaly`, deduplicados por `aiops.dedupTTLMinutes` (padrão 30).
+2. **Correlação.** Anomalias no mesmo recurso são agrupadas numa `Issue` com risk score e severidade.
+3. **Análise.** Um `AIInsight` é criado e a RPC `AnalyzeIssue` do servidor pede ao LLM a causa raiz, enriquecida com contexto do Kubernetes, logs, métricas, estado de GitOps e código-fonte vinculado.
+4. **Remediação.** Um `RemediationPlan` executa um Runbook compatível, um runbook gerado pela IA ou um loop agêntico observar-decidir-agir (RPC `AgenticStep`), com 54 ações tipadas (mais `Custom`, que as verificações de segurança rejeitam), snapshot antes das ações e rollback automático. ApprovalPolicies, o decision engine e o tier do cluster podem segurar um plano para um humano.
+5. **Resolução.** A Issue é resolvida ou escalada depois de `aiops.maxRemediationAttempts`, e um `PostMortem` é gerado. Notificação e escalação ficam por conta de [NotificationPolicy e EscalationPolicy](/pt/features/aiops/notifications).
+
+A máquina de estados completa, o catálogo de ações e as regras de rollback estão em [Ciclo de vida do incidente](/pt/features/aiops/incident-lifecycle) e [AIOps Platform](/pt/features/aiops-platform). Detalhes da coleta do watcher estão em [K8s Watcher](/pt/features/k8s-watcher).
 
 <Warning>
-**Uma Instance precisa de credencial.** O servidor que uma Instance
-provisiona escuta em toda interface dentro do cluster, então um spec sem
-`server.token`, sem `security.jwtSecretRef` e sem `security.jwtPublicKeyRef`
-provisionaria um servidor que recusa subir. O operator não cria o Deployment nesse caso — levanta uma
-condition na Instance:
-
-```bash
-kubectl get instance minha-instance \
-  -o jsonpath='{.status.conditions[?(@.type=="AuthenticationConfigured")].message}'
-```
-
-Use loopback com `security.bindAddress: "127.0.0.1"` quando o servidor só
-é alcançado de dentro do próprio pod. Uma credencial passada por
-`extraEnv` como `CHATCLI_SERVER_TOKEN`, `CHATCLI_JWT_SECRET`,
-`CHATCLI_JWT_PUBLIC_KEY` ou `CHATCLI_SERVER_TLS_CLIENT_CA` também conta.
+Use `targets`. A forma legada de alvo único (`watcher.deployment` + `watcher.namespace`) só recebe uma Role namespaced no namespace da Instance, então um alvo legado em outro namespace falha com erros `forbidden`. Com `targets` em outros namespaces o operator vincula a ClusterRole compartilhada `chatcli-watcher`.
 </Warning>
 
-#### Como o operator se autentica
+### ExecDiagnostic Allowlist
 
-O pipeline AIOps (alertas, análise, passos de remediação) chama o mesmo
-servidor, então o operator precisa de uma credencial própria. Ele escolhe
-uma nesta ordem e registra a escolha na Instance:
+O `ExecDiagnostic` só roda um comando dentro de um pod quando ele bate, caractere por caractere, com uma entrada de um allowlist somente leitura de cerca de 100 comandos embutidos (inspeção de processos e sistema de arquivos, arquivos de cgroup v1/v2, `/proc`, introspecção de rede e DNS, `curl`/`wget` contra endpoints de health, métricas e pprof em `localhost` nas portas comuns, `nc -zv` até o API server e o DNS). Qualquer outro é recusado com `command "..." not in approved diagnostic commands whitelist`.
 
-| Precedência | Campo | O que o operator envia |
-|---|---|---|
-| 1 | `spec.server.token` | o token compartilhado, como antes |
-| 2 | `spec.server.security.operatorTokenRef` | o valor referenciado, sem alteração: um JWT emitido para `chatcli-operator` pelo seu identity provider (servidores RS256), ou um token compartilhado dedicado |
-| 3 | `spec.server.security.jwtSecretRef` | tokens HS256 de curta duração que ele mesmo emite (`sub: chatcli-operator`, `role: operator`, uma hora, renovados aos 45 minutos), carimbados com `jwtIssuer` / `jwtAudience` quando definidos |
-| 4 | `spec.server.security.operatorClientCertSecretName` | o certificado de cliente dele (`tls.crt` / `tls.key`), apresentado em toda conexão; com `spec.server.tls.clientCASecretName` no servidor e sem credencial bearer, o certificado é a identidade inteira |
-
-```bash
-kubectl get instance minha-instance \
-  -o jsonpath='{.status.conditions[?(@.type=="OperatorCredentialConfigured")]}'
-```
-
-`OperatorCredentialConfigured=False` significa que o servidor está protegido
-de um jeito que o operator não consegue satisfazer (uma chave pública RS256
-sem `operatorTokenRef`, ou uma credencial passada só por `extraEnv`): a
-Instance ainda é provisionada, mas `AnalyzeIssue` e `AgenticStep` serão
-recusados até que um dos campos acima seja definido. O token emitido carrega
-o papel `operator`, que é o que os RPCs de AIOps precisam e nada mais.
-
-#### ServerSecuritySpec (`spec.server.security`)
-
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|-------------|-----------|
-| `jwtSecretRef` | SecretKeyRef | Não | Segredo de assinatura HS256 (`CHATCLI_JWT_SECRET`); o operator também emite os próprios tokens a partir dele |
-| `jwtPublicKeyRef` | SecretKeyRef | Não | Chave pública RSA (PEM) com que o servidor verifica tokens RS256 (`CHATCLI_JWT_PUBLIC_KEY`). O operator não consegue assinar com ela: defina `operatorTokenRef` também |
-| `jwtIssuer` | string | Não | Claim `iss` exigido (`CHATCLI_JWT_ISSUER`); carimbado nos tokens que o operator emite |
-| `jwtAudience` | string | Não | Claim `aud` exigido (`CHATCLI_JWT_AUDIENCE`); carimbado nos tokens que o operator emite |
-| `operatorTokenRef` | SecretKeyRef | Não | Credencial que o operator apresenta a este servidor: um JWT emitido fora de banda, ou o token compartilhado |
-| `mtlsRole` | string | Não | Papel de quem se identifica só pelo certificado de cliente (`viewer`, `user`, `operator`, `admin`; `CHATCLI_MTLS_ROLE`, padrão `user`) |
-| `operatorClientCertSecretName` | string | Não | Secret TLS (`tls.crt`, `tls.key`) que o operator apresenta como certificado de cliente ao discar para esta Instance |
-| `rateLimitRps` / `rateLimitBurst` | int32 | Não | Rate limit por cliente (`CHATCLI_RATE_LIMIT_RPS` / `CHATCLI_RATE_LIMIT_BURST`) |
-| `maxRecvMsgSize` / `maxSendMsgSize` / `maxConcurrentStreams` | int32 | Não | Limites de mensagem e de streams gRPC |
-| `bindAddress` | string | Não | Endereço de bind do servidor (em branco = toda interface no Kubernetes) |
-
-O TLS mútuo do lado do servidor fica em `spec.server.tls`: `clientCASecretName` nomeia um Secret cujo `ca.crt` é a CA contra a qual os certificados de cliente são verificados (montado em `/etc/chatcli/client-ca`, passado como `--tls-client-ca`); exige `enabled: true` e `secretName`, e conta como credencial na verificação de bind alcançável.
-
-### O que está realmente rodando
-
-Assim que o Deployment fica pronto o operator sonda o servidor com o próprio transporte e a própria credencial (`Health`, depois `GetServerInfo`) e registra o resultado, então `kubectl get instance` mostra a versão que respondeu e se o pipeline AIOps consegue conduzi-la:
-
-```bash
-kubectl get instance my-instance
-# NAME          READY   REPLICAS   PROVIDER   VERSION   AGE
-# my-instance   true    1          CLAUDEAI   1.211.2   3d
-kubectl get instance my-instance \
-  -o jsonpath='{.status.conditions[?(@.type=="ServerReachable")]}'
-```
-
-| Condição | Significado |
-|---|---|
-| `ServerReachable=True`, reason `Serving` | o servidor respondeu com versão, provider e modelo |
-| `ServerReachable=False`, reason `ProbeFailed` | falha de transporte ou de credencial; uma mensagem citando a verificação de credencial significa que os pods estão de pé mas a credencial do operator foi recusada |
-| `ServerReachable=False`, reason `NotServing` | o servidor respondeu `Health` com `NOT_SERVING` (drenando) |
-| `ServerReachable=Unknown` | ainda sem réplica pronta, nada sondado |
-
-`status.serverVersion` mantém a última versão conhecida mesmo após uma sonda falha; `status.serverProbeTime` é quando o operator tentou pela última vez.
-
-O pipeline AIOps contabiliza o gasto de LLM a partir dos tokens que o servidor informa em `AnalyzeIssue` e `AgenticStep` (o operator estimava as análises por contagem de caracteres e nunca contabilizava os passos agênticos), atribuído ao provider e modelo que de fato responderam, precificado com as mesmas tabelas do `/cost` da CLI.
-
-### Features, scheduling e ServiceAccount (tipados)
-
-O que antes exigia `spec.extraEnv` agora tem campos tipados:
-
-| Campo | Renderiza | Notas |
-|---|---|---|
-| `spec.features.memory` (`enabled`, `mode`) | `CHATCLI_MEMORY_ENABLED`, `CHATCLI_MEMORY_MODE` | `mode`: `index`, `pull` ou `off` |
-| `spec.features.knowledge` | `CHATCLI_CHAT_KNOWLEDGE` | nil mantém o padrão do servidor |
-| `spec.features.budget` (`sessionUSD`, `dailyUSD`, `hardStop`) | `CHATCLI_SESSION_BUDGET_USD`, `CHATCLI_DAILY_BUDGET_USD`, `CHATCLI_BUDGET_HARD_STOP` | |
-| `spec.features.hub` | `CHATCLI_HUB_ENABLED` | hub de conversas |
-| `spec.features.caBundleSecretName` | monta `ca.crt` em `/etc/chatcli/ca`, `CHATCLI_CA_BUNDLE` | CA corporativa confiada por toda conexão TLS de saída |
-| `spec.features.allowHTTPProviders` | `CHATCLI_ALLOW_HTTP_PROVIDERS` | desligado mantém a postura só-TLS |
-| `spec.features.encryptionKeyRef` | `CHATCLI_ENCRYPTION_KEY` a partir do Secret | criptografia em repouso |
-| `spec.features.logRotation` (`maxSizeMB`, `maxBackups`, `maxAgeDays`, `compress`) | `CHATCLI_LOG_*` | |
-| `spec.pipeline.enabled` | `CHATCLI_SERVER_PIPELINE` | os [RPCs de pipeline](/pt/features/server-mode#rpcs-de-pipeline) |
-| `spec.scheduling` (`nodeSelector`, `tolerations`, `affinity`, `imagePullSecrets`, `priorityClassName`, `podAnnotations`) | template do pod | os hashes de rollout do operator vencem uma anotação de pod conflitante |
-| `spec.serviceAccount.annotations` | o ServiceAccount gerenciado | IRSA / Workload Identity; anotações adicionadas por outras ferramentas são mantidas |
-
-Só o que está definido é renderizado, então os padrões do servidor continuam valendo para o resto.
-| `auditLogPath` | string | Não | Caminho do arquivo de auditoria (`CHATCLI_AUDIT_LOG_PATH`) |
-| `debug` | bool | Não | Logging de debug |
-| `enableReflection` | bool | Não | gRPC reflection (só para debugging) |
-
-### Campos do Spec
-
-#### Raiz
-
-| Campo | Tipo | Obrigatório | Padrão | Descrição |
-|-------|------|:-----------:|--------|-----------|
-| `replicas` | int32 | Não | `1` | Número de réplicas do servidor |
-| `provider` | string | **Sim** | | Provedor LLM |
-| `model` | string | Não | | Modelo LLM |
-| `image` | ImageSpec | Não | | Configuração da imagem |
-| `server` | ServerSpec | Não | | Configuração do servidor gRPC |
-| `watcher` | WatcherSpec | Não | | Configuração do K8s Watcher |
-| `resources` | ResourceRequirements | Não | | Requests/limits de CPU e memória |
-| `persistence` | PersistenceSpec | Não | | Persistência de sessões |
-| `securityContext` | PodSecurityContext | Não | nonroot/1000 | Security context do pod |
-| `fallback` | FallbackSpec | Não | | Cadeia de fallback entre provedores LLM |
-| `apiKeys` | SecretRefSpec | Não | | Secret com API keys (todos os providers do fallback) |
-| `aiops` | AIOpsSpec | Não | | Configuração do pipeline autônomo de gerenciamento de incidentes |
-
-#### AIOpsSpec
-
-Configura o pipeline de remediação automatica. Todos os campos são opcionais com defaults sensiveis. Runbooks auto-gerados pela IA herdam o valor de `maxRemediationAttempts` desta configuração.
-
-| Campo | Tipo | Obrigatório | Padrão | Range | Descrição |
-|-------|------|:-----------:|--------|-------|-----------|
-| `maxRemediationAttempts` | int32 | Não | `5` | 1-10 | Tentativas maximas de remediação antes de escalar para humano |
-| `resolutionCooldownMinutes` | int32 | Não | `10` | 0-120 | Minutos após resolver antes de aceitar novas anomalias do mesmo recurso |
-| `dedupTTLMinutes` | int32 | Não | `60` | 5-1440 | Tempo (min) que o cache de dedup retém hashes de alertas |
-| `enableAutoResolve` | bool | Não | `true` | | Auto-resolver issues Escalados quando o recurso recupera |
-| `agenticMaxSteps` | int32 | Não | `10` | 3-30 | Steps maximos por tentativa em modo agentico (cada step = 1 chamada a IA) |
-
-```yaml
-spec:
-  aiops:
-    maxRemediationAttempts: 5
-    resolutionCooldownMinutes: 10
-    dedupTTLMinutes: 60
-    enableAutoResolve: true
-    agenticMaxSteps: 10
-```
-
-<Note>
-No modo agentico, o postmortem inclui o **raciocinio completo da IA** em cada step — qual ação foi escolhida, por que, e o resultado observado. Isso garante auditoria total das decisoes autonomas da IA.
-</Note>
-
-#### FallbackSpec
-
-Configura failover automático entre provedores LLM. Quando o provedor primário falha (rate limit, timeout, erro de servidor), o sistema tenta automaticamente o próximo provedor na cadeia.
-
-| Campo | Tipo | Obrigatório | Padrão | Descrição |
-|-------|------|:-----------:|--------|-----------|
-| `enabled` | bool | **Sim** | | Ativa a cadeia de fallback |
-| `providers` | []FallbackProviderEntry | **Sim** | | Lista ordenada de provedores fallback (primeiro = maior prioridade) |
-| `maxRetries` | int32 | Não | `2` | Retentativas por provedor antes de ir para o próximo |
-| `cooldownBase` | string | Não | `"30s"` | Cooldown inicial após falha (backoff exponencial) |
-| `cooldownMax` | string | Não | `"5m"` | Cooldown máximo |
-
-#### FallbackProviderEntry
-
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `name` | string | **Sim** | Nome do provedor: OPENAI, OPENAI_ASSISTANT, CLAUDEAI, BEDROCK, GOOGLEAI, XAI, ZAI, MINIMAX, MOONSHOT, OPENROUTER, STACKSPOT, OLLAMA, COPILOT, DEVIN |
-| `model` | string | Não | Modelo LLM para este provedor |
-
-<Tip>
-O provedor primário (`spec.provider`) é sempre tentado primeiro. Os provedores em `fallback.providers` são tentados na ordem listada quando o primário falha. O Secret em `apiKeys` deve conter as API keys de **todos** os provedores na cadeia.
-</Tip>
-
-#### WatcherSpec
-
-| Campo | Tipo | Obrigatório | Padrão | Descrição |
-|-------|------|:-----------:|--------|-----------|
-| `enabled` | bool | Não | `false` | Ativa o watcher |
-| `targets` | []WatchTargetSpec | Não | | Lista de recursos a monitorar (multi-target) |
-| `deployment` | string | Não | | Deployment único (legado) |
-| `namespace` | string | Não | | Namespace do deployment (legado) |
-| `interval` | string | Não | `"30s"` | Intervalo de coleta |
-| `window` | string | Não | `"2h"` | Janela de observação |
-| `maxLogLines` | int32 | Não | `100` | Max linhas de log por pod |
-| `maxContextChars` | int32 | Não | `32000` | Budget de contexto LLM |
-
-#### WatchTargetSpec
-
-| Campo | Tipo | Obrigatório | Padrão | Descrição |
-|-------|------|:-----------:|--------|-----------|
-| `name` | string | **Sim**&ast; | | Nome do recurso a monitorar (ex: `postgres`, `fluentd`) |
-| `deployment` | string | Não | | Alias deprecated para `name` — mantido para compatibilidade |
-| `kind` | string | Não | `Deployment` | Tipo do recurso: `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob` |
-| `namespace` | string | **Sim** | | Namespace do recurso |
-| `metricsPort` | int32 | Não | `0` | Porta Prometheus (0 = desabilitado) |
-| `metricsPath` | string | Não | `/metrics` | Path do endpoint Prometheus |
-| `metricsFilter` | []string | Não | | Filtros glob para métricas |
-
-<Tip>
-Use `name` + `kind` para monitorar qualquer tipo de workload Kubernetes. Quando `kind` é omitido, assume `Deployment`. O campo legado `deployment` ainda funciona como alias para `name`. Exemplos:
-```yaml
-targets:
-  - name: api-gateway             # Deployment (kind padrão)
-    namespace: production
-  - name: postgres                # StatefulSet (banco de dados)
-    kind: StatefulSet
-    namespace: production
-  - name: fluentd                 # DaemonSet (agente de logging)
-    kind: DaemonSet
-    namespace: logging
-  - name: etl-pipeline            # CronJob (batch agendado)
-    kind: CronJob
-    namespace: data
-```
-O pipeline AIOps usará automaticamente ações de remediação específicas para cada tipo (ex: `ScaleStatefulSet`, `RestartDaemonSet`, `SuspendCronJob`) com base no kind detectado.
-</Tip>
-
-### Recursos Criados pelo Instance
-
-| Recurso | Nome | Descrição |
-|---------|------|-----------|
-| **Deployment** | `<name>` | Pods do servidor ChatCLI |
-| **Service** | `<name>` | Service gRPC (headless automático quando réplicas > 1 para LB client-side) |
-| **ConfigMap** | `<name>` | Variáveis de ambiente (provider, model, etc.) |
-| **ConfigMap** | `<name>-watch-config` | YAML multi-target (se `targets` definido) |
-| **ServiceAccount** | `<name>` | Identity para RBAC |
-| **Role** | `<name>-watcher` | Permissões K8s do watcher (single-namespace) |
-| **RoleBinding** | `<name>-watcher` | Binding da SA ao Role (single-namespace) |
-| **ClusterRoleBinding** | `<namespace>-<name>-watcher` | Binding da SA à ClusterRole compartilhada (multi-namespace) |
-| **PVC** | `<name>-sessions` | Persistência (se habilitada) |
-
-### Balanceamento gRPC
-
-O gRPC usa conexões HTTP/2 persistentes que fixam em um único pod via kube-proxy, deixando réplicas extras ociosas.
-
-- **1 réplica** (padrão): Service ClusterIP padrão
-- **Múltiplas réplicas**: Service headless (`ClusterIP: None`) é criado automaticamente, habilitando round-robin client-side via resolver `dns:///` do gRPC
-- **Keepalive**: WatcherBridge faz ping a cada 30s (timeout de 5s) para detectar pods inativos rapidamente. O servidor aceita pings com intervalo mínimo de 20s (`EnforcementPolicy.MinTime`)
-- **Transição**: Ao escalar de 1 para 2+ réplicas (ou voltar), o operator deleta e recria o Service automaticamente (ClusterIP é imutável no Kubernetes)
-
-### RBAC Automático
-
-- **Same namespace** (todos os targets no mesmo namespace do Instance): Cria `Role` + `RoleBinding` por Instance
-- **Cross-namespace** (targets em namespace diferente do Instance, ou em múltiplos namespaces): Cria apenas `ClusterRoleBinding` por Instance, referenciando a `ClusterRole` compartilhada `chatcli-watcher` (pré-provisionada pelo Helm chart / kustomize)
-- Na deleção do CR, o `ClusterRoleBinding` é removido pelo finalizer; a `ClusterRole` compartilhada permanece (é propriedade do release)
-
-<Note>
-A partir da v1.105.1, o operator **não cria mais `ClusterRole` em runtime** (hardening H5). As ClusterRoles compartilhadas — `chatcli-watcher` para o watcher e `chatcli-role-{viewer,operator,admin,superadmin}` para as platform roles — são instaladas pelo Helm chart do operator. O ServiceAccount do operator tem o verb `bind` restrito a esses nomes específicos via `resourceNames`, impedindo escalonamento de privilégio mesmo em caso de comprometimento.
-</Note>
-
-<Note>
-**Upgrade a partir de v1.105.0**: clusters com Instances multi-namespace pré-existentes tinham um `ClusterRoleBinding` apontando para uma ClusterRole por-Instance (formato antigo). Como `roleRef` é imutável no Kubernetes, um `helm upgrade` direto travava o reconcile com `cannot change roleRef`. A partir de v1.151.1, o operator detecta o `roleRef` divergente no início de `reconcileClusterRBAC`, deleta o CRB obsoleto e recria apontando para `chatcli-watcher` — migração transparente, sem intervenção manual.
-</Note>
-
-### Imagem do Servidor e Auto-Resolução
-
-A tag da imagem do servidor (`spec.image.tag`) segue três níveis de prioridade:
-
-1. **Pin explícito** em `spec.image.tag` — honrado literalmente (GitOps-friendly).
-2. **Omitido** — o operator resolve a partir do env var `CHATCLI_OPERATOR_APP_VERSION`, que o Helm chart injeta automaticamente a partir de `.Chart.AppVersion`. Efeito: `helm upgrade chatcli-operator` rola o servidor de todas as Instances que optaram por esse modo, sem patch manual.
-3. **Fallback** — `latest` quando nenhum dos dois está presente (ex.: `make deploy` sem Helm).
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: Instance
-metadata:
-  name: chatcli-prod
-spec:
-  image:
-    repository: ghcr.io/diillson/chatcli
-    # tag omitido → herda appVersion do chart (recomendado p/ ambientes que atualizam via Helm)
-  provider: CLAUDEAI
-  model: claude-sonnet-4-6
-  replicas: 2
-```
-
-<Tip>
-Para ambientes que querem versionamento imutável, continue pinando `spec.image.tag` e gerencie o upgrade manual. Para ambientes que querem "helm upgrade = upgrade completo", omita a tag.
-</Tip>
-
-### Auto-Rollout em Mudanças de Configuração
-
-O operator monitora mudanças em ConfigMaps e Secrets referenciados pelo Instance e dispara rolling updates automaticamente via hash annotations no PodTemplate:
-
-| Annotation | Fonte | Quando Muda |
-|------------|-------|-------------|
-| `chatcli.io/watch-config-hash` | ConfigMap `<name>-watch-config` | Targets do watcher alterados |
-| `chatcli.io/configmap-hash` | ConfigMap `<name>` | Variáveis de ambiente atualizadas |
-| `chatcli.io/secret-hash` | Secret referenciado em `apiKeys.name` | API keys criadas ou atualizadas |
-| `chatcli.io/tls-hash` | Secret referenciado em `server.tls.secretName` | Certificados TLS renovados |
-
-<Tip>
-Adicionar/remover targets no `watcher.targets` e aplicar o Instance causa rollout automático. Criar ou atualizar o Secret de API keys e renovar certificados TLS também disparam rollout automaticamente.
-</Tip>
-
-### Observação de Secrets e ConfigMaps
-
-O operator observa (`Watches`) Secrets no namespace do Instance. Quando um Secret referenciado em `apiKeys.name` ou `server.tls.secretName` é criado ou atualizado, o reconciler é acionado automaticamente — mesmo que o Secret não existisse quando o Instance foi criado.
-
-- **ConfigMap e Secret `envFrom`**: Marcados como `optional: true`, permitindo criar o Instance antes do Secret/ConfigMap
-- **Ordem flexível de deploy**: Namespace → Instance → Secret/ConfigMap (qualquer ordem após o namespace)
-
-
-
-## CRDs da Plataforma AIOps
-
-### Anomaly
-
-Representa um sinal bruto detectado pelo WatcherBridge.
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: Anomaly
-metadata:
-  name: watcher-highrestartcount-api-gateway-1234567890
-  namespace: production
-spec:
-  signalType: pod_restart    # pod_restart | oom_kill | pod_not_ready | deploy_failing | error_rate | latency_spike
-  source: watcher            # watcher | prometheus | manual
-  severity: warning          # critical | high | medium | low | warning
-  resource:
-    kind: Deployment
-    name: api-gateway
-    namespace: production
-  description: "HighRestartCount on api-gateway: container app restarted 8 times"
-  detectedAt: "2026-02-16T10:30:00Z"
-status:
-  correlated: true
-  issueRef:
-    name: api-gateway-pod-restart-1771276354
-```
-
-#### Campos do Anomaly Spec
-
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `signalType` | AnomalySignalType | Tipo do sinal detectado |
-| `source` | AnomalySource | Origem da detecção (watcher, prometheus, manual) |
-| `severity` | IssueSeverity | Severidade do sinal |
-| `resource` | ResourceRef | Recurso K8s afetado (kind, name, namespace) |
-| `description` | string | Descrição legível do problema |
-| `detectedAt` | Time | Timestamp da detecção |
-
-#### Sinais Detectados (21 tipos)
-
-**Sinais do Watcher:**
-
-| AlertType (Server) | SignalType (Anomaly) | Descrição |
-|--------------------|---------------------|-----------|
-| `HighRestartCount` | `pod_restart` | Pod com muitos restarts (CrashLoopBackOff) |
-| `OOMKilled` | `oom_kill` | Container terminado por falta de memória |
-| `PodNotReady` | `pod_not_ready` | Pod não está no estado Ready |
-| `DeploymentFailing` | `deploy_failing` | Deployment com Available=False |
-
-**Sinais adicionais (via Prometheus, webhooks ou detecção interna):**
-
-| SignalType | Descrição |
-|-----------|-----------|
-| `error_rate` | Taxa de erros HTTP elevada |
-| `latency` | Latência acima do threshold |
-| `cpu_high` | Uso de CPU elevado |
-| `memory_high` | Uso de memória elevado |
-| `disk_pressure` | Node com condição DiskPressure (disco cheio ou quase) |
-| `node_not_ready` | Node com condição NotReady (kubelet sem resposta, falha de rede ou hardware) |
-| `memory_pressure` | Node com condição MemoryPressure (memória insuficiente para novos pods) |
-| `pid_pressure` | Node com condição PIDPressure (processos excessivos, risco de fork bomb) |
-| `network_unavailable` | Node com rede indisponível (CNI falhou ou interface caiu) |
-| `pvc_pending` | PVC em estado Pending |
-| `ingress_error` | Erros no Ingress controller |
-| `hpa_maxed` | HPA no máximo de réplicas |
-| `job_failed` | Job falhou |
-| `cronjob_missed` | CronJob não executou no schedule |
-| `certificate_expiring` | Certificado TLS expirando |
-| `image_pull_error` | Erro ao puxar imagem do container |
-| `crashloop_backoff` | Pod em CrashLoopBackOff |
-| `helm_release_failed` | Helm release em estado failed |
-| `argocd_degraded` | ArgoCD Application degradada |
-| `config_drift` | Drift de configuração detectado |
-
-#### Monitoramento de Nodes
-
-O watcher monitora automaticamente a saude dos **nodes onde os pods dos targets estão rodando**. A cada ciclo de coleta, ele:
-
-1. Identifica os nodes via label selector dos pods do target
-2. Coleta as 5 condições oficiais do Kubernetes: `Ready`, `DiskPressure`, `MemoryPressure`, `PIDPressure`, `NetworkUnavailable`
-3. Coleta métricas de CPU/memória do node (via metrics server)
-4. Conta pods ativos vs capacidade do node
-5. Verifica se o node está cordoned (unschedulable)
-
-| Condição | Severidade | Signal | Ação disponível |
-|----------|:----------:|--------|-----------------|
-| Node NotReady | CRITICAL | `node_not_ready` | `CordonNode`, `DrainNode` |
-| DiskPressure | CRITICAL | `disk_pressure` | `CordonNode`, `DrainNode` |
-| MemoryPressure | CRITICAL | `memory_high` | `CordonNode`, `DrainNode` |
-| PIDPressure | WARNING | `node_not_ready` | `CordonNode` |
-| NetworkUnavailable | CRITICAL | `node_not_ready` | `CordonNode`, `DrainNode` |
-| Cordoned (Unschedulable) | WARNING | `node_not_ready` | Informativo |
-| Pod capacity >90% | WARNING | `node_not_ready` | `CordonNode` |
-
-As informações de node são incluidas no contexto enviado a IA para análise, permitindo que a root cause seja correlacionada com problemas de infraestrutura (ex.: "OOMKill causado por MemoryPressure no node X").
-
-### Issue
-
-Incidente correlacionado que agrupa anomalias e gerencia o ciclo de vida da remediação.
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: Issue
-metadata:
-  name: api-gateway-pod-restart-1771276354
-  namespace: production
-spec:
-  severity: high
-  source: watcher
-  signalType: pod_restart        # Propagated from Anomaly for tiered Runbook matching
-  description: "Correlated incident: pod_restart on api-gateway"
-  resource:
-    kind: Deployment
-    name: api-gateway
-    namespace: production
-  riskScore: 65
-  correlatedAnomalies:
-    - name: watcher-highrestartcount-api-gateway-1234567890
-    - name: watcher-oomkilled-api-gateway-1234567891
-status:
-  state: Analyzing          # Detected | Analyzing | Remediating | Resolved | Escalated | Failed
-  remediationAttempts: 0
-  maxRemediationAttempts: 5  # default: 5, configurable via Instance aiops.maxRemediationAttempts
-  detectedAt: "2026-02-16T10:30:00Z"
-  conditions:
-    - type: Analyzing
-      status: "True"
-      reason: AIInsightCreated
-```
-
-#### Estados do Issue
-
-| Estado | Descrição |
-|--------|-----------|
-| `Detected` | Issue recém-criado, aguardando análise |
-| `Analyzing` | AIInsight criado, aguardando resposta da IA (ou re-análise com failure context) |
-| `Remediating` | RemediationPlan em execução |
-| `Resolved` | Remediação bem-sucedida (dedup invalidado para detecção de recorrência) |
-| `Escalated` | Max tentativas atingido ou sem ações disponíveis (dedup invalidado) |
-| `Failed` | Falha terminal |
-
-### AIInsight
-
-Análise de causa raiz gerada por IA com ações sugeridas para remediação automática.
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: AIInsight
-metadata:
-  name: api-gateway-pod-restart-1771276354-insight
-  namespace: production
-spec:
-  issueRef:
-    name: api-gateway-pod-restart-1771276354
-  provider: CLAUDEAI
-  model: claude-sonnet-4-6
-status:
-  analysis: "High restart count caused by OOMKilled. Container memory limit (512Mi) is insufficient for the current workload pattern."
-  confidence: 0.87
-  recommendations:
-    - "Increase memory limit to 1Gi"
-    - "Investigate possible memory leak in the application"
-    - "Monitor GC pressure metrics"
-  suggestedActions:
-    - name: "Restart deployment"
-      action: RestartDeployment
-      description: "Restart pods to reclaim leaked memory immediately"
-    - name: "Scale up replicas"
-      action: ScaleDeployment
-      description: "Add more replicas to distribute memory pressure"
-      params:
-        replicas: "4"
-  generatedAt: "2026-02-16T10:31:00Z"
-```
-
-#### Campos do AIInsight Status
-
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `analysis` | string | Análise de causa raiz gerada pela IA |
-| `confidence` | float64 | Nível de confiança da análise (0.0-1.0) |
-| `recommendations` | []string | Recomendações legiveis para humanos |
-| `suggestedActions` | []SuggestedAction | Ações estruturadas para remediação automática |
-| `generatedAt` | Time | Quando a análise foi gerada |
-
-#### SuggestedAction
-
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `name` | string | Nome legível da ação |
-| `action` | string | Tipo da ação (54 tipos disponíveis — ver [Tipos de Ação](#tipos-de-ação-54-tipos)) |
-| `description` | string | Explicação do motivo desta ação |
-| `params` | map[string]string | Parâmetros da ação (ex: `replicas: "4"`) |
-
-### RemediationPlan
-
-Plano concreto de remediação gerado automaticamente a partir de Runbook ou ações da IA.
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: RemediationPlan
-metadata:
-  name: api-gateway-pod-restart-1771276354-plan-1
-  namespace: production
-spec:
-  issueRef:
-    name: api-gateway-pod-restart-1771276354
-  attempt: 1
-  strategy: "Attempt 1 (AI-generated): High restart count caused by OOMKilled"
-  actions:
-    - type: RestartDeployment
-    - type: ScaleDeployment
-      params:
-        replicas: "4"
-  safetyConstraints:
-    - "No delete operations"
-    - "No destructive changes"
-    - "Rollback on failure"
-status:
-  state: Completed           # Pending | Executing | Completed | Failed | RolledBack
-  result: "Deployment restarted and scaled to 4 replicas successfully"
-  startedAt: "2026-02-16T10:31:30Z"
-  completedAt: "2026-02-16T10:32:15Z"
-```
-
-#### Rollback Automático e Proteção de Estado
-
-O operator implementa um **sistema de rollback automático** que garante que remediações malsucedidas não deixem o cluster em estado pior do que antes. Antes de executar qualquer ação, o estado completo do recurso é capturado em um **snapshot estruturado restaurável**.
-
-<Steps>
-  <Step title="Snapshot Pré-Remediação">
-    Antes da primeira ação, o `RollbackEngine` captura um `ResourceSnapshot` estruturado com: replicas, imagens dos containers, CPU/memory requests e limits, estado do HPA (min/max replicas), e estado do node (schedulable/unschedulable). Funciona para **Deployments, StatefulSets, DaemonSets, Nodes e HPAs**.
-  </Step>
-  <Step title="Checkpoint por Ação">
-    Em planos com múltiplas ações, um `ActionCheckpoint` é capturado **antes de cada ação individual**. Isso permite saber exatamente qual ação modificou o quê e em que ponto o plano falhou.
-  </Step>
-  <Step title="Rollback Automático em Falha de Ação">
-    Se qualquer ação falha durante a execução, o operator **automaticamente restaura** o recurso para o estado do `PreflightSnapshot`. Replicas, imagens, resources requests/limits e estado do HPA são revertidos. O plano transiciona para estado `RolledBack` (não `Failed`).
-  </Step>
-  <Step title="Rollback em Timeout de Verificação">
-    Se todas as ações executam com sucesso mas o recurso **não fica healthy dentro de 90 segundos** (verification timeout), o operator também executa rollback automático para o estado pré-remediação.
-  </Step>
-  <Step title="Verificação Pós-Falha">
-    Após o rollback, o operator verifica se o recurso voltou ao estado healthy (`PostFailureHealthy`). Essa informação é registrada no status do plano para auditoria e decisão sobre retry.
-  </Step>
-</Steps>
-
-**O que é capturado no snapshot:**
-
-| Recurso | Campos Capturados |
-|---------|-------------------|
-| **Deployment** | replicas, container images, CPU/memory requests+limits, restart annotation |
-| **StatefulSet** | replicas, container images, CPU/memory requests+limits |
-| **DaemonSet** | container images, CPU/memory requests+limits |
-| **Node** | schedulable state (para reverter cordon/drain) |
-| **HPA** | minReplicas, maxReplicas |
-
-**Exemplo de RemediationPlan com rollback executado:**
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: RemediationPlan
-metadata:
-  name: api-gateway-plan-1
-  namespace: production
-status:
-  state: RolledBack              # Ação falhou, rollback automático executado
-  result: "Action AdjustResources (index 1) failed: invalid memory_limit | Rollback: Rolled back production/api-gateway: replicas: 5 → 3; container app: memory_limit=1Gi | Post-rollback: resource healthy"
-  rollbackPerformed: true
-  rollbackResult: "Rolled back production/api-gateway: replicas: 5 → 3; container app: memory_limit=1Gi"
-  postFailureHealthy: true       # Recurso voltou ao normal após rollback
-  preflightSnapshot:
-    resourceKind: Deployment
-    resourceName: api-gateway
-    namespace: production
-    replicas: 3
-    containerImages:
-      app: "ghcr.io/myorg/api-gateway:v2.1.0"
-    containerResources:
-      app:
-        cpuRequest: "200m"
-        cpuLimit: "1000m"
-        memoryRequest: "256Mi"
-        memoryLimit: "512Mi"
-    hpaMinReplicas: 2
-    hpaMaxReplicas: 8
-    capturedAt: "2026-02-16T10:31:00Z"
-  actionCheckpoints:
-    - actionIndex: 0
-      actionType: ScaleDeployment
-      success: true
-      timestamp: "2026-02-16T10:31:05Z"
-    - actionIndex: 1
-      actionType: AdjustResources
-      success: false
-      timestamp: "2026-02-16T10:31:10Z"
-  evidence:
-    - type: preflight_snapshot
-      data: "Structured snapshot captured: kind=Deployment replicas=3 containers=1"
-      timestamp: "2026-02-16T10:31:00Z"
-    - type: action_completed
-      data: "Action ScaleDeployment executed successfully"
-      timestamp: "2026-02-16T10:31:05Z"
-    - type: action_failed
-      data: "Action AdjustResources failed: invalid memory_limit format"
-      timestamp: "2026-02-16T10:31:10Z"
-    - type: rollback
-      data: "Rolled back production/api-gateway: replicas: 5 → 3; container app: memory_limit=1Gi"
-      timestamp: "2026-02-16T10:31:11Z"
-```
-
-<Warning>
-O rollback automático restaura o estado **anterior à remediação**, não resolve o problema original. Após o rollback, o IssueReconciler avalia se há tentativas restantes e dispara **re-análise com contexto de falha** — a IA recebe o que falhou e sugere uma estratégia diferente.
-</Warning>
-
-**Fluxo completo em caso de falha:**
-
-```mermaid
-flowchart TD
-    A[Ação Executada] -->|Falha| B[Rollback Automático]
-    A -->|Sucesso| C[Verificação de Saúde 90s]
-    C -->|Healthy| D[Completed ✓]
-    C -->|Timeout Unhealthy| B
-    B --> E{Rollback OK?}
-    E -->|Sim| F[Estado: RolledBack]
-    E -->|Não| G[Estado: Failed]
-    F --> H{Tentativas restantes?}
-    G --> H
-    H -->|Sim| I[Re-análise com failure context]
-    H -->|Não| J[Escalação para humano]
-    I --> K[IA sugere estratégia diferente]
-    K --> A
-```
-
-**Campos de status adicionados ao RemediationPlan:**
-
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `preflightSnapshot` | ResourceSnapshot | Estado completo do recurso antes de qualquer ação |
-| `actionCheckpoints` | []ActionCheckpoint | Checkpoint antes de cada ação com resultado (success/fail) |
-| `rollbackPerformed` | bool | Se o rollback automático foi executado |
-| `rollbackResult` | string | Descrição do que foi revertido (replicas, images, resources) |
-| `postFailureHealthy` | *bool | Se o recurso está healthy após rollback |
-
----
-
-#### Tipos de Ação (54 tipos)
-
-**Workload:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `ScaleDeployment` | Ajusta o número de réplicas | `replicas` |
-| `RestartDeployment` | Rollout restart do deployment | — |
-| `RollbackDeployment` | Desfaz rollout (anterior, saudável ou revisão específica) | `toRevision` (optional: `previous`, `healthy`, ou número) |
-| `PatchConfig` | Atualiza chaves de um ConfigMap | `configmap`, `key=value` |
-| `AdjustResources` | Ajusta CPU/memória requests/limits de containers | `memory_limit`, `memory_request`, `cpu_limit`, `cpu_request`, `container` |
-| `DeletePod` | Remove pod mais doente (CrashLoop > restarts) | `pod` (optional — auto-seleciona o mais doente) |
-| `RestartStatefulSetPod` | Restart de pod StatefulSet (preserva identidade/storage) | `pod` (optional — omitir para rolling restart do StatefulSet inteiro) |
-
-**GitOps:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `HelmRollback` | Rollback de Helm release para revisão anterior | `revision` (optional — padrão: anterior) |
-| `ArgoSyncApp` | Trigger de sync em ArgoCD Application | `revision` (optional — padrão: HEAD) |
-
-**Autoscaling:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `AdjustHPA` | Modifica min/max replicas ou target utilization do HPA | `minReplicas`, `maxReplicas`, `targetCPUUtilization` |
-
-**Infraestrutura:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `CordonNode` | Marca node como unschedulable | `node` |
-| `DrainNode` | Cordon + evict pods do node | `node` |
-
-**Storage:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `ResizePVC` | Expande PVC (somente expansão, não redução) | `pvc`, `size` (ex: `20Gi`) |
-
-**Security:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `RotateSecret` | Atualiza valores de Secret ou copia de source | `secret`, `sourceSecret` ou `key=value` |
-
-**Networking:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `UpdateIngress` | Modifica backend ou annotations de Ingress | `ingress`, `backendService`, `backendPort`, `annotation.*` |
-| `PatchNetworkPolicy` | Adiciona portas permitidas a NetworkPolicy | `networkPolicy`, `allowPort`, `protocol` |
-
-**Advanced:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|-----------|
-| `ApplyManifest` | Aplica manifesto JSON de um ConfigMap | `configmap`, `key` |
-| `ExecDiagnostic` | Executa comando diagnóstico whitelisted em pod | `command` (string exata — ver [allowlist](#execdiagnostic-allowlist)) |
-| `Custom` | Ação personalizada (bloqueada por safety checks) | — |
-
-#### ExecDiagnostic Allowlist
-
-A ação `ExecDiagnostic` faz match exato de string contra um allowlist de comandos read-only. Qualquer variação (flags diferentes, host alternativo, etc.) é rejeitada com `command "..." not in approved diagnostic commands whitelist`.
-
-**Comandos aprovados por padrão (~90):**
-
-| Categoria | Comandos |
-|-----------|----------|
-| **Processo / shell** | `env`, `whoami`, `id`, `hostname`, `pwd`, `uname -a`, `uname -r`, `ps aux`, `ps -ef`, `top -b -n1` |
-| **Filesystem / recursos** | `df -h`, `df -i`, `free -m`, `free -h`, `mount`, `uptime`, `ls -la /`, `ls -la /tmp`, `ls -la /var/log`, `du -sh /tmp`, `du -sh /var/log` |
-| **Cgroups v2** (pod moderno) | `cat /sys/fs/cgroup/memory.max`, `memory.current`, `memory.events`, `memory.stat`, `cpu.max`, `cpu.stat` |
-| **Cgroups v1** (pod legado) | `cat /sys/fs/cgroup/memory/memory.{limit_in_bytes,usage_in_bytes,oom_control,stat}`, `cat /sys/fs/cgroup/cpu/cpu.{cfs_quota_us,cfs_period_us,stat}` |
-| **/proc introspection** | `cat /proc/1/{cgroup,status,limits,cmdline,environ}`, `cat /proc/{meminfo,cpuinfo,loadavg,version}`, `cat /proc/net/{tcp,udp,sockstat}` |
-| **Rede (read-only)** | `netstat -tlnp`/`-an`/`-rn`, `ss -tlnp`/`-an`/`-s`, `ip addr`, `ip -s link`, `ip route`, `ip -6 route`, `ip neigh`, `ifconfig`, `arp -a` |
-| **DNS / resolver** | `cat /etc/{hosts,resolv.conf,nsswitch.conf}`, `nslookup/getent/dig/host kubernetes.default.svc.cluster.local`, `nslookup kube-dns.kube-system.svc.cluster.local` |
-| **Health / métricas / pprof** | `curl -s localhost{,:8080}/{health,healthz,ready,readyz,live,livez}`, `curl -s localhost:{8080,8081,9090,9091}/metrics`, `curl -s localhost:9090/-/{ready,healthy}`, `curl -s localhost:6060/debug/pprof/{,goroutine,heap}?debug=1` |
-| **Envoy / Istio sidecar** | `curl -s localhost:15000/ready`, `curl -s localhost:{15020,15021}/healthz/ready` |
-| **wget fallback (Alpine)** | `wget -qO- http://localhost{,:8080}/{health,healthz,metrics}` |
-| **Reachability TCP** | `nc -zv kubernetes.default.svc.cluster.local 443`, `nc -zv kube-dns.kube-system.svc.cluster.local 53` |
-
-Extender via env var `CHATCLI_ALLOWED_DIAGNOSTIC_COMMANDS` (comma-separated, lido uma vez na inicialização). Quem lê essa variável é o processo do **operator**, não o servidor, então defina-a no chart `chatcli-operator` com `security.allowedDiagnosticCommands` — uma entrada no `spec.extraEnv` de uma Instance vai parar no pod do servidor e não tem efeito:
+A lista é lida pelo processo do **operator**, então estenda no chart do operator, não na Instance. Vírgulas separam as entradas, então escape-as no `--set`, ou coloque o valor no seu arquivo de values (aqui `operator-values.yaml`):
 
 ```bash
 helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-  --namespace chatcli-system --reuse-values \
-  --set security.allowedDiagnosticCommands="dig +short redis.default.svc.cluster.local\, nc -zv redis.default.svc.cluster.local 6379"
+  --version 1.211.2 -n chatcli-system -f operator-values.yaml \
+  --set security.allowedDiagnosticCommands="curl -s localhost:5678/health\,nc -zv redis.default.svc.cluster.local 6379"
+
+kubectl -n chatcli-system logs deploy/chatcli-operator | grep 'Effective ExecDiagnostic allowlist loaded'
 ```
 
-<Warning>
-Cada entrada é matching exato. `nslookup <outro-host>` não funciona — é rejeitado. Se precisar de um host específico, adicione a string completa ao env var.
-</Warning>
+A linha de log da subida mostra as contagens de padrão, customizados e total, e cada entrada customizada.
 
-<Tip>
-A IA recebe esse allowlist no prompt de remediação (`server/handler_analysis.go`) e é instruída a escolher o comando certo por sintoma: `memory.events` para OOM, `cpu.stat` para throttling, `getent/dig` para DNS, pprof para apps Go travadas, `nc -zv` para dependência externa.
-</Tip>
+### Acompanhar o pipeline
 
-**StatefulSet:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|------------|
-| `ScaleStatefulSet` | Scaling ordenado de réplicas | `replicas` |
-| `RestartStatefulSet` | Rolling restart via annotation | — |
-| `RollbackStatefulSet` | Rollback via ControllerRevision | `toRevision` |
-| `AdjustStatefulSetResources` | Ajusta CPU/memória | `container`, `memory_limit`, `cpu_limit` |
-| `DeleteStatefulSetPod` | Deleta pod específico ou mais doente | `pod` (opcional) |
-| `ForceDeleteStatefulSetPod` | Force-delete de pod preso (grace=0) | `pod` (OBRIGATÓRIO) |
-| `UpdateStatefulSetStrategy` | Altera updateStrategy | `type`, `maxUnavailable` |
-| `RecreateStatefulSetPVC` | Deleta PVC preso para recriação | `pvc`, `confirm=true` |
-| `PartitionStatefulSetUpdate` | Partition para canary rollout | `partition` |
-
-**DaemonSet:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|------------|
-| `RestartDaemonSet` | Rolling restart em todos os nodes | — |
-| `RollbackDaemonSet` | Rollback via ControllerRevision | `toRevision` |
-| `AdjustDaemonSetResources` | Ajusta CPU/memória | `container`, `memory_limit`, `cpu_limit` |
-| `DeleteDaemonSetPod` | Deleta pod (opcionalmente em node específico) | `pod`, `node` (opcional) |
-| `UpdateDaemonSetStrategy` | Altera estratégia de update | `type`, `maxUnavailable`, `maxSurge` |
-| `PauseDaemonSetRollout` | Pausa rollout (maxUnavailable=0) | — |
-| `CordonAndDeleteDaemonSetPod` | Cordona node + deleta pod | `node` (OBRIGATÓRIO) |
-
-**Job:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|------------|
-| `RetryJob` | Deleta Job falhado + recria | — |
-| `AdjustJobResources` | Ajusta CPU/memória no template | `container`, `memory_limit`, `cpu_limit` |
-| `DeleteFailedJob` | Limpa Job falhado | — |
-| `SuspendJob` | Pausa Job (suspend=true) | — |
-| `ResumeJob` | Retoma Job (suspend=false) | — |
-| `AdjustJobParallelism` | Altera paralelismo | `parallelism` |
-| `AdjustJobDeadline` | Altera deadline | `activeDeadlineSeconds` |
-| `AdjustJobBackoffLimit` | Altera backoff limit | `backoffLimit` |
-| `ForceDeleteJobPods` | Force-delete de todos os pods | — |
-
-**CronJob:**
-
-| Tipo | Descrição | Parâmetros |
-|------|-----------|------------|
-| `SuspendCronJob` | Pausa agendamento | — |
-| `ResumeCronJob` | Retoma agendamento | — |
-| `TriggerCronJob` | Cria Job imediatamente | — |
-| `AdjustCronJobResources` | Ajusta CPU/memória no jobTemplate | `container`, `memory_limit`, `cpu_limit` |
-| `AdjustCronJobSchedule` | Altera schedule | `schedule` |
-| `AdjustCronJobDeadline` | Altera deadline | `startingDeadlineSeconds` |
-| `AdjustCronJobHistory` | Altera limites de histórico | `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` |
-| `AdjustCronJobConcurrency` | Altera política de concorrência | `concurrencyPolicy` |
-| `DeleteCronJobActiveJobs` | Mata Jobs ativos | — |
-| `ReplaceCronJobTemplate` | Substitui template de ConfigMap | `configmap`, `key` |
-
-#### Exemplos de RemediationPlan com Novas Ações
-
-<Tabs>
-  <Tab title="GitOps: HelmRollback">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: checkout-helm-rollback-plan-1
-      namespace: production
-    spec:
-      issueRef:
-        name: checkout-helm-release-failed-123
-      attempt: 1
-      strategy: "Rollback Helm release to previous stable revision"
-      actions:
-        - type: HelmRollback
-          params:
-            revision: "41"    # revision específica (omitir para anterior)
-    ```
-  </Tab>
-  <Tab title="GitOps: ArgoSyncApp">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: api-gateway-argo-sync-plan-1
-      namespace: production
-    spec:
-      issueRef:
-        name: api-gateway-argocd-degraded-456
-      attempt: 1
-      strategy: "Force ArgoCD sync to reconcile desired state"
-      actions:
-        - type: ArgoSyncApp
-          params:
-            revision: "abc123def"   # commit SHA (omitir para HEAD)
-    ```
-  </Tab>
-  <Tab title="StatefulSet + HPA">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: postgres-recovery-plan-1
-      namespace: databases
-    spec:
-      issueRef:
-        name: postgres-pod-restart-789
-      attempt: 1
-      strategy: "Restart unhealthy StatefulSet pod and adjust HPA"
-      actions:
-        - type: RestartStatefulSetPod
-          params:
-            pod: "postgres-2"   # pod específico (omitir para rolling restart)
-        - type: AdjustHPA
-          params:
-            minReplicas: "3"
-            maxReplicas: "10"
-            targetCPUUtilization: "70"
-    ```
-  </Tab>
-  <Tab title="Infra: Node Drain">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: node-disk-pressure-plan-1
-      namespace: kube-system
-    spec:
-      issueRef:
-        name: node-disk-pressure-issue-321
-      attempt: 1
-      strategy: "Cordon and drain node with disk pressure"
-      actions:
-        - type: CordonNode
-          params:
-            node: "worker-node-03"
-        - type: DrainNode
-          params:
-            node: "worker-node-03"
-    ```
-  </Tab>
-  <Tab title="Storage + Security">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: storage-and-certs-plan-1
-      namespace: production
-    spec:
-      issueRef:
-        name: pvc-full-cert-expired-555
-      attempt: 1
-      strategy: "Expand PVC and rotate expired certificate"
-      actions:
-        - type: ResizePVC
-          params:
-            pvc: "data-postgres-0"
-            size: "50Gi"
-        - type: RotateSecret
-          params:
-            secret: "tls-api-gateway"
-            sourceSecret: "tls-api-gateway-renewed"
-    ```
-  </Tab>
-  <Tab title="Networking">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: networking-fix-plan-1
-      namespace: production
-    spec:
-      issueRef:
-        name: ingress-backend-error-777
-      attempt: 1
-      strategy: "Fix ingress backend and open blocked port"
-      actions:
-        - type: UpdateIngress
-          params:
-            ingress: "api-gateway-ingress"
-            backendService: "api-gateway-v2"
-            backendPort: "8080"
-        - type: PatchNetworkPolicy
-          params:
-            networkPolicy: "api-gateway-netpol"
-            allowPort: "8443"
-            protocol: "TCP"
-    ```
-  </Tab>
-  <Tab title="Advanced: Manifest + Diagnostic">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: RemediationPlan
-    metadata:
-      name: advanced-fix-plan-1
-      namespace: production
-    spec:
-      issueRef:
-        name: complex-issue-999
-      attempt: 1
-      strategy: "Run diagnostics then apply fix manifest"
-      actions:
-        - type: ExecDiagnostic
-          params:
-            command: "df -h"
-        - type: ApplyManifest
-          params:
-            configmap: "hotfix-configmap"
-            key: "manifest.yaml"
-    ```
-  </Tab>
-</Tabs>
-
-### Runbook (Manual ou Auto-gerado)
-
-Procedimentos operacionais. Runbooks **manuais** têm prioridade sobre tudo. Quando não há Runbook manual, a IA **gera automaticamente** um Runbook CR reutilizável a partir das ações sugeridas.
-
-<Tabs>
-  <Tab title="Runbook manual">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Runbook
-    metadata:
-      name: high-error-rate-deployment
-      namespace: production
-    spec:
-      description: "Standard procedure for high error rate incidents on Deployments"
-      trigger:
-        signalType: error_rate
-        severity: high
-        resourceKind: Deployment
-      steps:
-        - name: Scale up
-          action: ScaleDeployment
-          description: "Increase replicas to absorb the error spike"
-          params:
-            replicas: "4"
-        - name: Rollback
-          action: RollbackDeployment
-          description: "Revert to previous stable version if scaling doesn't help"
-      maxAttempts: 3
-    ```
-  </Tab>
-  <Tab title="Runbook auto-gerado pela IA">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Runbook
-    metadata:
-      name: auto-pod-restart-high-deployment
-      labels:
-        platform.chatcli.io/auto-generated: "true"
-        platform.chatcli.io/source-issue: "api-gateway-pod-restart-1771276354"
-    spec:
-      description: "Auto-generated: High restart count caused by OOMKilled..."
-      trigger:
-        signalType: pod_restart
-        severity: high
-        resourceKind: Deployment
-      steps:
-        - name: Restart deployment
-          action: RestartDeployment
-        - name: Scale up replicas
-          action: ScaleDeployment
-          params:
-            replicas: "4"
-      maxAttempts: 3
-    ```
-
-    Auto-generated Runbooks são **reutilizados** para futuras Issues com o mesmo trigger, evitando chamadas desnecessárias ao LLM.
-  </Tab>
-  <Tab title="Runbook: Helm + ArgoCD">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Runbook
-    metadata:
-      name: helm-release-failed-runbook
-      namespace: production
-    spec:
-      description: "Rollback de Helm release e sync ArgoCD após falha de deploy"
-      trigger:
-        signalType: helm_release_failed
-        severity: critical
-        resourceKind: Deployment
-      steps:
-        - name: Rollback Helm
-          action: HelmRollback
-          description: "Reverte para a revisão anterior estável"
-        - name: Sync ArgoCD
-          action: ArgoSyncApp
-          description: "Força sync do ArgoCD para reconciliar estado"
-      maxAttempts: 2
-    ```
-  </Tab>
-  <Tab title="Runbook: StatefulSet + Storage">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Runbook
-    metadata:
-      name: statefulset-disk-full-runbook
-      namespace: databases
-    spec:
-      description: "Expande PVC e reinicia pod StatefulSet com disco cheio"
-      trigger:
-        signalType: disk_pressure
-        severity: high
-        resourceKind: StatefulSet
-      steps:
-        - name: Expand storage
-          action: ResizePVC
-          description: "Dobra o tamanho do PVC"
-          params:
-            pvc: "data-postgres-0"
-            size: "100Gi"
-        - name: Restart pod
-          action: RestartStatefulSetPod
-          description: "Reinicia o pod para reconhecer o novo tamanho"
-          params:
-            pod: "postgres-0"
-      maxAttempts: 2
-    ```
-  </Tab>
-</Tabs>
-
-### RemediationPlan (Agentic Mode)
-
-Quando não há Runbook manual nem ações sugeridas pela IA, o operator cria um **plano agêntico**. A IA atua como um agente com skills Kubernetes em um loop observe-decide-act:
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: RemediationPlan
-metadata:
-  name: api-gateway-pod-restart-plan-1
-  namespace: production
-spec:
-  issueRef:
-    name: api-gateway-pod-restart-1771276354
-  attempt: 1
-  strategy: "Agentic AI remediation"
-  agenticMode: true
-  agenticMaxSteps: 10
-  agenticHistory:
-    - stepNumber: 1
-      aiMessage: "High restart count with OOMKilled. Scaling up to reduce memory pressure."
-      action:
-        type: ScaleDeployment
-        params:
-          replicas: "5"
-      observation: "SUCCESS: ScaleDeployment executed successfully"
-    - stepNumber: 2
-      aiMessage: "Pods still restarting. Adjusting memory limits."
-      action:
-        type: AdjustResources
-        params:
-          memory_limit: "1Gi"
-          memory_request: "512Mi"
-      observation: "SUCCESS: AdjustResources executed successfully"
-    - stepNumber: 3
-      aiMessage: "All pods running stable. Issue resolved."
-status:
-  state: Completed
-  agenticStepCount: 3
-  agenticStartedAt: "2026-02-16T10:31:00Z"
+```bash
+kubectl get anomalies -A            # SOURCE  SIGNAL  CORRELATED  AGE
+kubectl get issues -A               # SEVERITY  STATE  RISK  AGE
+kubectl get aiinsights -A           # ISSUE  PROVIDER  CONFIDENCE  AGE
+kubectl get remediationplans -A     # ISSUE  ATTEMPT  STATE  AGE
+kubectl get postmortems -A          # ISSUE  SEVERITY  STATE  AGE
+kubectl get approvalrequests -A     # ISSUE  PLAN  STATE  RULE  AGE
 ```
 
-<Note>
-Safety Guards: Maximum of 10 steps (configurable via `agenticMaxSteps`), timeout of 10 minutes. If an action fails, the observation reports "FAILED: error" and the loop continues -- the AI receives the feedback and adapts.
-</Note>
+## Opções de autenticação
 
-**Na resolução agêntica:** O operator gera automaticamente:
-1. **PostMortem CR** com timeline, causa raiz, impacto, lições aprendidas
-2. **Runbook CR** reutilizável com os passos bem-sucedidos (label `source=agentic`)
+| Opção | Campos da Instance | O que os clientes apresentam | O que o operator apresenta |
+|-------|--------------------|------------------------------|----------------------------|
+| Token compartilhado | `server.token` | `--token <token>` (papel admin) | O mesmo token |
+| JWT HS256 | `server.security.jwtSecretRef` (+ `jwtIssuer`, `jwtAudience` opcionais) | Um JWT assinado com o segredo | Tokens que ele mesmo emite a partir do segredo |
+| JWT RS256 | `server.security.jwtPublicKeyRef` + `operatorTokenRef` **ou** `operatorClientCertSecretName` | Um JWT do seu provedor de identidade | O token de `operatorTokenRef`, ou seu certificado de cliente |
+| mTLS | `server.tls.clientCASecretName` (+ `security.mtlsRole`) + `security.operatorClientCertSecretName` | Um certificado de cliente assinado pela CA (`CHATCLI_TLS_CLIENT_CERT/KEY`) | Seu certificado de cliente |
 
-### PostMortem (Auto-generated)
-
-Relatório de incidente gerado automaticamente após **qualquer resolução de remediação** (standard ou agêntica). Contém o histórico completo do incidente: detecção, análise, ações executadas, resolução, além de **métricas**, **correlação git**, **cascade chain**, **trending de incidentes recorrentes** e campo de **feedback do desenvolvedor**.
-
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: PostMortem
-metadata:
-  name: pm-api-gateway-pod-restart-1771276354
-  namespace: production
-spec:
-  issueRef:
-    name: api-gateway-pod-restart-1771276354
-  resource:
-    kind: Deployment
-    name: api-gateway
-    namespace: production
-  severity: high
-status:
-  state: Open              # Open | InReview | Closed
-  summary: "OOMKilled containers caused cascading restarts on api-gateway"
-  rootCause: "Memory limit (512Mi) insufficient for current workload pattern"
-  impact: "Service degradation for 5 minutes, 30% error rate increase"
-  timeline:
-    - timestamp: "2026-02-16T10:30:00Z"
-      type: detected
-      detail: "Issue detected: pod_restart on api-gateway"
-    - timestamp: "2026-02-16T10:31:00Z"
-      type: action_executed
-      detail: "ScaleDeployment to 5 replicas"
-    - timestamp: "2026-02-16T10:31:35Z"
-      type: action_executed
-      detail: "AdjustResources memory_limit=1Gi"
-    - timestamp: "2026-02-16T10:32:10Z"
-      type: resolved
-      detail: "All pods stable, issue resolved"
-  lessonsLearned:
-    - "Memory limits should account for peak workload patterns"
-    - "Set up HPA to auto-scale on memory pressure"
-  preventionActions:
-    - "Configure HPA with min 3 replicas for api-gateway"
-    - "Set memory limit to 1Gi across all environments"
-  duration: "2m10s"
-  generatedAt: "2026-02-16T10:32:10Z"
-  # Novos campos de enrichment (preenchidos automaticamente pelo operator)
-  metricSnapshots:
-    - name: "memory_usage"
-      value: "498000000"
-      timestamp: "2026-02-16T10:30:00Z"
-      phase: "during"
-    - name: "memory_usage"
-      value: "312000000"
-      timestamp: "2026-02-16T10:35:00Z"
-      phase: "after"
-  blastRadius:
-    - resource:
-        kind: Service
-        name: api-gateway-svc
-        namespace: production
-      impact: "5xx responses during pod restarts"
-      severity: "high"
-  gitCorrelation:
-    commitSHA: "a1b2c3d4e5f6"
-    commitMessage: "feat: add webhook handler for notifications"
-    author: "dev@team.com"
-    timestamp: "2026-02-16T09:15:00Z"
-    confidence: 0.82
-    filesChanged:
-      - "internal/webhook/handler.go"
-      - "internal/webhook/handler_test.go"
-  trending:
-    occurrenceCount: 3
-    windowDays: 30
-    relatedPostMortems:
-      - "pm-api-gateway-oom-20260205"
-      - "pm-api-gateway-oom-20260210"
-    pattern: "Recurring oom_kill on Deployment/api-gateway (3 occurrences in 30 days)"
-  gitOpsContext: "Helm release 'api-gateway' chart=api-gw version=2.1.0 status=deployed revision=15"
-  logAnalysisSummary: "1 Go panic stack trace; 8 critical error patterns (resource/connectivity)"
-  cascadeChain:
-    - "production/api-gateway(root_cause)"
-    - "production/frontend(victim)"
-  # Feedback do dev (preenchido manualmente após revisão)
-  feedback:
-    overrideRootCause: ""          # vazio = concorda com a IA
-    remediationAccuracy: 4         # 1-5 scale
-    comments: "Boa análise, mas poderia ter sugerido AdjustResources antes do restart"
-    providedBy: "sre@team.com"
-    providedAt: "2026-02-17T09:00:00Z"
-```
-
-#### Campos do PostMortem Status
-
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `state` | PostMortemState | Estado: Open, InReview, Closed |
-| `summary` | string | Resumo do incidente gerado pela IA |
-| `rootCause` | string | Causa raiz determinada pela IA |
-| `impact` | string | Impacto do incidente |
-| `timeline` | []TimelineEvent | Linha do tempo (detected, analyzed, action_executed, resolved) |
-| `actionsExecuted` | []ActionRecord | Ações executadas com resultado |
-| `lessonsLearned` | []string | Lições aprendidas |
-| `preventionActions` | []string | Ações preventivas sugeridas |
-| `duration` | string | Duração total do incidente |
-| `generatedAt` | Time | Quando o PostMortem foi gerado |
-| `reviewedAt` | Time | Quando o PostMortem foi revisado por humano |
-| `metricSnapshots` | []MetricSnapshot | Métricas Prometheus capturadas antes/durante/depois do incidente |
-| `blastRadius` | []BlastRadiusEntry | Serviços e recursos impactados pelo incidente |
-| `gitCorrelation` | GitCorrelation | Commit suspeito correlacionado ao incidente (SHA, autor, arquivos, confiança) |
-| `sliImpact` | string | Impacto nos SLIs e error budgets |
-| `errorBudgetBurned` | float64 | Percentual de error budget consumido |
-| `trending` | TrendingInfo | Informação de padrão recorrente (contagem, janela, PostMortems relacionados) |
-| `feedback` | DevFeedback | Feedback humano (override de causa raiz, accuracy 1-5, comentários) |
-| `gitOpsContext` | string | Estado do Helm/ArgoCD/Flux no momento do incidente |
-| `logAnalysisSummary` | string | Resumo dos achados da análise de logs |
-| `cascadeChain` | []string | Cadeia de cascade failure se aplicável |
-
-#### Matching de Runbooks (Tiered)
-
-```text
-Tier 1: SignalType + Severity + ResourceKind (match exato, preferido)
-Tier 2: Severity + ResourceKind (fallback quando signal não bate)
-```
-
-#### Prioridade de Remediação
-
-```text
-1. Runbook manual existente (match tiered)
-2. Runbook auto-gerado pela IA (materializado como CR reutilizável)
-3. Remediação agêntica por IA (loop observe-decide-act, gera PostMortem + Runbook)
-4. Escalonamento (apenas quando agêntico falha após max tentativas)
-```
-
-
-
-### SourceRepository (Code-Aware Diagnostics)
-
-Vincula um workload Kubernetes ao seu repositório de código-fonte. Quando configurado, a IA recebe contexto de código durante análise de incidentes: commits recentes correlacionados ao timestamp, trechos de código referenciados em stack traces, e arquivos de configuração (Dockerfile, values.yaml).
-
-<Note>
-**Validação de entrada (hardening):** `spec.url` aceita apenas as formas `https://`, `ssh://` ou `git@host:path`, e `spec.branch` é restrito a `[A-Za-z0-9._/-]` sem `-` inicial — fechando o vetor de injeção de argumento no git (ex.: `--upload-pack`). Leitura de trechos referenciados em stack traces é confinada ao clone do repositório via `os.Root` (sem traversal nem escape por symlink). URLs ou branches fora do padrão fazem o sync falhar com erro explícito no status.
-</Note>
-
-<Tabs>
-  <Tab title="Token Auth (GitHub PAT)">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: SourceRepository
-    metadata:
-      name: api-gateway-repo
-      namespace: production
-    spec:
-      url: "https://github.com/myorg/api-gateway.git"
-      branch: main
-      authType: token
-      secretRef: git-token       # Secret com key "token"
-      resource:
-        kind: Deployment
-        name: api-gateway
-        namespace: production
-      paths: ["cmd/", "internal/"]
-      dockerfile: "Dockerfile"
-      language: "Go"
-      syncIntervalMinutes: 30
-    ---
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: git-token
-      namespace: production
-    type: Opaque
-    stringData:
-      token: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    ```
-  </Tab>
-  <Tab title="SSH Key">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: SourceRepository
-    metadata:
-      name: payment-service-repo
-      namespace: production
-    spec:
-      url: "git@github.com:myorg/payment-service.git"
-      branch: main
-      authType: ssh
-      secretRef: git-ssh-key     # Secret com key "ssh-key"
-      resource:
-        kind: Deployment
-        name: payment-service
-        namespace: production
-      language: "Java"
-    ---
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: git-ssh-key
-      namespace: production
-    type: Opaque
-    data:
-      ssh-key: <base64-encoded-private-key>
-    ```
-  </Tab>
-  <Tab title="Basic Auth">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: SourceRepository
-    metadata:
-      name: worker-repo
-      namespace: batch
-    spec:
-      url: "https://gitlab.internal.com/team/worker.git"
-      branch: develop
-      authType: basic
-      secretRef: git-basic-auth  # Secret com keys "username" e "password"
-      resource:
-        kind: Deployment
-        name: worker
-        namespace: batch
-      paths: ["src/"]
-      language: "Python"
-    ---
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: git-basic-auth
-      namespace: batch
-    type: Opaque
-    stringData:
-      username: "deploy-bot"
-      password: "xxxxxxxxxxxx"
-    ```
-  </Tab>
-  <Tab title="Public Repo (no auth)">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: SourceRepository
-    metadata:
-      name: oss-frontend-repo
-      namespace: staging
-    spec:
-      url: "https://github.com/myorg/frontend.git"
-      branch: main
-      authType: none             # repo público, sem auth
-      resource:
-        kind: Deployment
-        name: frontend
-        namespace: staging
-      paths: ["src/", "pages/"]
-      language: "TypeScript"
-      syncIntervalMinutes: 60    # sync menos frequente para staging
-    ```
-  </Tab>
-  <Tab title="StatefulSet (Database)">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: SourceRepository
-    metadata:
-      name: postgres-migrations-repo
-      namespace: databases
-    spec:
-      url: "https://github.com/myorg/db-migrations.git"
-      branch: main
-      authType: token
-      secretRef: git-token
-      resource:
-        kind: StatefulSet         # funciona com qualquer resource kind
-        name: postgres
-        namespace: databases
-      paths: ["migrations/", "schemas/"]
-      dockerfile: "Dockerfile.migrate"
-    ```
-  </Tab>
-</Tabs>
-
-**O que o operator faz com o SourceRepository:**
-
-1. **Clone shallow** do repositório (depth 50) e sync periódico (configurável via `syncIntervalMinutes`)
-2. **Indexa** linguagens detectadas, entrypoints (main.go, app.py, index.ts, etc.), config files (Dockerfile, values.yaml, Chart.yaml)
-3. **Correlação temporal**: encontra commits nos 30 min antes do incidente
-4. **Commit suspeito**: identifica o commit mais provável de ter causado o problema (score por proximidade temporal + volume de mudanças)
-5. **Extração de código**: quando stack traces referenciam arquivos (ex: `handler.go:42`), extrai trechos com contexto de 5 linhas antes/depois
-6. **Feed para IA**: todo o contexto é incluído no prompt de análise
-
-<Note>
-O repositório é clonado localmente no operator pod. Para repos privados, crie um Secret com a chave correspondente ao `authType` escolhido e referencie em `secretRef`. O operator suporta repos **HTTPS** (token/basic) e **SSH** (ssh-key).
-</Note>
-
----
-
-## Correlation Engine
-
-O motor de correlação agrupa anomalias em issues usando:
-
-### Risk Scoring
-
-Cada tipo de sinal tem um peso:
-
-| Sinal | Peso |
-|-------|------|
-| `oom_kill` | 30 |
-| `error_rate` | 25 |
-| `deploy_failing` | 25 |
-| `latency_spike` | 20 |
-| `pod_restart` | 20 |
-| `pod_not_ready` | 20 |
-
-O risk score é a soma dos pesos das anomalias correlacionadas (máximo 100).
-
-### Classificação de Severidade
-
-| Risk Score | Severidade |
-|-----------|-----------|
-| >= 80 | Critical |
-| >= 60 | High |
-| >= 40 | Medium |
-| &lt; 40 | Low |
-
-### Agrupamento
-
-- Anomalias no **mesmo recurso** (deployment + namespace) dentro da **mesma janela temporal** são agrupadas no mesmo Issue
-- **Incident ID** deterministico: hash do recurso + tipo de sinal (evita duplicatas)
-
-
-
-## WatcherBridge
-
-O `WatcherBridge` e o componente que conecta o servidor ChatCLI ao operator:
-
-- **Stream primeiro**: Mantém aberto o stream `StreamAlerts` do servidor e transforma cada alerta em Anomaly no instante em que chega. O stream abre com os alertas ativos agora, então nada gerado enquanto a bridge estava fora se perde
-- **Liveness**: O servidor manda heartbeat a cada 15 segundos; 60 segundos de silêncio reabrem o stream. As reaberturas recuam de 1s a 30s, e três tentativas silenciosas seguidas derrubam a conexão para redescobrir a Instance (endereço ou credenciais podem ter mudado)
-- **Fallback por polling**: Um servidor sem `StreamAlerts` (release antigo) responde `UNIMPLEMENTED`; a bridge então consulta `GetAlerts` a cada 30 segundos e volta a sondar o stream depois de 10 minutos, então um upgrade do servidor é aproveitado sem reiniciar o operator. `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll` (valor `alertTransport` do chart) força o polling
-- **Resync**: Se o servidor derruba a bridge por ficar para trás (`ABORTED`), o stream é reaberto na hora com o snapshot atual; o dedup absorve as repetições
-- **Descoberta**: Localiza o servidor via Instance CRs (primeiro Instance com endpoint gRPC pronto)
-- **Dedup**: Hash SHA256 do tipo+deployment+namespace (sem componente temporal — um problema contínuo gera apenas uma Anomaly). TTL de 2 horas
-- **Invalidação de dedup**: Quando Issue atinge estado terminal (Resolved/Escalated), entradas de dedup para o recurso são removidas, permitindo detecção imediata de recorrência
-- **Poda**: Remove hashes expirados automaticamente (> 2h)
-- **Criação**: Converte alertas em Anomaly CRs com nomes K8s válidos
-
-
-
-## Exemplos de Uso
-
-<Tabs>
-  <Tab title="Minimo (sem AIOps)">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Instance
-    metadata:
-      name: chatcli-simple
-    spec:
-      provider: OPENAI
-      apiKeys:
-        name: chatcli-api-keys
-    ```
-  </Tab>
-  <Tab title="AIOps Completo">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Instance
-    metadata:
-      name: chatcli-aiops
-    spec:
-      provider: CLAUDEAI
-      apiKeys:
-        name: chatcli-api-keys
-      server:
-        port: 50051
-      watcher:
-        enabled: true
-        interval: "15s"
-        maxContextChars: 32000
-        targets:
-          - deployment: api-gateway
-            namespace: production
-            metricsPort: 9090
-            metricsFilter: ["http_*", "grpc_*"]
-          - deployment: auth-service
-            namespace: production
-            metricsPort: 9090
-          - deployment: worker
-            namespace: batch
-          - deployment: ml-inference
-            namespace: ml
-            metricsPort: 8080
-      resources:
-        requests:
-          cpu: 200m
-          memory: 256Mi
-        limits:
-          cpu: "1"
-          memory: 1Gi
-      persistence:
-        enabled: true
-        size: 5Gi
-    ```
-  </Tab>
-  <Tab title="Com Fallback Multi-Provider">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Instance
-    metadata:
-      name: chatcli-resilient
-      namespace: chatcli-system
-    spec:
-      provider: OPENAI
-      model: gpt-4o
-      fallback:
-        enabled: true
-        providers:
-          - name: CLAUDEAI
-            model: claude-sonnet-4-6
-          - name: GOOGLEAI
-            model: gemini-2.5-flash
-        maxRetries: 2
-        cooldownBase: "30s"
-        cooldownMax: "5m"
-      apiKeys:
-        name: chatcli-api-keys
-      watcher:
-        enabled: true
-        targets:
-          - deployment: api-gateway
-            namespace: production
-    ---
-    # Secret com keys de TODOS os providers do fallback
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: chatcli-api-keys
-      namespace: chatcli-system
-    type: Opaque
-    stringData:
-      OPENAI_API_KEY: "sk-xxx"
-      ANTHROPIC_API_KEY: "sk-ant-xxx"
-      GOOGLEAI_API_KEY: "xxx"
-    ```
-
-    Quando o OpenAI falha (rate limit, timeout), o sistema tenta automaticamente Claude, depois Google AI. Cada provedor tem até 2 retentativas antes de ir para o próximo. Após falha, o provedor entra em cooldown exponencial (30s → 1m → 2m → ... até 5m max).
-  </Tab>
-  <Tab title="Runbook Manual (opcional)">
-    ```yaml
-    apiVersion: platform.chatcli.io/v1alpha1
-    kind: Runbook
-    metadata:
-      name: oom-kill-runbook
-      namespace: production
-    spec:
-      description: "Procedure for OOMKilled containers"
-      trigger:
-        signalType: oom_kill
-        severity: critical
-        resourceKind: Deployment
-      steps:
-        - name: Restart pods
-          action: RestartDeployment
-          description: "Restart to reclaim leaked memory"
-        - name: Scale up
-          action: ScaleDeployment
-          description: "Add replicas to distribute memory pressure"
-          params:
-            replicas: "5"
-      maxAttempts: 2
-    ```
-  </Tab>
-  <Tab title="Secret de API Keys">
-    ```yaml
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: chatcli-api-keys
-    type: Opaque
-    stringData:
-      ANTHROPIC_API_KEY: "sk-ant-xxx"
-      # OPENAI_API_KEY: "sk-xxx"
-      # GOOGLEAI_API_KEY: "xxx"
-    ```
-  </Tab>
-</Tabs>
-
-
-
-## Status e Monitoramento
+O operator escolhe a própria credencial nesta ordem: `server.token`, depois `security.operatorTokenRef`, depois `security.jwtSecretRef` (tokens emitidos por ele), depois `security.operatorClientCertSecretName`. Um certificado de cliente, quando configurado, é apresentado em toda conexão além de qualquer credencial bearer.
 
 <AccordionGroup>
-  <Accordion title="Verificar Instancias">
-    ```bash
-    kubectl get instances
-    ```
-    ```text
-    NAME            READY   REPLICAS   PROVIDER    AGE
-    chatcli-aiops   true    1          CLAUDEAI    5m
-    ```
+  <Accordion title="Token compartilhado">
+    A opção mais simples, usada no passo a passo. Quem tem o token é `admin` no servidor (subject `legacy-token`), e todos os chamadores por token dividem um único balde de rate limit. Para trocar, atualize o Secret: os pods reiniciam e o operator passa a usar o novo valor.
   </Accordion>
-  <Accordion title="Verificar Issues Ativos">
+  <Accordion title="JWT HS256 (o operator emite os próprios tokens)">
     ```bash
-    kubectl get issues -A
+    kubectl -n chatcli create secret generic chatcli-jwt --from-literal=secret="$(openssl rand -hex 48)"
     ```
-    ```text
-    NAME                                    SEVERITY   STATE         RISK   AGE
-    api-gateway-pod-restart-1771276354      high       Remediating   65     2m
-    worker-oom-kill-3847291023              critical   Analyzing     90     30s
+
+    ```yaml
+    spec:
+      server:
+        security:
+          jwtSecretRef:
+            name: chatcli-jwt
+            key: secret
+          jwtIssuer: "https://auth.example.com"   # opcional: iss obrigatório
+          jwtAudience: "chatcli"                  # opcional: aud obrigatório
     ```
+
+    Os tokens precisam ter `exp` (sem ele o token é recusado), são conferidos com 30 segundos de tolerância de relógio e respeitam `nbf`; `iss` e `aud` são conferidos quando configurados. A claim `role` mapeia `admin` para admin, `operator` e `user` para user, `viewer` e `readonly` para somente leitura; sem a claim, user. O operator emite os próprios tokens (`sub: chatcli-operator`, `role: operator`, uma hora, renovados após 45 minutos) com `jwtIssuer` e `jwtAudience`. Como emitir tokens para pessoas: [autenticação no Server Mode](/pt/features/server-mode#autenticação-do-servidor).
   </Accordion>
-  <Accordion title="Verificar Insights da IA">
-    ```bash
-    kubectl get aiinsights -A
+  <Accordion title="JWT RS256 (seu provedor de identidade assina)">
+    ```yaml
+    spec:
+      server:
+        security:
+          jwtPublicKeyRef:            # chave(s) pública(s) PEM que o servidor usa para validar
+            name: chatcli-jwt-public
+            key: public.pem
+          operatorTokenRef:           # um JWT que seu IdP emitiu para o operator
+            name: chatcli-operator-jwt
+            key: token
     ```
-    ```text
-    NAME                                           ISSUE                                   PROVIDER   CONFIDENCE   AGE
-    api-gateway-pod-restart-1771276354-insight      api-gateway-pod-restart-1771276354      CLAUDEAI   0.87         1m
-    ```
+
+    O operator não consegue assinar tokens RS256, então precisa de `operatorTokenRef` (ou de um certificado de cliente). Esse token também precisa de `exp`, então mantenha o Secret renovado antes de expirar (por exemplo com External Secrets); o operator reconecta quando o Secret muda, sem reiniciar os pods do servidor.
   </Accordion>
-  <Accordion title="Verificar Planos de Remediação">
-    ```bash
-    kubectl get remediationplans -A
+  <Accordion title="mTLS (certificados de cliente)">
+    ```yaml
+    spec:
+      server:
+        tls:
+          enabled: true
+          secretName: chatcli-tls
+          clientCASecretName: chatcli-client-ca   # Secret com ca.crt
+        security:
+          mtlsRole: user                          # papel de quem chega só com certificado
+          operatorClientCertSecretName: chatcli-operator-client   # tls.crt + tls.key assinados por essa CA
     ```
-    ```text
-    NAME                                          ISSUE                                   ATTEMPT   STATE       AGE
-    api-gateway-pod-restart-1771276354-plan-1      api-gateway-pod-restart-1771276354      1         Completed   1m
-    ```
-  </Accordion>
-  <Accordion title="Verificar PostMortems">
-    ```bash
-    kubectl get postmortems -A
-    ```
-    ```text
-    NAME                                          ISSUE                                   SEVERITY   STATE   AGE
-    pm-api-gateway-pod-restart-1771276354         api-gateway-pod-restart-1771276354      high       Open    30s
-    ```
-  </Accordion>
-  <Accordion title="Verificar Anomalias">
-    ```bash
-    kubectl get anomalies -A
-    ```
-    ```text
-    NAME                                               SIGNAL        SOURCE    SEVERITY   AGE
-    watcher-highrestartcount-api-gateway-1234567890     pod_restart   watcher   warning    3m
-    watcher-oomkilled-worker-9876543210                 oom_kill      watcher   critical   1m
-    ```
+
+    O servidor passa a exigir um certificado de cliente válido em **toda** conexão, inclusive dos usuários da CLI. Quem chega só com certificado é identificado pelo CN (ou pelo primeiro SAN URI/DNS) e recebe `mtlsRole` (`viewer`, `readonly`, `user`, `operator` ou `admin`; padrão do servidor `user`); um token bearer enviado junto tem precedência. Emita os certificados de cliente com `extendedKeyUsage = clientAuth` a partir da mesma CA do passo de TLS.
   </Accordion>
 </AccordionGroup>
 
+<Warning>
+**O JWT falha fechado.** Quando há material JWT configurado mas ele não carrega (uma chave pública que não é um PEM RSA válido, ou um `CHATCLI_JWT_SECRET` que parece material de chave mas não pode ser lido):
 
+- se o JWT é a **única** credencial, o servidor se recusa a subir (`refusing to start: CHATCLI_JWT_PUBLIC_KEY is set but no RSA public key could be loaded: ...`) e o pod entra em crash loop até a chave ser corrigida;
+- se há um token compartilhado ou uma CA de cliente ao lado, o servidor sobe, o token e os certificados continuam funcionando e os chamadores JWT são recusados.
+
+Ele nunca cai para servir sem autenticação.
+</Warning>
+
+Servidores só em loopback (`security.bindAddress: "127.0.0.1"`) podem rodar sem credencial, mas aí nada fora do pod os alcança, nem o operator: `ServerReachable` fica `False`. Só faz sentido para um servidor acessado a partir de um sidecar.
+
+## Referência do spec da Instance
+
+Só `spec.provider` é obrigatório. O schema do CRD é a única validação: não existe admission webhook.
+
+### Nível raiz
+
+| Campo | Tipo | Padrão | Descrição |
+|-------|------|--------|-----------|
+| `replicas` | int32 | `1` | Pods do servidor (mínimo 0). Mais de um torna o Service headless |
+| `provider` | string | **obrigatório** | `OPENAI`, `OPENAI_ASSISTANT`, `CLAUDEAI`, `BEDROCK`, `GOOGLEAI`, `XAI`, `ZAI`, `MINIMAX`, `MOONSHOT`, `STACKSPOT`, `OLLAMA`, `COPILOT`, `OPENROUTER`. O CRD não valida por enum: um erro de digitação só aparece no log do servidor. `DEVIN` precisa da CLI local do Devin e não está disponível na imagem do servidor |
+| `model` | string | — | Modelo padrão (`--model`, `LLM_MODEL`), por exemplo `claude-sonnet-5` ou `gpt-6-sol` |
+| `image.repository` | string | `ghcr.io/diillson/chatcli` | Imagem do servidor |
+| `image.tag` | string | release do operator | Sem valor: o `CHATCLI_OPERATOR_APP_VERSION` do operator (definido pelo chart e pelo `manager.yaml`), senão `latest` |
+| `image.pullPolicy` | string | `IfNotPresent` | Política de pull |
+| `apiKeys.name` | string | — | Secret carregado inteiro via `envFrom` (opcional: o pod sobe sem ele) |
+| `resources` | ResourceRequirements | **nenhum** | Copiado como está; o operator não define requests nem limits |
+| `securityContext` | PodSecurityContext | UID 1000 não root, seccomp RuntimeDefault | Quando definido, **substitui** o padrão por inteiro |
+| `persistence` | objeto | — | `enabled`, `size` (`1Gi`), `storageClassName` |
+| `scheduling` | objeto | — | `nodeSelector`, `tolerations`, `affinity`, `imagePullSecrets`, `priorityClassName`, `podAnnotations` (as anotações de hash do operator prevalecem em conflito) |
+| `serviceAccount.annotations` | map | — | Mescladas na ServiceAccount gerenciada (IRSA `eks.amazonaws.com/role-arn`, GKE `iam.gke.io/gcp-service-account`); anotações de outras ferramentas são mantidas |
+| `extraEnv` | []EnvVar | — | Variáveis extras. Entram antes dos campos tipados, então o campo tipado vence quando os dois definem o mesmo nome |
+
+### `spec.server`
+
+| Campo | Tipo | Padrão | Descrição |
+|-------|------|--------|-----------|
+| `port` | int32 | `50051` | Porta gRPC (porta `grpc` do container, porta do Service, alvo do operator) |
+| `metricsPort` | int32 | `9090` | HTTP `/metrics` e `/healthz`. Sempre ligado: `0` vira 9090, não desliga, porque as probes dependem dele |
+| `token` | `{name, key}` | — | Token compartilhado → `CHATCLI_SERVER_TOKEN` |
+| `tls.enabled` | bool | `false` | Serve TLS (`--tls-cert`/`--tls-key` de `/etc/chatcli/tls`) |
+| `tls.secretName` | string | — | Secret com `tls.crt`, `tls.key` e, para CA privada, `ca.crt` (a raiz de confiança do operator). Obrigatório quando ligado |
+| `tls.clientCASecretName` | string | — | Secret cujo `ca.crt` valida certificados de cliente (mTLS, `/etc/chatcli/client-ca`). Ignorado sem `tls.enabled` |
+
+### `spec.server.security`
+
+| Campo | Tipo | Padrão do servidor | Descrição |
+|-------|------|--------------------|-----------|
+| `jwtSecretRef` | `{name, key}` | — | Segredo HS256 → `CHATCLI_JWT_SECRET`; o operator emite seus tokens a partir dele |
+| `jwtPublicKeyRef` | `{name, key}` | — | Chave(s) pública(s) RSA em PEM → `CHATCLI_JWT_PUBLIC_KEY` (RS256) |
+| `jwtIssuer` / `jwtAudience` | string | — | Claims `iss` / `aud` obrigatórias; gravadas nos tokens emitidos |
+| `operatorTokenRef` | `{name, key}` | — | Credencial que o operator apresenta (JWT externo ou token dedicado) |
+| `operatorClientCertSecretName` | string | — | Secret TLS (`tls.crt`, `tls.key`) que o operator apresenta como certificado de cliente |
+| `mtlsRole` | enum | `user` | `viewer`, `readonly`, `user`, `operator`, `admin` para quem chega só com certificado → `CHATCLI_MTLS_ROLE` |
+| `rateLimitRps` / `rateLimitBurst` | int32 | `10` / `20` | Token bucket por chamador (chaveado pelo subject autenticado) |
+| `maxRecvMsgSize` / `maxSendMsgSize` | int32 | 50 MB | Limites de mensagem gRPC em bytes |
+| `maxConcurrentStreams` | int32 | `100` | Streams por conexão |
+| `bindAddress` | string | todas as interfaces num pod | `127.0.0.1` deixa o servidor só em loopback (veja acima) |
+| `auditLogPath` | string | — | Arquivo de auditoria JSON-lines encadeado por hash. Precisa ser absoluto **e gravável**: o sistema de arquivos raiz é somente leitura, então use um caminho em `/home/chatcli/.chatcli/` (emptyDir) ou `/home/chatcli/.chatcli/sessions/` (o PVC) |
+| `debug` | bool | `false` | Log verboso do servidor |
+| `enableReflection` | bool | `false` | gRPC server reflection (`CHATCLI_GRPC_REFLECTION=true`). Só para depuração |
+
+### `spec.watcher`
+
+| Campo | Tipo | Padrão | Descrição |
+|-------|------|--------|-----------|
+| `enabled` | bool | `false` | Roda o watcher no pod do servidor |
+| `targets[]` | lista | — | Recursos a observar (abaixo). Quando definido, `deployment`/`namespace` são ignorados |
+| `deployment` / `namespace` | string | — | Alvo único legado (só RBAC namespaced) |
+| `interval` | string | `30s` | Intervalo de coleta |
+| `window` | string | `2h` | Janela de observação |
+| `maxLogLines` | int32 | `100` | Linhas de log por pod |
+| `maxContextChars` | int32 | `32000` | Orçamento de contexto enviado ao LLM (modo multi-alvo) |
+
+`targets[]`: `name` (nome do recurso; `deployment` é o alias obsoleto), `kind` (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`; padrão `Deployment`), `namespace` (obrigatório), `metricsPort` (0 = sem métricas), `metricsPath` (padrão do servidor `/metrics`), `metricsFilter` (padrões glob).
+
+### `spec.fallback`
+
+| Campo | Tipo | Padrão | Descrição |
+|-------|------|--------|-----------|
+| `enabled` | bool | **obrigatório** | Gera a cadeia |
+| `providers[]` | `{name, model}` | **obrigatório** | Provedores em ordem; `name` é validado por enum (os mesmos valores de `provider`, mais `DEVIN`) |
+| `maxRetries` | int32 | `2` | Tentativas por provedor. `0` é tratado como ausente e mantém o padrão 2 do servidor |
+| `cooldownBase` / `cooldownMax` | string | `30s` / `5m` | Cooldown exponencial de um provedor que falhou |
+
+O operator coloca `spec.provider` (com `spec.model`) na frente, a menos que a lista já o cite, caso em que a sua ordem é mantida. O servidor só monta a cadeia quando pelo menos dois dos provedores têm credencial, e a usa em requisições que não trazem credencial nem provedor explícito próprios. Coloque a chave de todos os provedores no Secret de `apiKeys`. Detalhes do comportamento: [Provider Fallback](/pt/features/provider-fallback).
+
+```yaml
+spec:
+  provider: CLAUDEAI
+  model: claude-sonnet-5
+  fallback:
+    enabled: true
+    providers:            # cadeia efetiva: CLAUDEAI, OPENAI, GOOGLEAI
+      - name: OPENAI
+        model: gpt-6-sol
+      - name: GOOGLEAI
+        model: gemini-3.8-flash
+```
+
+### `spec.aiops`
+
+O pipeline de AIOps lê essas configurações da Instance de onde o WatcherBridge recebe os alertas (labels `platform.chatcli.io/instance` e `platform.chatcli.io/instance-namespace` em cada Anomaly e Issue); na falta delas, vale a primeira Instance pronta.
+
+| Campo | Padrão | Faixa | Descrição |
+|-------|--------|-------|-----------|
+| `maxRemediationAttempts` | `5` | 1–10 | Tentativas antes de a Issue escalar |
+| `resolutionCooldownMinutes` | `10` | 0–120 | Período de silêncio após uma resolução antes que o mesmo recurso abra nova Issue; `0` desliga |
+| `dedupTTLMinutes` | `30` | 5–1440 | Por quanto tempo o bridge lembra de um alerta |
+| `enableAutoResolve` | `true` | — | Resolve Issues escaladas quando o recurso se recupera (Deployment, StatefulSet, DaemonSet, Job quando `Complete`, Node quando `Ready`) |
+| `agenticMaxSteps` | `10` | 3–30 | Passos por tentativa de remediação agêntica (uma chamada ao LLM cada) |
+
+### `spec.features` e `spec.pipeline`
+
+| Campo | Gera | Observações |
+|-------|------|-------------|
+| `features.memory.enabled` / `.mode` | `CHATCLI_MEMORY_ENABLED`, `CHATCLI_MEMORY_MODE` | `mode`: `index`, `pull` ou `off` |
+| `features.knowledge` | `CHATCLI_CHAT_KNOWLEDGE` | Sem valor mantém o padrão do servidor |
+| `features.budget.sessionUSD` / `.dailyUSD` / `.hardStop` | `CHATCLI_SESSION_BUDGET_USD`, `CHATCLI_DAILY_BUDGET_USD`, `CHATCLI_BUDGET_HARD_STOP` | Limites de gasto |
+| `features.hub` | `CHATCLI_HUB_ENABLED` | Conversation hub; sem valor mantém o padrão do servidor |
+| `features.caBundleSecretName` | `ca.crt` do Secret em `/etc/chatcli/ca`, `CHATCLI_CA_BUNDLE` | CA corporativa para toda conexão TLS de saída |
+| `features.allowHTTPProviders` | `CHATCLI_ALLOW_HTTP_PROVIDERS=true` | Permite endpoints de provedor em HTTP puro |
+| `features.encryptionKeyRef` | `CHATCLI_ENCRYPTION_KEY` | Chave de criptografia em repouso dos stores do servidor |
+| `features.logRotation.*` | `CHATCLI_LOG_MAX_SIZE_MB`, `_MAX_BACKUPS`, `_MAX_AGE_DAYS`, `_COMPRESS` | Rotação do arquivo de log do servidor (padrões 100 MB, 3 backups, 28 dias, compactado); as mesmas entradas vão também para o stderr, então o `kubectl logs` as carrega |
+| `pipeline.enabled` | `CHATCLI_SERVER_PIPELINE=true` | Serve as [RPCs de pipeline](/pt/features/server-mode#rpcs-de-pipeline) (as RPCs de execução exigem o papel admin) |
+
+### `spec.mcp`, `spec.agents`, `spec.plugins`
+
+| Campo | Descrição |
+|-------|-----------|
+| `mcp.enabled` | Monta `/etc/chatcli/mcp/mcp_servers.json` e passa `--mcp-config` |
+| `mcp.servers[]` | `name`, `transport` (`stdio` ou `sse`), `command`, `args`, `env`, `url`, `enabled` (padrão `true`), `overrides` (ferramentas embutidas que o servidor substitui). Gerado no ConfigMap `<name>-mcp` |
+| `mcp.existingConfigMap` | Seu próprio ConfigMap com a chave `mcp_servers.json`; `servers` passa a ser ignorado |
+| `agents.configMapRef` | ConfigMap de arquivos `.md` de agentes, montado somente leitura em `/home/chatcli/.chatcli/agents` |
+| `agents.skillsConfigMapRef` | ConfigMap de arquivos `.md` de skills, montado em `/home/chatcli/.chatcli/skills` |
+| `plugins.pvcName` | PVC existente com binários de plugin, montado em `/home/chatcli/.chatcli/plugins` (prevalece sobre `image`) |
+| `plugins.image` | Imagem cujo `/plugins/*` um init container (`plugin-loader`) copia para um emptyDir de 500Mi |
+
+### Status
+
+| Campo | Descrição |
+|-------|-----------|
+| `ready` | Réplicas prontas > 0 e ≥ `spec.replicas` |
+| `replicas` / `readyReplicas` | Vindos do Deployment |
+| `conditions` | Veja [Condições da Instance](#condições-da-instance) |
+| `observedGeneration` | Última geração reconciliada |
+| `serverVersion` | Versão que o servidor informou na última sonda bem-sucedida (mantida após uma sonda que falhou) |
+| `serverProbeTime` | Quando o resultado da sonda foi registrado pela última vez |
+
+## O que o operator cria
+
+Tudo recebe o nome da Instance, os labels `app.kubernetes.io/name: chatcli`, `app.kubernetes.io/instance: <name>`, `app.kubernetes.io/managed-by: chatcli-operator`, e pertence à Instance (é apagado junto com ela).
+
+| Recurso | Nome | Observações |
+|---------|------|-------------|
+| ServiceAccount | `<name>` | Leva as `serviceAccount.annotations` |
+| ConfigMap | `<name>` | Provedor, modelo, porta, cadeia de fallback, ajustes de `security.*`; carregado via `envFrom` |
+| ConfigMap | `<name>-watch-config` | Alvos do watcher, quando `targets` está definido |
+| ConfigMap | `<name>-mcp` | Servidores MCP, quando `mcp.enabled` sem `existingConfigMap` |
+| Service | `<name>` | Portas `grpc` e `metrics`. `ClusterIP`, ou headless (`clusterIP: None`) com `replicas` > 1; o operator apaga e recria o Service na transição |
+| Deployment | `<name>` | Veja abaixo |
+| PersistentVolumeClaim | `<name>-sessions` | Com `persistence.enabled`: ReadWriteOnce, criado uma vez e nunca redimensionado, montado em `/home/chatcli/.chatcli/sessions` |
+| Role + RoleBinding | `<name>-watcher` | Watcher ligado, todos os alvos no namespace da Instance |
+| ClusterRoleBinding | `<namespace>-<name>-watcher` | Alvos do watcher em outros namespaces; vincula a ClusterRole compartilhada `chatcli-watcher`. Removido pelo finalizer da Instance |
+
+**O Deployment** roda `chatcli server --port <port> --metrics-port <metricsPort> --provider ... [--model ...] [--tls-cert ... --tls-key ... [--tls-client-ca ...]] [--mcp-config ...] [--watch-config ... | --watch-deployment ...]` com:
+
+- probes em `GET /healthz` da porta `metrics` (HTTP puro, sem credencial): startup a cada 5s por até 5 minutos, readiness a cada 10s (sai do Service após 30s de falhas), liveness a cada 20s (reinicia após 2 minutos);
+- security context do pod `runAsNonRoot`, UID 1000, `seccompProfile: RuntimeDefault` (a menos que haja `spec.securityContext`) e, em todo container, inclusive o init container `plugin-loader`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` e todas as capabilities removidas: o pod passa no Pod Security Standard `restricted`;
+- emptyDirs graváveis `/tmp` (100Mi) e `/home/chatcli/.chatcli` (200Mi); tudo o que estiver fora do PVC de sessões se perde quando o pod reinicia;
+- `HOME=/home/chatcli`, o ConfigMap `<name>` e o Secret de `apiKeys` como `envFrom`, depois `extraEnv`, depois as variáveis tipadas de credencial e features. As referências a Secret são opcionais, então um Secret ausente não trava o pod: ele sobe sem o valor.
+
+### Gatilhos de rollout
+
+O pod lê a configuração na subida, então o operator grava hashes no template do pod e qualquer mudança reinicia os pods:
+
+| Anotação | Muda quando |
+|----------|-------------|
+| `chatcli.io/configmap-hash` | O ConfigMap `<name>` muda (provedor, modelo, porta, fallback, `security.*`) |
+| `chatcli.io/watch-config-hash` | Os alvos do watcher mudam |
+| `chatcli.io/secret-hash` | Qualquer chave do Secret de `apiKeys` muda, ou o Secret aparece |
+| `chatcli.io/tls-hash` | Qualquer chave do Secret de TLS muda (renovação do certificado) |
+| `chatcli.io/credentials-hash` | A chave referenciada de `server.token`, `jwtSecretRef`, `jwtPublicKeyRef`, o `ca.crt` de `tls.clientCASecretName` ou `features.caBundleSecretName`, `features.encryptionKeyRef`, ou qualquer `secretKeyRef` de `extraEnv` muda, aparece ou some |
+
+Mudanças no próprio template do pod (imagem, recursos, env, scheduling) reiniciam os pods como em qualquer Deployment. Todo Secret referenciado pela Instance é observado, então criar ou trocar um deles reconcilia a Instance na hora.
+
+**O que atualiza só o operator:** `operatorTokenRef` e `operatorClientCertSecretName` são lidos pelo operator, não pelo pod. Trocá-los não reinicia o servidor; o operator refaz a conexão com o material novo (a sonda de status disca do zero toda vez).
+
+**O que não reinicia os pods:** edições nos ConfigMaps de `agents.configMapRef`, `agents.skillsConfigMapRef` e `mcp.existingConfigMap`, mudanças em `mcp.servers` e uma imagem de plugins nova com a mesma tag. Rode `kubectl -n <ns> rollout restart deploy/<name>` depois de mudá-los.
+
+## Rodando em produção
+
+### Checklist
+
+- [ ] O certificado TLS cobre `<name>.<namespace>.svc.cluster.local` (mais os nomes curtos e, se exposto, o nome externo), e o Secret tem `ca.crt` para CA privada.
+- [ ] `TLSConfigured`, `AuthenticationConfigured`, `OperatorCredentialConfigured`, `Available` e `ServerReachable` estão todas `True`.
+- [ ] Uma credencial por público: token compartilhado só para automações que você confia como admin; JWTs (HS256 ou RS256) ou mTLS para pessoas.
+- [ ] `spec.resources` com requests e limits em toda Instance.
+- [ ] As API keys do dashboard estão em `chatcli-operator-secrets`, uma por time com o menor papel necessário, e `security.devMode` está desligado.
+- [ ] NetworkPolicies restringem os pods da Instance e do operator, inclusive as portas de métricas em HTTP puro.
+- [ ] Imagens fixadas (versão do chart do operator; `spec.image.tag` só se quiser desacoplar o servidor da release do operator).
+- [ ] Só uma Instance no cluster deve conduzir o AIOps.
+- [ ] O allowlist do ExecDiagnostic cobre as portas de health dos seus workloads.
+- [ ] Recursos customizados e Secrets referenciados estão no backup.
+
+### TLS e RBAC
+
+- **TLS em tudo que o operator conversa.** O operator disca nas Instances só com TLS 1.3, validando o certificado contra o `ca.crt` da Instance (ou as CAs do sistema, ou `security.grpcTLS.caFile`). O servidor também só aceita TLS 1.3. Faça a rotação com o cert-manager ou trocando o Secret: os pods reiniciam (`chatcli.io/tls-hash`) e o operator confia no novo `ca.crt` na próxima conexão.
+- **RBAC do operator.** A ClusterRole do operator é ampla por necessidade: acesso total aos seus 17 CRDs; Deployments, Services, ConfigMaps, ServiceAccounts e PVCs; leitura e escrita de Secrets em todo o cluster (ele lê os Secrets referenciados e executa `RotateSecret`); pods (inclusive create, para os pods de stress do chaos), eviction de pods (o `DrainNode` usa a Eviction API), logs, e eventos do core e de `events.k8s.io`; nodes (cordon/drain); workloads, HPAs, Ingresses e NetworkPolicies para remediação; leases para o leader election.
+- **Sem escalada de RBAC em tempo de execução.** O operator nunca cria nem altera ClusterRoles. Ele só pode fazer `bind` das pré-provisionadas `chatcli-watcher` e `chatcli-role-{viewer,operator,admin,superadmin}` (restrito por `resourceNames`), então um operator comprometido não consegue vincular uma ClusterRole mais privilegiada. As ClusterRoles `chatcli-role-*` existem para você vincular a pessoas; o operator não vincula nada a usuários.
+- **Barreiras da remediação.** O `ApplyManifest` só cria ou atualiza os 17 kinds permitidos (Deployment, StatefulSet, DaemonSet, ReplicaSet, Service, ConfigMap, HorizontalPodAutoscaler, PodDisruptionBudget, Ingress, CronJob, Job, ServiceMonitor, PrometheusRule, PodMonitor, ServiceEntry, VirtualService, DestinationRule; estenda com `security.allowedResourceTypes`) no namespace da Issue, e só onde o RBAC do próprio operator permite a escrita: o chart concede escrita em Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, ConfigMaps, HPAs, Ingresses e NetworkPolicies, então kinds como ServiceMonitor ou VirtualService também precisam de uma ClusterRole que você adicione. O `ExecDiagnostic` fica limitado ao allowlist. Os logs passam por 18 padrões de limpeza (chaves de nuvem e de API, JWTs, tokens bearer, senhas, strings de conexão, chaves privadas, endereços IPv4, e-mails, segredos longos em base64/hex) antes de chegarem ao LLM.
+
+### Credenciais e rotação
+
+| Secret | Efeito da rotação |
+|--------|-------------------|
+| `apiKeys` (chaves de LLM) | Os pods reiniciam |
+| Secret de TLS | Os pods reiniciam; o operator relê o `ca.crt` |
+| `server.token`, `jwtSecretRef`, `jwtPublicKeyRef` | Os pods reiniciam; o operator reconecta com o valor novo |
+| CA de cliente, CA bundle, chave de criptografia, refs de Secret em `extraEnv` | Os pods reiniciam |
+| `operatorTokenRef`, `operatorClientCertSecretName` | Só o operator: reconecta, sem restart |
+| `chatcli-operator-secrets` (keys do dashboard) | Relido em até 30 segundos, sem restart |
+
+Trocar o token compartilhado reinicia o servidor e muda o operator ao mesmo tempo, mas todo usuário da CLI precisa do novo valor. Para rotação sem interrupção para usuários, prefira JWTs.
+
+### Recursos
+
+O operator **não** aplica requests nem limits às Instances, o que deixa os pods como BestEffort: os primeiros a serem despejados sob pressão no nó. Comece com `requests: {cpu: 250m, memory: 256Mi}` e `limits: {cpu: "1", memory: 1Gi}` e ajuste ao seu tráfego; watcher, servidores MCP e as RPCs de pipeline aumentam o consumo. O próprio operator vem com requests 100m/128Mi e limits 500m/256Mi; aumente em clusters com muitas Issues.
+
+### Alta disponibilidade
+
+- **Operator:** rode `replicaCount: 2` ou mais com `leaderElect: true`. Os controllers e o WatcherBridge rodam só no líder; a API REST e o dashboard são servidos por todas as réplicas, então o Service continua respondendo durante um failover. O chart não cria PodDisruptionBudget para o operator; crie um se você drena nós com frequência.
+- **Instances:** `replicas` > 1 torna o Service headless e o operator balanceia em round-robin entre os pods. Cada pod é um servidor independente (memória, watcher e emptyDir próprios), e o stream de alertas se prende a um pod por vez. Para uma Instance de AIOps, uma réplica costuma ser o certo.
+- **Persistência e réplicas:** o PVC de sessões é ReadWriteOnce e o Deployment usa a estratégia RollingUpdate padrão. Com `persistence.enabled`, uma segunda réplica, ou o pod extra de um rollout, agendado em outro nó não consegue anexar o volume (`Multi-Attach error`) e o rollout trava. Mantenha uma réplica com persistência e fixe-a com `scheduling.affinity` se o storage for zonal, ou rode sem persistência quando escalar horizontalmente.
+- O operator não cria PodDisruptionBudget, HorizontalPodAutoscaler nem NetworkPolicy para Instances.
+
+### Políticas de rede
+
+- **Operator:** ligue `networkPolicy.enabled` no chart (ou `make deploy-network-policy` nos manifestos crus). A entrada é liberada na porta da API (restrinja com `networkPolicy.apiIngressFrom`), na de métricas (`metricsIngressFrom`) e na de health. Com `egress: restricted`, a saída fica limitada a DNS, 443, a porta da API do Kubernetes (`kubernetesApiPort`, 6443), a porta gRPC das Instances (`instanceGrpcPort`, 50051) e a porta do Prometheus tirada de `prometheusUrl`; acrescente `egressExtraPorts` para SMTP (587/465), git via SSH (22) ou webhooks em outras portas.
+- **Instances:** o operator não cria nenhuma. Um ponto de partida:
+
+  ```yaml
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: chatcli
+    namespace: chatcli
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: chatcli
+        app.kubernetes.io/instance: chatcli
+    policyTypes: [Ingress, Egress]
+    ingress:
+      - ports: [{port: 50051, protocol: TCP}]   # gRPC: o operator e seus clientes
+        from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: chatcli-system
+      - ports: [{port: 9090, protocol: TCP}]    # métricas + /healthz (probes do kubelet, Prometheus)
+    egress:
+      - ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+      - ports: [{port: 443, protocol: TCP}, {port: 6443, protocol: TCP}]   # APIs de LLM, API do Kubernetes (watcher)
+  ```
+
+  Acrescente um `from` para os seus clientes na 50051, e saída para o `metricsPort` dos alvos do watcher quando coletar métricas deles. O tráfego das probes do kubelet fica isento de NetworkPolicy na maioria dos CNIs, mas não em todos, por isso o exemplo deixa a 9090 aberta para qualquer origem.
+
+### Pod Security
+
+Os pods da Instance e do operator atendem ao Pod Security Standard `restricted` com os padrões, então você pode rotular os namespaces com `pod-security.kubernetes.io/enforce: restricted`. Se definir `spec.securityContext`, ele substitui o padrão inteiro: mantenha `runAsNonRoot: true` e `seccompProfile: {type: RuntimeDefault}`. Com persistência num storage que não seja gravável pelo grupo, acrescente `fsGroup: 1000` para o servidor conseguir gravar as sessões.
+
+### Métricas e monitoramento
+
+- O servidor expõe `/metrics` (e `/healthz`) na porta `metrics` do Service da Instance (9090); o operator expõe métricas de controllers e de AIOps (`chatcli_operator_*`) na 8080 (`serviceMonitor.enabled: true` no chart).
+- **Os dois são HTTP puro sem autenticação**, e o listener de métricas do servidor escuta em todas as interfaces independentemente de `bindAddress`. Restrinja com NetworkPolicy.
+- Para uma Instance, crie seu próprio ServiceMonitor:
+
+  ```yaml
+  apiVersion: monitoring.coreos.com/v1
+  kind: ServiceMonitor
+  metadata:
+    name: chatcli
+    namespace: chatcli
+  spec:
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: chatcli
+        app.kubernetes.io/instance: chatcli
+    endpoints:
+      - port: metrics
+        interval: 30s
+  ```
+
+- Nomes de métricas, dashboards do Grafana e queries úteis: [Web Dashboard](/pt/features/aiops/web-dashboard#referência-de-métricas-prometheus). Alerte em `chatcli_operator_instance_ready == 0` e na condition `ServerReachable`.
+
+### Imagens, versões e upgrades
+
+- As imagens do operator e do servidor são publicadas como `ghcr.io/diillson/chatcli-operator:<version>` e `ghcr.io/diillson/chatcli:<version>` (mais `latest`), multi-arch (amd64, arm64), com SBOM e provenance, assinadas keyless com cosign:
+
+  ```bash
+  cosign verify ghcr.io/diillson/chatcli-operator:1.211.2 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github.com/diillson/chatcli/'
+  ```
+
+- **Fixação.** O chart fixa a imagem do operator no seu `appVersion` e passa `CHATCLI_OPERATOR_APP_VERSION`, então uma Instance sem `spec.image.tag` roda a mesma release e um `helm upgrade` do operator atualiza esses servidores também. Defina `spec.image.tag` só para desacoplar uma Instance da release do operator. Evite `latest` em produção.
+- **Upgrade.** Mantenha seus values num arquivo e faça o upgrade com ele; o `--reuse-values` não traz os padrões de chaves novas do chart e pode falhar na renderização (o Helm 3.14+ oferece `--reset-then-reuse-values`):
+
+  ```bash
+  helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
+    --version 1.211.2 -n chatcli-system -f operator-values.yaml
+  ```
+
+  O hook de CRDs reaplica os CRDs antes.
+- **Upgrade para `1.211.2`:** os pods de toda Instance reiniciam uma vez, porque o template do pod ganha as probes de startup/readiness/liveness e a anotação `chatcli.io/credentials-hash` (e uma imagem nova nas Instances que seguem a release do operator). Planeje como um rollout do servidor.
+- **Desinstalação.** Apague as Instances primeiro, com o operator ainda rodando: o finalizer delas (`platform.chatcli.io/finalizer`) é removido pelo operator, e uma Instance apagada depois que o operator já saiu fica em `Terminating` até você removê-lo à mão (`kubectl patch instance <name> -n <ns> --type merge -p '{"metadata":{"finalizers":null}}'`). O `helm uninstall` mantém os CRDs (o Helm nunca apaga `crds/`); apagá-los apaga todos os recursos customizados.
+
+### Backup
+
+- Recursos customizados, por exemplo `kubectl get instances,runbooks,notificationpolicies,escalationpolicies,approvalpolicies,incidentslas,servicelevelobjectives,sourcerepositories,clusterregistrations -A -o yaml`; acrescente `issues,postmortems,auditevents` se guarda histórico de incidentes no cluster. Ferramentas como o Velero fazem backup de namespaces com seus recursos customizados.
+- Os Secrets referenciados pelas Instances, e o `chatcli-operator-secrets`, a partir do seu cofre de segredos.
+- O PVC de sessões guarda as sessões do servidor. Ele pertence à Instance: apagar a Instance apaga o claim (o volume segue a reclaim policy da StorageClass).
+- O gasto com LLM registrado pelo pipeline fica nos ConfigMaps `chatcli-cost-ledger` dos namespaces onde as Issues acontecem.
+
+### O que não existe
+
+- Nenhum admission ou validating webhook: o schema do CRD é a única validação, e o operator informa o resto como conditions.
+- Nenhuma conexão em texto puro do operator até uma Instance.
+- Nenhum gRPC reflection, a menos que você defina `spec.server.security.enableReflection`.
+- Nenhum PodDisruptionBudget, HPA, NetworkPolicy, ServiceMonitor, Ingress ou LoadBalancer criado para Instances; o Service é sempre ClusterIP ou headless.
+- Nenhum TLS ou autenticação nos endpoints de métricas.
+- Nenhum SSO/OIDC no dashboard: só API keys.
+- Nenhum arquivo de auditoria no operator: as ações dele são recursos AuditEvent. O servidor tem o próprio arquivo de auditoria (`security.auditLogPath`).
+- Nenhum RBAC automático para pessoas: vincule as ClusterRoles `chatcli-role-*` você mesmo.
+
+## Solução de problemas
+
+| Sintoma | Causa | Correção |
+|---------|-------|----------|
+| `ServerReachable=False`, mensagem com `x509: certificate is valid for ..., not chatcli.chatcli.svc.cluster.local` | O certificado não tem o nome que o operator disca | Emita de novo com `<name>.<namespace>.svc.cluster.local` nos SANs |
+| `ServerReachable=False`, `x509: certificate signed by unknown authority` | CA privada, e o Secret de TLS não tem `ca.crt` | Acrescente `ca.crt` ao Secret (ou defina `security.grpcTLS.caFile` no operator) |
+| `ServerReachable=False`, `tls: first record does not look like a TLS handshake` | A Instance serve texto puro (`tls.enabled` falso) e o operator sempre usa TLS | Ligue `spec.server.tls` |
+| `ServerReachable=False`, `server info (credential check): rpc error: code = Unauthenticated desc = authentication failed` | O transporte funciona, a credencial do operator é recusada: token errado, segredo JWT diferente, `iss`/`aud` divergentes, `operatorTokenRef` expirado | Confira `OperatorCredentialConfigured` e o Secret referenciado |
+| `Unauthenticated` `authentication failed` com uma credencial que funciona no resto do tempo; o log do servidor mostra `auth failure rate limit exceeded` | Algo no mesmo host de cliente falhou a autenticação mais de 5 vezes num minuto (o limitador de falhas do servidor permite uma rajada de 5 por host, reposta a uma a cada 12 segundos; só tentativas que falham contam, credenciais válidas nunca são limitadas) | Encontre o chamador com credencial errada ou expirada; o limitador se recupera sozinho |
+| `ServerReachable=False`, `reading secret "...": ...` ou `key "..." not found in secret "..."` | Um Secret que o operator lê está ausente ou tem outra chave | Crie-o ou corrija `key` |
+| `ServerReachable=False`, `... verifies RS256 tokens (jwtPublicKeyRef) and the operator has no credential to present` | RS256 sem credencial para o operator | Defina `operatorTokenRef` ou `operatorClientCertSecretName` |
+| `ServerReachable=False` / `NotServing` | O servidor está desligando | Passageiro em rollouts; fora isso, leia o log do servidor |
+| `AuthenticationConfigured=False` / `CredentialMissing`, sem Deployment | Nenhuma credencial num bind alcançável | Defina um dos campos listados na mensagem |
+| `TLSConfigured=False` / `SecretNameMissing`, sem Deployment | `tls.enabled` sem `secretName` | Defina `spec.server.tls.secretName` |
+| Log do pod `refusing to serve an unauthenticated API on 0.0.0.0: ...` com `AuthenticationConfigured=True` | O Secret ou a chave do token não existe (as refs de Secret são opcionais, então o pod subiu sem ele) | Crie o Secret ou corrija a chave; o valor novo reinicia os pods |
+| Log do pod `refusing to start: CHATCLI_JWT_PUBLIC_KEY is set but no RSA public key could be loaded` | O JWT é a única credencial e a chave não pode ser lida | Corrija o PEM no Secret referenciado |
+| Log do pod `FATAL: TLS certificate load failed` / `FATAL: mTLS client CA load failed` | O Secret de TLS não tem `tls.crt`/`tls.key`, ou o da CA de cliente não tem `ca.crt` | Corrija as chaves do Secret |
+| Pod preso em `ContainerCreating`, evento `MountVolume.SetUp failed ... secret "..." not found` | Um Secret montado (TLS, CA de cliente, CA bundle) não existe | Crie-o |
+| Pods não ficam Ready, probe com `connection refused` na 9090 | O servidor sai antes de escutar (veja as recusas acima) ou ainda está subindo | Leia `kubectl logs --previous`; a probe de startup dá 5 minutos |
+| Rollout travado com `Multi-Attach error` | PVC de sessões ReadWriteOnce e um pod em outro nó | Veja [Alta disponibilidade](#alta-disponibilidade) |
+| `chatcli connect` falha com `x509: certificate is valid for ..., not localhost` | O port-forward chega ao servidor como `localhost` | Acrescente `localhost` e `127.0.0.1` aos SANs, ou conecte por um nome que o certificado tenha |
+| `chatcli connect` com erro de handshake contra servidor sem TLS | Sem `--tls` a CLI continua discando TLS, a menos que você diga o contrário | Use TLS, ou `CHATCLI_ALLOW_INSECURE=true` para um servidor local em texto puro |
+| Dashboard/API `401` `no API keys configured; set CHATCLI_OPERATOR_DEV_MODE=true for development` | Nenhuma key carregada: o Secret não existe, está em outro namespace, não tem a chave `api-keys` ou o YAML não é válido (uma edição ruim limpa as keys carregadas) | Crie ou corrija o `chatcli-operator-secrets` no namespace do operator; espere até 30s; procure `failed to parse api-keys` no log do operator |
+| `401` `missing API key in X-API-Key header` / `invalid API key` | Header ausente ou key errada | Envie `X-API-Key` |
+| `403` `insufficient permissions` | O papel da key está abaixo do que o endpoint exige, ou não é `viewer`, `operator` nem `admin` | Use uma key com o papel certo |
+| `429` `rate limit exceeded: 30 requests per minute` (ou `600`) | Chamadas demais sem key válida de um mesmo host (ou por key) | Respeite o `Retry-After`; use uma key válida |
+| Nenhuma Anomaly ou Issue, embora o watcher rode | O WatcherBridge escolheu outra Instance pronta, ou o operator não alcança esta | O log `Connected to Instance` do operator mostra a que está em uso; mantenha uma única Instance de AIOps com `ServerReachable` True |
+| Erros `forbidden` do watcher no log do servidor | `watcher.namespace` legado em outro namespace, ou a ClusterRole `chatcli-watcher` ausente (`rbac.create=false`) | Use `watcher.targets`; mantenha o RBAC do chart |
+| `ExecDiagnostic` recusado: `command "..." not in approved diagnostic commands whitelist` | A string exata não está no allowlist | Acrescente em `security.allowedDiagnosticCommands` |
+| Instance presa em `Terminating` | O operator não está rodando para remover o finalizer | Suba o operator, ou remova o finalizer à mão |
+| `helm upgrade` falha com `nil pointer evaluating` numa chave nova | `--reuse-values` sem os padrões do chart novo | Faça o upgrade com seu arquivo de values, ou `--reset-then-reuse-values` |
 
 ## Desenvolvimento
 
 ```bash
 cd operator
 
-# Build
-go build ./...
+make build                 # fmt, vet, go build -o bin/manager main.go
+make test                  # testes unitários (fake client)
+make test-integration      # envtest: kube-apiserver + etcd de verdade (Kubernetes 1.37.0), os CRDs de
+                           # config/crd/bases e os controllers ligados como no main.go;
+                           # binários baixados em ./bin; pulado quando KUBEBUILDER_ASSETS não está definido
+make dash-preview          # o dashboard web sobre dados sintéticos, sem cluster:
+                           # http://127.0.0.1:8085/, API key "preview" (DASHPREVIEW_ADDR sobrescreve)
+make run                   # roda o operator localmente contra o kubeconfig atual
 
-# Testes unitários (client fake, reconcilers acionados à mão)
-go test ./... -v
+# Imagens (o contexto de build é a raiz do repositório)
+make docker-build IMG=registry.example.com/chatcli-operator:dev
+make docker-push  IMG=registry.example.com/chatcli-operator:dev
+# Imagem do servidor; VERSION é o que a coluna VERSION da Instance mostra
+docker build -t registry.example.com/chatcli:dev \
+  --build-arg VERSION=dev-$(git rev-parse --short HEAD) ..
 
-# Testes de integração: os controllers rodam contra um API server real
-# (envtest: kube-apiserver + etcd) com os CRDs de config/crd/bases,
-# ligados exatamente como o main.go liga, sobre um servidor ChatCLI em memória.
-# Os binários são baixados uma vez em ./bin; sem KUBEBUILDER_ASSETS a
-# suíte pula, então um `go test ./...` comum continua verde.
-make test-integration
-
-# Preview do web dashboard: sem cluster. Serve o dashboard embutido em
-# http://127.0.0.1:8085/ sobre um client fake com incidentes sintéticos,
-# runbooks, SLOs e uma aprovação pendente. Entre com a API key "preview".
-# Troque o endereço com DASHPREVIEW_ADDR=127.0.0.1:9090.
-make dash-preview
-
-# Docker (deve ser construído a partir do root do repositório)
-docker build -f operator/Dockerfile -t myregistry/chatcli-operator:dev .
-
-# Deploy via Helm (recomendado)
-helm install chatcli-operator ../deploy/helm/chatcli-operator/ \
-  --namespace chatcli-system --create-namespace \
-  --set image.repository=myregistry/chatcli-operator \
-  --set image.tag=dev
-
-# Ou deploy via kubectl (alternativa)
-make deploy IMG=myregistry/chatcli-operator:dev
+# Implante o seu build
+make deploy IMG=registry.example.com/chatcli-operator:dev
+# ou
+helm install chatcli-operator ../deploy/helm/chatcli-operator -n chatcli-system --create-namespace \
+  --set image.repository=registry.example.com/chatcli-operator --set image.tag=dev
 ```
 
+O `make manifests` só imprime o comando do `controller-gen`; os CRDs gerados ficam versionados em `config/crd/bases/` e copiados para o `crds/` dos dois charts.
 
-
-## Segurança
-
-O Operator implementa múltiplas camadas de segurança por padrão, seguindo o princípio de **fail-closed** (negar por padrão):
-
-### Autenticação da REST API
-
-A API REST opera em modo **fail-closed** por padrão -- não há modo dev sem autenticação. Toda requisição deve incluir um header `X-API-Key` válido com role mapeada (viewer/operator/admin).
-
-As API keys são carregadas com a seguinte ordem de prioridade e recarregadas automaticamente a cada 30 segundos:
-
-1. **Secret** `chatcli-operator-secrets` (prioridade) — campo `api-keys` com lista YAML `{key, role, description}`
-2. **ConfigMap** `chatcli-operator-config` (fallback) — mesmo campo `api-keys`
-3. Rejeita a requisição (ou aceita em dev-mode se `CHATCLI_OPERATOR_DEV_MODE=true`)
-
-<Note>
-**Dois Secrets distintos no projeto** — não confunda com as LLM keys do servidor (`chatcli-api-keys` consumido pelo chatcli server via `Instance.spec.apiKeys.name`). Tabela comparativa em [Segurança — Autenticação](/pt/features/security#auten%C3%A7%C3%A3o-do-operator).
-
-O Secret `chatcli-operator-secrets` precisa estar **no mesmo namespace que o pod do operator** (o controller resolve via `POD_NAMESPACE` env / arquivo do ServiceAccount, com fallback `chatcli-system`). Se você fez `helm install --namespace <X>`, crie o Secret em `<X>`.
-</Note>
-
-<Tip>
-Alterações nas API keys -- tanto no Secret quanto no ConfigMap -- são detectadas automaticamente a cada 30s. Nenhum restart do operator é necessário.
-</Tip>
-
-### Allowlist de Tipos de Recurso
-
-O Operator classifica tipos de recurso Kubernetes em duas categorias:
-
-<Tabs>
-  <Tab title="17 Tipos Seguros (permitidos)">
-    Pods, Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, Ingresses, Jobs, CronJobs, ReplicaSets, Endpoints, PersistentVolumeClaims, HorizontalPodAutoscalers, NetworkPolicies, ServiceAccounts, Namespaces, Events.
-  </Tab>
-  <Tab title="18 Tipos Perigosos (bloqueados)">
-    Secrets, ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, CustomResourceDefinitions, MutatingWebhookConfigurations, ValidatingWebhookConfigurations, PodSecurityPolicies, Nodes, PersistentVolumes, StorageClasses, CSIDrivers, CSINodes, VolumeAttachments, CertificateSigningRequests, TokenReviews, SubjectAccessReviews.
-  </Tab>
-</Tabs>
-
-### Scrubbing de Logs
-
-Antes de enviar logs de aplicação ao LLM para análise, o Operator remove **18 padrões sensíveis**, incluindo:
-- Tokens JWT/Bearer, API keys, senhas
-- Endereços de e-mail, IPs internos, URLs com credenciais
-- Números de cartão de crédito, SSNs, certificados PEM
-
-### TLS e RBAC
-
-- **TLS 1.3** obrigatório em todas as conexões do servidor ChatCLI
-- **ClusterRoles** com privilégio mínimo (read-only por padrão)
-- **NetworkPolicy** configurável para restringir tráfego de rede ao namespace do Operator
-- **Hardening H5 — RBAC sem escalonamento em runtime**: o operator nunca cria ou altera `ClusterRole`/`ClusterRoleBinding` em runtime. As ClusterRoles compartilhadas (`chatcli-watcher`, `chatcli-role-*`) são pré-provisionadas pelo Helm chart, e o SA do operator tem o verb `bind` restrito a esses nomes via `resourceNames`. Um operator comprometido não consegue referenciar uma ClusterRole mais privilegiada em um novo `ClusterRoleBinding`.
-
-### Auditoria
-
-- **AuditEvent CRD** para trilha de auditoria imutável (append-only)
-- Logs estruturados com Request ID para correlação
-- Integração com `CHATCLI_AUDIT_LOG_PATH` via `extraEnv`
-
-```yaml
-spec:
-  extraEnv:
-    - name: CHATCLI_AGENT_SECURITY_MODE
-      value: "strict"
-    - name: CHATCLI_AUDIT_LOG_PATH
-      value: "/var/log/chatcli/audit.jsonl"
-```
-
-<Warning>
-Em modo `strict`, o agent security bloqueia qualquer operação de escrita no cluster que não esteja na allowlist. Isso é recomendado para ambientes de produção.
-</Warning>
-
-
-
-## Próximo Passo
+## Próximos passos
 
 <CardGroup cols={2}>
   <Card title="AIOps Platform" icon="brain" href="/pt/features/aiops-platform">
-    Deep-dive na arquitetura AIOps
+    Como o pipeline funciona por dentro
   </Card>
-  <Card title="K8s Watcher" icon="binoculars" href="/pt/features/k8s-watcher">
-    Detalhes de coleta e budget
+  <Card title="Ciclo de vida do incidente" icon="route" href="/pt/features/aiops/incident-lifecycle">
+    Estados, ações de remediação e rollback
   </Card>
-  <Card title="Modo Servidor" icon="server" href="/pt/features/server-mode">
-    RPCs StreamAlerts, GetAlerts e AnalyzeIssue
+  <Card title="Server Mode" icon="server" href="/pt/features/server-mode">
+    Flags, autenticação e as RPCs gRPC
   </Card>
-  <Card title="Monitoramento K8s" icon="book" href="/pt/cookbook/k8s-monitoring">
-    Receita: Monitoramento K8s com IA
+  <Card title="Setup de produção" icon="book" href="/pt/cookbook/aiops-production-setup">
+    Receita: um setup de AIOps em produção
   </Card>
 </CardGroup>

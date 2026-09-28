@@ -14,31 +14,19 @@ icon: "circle-check"
 </ParamField>
 
 <ParamField body="approver" type="string" required>
-  Quem está aprovando a solicitação. Valor vazio retorna `400`.
+  Nome de quem aprova, registrado junto com a identidade da API key. Valor vazio retorna `400`.
 </ParamField>
 
 <ParamField body="reason" type="string">
   Justificativa opcional
 </ParamField>
 
-A chamada define `status.state` da solicitação como `Approved`; o operator então reage ao novo estado: o RemediationPlan que aguardava a aprovação passa para `Executing`. A resposta traz o item atualizado em `spec` e `resourceMeta` (sem `status`).
+A chamada registra **uma decisão** numa solicitação `Pending`, do mesmo jeito que a annotation `platform.chatcli.io/approve`: ela adiciona uma entrada a `status.decisions` com o aprovador, o motivo e um timestamp. Ela nunca define `status.state` por conta própria. O ApprovalReconciler então avalia as decisões contra a regra: quando as aprovações necessárias chegam (uma no `manual`, `requiredApprovers` aprovadores distintos no `quorum`) e a change window está aberta, a solicitação vira `Approved` e o RemediationPlan que aguardava passa para `Executing`. A resposta volta logo depois de a decisão ser registrada, então costuma ainda mostrar `Pending`, com a nova entrada em `decisions` e em `approvedBy`. O item vem em `spec` e em `status`, mais `resourceMeta`.
 
-<Warning>
-**Limitações da decisão via REST (versão atual):**
-
-- **O aprovador e o motivo não são gravados.** O handler também escreve `status.approvedBy`, `status.decisionReason` e `status.decidedAt`, mas o CRD ApprovalRequest não define esses campos, então o API server do Kubernetes os descarta. Só a mudança de estado persiste; a resposta e os GETs seguintes os mostram vazios, e nenhuma entrada é adicionada a `status.decisions`.
-- **Sem checagem de estado ou expiração.** A solicitação não precisa estar `Pending`: uma já decidida ou `Expired` é sobrescrita, e não há `409`/`410`.
-- **O quórum é ignorado.** Uma única chamada decide a solicitação mesmo quando a regra exige vários aprovadores.
-
-Para registrar quem decidiu e por quê (e passar pelo caminho de decisão do próprio controller, incluindo quórum), anote o ApprovalRequest:
-
-```bash
-kubectl -n production annotate approvalrequest approval-payment-service-oom-kill-1773933600-plan-1 \
-  platform.chatcli.io/approve="oncall-sre:aumento de memória confirmado"
-```
-
-O valor é `<aprovador>:<motivo>`; o controller o adiciona a `status.decisions` e remove a annotation.
-</Warning>
+- **Identidade do aprovador.** O aprovador é gravado como `<approver> (api-key: <identidade>)`, onde a identidade é o `name` da entrada da API key, senão o `description`, senão uma impressão digital `key-<hash>` (`dev-mode` no dev mode). O nome digitado tem os espaços das pontas removidos, perde caracteres de controle e é cortado em 128 caracteres.
+- **O quórum conta API keys.** Duas aprovações feitas com a mesma chave contam uma vez, sejam quais forem os nomes digitados, e a mesma chave não decide duas vezes sobre uma solicitação. Uma chave compartilhada, ou o dev mode, não satisfaz `requiredApprovers: 2`: dê a cada aprovador a sua própria chave.
+- **`409`** quando a solicitação não está mais `Pending` (já aprovada, rejeitada ou expirada), ou quando a mesma chave já registrou uma decisão nela.
+- **Change window.** Uma aprovação registrada fora da janela da regra é mantida; a solicitação vira `Approved` quando a janela abre e não expira enquanto espera. Veja [Fluxo de Aprovação](/pt/features/aiops/approval-workflow#changewindowspec).
 
 <RequestExample>
 ```json Request
@@ -61,13 +49,48 @@ O valor é `<aprovador>:<motivo>`; o controller o adiciona a `status.decisions` 
     "action": "AdjustResources",
     "reason": "production-changes",
     "requestedBy": "chatcli-operator",
-    "state": "Approved",
+    "state": "Pending",
+    "approvedBy": "oncall-sre (api-key: sre-oncall)",
+    "decisionReason": "aumento de memória confirmado",
     "creationTimestamp": "2026-03-19T15:21:05Z",
     "labels": {
       "platform.chatcli.io/issue": "payment-service-oom-kill-1773933600",
       "platform.chatcli.io/policy": "production-changes",
       "platform.chatcli.io/remediation-plan": "payment-service-oom-kill-1773933600-plan-1"
-    }
+    },
+    "decisions": [
+      {
+        "approver": "oncall-sre (api-key: sre-oncall)",
+        "decision": "approved",
+        "reason": "aumento de memória confirmado",
+        "timestamp": "2026-03-19T15:24:40Z"
+      }
+    ]
+  },
+  "status": {
+    "name": "approval-payment-service-oom-kill-1773933600-plan-1",
+    "namespace": "production",
+    "resource": "payment-service-oom-kill-1773933600",
+    "action": "AdjustResources",
+    "reason": "production-changes",
+    "requestedBy": "chatcli-operator",
+    "state": "Pending",
+    "approvedBy": "oncall-sre (api-key: sre-oncall)",
+    "decisionReason": "aumento de memória confirmado",
+    "creationTimestamp": "2026-03-19T15:21:05Z",
+    "labels": {
+      "platform.chatcli.io/issue": "payment-service-oom-kill-1773933600",
+      "platform.chatcli.io/policy": "production-changes",
+      "platform.chatcli.io/remediation-plan": "payment-service-oom-kill-1773933600-plan-1"
+    },
+    "decisions": [
+      {
+        "approver": "oncall-sre (api-key: sre-oncall)",
+        "decision": "approved",
+        "reason": "aumento de memória confirmado",
+        "timestamp": "2026-03-19T15:24:40Z"
+      }
+    ]
   },
   "resourceMeta": {
     "name": "approval-payment-service-oom-kill-1773933600-plan-1",
@@ -92,6 +115,18 @@ O valor é `<aprovador>:<motivo>`; o controller o adiciona a `status.decisions` 
   "error": "Bad Request",
   "code": 400,
   "message": "approver is required"
+}
+```
+</ResponseExample>
+
+<ResponseExample>
+```json Response 409
+{
+  "apiVersion": "v1",
+  "kind": "Error",
+  "error": "Conflict",
+  "code": 409,
+  "message": "approval request is not pending: state is Approved"
 }
 ```
 </ResponseExample>
