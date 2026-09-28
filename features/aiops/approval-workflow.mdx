@@ -5,7 +5,7 @@ description: "Change control with approval policies, blast radius assessment, an
 icon: "shield-check"
 ---
 
-In production environments, not every automatic remediation should be executed without human oversight. The ChatCLI **Approval Workflow** system allows defining granular policies that control which actions require approval, who can approve, and during which change windows actions are allowed.
+In production environments, not every automatic remediation should be executed without human oversight. The ChatCLI **Approval Workflow** lets you define policies that control which remediation plans must wait for a human, how many approvals they need, and during which change windows a decision can be applied.
 
 
 
@@ -16,14 +16,14 @@ In production environments, not every automatic remediation should be executed w
     Prevents automatic remediation from causing greater impact than the original problem (e.g., accidental rollback in production)
   </Card>
   <Card title="Compliance" icon="file-certificate">
-    Complete audit trail of who approved, when, and why. Required for SOC2, PCI-DSS, HIPAA.
+    Every request, decision and expiry is kept on the `ApprovalRequest` CR and recorded as an `AuditEvent`.
   </Card>
   <Card title="Trust" icon="handshake">
     Teams adopt AIOps more easily when they know that critical actions require human approval.
   </Card>
 </CardGroup>
 
-Without approval workflows, an AI that detects a false positive could execute an unnecessary rollback, affecting a healthy deployment. With approval policies, high-impact actions are blocked until a human validates the analysis and blast radius.
+Without approval workflows, an AI that detects a false positive could execute an unnecessary rollback, affecting a healthy deployment. With approval policies, high-impact plans are parked until a human validates the analysis and blast radius.
 
 
 
@@ -35,37 +35,39 @@ sequenceDiagram
     participant RR as RemediationReconciler
     participant AP as ApprovalPolicy
     participant AR as ApprovalRequest
-    participant H as Human (kubectl/API)
+    participant H as Human (kubectl/API/dashboard)
     participant K8s as Kubernetes API
 
-    IR->>RR: RemediationPlan created
-    RR->>AP: Checks if action requires approval
+    IR->>RR: RemediationPlan created (state Pending)
+    RR->>AP: First matching rule in the plan's namespace?
 
-    alt Auto-approve (conditions met)
-        AP-->>RR: Auto-approved (confidence greater than 0.9, severity at most medium)
-        RR->>K8s: Executes actions immediately
-    else Manual/Quorum required
-        AP->>AR: Creates ApprovalRequest CR
-        RR->>K8s: Adds annotation "approval-pending"
-        RR->>RR: Pauses execution (requeue 30s)
+    alt No rule matches, or the rule is mode auto
+        RR->>RR: Cluster tier and decision engine gates (if enabled)
+        RR->>K8s: Executes actions
+    else manual or quorum rule
+        RR->>AR: Creates ApprovalRequest "approval-<plan>"
+        RR->>K8s: Annotates plan "approval-pending", state WaitingApproval
+        RR->>RR: Re-checks every 10s
 
-        Note over AR,H: Notification sent via NotificationPolicy
-
-        H->>AR: Approves (annotation or API)
-        AR-->>RR: Status: Approved
-        RR->>K8s: Removes annotation, executes actions
-    else Timeout
-        AP->>AR: Status: Expired
+        H->>AR: Approves or rejects (annotation, REST API, dashboard)
+        AR-->>RR: status.state Approved
+        RR->>K8s: Plan to Executing, runs actions
+    else Rejected or timeout
+        AR-->>RR: status.state Rejected / Expired
         RR->>K8s: Marks RemediationPlan as Failed
-        IR->>IR: Retry or escalation
+        IR->>IR: Re-analysis and a new plan, or Escalated at max attempts
     end
 ```
+
+<Note>
+The operator does **not** send a notification when an ApprovalRequest is created. NotificationPolicies are driven by Issue state changes, not by approval requests. Watch `kubectl get approvalrequests -A`, the web dashboard, or alert on the metrics below to know a request is waiting.
+</Note>
 
 
 
 ## ApprovalPolicy CRD
 
-The `ApprovalPolicy` defines **rules** that determine which remediation actions need approval, under which conditions, and who can approve.
+The `ApprovalPolicy` (short name `ap`) defines **rules** that decide which remediation plans need approval and how that approval is obtained. It only applies to plans in **its own namespace**: the operator lists the enabled ApprovalPolicies in the namespace of the RemediationPlan (the namespace of the Issue), never across namespaces.
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
@@ -74,60 +76,41 @@ metadata:
   name: production-approval-policy
   namespace: production
 spec:
+  enabled: true
   rules:
-    - name: auto-approve-low-risk
-      match:
-        severities: [low, medium]
-        actionTypes: [RestartDeployment, ScaleDeployment]
-        namespaces: [staging, development]
-      mode: auto
-      autoApproveConditions:
-        minConfidence: 0.85
-        maxSeverity: medium
-        historicalSuccessRate: 0.90
-
-    - name: manual-approve-rollback
-      match:
-        actionTypes: [RollbackDeployment]
-        namespaces: [production, payments]
-      mode: manual
-      requiredApprovers: 1
-      timeoutMinutes: 30
-
     - name: quorum-critical-production
       match:
         severities: [critical, high]
-        namespaces: [production]
         resourceKinds: [Deployment, StatefulSet]
       mode: quorum
       requiredApprovers: 2
       timeoutMinutes: 15
 
-    - name: block-critical-namespace-rollback
+    - name: manual-approve-rollback
       match:
-        actionTypes: [RollbackDeployment]
-        namespaces: [payments, auth]
-        severities: [critical]
+        actionTypes: [RollbackDeployment, HelmRollback]
       mode: manual
-      requiredApprovers: 2
-      timeoutMinutes: 10
+      timeoutMinutes: 30
+      changeWindow:
+        timezone: "America/Sao_Paulo"
+        allowedDays: [Monday, Tuesday, Wednesday, Thursday, Friday]
+        startHour: 9
+        endHour: 18
 
-  changeWindow:
-    timezone: "America/Sao_Paulo"
-    allowedDays: [1, 2, 3, 4, 5]    # Monday to Friday
-    startHour: 9
-    endHour: 18
-    overrideForCritical: true         # Critical ignores change window
-    blackoutDates:
-      - date: "2026-03-20"
-        reason: "Q1 pre-release freeze"
-      - date: "2026-12-24"
-        reason: "Christmas Eve"
-      - date: "2026-12-31"
-        reason: "New Year's Eve"
+    - name: restarts-without-approval
+      match:
+        severities: [low, medium]
+        actionTypes: [RestartDeployment, ScaleDeployment]
+      mode: auto
 ```
 
 ### Spec Fields
+
+| Field | Type | Required | Description |
+|-------|------|:--------:|-------------|
+| `rules` | []ApprovalRule | **Yes** | Evaluated top to bottom; the first rule that matches wins |
+| `enabled` | bool | No (default `true`) | Disabled policies are skipped |
+| `defaultMode` | string | No (default `manual`) | Shown in `kubectl get ap`, but **not read by the operator**: when no rule matches, the policy does not gate the plan |
 
 #### ApprovalRule
 
@@ -135,72 +118,59 @@ Each rule defines a **match + mode** pair with specific configurations.
 
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `name` | string | **Yes** | Unique rule name within the policy |
+| `name` | string | **Yes** | Rule name, copied to the request as `spec.ruleName` |
 | `match` | ApprovalMatch | **Yes** | Matching criteria |
-| `mode` | string | **Yes** | `auto`, `manual`, `quorum` |
-| `requiredApprovers` | int | For manual/quorum | Minimum number of approvers |
-| `timeoutMinutes` | int | No | Timeout in minutes (default: `60`) |
-| `autoApproveConditions` | AutoApproveConditions | For auto | Conditions for auto-approval |
-
+| `mode` | string | **Yes** (default `manual`) | `auto`, `manual`, `quorum` |
+| `requiredApprovers` | int | No (default `1`) | Approvals needed in `quorum` mode (ignored by `manual`) |
+| `timeoutMinutes` | int | No (default `30`) | Minutes from request creation until it expires |
+| `changeWindow` | ChangeWindowSpec | No | When a decision on this rule's requests may be applied |
+| `autoApproveConditions` | AutoApproveConditions | No | See the `auto` tab below: currently has no effect on operator-created plans |
 
 #### ApprovalMatch
 
-Defines which remediations are covered by this rule. The logic is **AND** between fields and **OR** within each field.
+Defines which remediations are covered by this rule. The logic is **AND** between fields and **OR** within each field. An empty field matches everything, so a rule with an empty `match` matches every plan.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `severities` | []string | `critical`, `high`, `medium`, `low` |
-| `actionTypes` | []string | `ScaleDeployment`, `RestartDeployment`, `RollbackDeployment`, `PatchConfig`, `AdjustResources`, `DeletePod`, `Custom` |
-| `namespaces` | []string | Affected K8s namespaces |
-| `resourceKinds` | []string | `Deployment`, `StatefulSet`, `DaemonSet` |
+| Field | Type | Matched against |
+|-------|------|-----------------|
+| `severities` | []string | Issue `spec.severity`: `critical`, `high`, `medium`, `low` |
+| `actionTypes` | []string | Matches if **any** action of the plan has one of these types. Any value of the RemediationPlan action enum, e.g. `ScaleDeployment`, `RestartDeployment`, `RollbackDeployment`, `PatchConfig`, `AdjustResources`, `DeletePod`, `HelmRollback`, `ArgoSyncApp`, `DrainNode`, `ApplyManifest`, `RestartStatefulSet`, `RetryJob`, `SuspendCronJob`, `Custom` (see the [K8s Operator](/features/k8s-operator) page for the full list) |
+| `namespaces` | []string | Issue `spec.resource.namespace` |
+| `resourceKinds` | []string | Issue `spec.resource.kind`, case-insensitive (e.g. `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`) |
 
 <Note>
-When multiple rules match, the **most restrictive** rule prevails. Priority order is: `manual` &gt; `quorum` &gt; `auto`. If one rule requires `quorum` with 2 approvers and another requires `manual` with 1, the system applies `quorum` with 2.
+There is no "most restrictive rule wins" merging. Within a policy the **first matching rule** is used and the rest are ignored, so put the strict rules first. If several enabled ApprovalPolicies exist in the same namespace, the order in which they are evaluated is not guaranteed; keep one policy per namespace, or make their matches disjoint.
 </Note>
 
 #### Three Approval Modes
 
 <Tabs>
   <Tab title="auto">
-    **Auto-approve**: The system automatically approves if **all** `autoApproveConditions` are met. Otherwise, it escalates to `manual`.
+    **Auto**: a matching `auto` rule means "this plan does not need approval from the policy". No ApprovalRequest is created and the plan proceeds (the cluster tier and the decision engine, when enabled, still evaluate it).
+
+    Because the first match wins, an `auto` rule also shadows every rule below it for the plans it matches.
+
+    The CRD accepts `autoApproveConditions`:
 
     | Condition | Type | Description |
     |-----------|------|-------------|
-    | `minConfidence` | float64 | Minimum AI analysis confidence (0.0-1.0) |
-    | `maxSeverity` | string | Maximum severity for auto-approve |
-    | `historicalSuccessRate` | float64 | Minimum historical success rate for this action type |
+    | `minConfidence` | float64 | Minimum AIInsight confidence (0.0-1.0) |
+    | `maxSeverity` | string | Maximum severity |
+    | `historicalSuccessRate` | float64 | Minimum success rate of the same action types in this namespace (0.0-1.0) |
 
-    ```yaml
-    mode: auto
-    autoApproveConditions:
-      minConfidence: 0.90      # AI has >= 90% confidence
-      maxSeverity: medium      # Up to medium severity
-      historicalSuccessRate: 0.85  # >= 85% success in similar actions
-    ```
-
-    **Evaluation logic:**
-
-    ```text
-    auto_approve = (
-      ai_confidence >= minConfidence AND
-      severity <= maxSeverity AND
-      historical_success_rate >= historicalSuccessRate
-    )
-
-    If auto_approve = false -> escalates to manual mode (1 approver)
-    ```
+    <Warning>
+    `autoApproveConditions` are evaluated only by the approval controller for an existing ApprovalRequest whose rule is `auto`, and the operator never creates such a request: an `auto` rule lets the plan through before any request exists. In practice the conditions have **no effect** today; an `auto` rule always lets matching plans run. When they are evaluated, `maxSeverity` is not enforced either (the comparison never sees the Issue severity). Use `manual`/`quorum` rules, or the [decision engine](/features/aiops/decision-engine), when you need confidence-based gating.
+    </Warning>
   </Tab>
   <Tab title="manual">
-    **Manual**: Requires explicit approval from at least `requiredApprovers` humans. The RemediationPlan stays paused until approval or timeout.
+    **Manual**: the plan waits until **one** human approves or rejects it, or the request times out. `requiredApprovers` is ignored in this mode: the first approval approves the request.
 
     ```yaml
     mode: manual
-    requiredApprovers: 1
     timeoutMinutes: 30
     ```
   </Tab>
   <Tab title="quorum">
-    **Quorum**: Requires approval from `requiredApprovers` people. Ensures that approval does not depend on a single individual.
+    **Quorum**: requires `requiredApprovers` approvals. Any single rejection rejects the request.
 
     ```yaml
     mode: quorum
@@ -208,213 +178,171 @@ When multiple rules match, the **most restrictive** rule prevails. Priority orde
     timeoutMinutes: 15
     ```
 
-    In this example, at least 2 approvers are needed for the action to be executed.
+    In this example, two approval decisions are needed for the plan to run.
+
+    <Warning>
+    Approvers are not de-duplicated: every `approved` decision counts, even two from the same name. The name in the annotation is free text and is not verified against the Kubernetes user who wrote it, so the real control is who has RBAC to update `approvalrequests`. Also, one approval through the REST API or dashboard approves a quorum request outright (see [Via REST API](#via-rest-api)).
+    </Warning>
   </Tab>
 </Tabs>
 
 #### ChangeWindowSpec
 
-Defines change windows that control **when** automatic remediation can be executed.
+A change window is set **per rule** (`rules[].changeWindow`), not at the policy level. It only affects requests raised by that rule.
 
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `timezone` | string | **Yes** | IANA timezone (e.g., `America/Sao_Paulo`) |
-| `allowedDays` | []int | **Yes** | Allowed days (0=Sunday, 6=Saturday) |
-| `startHour` | int | **Yes** | Window start hour (0-23) |
-| `endHour` | int | **Yes** | Window end hour (0-23) |
-| `overrideForCritical` | bool | No | If `true`, `critical` severity ignores the change window |
-| `blackoutDates` | []BlackoutDate | No | Specific dates with total freeze |
+| `timezone` | string | No (default `UTC`) | IANA timezone (e.g., `America/Sao_Paulo`) |
+| `allowedDays` | []string | No (default Monday to Friday) | Day names in English, case-insensitive: `Monday` ... `Sunday` |
+| `startHour` | int | **Yes** | Window start hour (0-23, inclusive) |
+| `endHour` | int | **Yes** | Window end hour (0-23, **exclusive**). If `startHour > endHour` the window spans midnight (e.g. 22 to 6) |
+
+There are no blackout dates and no override for critical severity.
 
 <Warning>
-When outside the change window, remediation actions are **queued** (not discarded). They will be automatically executed when the next window opens -- as long as the Issue is still active and the approval has not expired.
+Outside the window the approval controller does not process the request at all: approve/reject annotations are left in place and applied when the window opens (it re-checks every minute). The **timeout keeps running**, and it is checked before the window, so a request whose timeout elapses outside the window expires and the plan fails. Size `timeoutMinutes` to cover the gap until the next window. An invalid `timezone` is logged and the window is ignored. A decision made through the REST API or dashboard is not held by the window.
 </Warning>
 
 
 
 ## ApprovalRequest CRD
 
-The `ApprovalRequest` is automatically created by the `RemediationReconciler` when an action requires approval. It contains all the information needed for the approver to make an informed decision.
+The `ApprovalRequest` (short name `ar`) is created by the `RemediationReconciler` when a plan must wait. Its name is always `approval-<plan-name>`, it lives in the plan's namespace, and it is owned by the RemediationPlan (deleting the plan deletes it).
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: ApprovalRequest
 metadata:
-  name: approve-api-gateway-rollback-1234
+  name: approval-api-gateway-oom-kill-1771276354-plan-1
   namespace: production
   labels:
     platform.chatcli.io/issue: api-gateway-oom-kill-1771276354
-    platform.chatcli.io/action-type: RollbackDeployment
-    platform.chatcli.io/severity: critical
+    platform.chatcli.io/remediation-plan: api-gateway-oom-kill-1771276354-plan-1
+    platform.chatcli.io/policy: production-approval-policy
+  annotations:
+    # Added by the approval controller (advisory prediction, see Blast Radius)
+    platform.chatcli.io/blast-risk-level: medium
 spec:
   issueRef:
     name: api-gateway-oom-kill-1771276354
-  remediationPlanRef:
-    name: api-gateway-oom-kill-plan-1
-  requestedAction:
-    type: RollbackDeployment
-    params:
-      toRevision: "previous"
-  policyRef:
-    name: production-approval-policy
-    rule: manual-approve-rollback
+  remediationPlanRef: api-gateway-oom-kill-1771276354-plan-1
+  policyRef: production-approval-policy
+  ruleName: manual-approve-rollback
+  requester: chatcli-operator
+  requestedActions:
+    - type: RollbackDeployment
+      params:
+        toRevision: "previous"
   requiredApprovers: 1
   timeoutMinutes: 30
-
   blastRadius:
     affectedPods: 5
-    affectedServices:
-      - name: api-gateway
-        namespace: production
-        endpoints: 3
-      - name: api-gateway-internal
-        namespace: production
-        endpoints: 2
-    affectedIngresses:
-      - name: api-gateway-ingress
-        namespace: production
-    riskLevel: high
-    estimatedDowntime: "30s"
-    rollbackAvailable: true
-
+    affectedServices: 2
+    affectedNamespaces: [production]
+    riskLevel: medium
+    description: "Medium blast radius: 5 pods and 2 services affected"
   evidence:
     aiConfidence: 0.87
-    analysis: "High restart count caused by OOMKilled. Container memory limit (512Mi) insufficient."
+    aiAnalysis: "High restart count caused by OOMKilled. Container memory limit (512Mi) insufficient."
     historicalSuccessRate: 0.92
-    similarIncidents: 3
-    lastSimilarResolution: "RollbackDeployment to revision 5 (2 days ago, success)"
-
+    previousAttempts: 12
 status:
   state: Pending            # Pending | Approved | Rejected | Expired
-  decisions: []
-  createdAt: "2026-03-19T14:30:00Z"
-  expiresAt: "2026-03-19T15:00:00Z"
+  autoApproved: false
 ```
 
 ### Spec Fields
 
 #### Root
 
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `issueRef` | ObjectRef | **Yes** | Reference to the Issue that originated the request |
-| `remediationPlanRef` | ObjectRef | **Yes** | Reference to the paused RemediationPlan |
-| `requestedAction` | ActionSpec | **Yes** | Action that requires approval |
-| `policyRef` | PolicyRef | **Yes** | Reference to the policy and rule that triggered it |
-| `requiredApprovers` | int | **Yes** | Minimum number of approvers |
-| `timeoutMinutes` | int | **Yes** | Time until expiration |
-| `blastRadius` | BlastRadiusAssessment | **Yes** | Impact assessment |
-| `evidence` | ApprovalEvidence | **Yes** | Evidence for decision-making |
+| Field | Type | Description |
+|-------|------|-------------|
+| `issueRef.name` | string | Issue that originated the plan |
+| `remediationPlanRef` | string | Name of the parked RemediationPlan |
+| `policyRef` | string | ApprovalPolicy name, or `decision-engine` / `cluster-tier` for [synthetic requests](#requests-without-an-approvalpolicy) |
+| `ruleName` | string | Rule that matched |
+| `requestedActions` | []RemediationAction | All actions of the plan (`type`, `params`) |
+| `requester` | string | Always `chatcli-operator` for operator-created requests |
+| `requiredApprovers` | int | Copied from the rule (default `1`) |
+| `timeoutMinutes` | int | Copied from the rule (default `30`) |
+| `blastRadius` | BlastRadiusAssessment | Impact assessment computed at creation |
+| `evidence` | ApprovalEvidence | Evidence for the decision |
 
 #### BlastRadiusAssessment
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `affectedPods` | int | Number of pods that will be affected by the action |
-| `affectedServices` | []ServiceRef | Services that route to the affected pods |
-| `affectedIngresses` | []IngressRef | Ingresses that expose the affected services |
-| `riskLevel` | string | `critical`, `high`, `medium`, `low` (calculated) |
-| `estimatedDowntime` | string | Estimated downtime during the action |
-| `rollbackAvailable` | bool | Whether the action can be reverted |
+| `affectedPods` | int | Pods of the target workload |
+| `affectedServices` | int | Number of Services whose selector matches the pod template |
+| `affectedNamespaces` | []string | The target's namespace |
+| `riskLevel` | string | `low`, `medium`, `high`, `critical` (or `unknown` if the calculation failed) |
+| `description` | string | Human-readable summary |
 
 #### ApprovalEvidence
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `aiConfidence` | float64 | AI analysis confidence level (0.0-1.0) |
-| `analysis` | string | AI analysis summary |
-| `historicalSuccessRate` | float64 | Success rate of similar actions in history |
-| `similarIncidents` | int | Number of similar incidents in the past |
-| `lastSimilarResolution` | string | Description of the last similar resolution |
+| `aiConfidence` | float64 | Confidence of the Issue's AIInsight (0.0-1.0); `0` if the insight was not found |
+| `aiAnalysis` | string | AIInsight analysis text |
+| `historicalSuccessRate` | float64 | Share of finished plans in this namespace, sharing an action type with this plan, that ended `Completed` (vs `Failed`/`RolledBack`); `0` when there is no history |
+| `previousAttempts` | int | Sample size of that rate (finished plans sharing an action type, counted once per matching action), not the attempt number of this Issue |
+| `preflightSnapshot` | string | Defined in the CRD, not filled by the operator |
 
-#### ApprovalDecision
+#### Status
 
-Each approval or rejection is recorded as a decision in the status:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `approver` | string | Approver identifier (user or system) |
-| `decision` | string | `approved` or `rejected` |
-| `reason` | string | Justification for the decision |
-| `timestamp` | Time | When the decision was made |
+| Field | Description |
+|-------|-------------|
+| `state` | `Pending`, `Approved`, `Rejected`, `Expired` |
+| `decisions[]` | `approver`, `decision` (`approved`/`rejected`), `reason`, `timestamp`, recorded for annotation-based decisions |
+| `approvedAt`, `rejectedAt`, `expiredAt` | Transition timestamps |
+| `autoApproved` | `true` only when an `auto` rule's conditions approved it |
 
 #### ApprovalRequest States
 
 ```mermaid
 stateDiagram-v2
     [*] --> Pending : ApprovalRequest created
-    Pending --> Approved : Sufficient approvers approved
+    Pending --> Approved : 1 approval (manual) / requiredApprovers approvals (quorum)
     Pending --> Rejected : Any approver rejected
-    Pending --> Expired : Timeout reached
+    Pending --> Expired : timeoutMinutes since creation
     Approved --> [*]
     Rejected --> [*]
     Expired --> [*]
 
-    note right of Approved : RemediationReconciler\nresumes execution
-    note right of Rejected : RemediationPlan marked\nas Failed
-    note right of Expired : Issue returns to\nAnalyzing (retry)
+    note right of Approved : Plan moves to Executing
+    note right of Rejected : Plan marked Failed
+    note right of Expired : Plan marked Failed
 ```
 
 <Info>
-A single rejection is sufficient to block the action, regardless of the number of approvals. This ensures that any team member can veto a risky action.
+A single rejection is sufficient to block the plan, regardless of the number of approvals. A rejected or expired plan counts as a failed remediation attempt: the Issue goes back to `Analyzing` for a new plan while attempts remain (which may raise a new ApprovalRequest), and becomes `Escalated` when the maximum is reached. Deleting the ApprovalRequest before a decision also fails the plan; it never lets it run.
 </Info>
 
 
 
 ## Blast Radius Calculator
 
-The blast radius calculator evaluates the potential impact of a remediation action before requesting approval.
+Two calculations run, both informational: neither one blocks a plan on its own.
 
 ### How It Works
 
 <Steps>
-  <Step title="Query deployment pods">
-    The calculator lists all pods managed by the target deployment using label selectors.
-
-    ```text
-    pods = kubectl get pods -l app=api-gateway -n production
-    affectedPods = len(pods)  // e.g., 5
-    ```
+  <Step title="Assessment stored in the spec (at request creation)">
+    For a `Deployment` target, the calculator counts the pods matching the Deployment selector (falling back to `spec.replicas` when none are found) and the Services in the namespace whose selector matches the pod template labels. For other kinds it counts the pods in the namespace that have an owner reference with the target's name, and reports `0` services.
   </Step>
-  <Step title="Find services routing to the pods">
-    For each Service in the namespace, checks if the selector matches the deployment pod labels.
-
-    ```text
-    for service in namespace.services:
-      if service.selector matches pod.labels:
-        affectedServices.append(service)
-    ```
-  </Step>
-  <Step title="Find ingresses exposing the services">
-    For each Ingress in the namespace, checks if it references any of the affected services.
-
-    ```text
-    for ingress in namespace.ingresses:
-      for rule in ingress.rules:
-        if rule.backend.service in affectedServices:
-          affectedIngresses.append(ingress)
-    ```
-  </Step>
-  <Step title="Calculate risk level">
-    The risk level is determined by the number of affected pods:
-
+  <Step title="Risk level from the pod count">
     ```text
     if affectedPods > 10:  riskLevel = "critical"
-    if affectedPods > 5:   riskLevel = "high"
-    if affectedPods > 2:   riskLevel = "medium"
+    elif affectedPods > 5: riskLevel = "high"
+    elif affectedPods > 2: riskLevel = "medium"
     else:                  riskLevel = "low"
     ```
   </Step>
-  <Step title="Estimate downtime">
-    Based on the action type:
-
-    | Action | Estimated Downtime |
-    |--------|-------------------|
-    | `ScaleDeployment` (up) | 0s (no pods removed) |
-    | `RestartDeployment` | ~30s (rolling update) |
-    | `RollbackDeployment` | ~30-60s (rolling update) |
-    | `AdjustResources` | ~30s (rolling update) |
-    | `DeletePod` | ~10s (recreation by ReplicaSet) |
-    | `PatchConfig` | 0s (no restart) |
+  <Step title="Adjustment by action type">
+    A `RollbackDeployment` action raises `low` to `medium`. A `Custom` action raises `low` or `medium` to `high`. Other action types do not change the level. Ingresses and estimated downtime are not computed.
+  </Step>
+  <Step title="Prediction annotations (approval controller)">
+    While the request is `Pending`, the approval controller runs the blast radius predictor on the **first** action of the plan (PodDisruptionBudget, ResourceQuota, node capacity and affected Services checks) and stores the result in two annotations on the ApprovalRequest: `platform.chatcli.io/blast-radius` (text summary) and `platform.chatcli.io/blast-risk-level`. This happens once per request.
   </Step>
 </Steps>
 
@@ -424,72 +352,76 @@ The blast radius calculator evaluates the potential impact of a remediation acti
 
 ### Complete Flow
 
+When a RemediationPlan is `Pending`, the RemediationReconciler runs three gates in order. The first one that parks the plan wins; the next ones are skipped.
+
 ```mermaid
 sequenceDiagram
-    participant IR as IssueReconciler
     participant RR as RemediationReconciler
-    participant APC as ApprovalPolicyChecker
-    participant BRC as BlastRadiusCalculator
+    participant AP as ApprovalPolicies (plan namespace)
+    participant CT as Cluster tier
+    participant DE as Decision engine
     participant AReq as ApprovalRequest CR
     participant K8s as Kubernetes API
 
-    IR->>K8s: Creates RemediationPlan
-    RR->>K8s: Detects new RemediationPlan (state: Pending)
-    RR->>APC: Checks if approval is needed
-    APC->>APC: Match rules against action + namespace + severity
-
-    alt No rule matches
-        APC-->>RR: No approval needed
-        RR->>K8s: Executes actions
-    else Auto-approve rule matches
-        APC->>APC: Evaluates autoApproveConditions
-        alt Conditions met
-            APC-->>RR: Auto-approved
-            RR->>K8s: Executes actions
-        else Conditions not met
-            APC->>BRC: Calculates blast radius
-            BRC-->>APC: BlastRadiusAssessment
-            APC->>K8s: Creates ApprovalRequest CR
-            APC->>K8s: Annotates Plan approval-pending=request-name
-            RR->>RR: Requeue 30s
+    RR->>AP: First enabled policy/rule that matches
+    alt manual or quorum rule
+        RR->>AReq: Creates approval-<plan> (policyRef = policy name)
+        RR->>K8s: Annotates plan approval-pending, state WaitingApproval
+    else no match, or auto rule
+        RR->>CT: Tier of CHATCLI_OPERATOR_CLUSTER_NAME requires approval?
+        alt yes
+            RR->>AReq: Creates approval-<plan> (policyRef = cluster-tier)
+        else no
+            RR->>DE: Decision engine enabled and verdict requires approval?
+            alt yes
+                RR->>AReq: Creates approval-<plan> (policyRef = decision-engine)
+            else no
+                RR->>K8s: Validates safety constraints, state Executing
+            end
         end
-    else Manual/quorum rule matches
-        APC->>BRC: Calculates blast radius
-        BRC-->>APC: BlastRadiusAssessment
-        APC->>K8s: Creates ApprovalRequest CR
-        APC->>K8s: Annotates Plan approval-pending=request-name
-        RR->>RR: Requeue 30s
     end
 
-    Note over RR: Next reconcile (30s later)
-    RR->>K8s: Reads ApprovalRequest status
+    Note over RR: While WaitingApproval, re-checks every 10s
+    RR->>AReq: Reads status.state
     alt Approved
-        RR->>K8s: Removes annotation "approval-pending"
-        RR->>K8s: Executes actions
+        RR->>K8s: State Executing, runs actions
     else Rejected
-        RR->>K8s: Marks Plan as Failed (reason: rejected)
+        RR->>K8s: Plan Failed ("Approval rejected by ...")
     else Expired
-        RR->>K8s: Marks Plan as Failed (reason: timeout)
-    else Still Pending
-        RR->>RR: Requeue 30s
+        RR->>K8s: Plan Failed ("Approval request expired without decision")
+    else ApprovalRequest missing
+        RR->>K8s: Plan Failed ("Approval request was deleted before decision")
     end
 ```
 
+The gate **fails closed** when it cannot raise a request: if creating the ApprovalRequest or annotating the plan fails, the plan stays `Pending` and is retried; it never runs because the gate errored. An ApprovalRequest that already exists with the same name is reused rather than skipped.
+
+<Warning>
+Two paths still let the plan through without approval: if listing the ApprovalPolicies fails, the error is logged and the plan proceeds to the tier and decision-engine gates; and if the parent Issue cannot be read, all three gates are skipped. An unknown cluster name or a decision-engine error also falls back to "policies only".
+</Warning>
+
+### Requests without an ApprovalPolicy
+
+The [cluster tier](/features/aiops/federation#remediation-policy-per-tier) and the [decision engine](/features/aiops/decision-engine) can park a plan even when no ApprovalPolicy exists. Their requests carry a synthetic `policyRef` (`cluster-tier` or `decision-engine`) and always follow the same built-in rule: `manual` mode, one approver, 30-minute timeout, no change window. They are approved or rejected exactly like any other request.
+
+| Gate | Enabled by | Parks the plan when |
+|------|------------|---------------------|
+| Cluster tier | Operator env `CHATCLI_OPERATOR_CLUSTER_NAME` (chart `clusterName`) naming a ClusterRegistration (by name or `displayName`) | tier `critical`: every severity; `standard`: `critical` and `high`; `non-critical`: never |
+| Decision engine | `CHATCLI_OPERATOR_DECISION_ENGINE=true` (chart `decisionEngine.enabled`) | Circuit breaker open (3+ failed or rolled-back plans in the namespace in the last hour), or the adjusted confidence/severity verdict is `approval` or `manual` |
+
+The decision engine also leaves its verdict on the plan as annotations: `platform.chatcli.io/decision-mode`, `platform.chatcli.io/confidence`, `platform.chatcli.io/risk` and `platform.chatcli.io/decision-reason`. See the [Decision Engine](/features/aiops/decision-engine) page for the thresholds.
+
 ### Control Annotation
 
-The `RemediationReconciler` uses the `platform.chatcli.io/approval-pending` annotation to control the flow:
+When a plan is parked, the reconciler sets `platform.chatcli.io/approval-pending` on the RemediationPlan to the name of the ApprovalRequest:
 
 ```yaml
 metadata:
   annotations:
-    platform.chatcli.io/approval-pending: "approve-api-gateway-rollback-1234"
+    platform.chatcli.io/approval-pending: "approval-api-gateway-oom-kill-1771276354-plan-1"
 ```
 
-When this annotation is present:
-1. The reconciler **does not execute any action**
-2. Queries the status of the referenced `ApprovalRequest`
-3. Removes the annotation only when the request is `Approved`
-4. If `Rejected` or `Expired`, marks the plan as `Failed`
+The annotation is informational. The gate is the plan's `WaitingApproval` state plus the ApprovalRequest status, which the reconciler always reads directly, so deleting the annotation does not bypass approval. On approval or rejection the approval controller removes it; on rejection it also writes `platform.chatcli.io/rejection-reason` on the plan.
 
 
 
@@ -497,124 +429,134 @@ When this annotation is present:
 
 ### Via kubectl
 
-The most direct way to approve is using annotations:
+The recommended way to decide is an annotation on the ApprovalRequest:
 
 ```bash
 # Approve
-kubectl annotate approvalrequest approve-api-gateway-rollback-1234 \
+kubectl annotate approvalrequest approval-api-gateway-oom-kill-1771276354-plan-1 \
   -n production \
-  platform.chatcli.io/approve="edilson:LGTM, acceptable blast radius"
+  platform.chatcli.io/approve="alice:LGTM, acceptable blast radius"
 
 # Reject
-kubectl annotate approvalrequest approve-api-gateway-rollback-1234 \
+kubectl annotate approvalrequest approval-api-gateway-oom-kill-1771276354-plan-1 \
   -n production \
-  platform.chatcli.io/reject="edilson:Risk too high, investigate memory leak first"
+  platform.chatcli.io/reject="bob:Risk too high, investigate memory leak first"
 ```
 
 **Annotation format:**
 
 ```text
-platform.chatcli.io/approve="<user>:<reason>"
-platform.chatcli.io/reject="<user>:<reason>"
+platform.chatcli.io/approve="<approver>:<reason>"
+platform.chatcli.io/reject="<approver>:<reason>"
 ```
 
-The `ApprovalRequest` reconciler detects the annotation, records the decision in the status, and removes the annotation.
+The approval controller (it polls pending requests every 15 seconds) records the decision in `status.decisions`, updates `status.state`, and removes the annotation. For a quorum, each approver adds the annotation in turn after the previous one was consumed; if two people annotate before the controller runs, the second needs `--overwrite` and replaces the first.
+
+<Note>
+`<approver>` is whatever text is written: the operator does not check it against the identity of the Kubernetes user. Restrict `update`/`patch` on `approvalrequests` with RBAC to the people allowed to approve.
+</Note>
 
 ### Via REST API
 
-The operator exposes a REST API for integrations:
+The operator REST API (port `8090`) exposes the requests. Authentication is the `X-API-Key` header; listing needs the `viewer` role, approve/reject need `operator`. Pass `?namespace=` to target a namespace; without it the request is looked up by name across all namespaces.
 
 <CodeGroup>
 
 ```bash Approve
 curl -X POST \
-  http://localhost:8090/api/v1/approvals/approve-api-gateway-rollback-1234/approve \
+  "http://localhost:8090/api/v1/approvals/approval-api-gateway-oom-kill-1771276354-plan-1/approve?namespace=production" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "X-API-Key: $CHATCLI_API_KEY" \
   -d '{
-    "approver": "edilson",
-    "reason": "LGTM, acceptable blast radius. AI confidence 87% with success history."
+    "approver": "alice",
+    "reason": "LGTM, acceptable blast radius."
   }'
 ```
 
 ```bash Reject
 curl -X POST \
-  http://localhost:8090/api/v1/approvals/approve-api-gateway-rollback-1234/reject \
+  "http://localhost:8090/api/v1/approvals/approval-api-gateway-oom-kill-1771276354-plan-1/reject?namespace=production" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "X-API-Key: $CHATCLI_API_KEY" \
   -d '{
-    "approver": "edilson",
+    "approver": "bob",
     "reason": "Risk too high. Investigate memory leak before rollback."
   }'
 ```
 
 ```bash List pending
-curl -X GET \
-  http://localhost:8090/api/v1/approvals?state=Pending \
-  -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8090/api/v1/approvals?state=Pending&namespace=production" \
+  -H "X-API-Key: $CHATCLI_API_KEY"
 ```
 
 ```bash Details
-curl -X GET \
-  http://localhost:8090/api/v1/approvals/approve-api-gateway-rollback-1234 \
-  -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8090/api/v1/approvals/approval-api-gateway-oom-kill-1771276354-plan-1?namespace=production" \
+  -H "X-API-Key: $CHATCLI_API_KEY"
 ```
 
 </CodeGroup>
 
-**API response (example):**
+`approver` is required in the body (400 otherwise). **API response (example):**
 
 ```json
 {
-  "name": "approve-api-gateway-rollback-1234",
-  "namespace": "production",
-  "state": "Approved",
-  "requestedAction": {
-    "type": "RollbackDeployment",
-    "params": {"toRevision": "previous"}
+  "apiVersion": "v1",
+  "kind": "ApprovalRequest",
+  "spec": {
+    "name": "approval-api-gateway-oom-kill-1771276354-plan-1",
+    "namespace": "production",
+    "resource": "api-gateway-oom-kill-1771276354",
+    "action": "RollbackDeployment",
+    "reason": "production-approval-policy",
+    "requestedBy": "chatcli-operator",
+    "state": "Approved",
+    "creationTimestamp": "2026-03-19T14:30:00Z"
   },
-  "blastRadius": {
-    "affectedPods": 5,
-    "riskLevel": "high"
-  },
-  "decisions": [
-    {
-      "approver": "edilson",
-      "decision": "approved",
-      "reason": "LGTM, acceptable blast radius",
-      "timestamp": "2026-03-19T14:35:00Z"
-    }
-  ]
+  "resourceMeta": {
+    "name": "approval-api-gateway-oom-kill-1771276354-plan-1",
+    "namespace": "production"
+  }
 }
 ```
 
-### Via Slack (interactive)
+In this representation `resource` is the Issue name, `action` the first requested action and `reason` the policy name.
 
-When integrated with the Slack channel via `NotificationPolicy`, the ApprovalRequest includes interactive buttons in Block Kit:
+<Warning>
+The REST approve/reject (also used by the web dashboard, which sends the approver `web-ui`) writes `status.state` directly. It does not go through the approval controller, so today it:
+- approves a **quorum** request with a single call, and ignores the change window;
+- does not add an entry to `status.decisions`, and the `approvedBy`/`rejectedBy`/`decisionReason` fields it writes are not part of the CRD schema and are dropped by the API server. The approver and reason are therefore lost: the plan result reads "Approval rejected by unknown";
+- does not check that the request is still `Pending`;
+- does not increment `chatcli_operator_approvals_total`.
 
-- **Approve**: Records approval with the Slack user as approver
-- **Reject**: Opens a dialog for rejection reason
-- **Details**: Expands blast radius and AI evidence
+Use the kubectl annotation when you need quorum, change windows, or a recorded approver.
+</Warning>
 
-<Note>
-The interactive Slack integration requires additional configuration of a Slack App with Interactive Components enabled and a callback endpoint pointing to the operator.
-</Note>
+### Via Slack
+
+There is no interactive Slack approval. The operator has no Slack callback endpoint and does not post approval requests to any channel.
 
 
 
 ## Complete YAML Examples
 
-### Auto-approve for Low Severity + High Confidence
+### No Approval for Low-Risk Actions in Staging
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: ApprovalPolicy
 metadata:
-  name: staging-auto-approve
+  name: staging-approval
   namespace: staging
 spec:
   rules:
-    - name: auto-approve-all-staging
+    # Rollbacks first: the first matching rule wins
+    - name: manual-for-rollback-staging
+      match:
+        actionTypes: [RollbackDeployment, HelmRollback]
+      mode: manual
+      timeoutMinutes: 60
+
+    - name: low-risk-without-approval
       match:
         severities: [low, medium]
         actionTypes:
@@ -622,27 +564,10 @@ spec:
           - ScaleDeployment
           - AdjustResources
           - DeletePod
-        namespaces: [staging]
       mode: auto
-      autoApproveConditions:
-        minConfidence: 0.80
-        maxSeverity: medium
-        historicalSuccessRate: 0.75
-
-    - name: manual-for-rollback-staging
-      match:
-        actionTypes: [RollbackDeployment]
-        namespaces: [staging]
-      mode: manual
-      requiredApprovers: 1
-      timeoutMinutes: 60
-
-  changeWindow:
-    timezone: "America/Sao_Paulo"
-    allowedDays: [0, 1, 2, 3, 4, 5, 6]   # All days
-    startHour: 0
-    endHour: 23
 ```
+
+A plan that contains a rollback and a restart matches the first rule and waits for approval. Plans matching no rule are not gated by this policy.
 
 ### Quorum of 2 Approvers for Production
 
@@ -654,31 +579,18 @@ metadata:
   namespace: production
 spec:
   rules:
-    - name: quorum-all-production-actions
-      match:
-        severities: [critical, high, medium]
-        namespaces: [production]
-      mode: quorum
-      requiredApprovers: 2
-      timeoutMinutes: 15
-
-    - name: auto-low-severity-restart
+    - name: low-severity-restart
       match:
         severities: [low]
         actionTypes: [RestartDeployment]
-        namespaces: [production]
       mode: auto
-      autoApproveConditions:
-        minConfidence: 0.95
-        maxSeverity: low
-        historicalSuccessRate: 0.98
 
-  changeWindow:
-    timezone: "America/Sao_Paulo"
-    allowedDays: [1, 2, 3, 4, 5]
-    startHour: 9
-    endHour: 18
-    overrideForCritical: true
+    - name: quorum-all-production-actions
+      match:
+        severities: [critical, high, medium]
+      mode: quorum
+      requiredApprovers: 2
+      timeoutMinutes: 15
 ```
 
 ### Change Window Weekdays 9-18 UTC
@@ -692,32 +604,21 @@ metadata:
 spec:
   rules:
     - name: all-actions-require-approval
-      match:
-        namespaces: [production]
+      match: {}                # matches every plan in this namespace
       mode: manual
-      requiredApprovers: 1
-      timeoutMinutes: 120
-
-  changeWindow:
-    timezone: "UTC"
-    allowedDays: [1, 2, 3, 4, 5]    # Monday to Friday
-    startHour: 9
-    endHour: 18
-    overrideForCritical: true
-    blackoutDates:
-      - date: "2026-03-27"
-        reason: "End of Q1 freeze"
-      - date: "2026-03-28"
-        reason: "End of Q1 freeze"
-      - date: "2026-06-30"
-        reason: "End of Q2 freeze"
+      timeoutMinutes: 960      # long enough to survive the night until the window opens
+      changeWindow:
+        timezone: "UTC"
+        allowedDays: [Monday, Tuesday, Wednesday, Thursday, Friday]
+        startHour: 9
+        endHour: 18            # decisions applied from 09:00 to 17:59 UTC
 ```
 
 <Tip>
-Use `overrideForCritical: true` to allow `critical` incidents to be remediated outside the change window. Without this, a critical incident at 3am would be queued until 9am.
+There is no override for critical incidents: a critical plan raised at 3am waits until 9am like any other. If critical incidents must be handled at night, put a rule without `changeWindow` for `severities: [critical]` above the windowed rule.
 </Tip>
 
-### RollbackDeployment Block in Critical Namespaces
+### Rollback Protection in a Critical Namespace
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
@@ -727,50 +628,37 @@ metadata:
   namespace: payments
 spec:
   rules:
-    - name: block-rollback-payments
+    - name: quorum-rollback-payments
       match:
-        actionTypes: [RollbackDeployment]
-        namespaces: [payments, auth, billing]
+        actionTypes: [RollbackDeployment, HelmRollback]
       mode: quorum
       requiredApprovers: 2
       timeoutMinutes: 10
 
-    - name: block-delete-pod-payments
+    - name: manual-delete-pod-payments
       match:
         actionTypes: [DeletePod]
-        namespaces: [payments]
       mode: manual
-      requiredApprovers: 1
       timeoutMinutes: 15
+      changeWindow:
+        timezone: "America/Sao_Paulo"
+        allowedDays: [Monday, Tuesday, Wednesday, Thursday]   # no Friday changes
+        startHour: 10
+        endHour: 16
 
-    - name: auto-scale-only
+    - name: scale-without-approval
       match:
         actionTypes: [ScaleDeployment]
-        namespaces: [payments]
       mode: auto
-      autoApproveConditions:
-        minConfidence: 0.90
-        maxSeverity: high
-        historicalSuccessRate: 0.95
-
-  changeWindow:
-    timezone: "America/Sao_Paulo"
-    allowedDays: [1, 2, 3, 4]    # Mon-Thu (no Friday for pre-weekend freeze)
-    startHour: 10
-    endHour: 16
-    overrideForCritical: true
-    blackoutDates:
-      - date: "2026-03-31"
-        reason: "Month-end close"
-      - date: "2026-04-30"
-        reason: "Month-end close"
 ```
+
+Because a policy only covers its own namespace, create one per namespace you want to protect (`payments`, `auth`, `billing`, ...).
 
 
 
 ## Auditing and Compliance
 
-All approval decisions are recorded in the `ApprovalRequest` CR status, creating a complete audit trail:
+Annotation-based decisions are recorded in the `ApprovalRequest` status:
 
 ```bash
 # View approval history
@@ -778,42 +666,48 @@ kubectl get approvalrequests -n production \
   -o custom-columns=NAME:.metadata.name,STATE:.status.state,APPROVER:.status.decisions[0].approver,REASON:.status.decisions[0].reason,TIME:.status.decisions[0].timestamp
 
 # Output:
-# NAME                                  STATE      APPROVER   REASON              TIME
-# approve-api-gw-rollback-1234          Approved   edilson    LGTM                2026-03-19T14:35:00Z
-# approve-worker-scale-5678             Approved   system     Auto-approved       2026-03-19T15:00:00Z
-# approve-payment-restart-9012          Rejected   maria      Risk too high       2026-03-19T15:30:00Z
-# approve-auth-rollback-3456            Expired    -          Timeout (15min)     2026-03-19T16:00:00Z
+# NAME                              STATE      APPROVER   REASON          TIME
+# approval-api-gw-oom-plan-1        Approved   alice      LGTM            2026-03-19T14:35:00Z
+# approval-payment-restart-plan-2   Rejected   bob        Risk too high   2026-03-19T15:30:00Z
+# approval-auth-rollback-plan-1     Expired    <none>     <none>          <none>
 ```
 
-For SOC2 and PCI-DSS compliance, export ApprovalRequests periodically:
+The default `kubectl get ar` columns are `Issue`, `Plan`, `State`, `Rule`, `Age`.
+
+The RemediationReconciler also writes `AuditEvent` CRs for the lifecycle: `approval_requested` when a plan is parked, and `approval_approved`, `approval_rejected` or `approval_expired` when it acts on the outcome (`correlationId` = Issue name). See [Audit and Compliance](/features/aiops/audit-compliance).
+
+ApprovalRequests are owned by their RemediationPlan and are deleted with it, so export them periodically if you need long-term records:
 
 ```bash
 kubectl get approvalrequests -A -o json | jq '.items[] | {
   name: .metadata.name,
   namespace: .metadata.namespace,
-  action: .spec.requestedAction.type,
+  policy: .spec.policyRef,
+  rule: .spec.ruleName,
+  actions: [.spec.requestedActions[].type],
   state: .status.state,
   decisions: .status.decisions,
   blastRadius: .spec.blastRadius.riskLevel,
-  created: .status.createdAt
+  created: .metadata.creationTimestamp
 }' > approval-audit-$(date +%Y%m%d).json
 ```
+
+The ApprovalPolicy status keeps `totalApproved`, `totalRejected`, `totalExpired` and `totalAutoApproved` (not kept for synthetic requests). These counters are incremented each time the approval controller reconciles a finished request, including after an operator restart, so they can over-count; use the Prometheus metrics for accurate rates.
 
 
 
 ## Prometheus Metrics
 
-The approval workflow system exposes metrics for monitoring:
+The approval workflow system exposes these metrics on the operator metrics endpoint (port `8080`):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `chatcli_approvals_total` | Counter | `policy`, `rule`, `namespace`, `decision` | Total approvals by decision (approved/rejected/expired/auto) |
-| `chatcli_approval_duration_seconds` | Histogram | `policy`, `rule`, `decision` | Time between request creation and decision |
-| `chatcli_approvals_pending` | Gauge | `policy`, `namespace` | Number of pending ApprovalRequests |
-| `chatcli_approval_auto_approved_total` | Counter | `policy`, `rule`, `namespace` | Total auto-approvals |
-| `chatcli_approval_auto_escalated_total` | Counter | `policy`, `rule`, `namespace` | Auto-approve that escalated to manual |
-| `chatcli_approval_blast_radius_pods` | Histogram | `namespace`, `action_type` | Distribution of affected pods in requests |
-| `chatcli_change_window_blocked_total` | Counter | `policy`, `namespace` | Actions blocked by change window |
+| `chatcli_operator_approvals_total` | Counter | `mode` (`auto`/`manual`/`quorum`), `result` (`approved`/`rejected`/`expired`) | Decisions applied by the approval controller (REST decisions are not counted) |
+| `chatcli_operator_approval_duration_seconds` | Histogram | `mode` | Time from request creation to decision or expiry |
+| `chatcli_operator_decision_engine_evaluations_total` | Counter | `mode` (`auto`/`auto-notify`/`approval`/`manual`/`blocked`) | Decision engine verdicts |
+| `chatcli_operator_decision_engine_circuit_breaker_state` | Gauge | `namespace` | `1` when the decision engine circuit breaker is open |
+
+There is no gauge of pending requests; count them with `kubectl get ar -A` or the REST API (`?state=Pending`).
 
 **Recommended Prometheus alerts:**
 
@@ -821,17 +715,10 @@ The approval workflow system exposes metrics for monitoring:
 groups:
   - name: chatcli-approvals
     rules:
-      - alert: ApprovalRequestPendingTooLong
-        expr: chatcli_approvals_pending > 0 and time() - chatcli_approval_created_timestamp > 600
-        for: 1m
-        labels:
-          severity: warning
-        annotations:
-          summary: "ApprovalRequest pending for more than 10 minutes"
-          description: "{{ $labels.policy }}/{{ $labels.namespace }} has requests awaiting approval"
-
       - alert: HighRejectionRate
-        expr: rate(chatcli_approvals_total{decision="rejected"}[1h]) / rate(chatcli_approvals_total[1h]) > 0.3
+        expr: |
+          sum(rate(chatcli_operator_approvals_total{result="rejected"}[1h]))
+            / sum(rate(chatcli_operator_approvals_total[1h])) > 0.3
         for: 30m
         labels:
           severity: warning
@@ -840,13 +727,22 @@ groups:
           description: "May indicate false positives in AI analysis or an overly permissive policy"
 
       - alert: ApprovalTimeoutRate
-        expr: rate(chatcli_approvals_total{decision="expired"}[1h]) > 0.1
+        expr: sum(increase(chatcli_operator_approvals_total{result="expired"}[1h])) > 0
         for: 1h
         labels:
           severity: warning
         annotations:
           summary: "Approvals expiring due to timeout"
-          description: "Teams may not be receiving notifications or timeouts are too short"
+          description: "Nobody is watching pending ApprovalRequests, or timeouts are too short for the change window"
+
+      - alert: DecisionEngineCircuitBreakerOpen
+        expr: max by (namespace) (chatcli_operator_decision_engine_circuit_breaker_state) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Decision engine circuit breaker open in {{ $labels.namespace }}"
+          description: "Every plan in this namespace now waits for approval"
 ```
 
 

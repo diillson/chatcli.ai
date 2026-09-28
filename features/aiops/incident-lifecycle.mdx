@@ -7,72 +7,105 @@ icon: "arrows-spin"
 
 ## Overview
 
-The ChatCLI AIOps platform manages incidents through a well-defined state machine with **6 states** for incidents and **6 states** for remediation plans. Understanding this lifecycle is essential for operators who need to intervene when automatic remediation fails.
+The ChatCLI AIOps platform manages incidents (`Issue` CRs, short name `iss`) through a state machine with **7 states**, and remediation plans (`RemediationPlan` CRs, short name `rp`) through a state machine with **7 states**. Understanding this lifecycle is essential for operators who need to intervene when automatic remediation fails.
+
+```bash
+kubectl get iss -A          # columns: Severity, State, Risk, Age
+kubectl get rp -n <ns>      # columns: Issue, Attempt, State, Age
+```
 
 ## Incident States
 
 | State | Description | Terminal? |
 |-------|-------------|-----------|
-| `Detected` | Anomaly correlated into an incident, awaiting analysis | No |
+| `Detected` | Issue created from correlated anomalies; the controller immediately creates the AIInsight and moves on | No |
 | `Analyzing` | AI is performing root cause analysis | No |
 | `Remediating` | A remediation plan is executing | No |
-| `Resolved` | Incident successfully resolved | Yes |
-| `Escalated` | All automatic retries exhausted — **requires human intervention** (auto-resolves if resource recovers) | Semi-terminal |
-| `Failed` | Single attempt failed with no retry configured | Yes |
+| `Contained` | The plan ran a containment action (a step with param `containment: "true"`, e.g. `ScaleDeployment` to 0 replicas) — **the service is silenced, not fixed; a human must act** | No (auto-resolves when the workload is restored) |
+| `Resolved` | Incident resolved | Yes |
+| `Escalated` | All automatic attempts exhausted — **requires human intervention** (auto-resolves if the resource recovers) | Semi-terminal |
+| `Failed` | Accepted by the CRD and treated as terminal, but **no controller currently sets it** — failed remediations are retried and then escalated | Yes |
+
+<Warning>
+**`Contained` state** — A plan that completes after executing an action with `containment: "true"` (for example `ScaleDeployment replicas=0 containment=true`) does **not** mark the Issue `Resolved`. It transitions to `Contained`, which:
+
+- Is **not** terminal: it auto-resolves only when the workload is back with desired replicas **> 0** and all replicas ready (checked every 60 seconds; Deployment and StatefulSet only — other kinds stay `Contained` until resolved manually)
+- Sets `status.requiresHumanAction: true` and `status.requiredAction` on the Issue, plus the `Contained` and `RequiresHumanAction` conditions
+- Generates a PostMortem with `requiresHumanAction: true` that cannot stay `Closed` until a human acknowledges it (see [below](#postmortems-with-requireshumanaction))
+- Is counted in `analytics/summary` as `containedIssues` **and** as open
+
+Configure a `NotificationPolicy` rule with `states: [Contained]` so humans are paged when this happens.
+</Warning>
 
 ## State Machine Flow
 
 ```
-Detected → Analyzing → Remediating → Resolved
-                ↓              ↓
-           Escalated      Failed/RolledBack
-           (after max         ↓
-            retries)     Re-analyze (up to 5x)
-                              ↓
-                         Escalated
-                              ↓
-                    Auto-resolve if resource
-                    recovers (configurable)
+Detected → Analyzing → Remediating ──(plan Completed)──────────────→ Resolved
+               ↑            │                                          ↑
+               │            ├─(plan Completed with containment)→ Contained ─┘ (human restores replicas)
+               │            │
+               │            └─(plan Failed / RolledBack)
+               │                     │
+               └── re-analysis ←─────┤ attempts < max
+                   (with failure     │
+                    context)         └─ attempts = max → Escalated
+                                                            │
+                                         auto-resolve if the resource
+                                         recovers (configurable) → Resolved
 ```
 
 ### Detection Phase (`Detected`)
 
-When the watcher bridge detects anomalies, the correlation engine groups them into incidents:
+When the watcher bridge turns a server alert into an `Anomaly` CR, the Anomaly controller correlates it:
 
-1. **Signal scoring** — each signal type has a weight (OOMKill=40, ErrorRate=30, PodRestart=25, etc.)
-2. **Risk score calculation** — aggregated from all correlated anomalies
-3. **Severity determination** — Critical (risk > 80), High (> 60), Medium (> 40), Low (otherwise)
-4. **Incident ID generation** — format: `INC-YYYYMMDD-NNN`
-5. **Max remediation attempts** set to 5 (default, configurable via Instance `aiops.maxRemediationAttempts`)
+1. **Existing incident** — if a non-terminal Issue (anything except `Resolved`, `Escalated`, `Failed`) already exists for the same resource (kind + name + namespace), the anomaly is attached to it and its risk score is raised if the new score is higher
+2. **Resolution cooldown** — if an Issue for the same resource was `Resolved` within `resolutionCooldownMinutes`, the anomaly is suppressed
+3. **Noise reduction** — repetitive, seasonal, flapping or high alert-fatigue (score > 80) anomalies are suppressed
+4. **Signal scoring** — each signal type has a weight (`oom_kill`=40, `error_rate`=30, `pod_restart`=25, `deploy_failing`=25, `latency`=20, `pod_not_ready`=20, `cpu_high`=15, `memory_high`=15, any other signal=10); the risk score sums all uncorrelated anomalies for the resource in the last 10 minutes, capped at 100
+5. **Severity determination** — `oom_kill` is always `critical`; otherwise Critical (risk ≥ 80), High (≥ 60), Medium (≥ 30), Low (below 30)
+6. **Incident ID** — format `INC-YYYYMMDD-NNN`, stored in the label `platform.chatcli.io/inc-id`. The Issue **name** is `<resource>-<signal>-<unix-timestamp>` (e.g. `payment-api-oom-kill-1773900000`); the REST API and `kubectl` address Issues by that name, not by the INC ID
+7. **Max remediation attempts** — set on the first reconcile from `aiops.maxRemediationAttempts` (default 5). If a runbook is later selected, its `maxAttempts` replaces this value (see the tip below)
+
+<Note>
+`Escalated` counts as closed for correlation: while an Issue is `Escalated`, new anomalies for the same resource open a **new** Issue instead of attaching to the escalated one.
+</Note>
+
+To find an Issue by its incident ID:
+
+```bash
+kubectl get iss -A -l platform.chatcli.io/inc-id=INC-20260319-001
+```
 
 ### Analysis Phase (`Analyzing`)
 
-The system creates an AIInsight CR for AI-powered analysis. During detection, ALL matching runbooks are injected into the AI context for validation.
+The system creates an AIInsight CR (`<issue>-insight`) for AI-powered analysis. At detection, ALL matching runbooks are injected into the AIInsight (annotations `platform.chatcli.io/candidate-runbooks` and `platform.chatcli.io/runbook-context`) for validation.
 
 1. **Runbook candidate discovery** (tiered):
-   - **Tier 1**: All runbooks matching SignalType + Severity + ResourceKind
-   - **Tier 2**: Fallback on Severity + ResourceKind
+   - **Tier 1**: runbooks matching SignalType + Severity + ResourceKind
+   - **Tier 2**: runbooks matching Severity + ResourceKind with a different signal
    - Multiple runbooks can exist per trigger (different root causes produce different runbooks)
-2. **AI validates candidates**: The LLM receives all candidate runbooks and evaluates each against the current root cause analysis:
-   - **`RUNBOOK_APPROVED: &lt;name&gt;`** → uses that specific runbook (fast path)
+2. **AI validates candidates**: the LLM receives all candidate runbooks and evaluates each against the current root cause analysis:
+   - **`RUNBOOK_APPROVED: &lt;name&gt;`** → uses that runbook (fast path); if the name does not match any candidate, the first candidate is used
    - **`RUNBOOK_REJECTED`** → skips all candidates, uses AI suggestions or agentic mode
-   - **Neither** → uses first candidate as default (backward compatibility)
-3. **If no candidates exist** and AI has suggested actions → generates a new runbook
-4. **If no candidates and no AI actions** → enters **Agentic Mode** (AI-driven step-by-step)
-5. Transitions to `Remediating`
+   - **Neither** → uses the first candidate as default (backward compatibility)
+3. **If no runbook was selected** and the AI suggested actions → generates a new runbook from those actions and uses it
+4. **If no runbook and no AI actions** → enters **Agentic Mode** (AI-driven step-by-step)
+5. Creates the RemediationPlan `<issue>-plan-<attempt>` and transitions to `Remediating`
 
 ### Remediation Phase (`Remediating`)
 
-The remediation controller executes the plan using a **ReAct loop** (Reason-Act-Observe):
+Before executing, the remediation controller checks the approval gates in order: a matching `ApprovalPolicy`, then the local cluster's tier (when `CHATCLI_OPERATOR_CLUSTER_NAME` is set), then the [decision engine](/features/aiops/decision-engine) (when `CHATCLI_OPERATOR_DECISION_ENGINE=true`). A gated plan waits in `WaitingApproval` (see [Approval Workflow](/features/aiops/approval-workflow)).
 
-1. **Pre-flight snapshot** captured for rollback capability
+The plan then executes using a **ReAct loop** (Reason-Act-Observe):
+
+1. **Pre-flight snapshot** of the target workload captured for rollback
 2. For **each action** in the plan:
-   - **OBSERVE** — checks if the resource is already healthy (after the previous action). If so, **stops immediately** without executing remaining actions (early exit)
-   - **ACT** — executes the action with checkpoint
-   - If the action **fails** → automatic rollback to pre-flight state
-3. **Final health verification** (polls for up to 90 seconds)
-4. **On success** → `Resolved` + PostMortem generated
-5. **On failure** → automatic rollback attempted → re-analyze with failure context
+   - **OBSERVE** — from the second action on, checks if the resource is already healthy. If so, **stops immediately** without executing the remaining actions (early exit)
+   - **ACT** — executes the action and records a checkpoint
+   - If the action **fails** → automatic rollback to the pre-flight snapshot
+3. **Final health verification** (polls every 10 seconds, for up to 90 seconds; on timeout, rollback to the pre-flight snapshot)
+4. **On success** → `Resolved` (or `Contained`, if a containment action ran) + PostMortem generated
+5. **On failure** → re-analysis with the failure context (next attempt) or escalation
 
 ```
 Example: plan with 3 actions (AdjustResources + DeletePod + RollbackDeployment)
@@ -80,69 +113,84 @@ Example: plan with 3 actions (AdjustResources + DeletePod + RollbackDeployment)
   Action 1: AdjustResources → SUCCESS (memory 1Mi → 64Mi)
   Action 2: OBSERVE → resource healthy (ReadyReplicas == Desired)
             → EARLY EXIT! Skips DeletePod and RollbackDeployment
-            → Evidence: "Resource healthy after 1/3 actions — skipped remaining 2"
+            → Evidence: "Resource healthy after 1/3 actions — skipped remaining 2 actions"
 ```
 
 This prevents contradictory actions from being executed (e.g., `AdjustResources` followed by `RollbackDeployment` which would undo the fix) and reduces operational impact to the minimum necessary.
 
 ### Retry Mechanism
 
-When remediation fails:
+When the latest plan ends `Failed` or `RolledBack`:
 
-- **Attempt &lt; MaxAttempts (5)**: The system re-analyzes with the failure context injected, potentially selecting a different runbook or strategy
-- **All attempts exhausted**: Transitions to `Escalated`
+- **Attempt &lt; max attempts**: the failure evidence of all failed plans is written to the AIInsight (annotation `platform.chatcli.io/failure-context`), the analysis is cleared, and the Issue goes back to `Analyzing` — potentially selecting a different runbook or strategy
+- **All attempts exhausted**: transitions to `Escalated`
+
+<Note>
+Every way a plan can end `Failed` counts as a failed attempt — including a **rejected or expired approval**. Rejecting an approval therefore triggers re-analysis and a new plan (and, eventually, escalation); it does not stop the incident.
+</Note>
 
 ### Escalated State — What Operators Must Do
 
 When an incident reaches `Escalated`, the system has exhausted all automatic options. Here's what happens and what you need to do:
 
 **What the system does automatically:**
-1. Triggers the EscalationPolicy matching the incident severity
-2. Sends notifications to L1 on-call (Slack, PagerDuty, etc.)
-3. If no acknowledgment within the configured timeout, escalates to L2, then L3
-4. Generates audit events for compliance
+1. Starts the first matching enabled `EscalationPolicy` (by `severities`; a policy with `defaultPolicy: true` is the fallback) and notifies level 0 — **skipped for chaos-induced Issues**
+2. Sends the notifications of any `NotificationPolicy` rule that matches the `Escalated` state
+3. Advances to the next level when the current level's `timeoutMinutes` expires (see [Notifications](/features/aiops/notifications) for the current limitations of level progression)
+4. Records an `issue_escalated` audit event
+5. Keeps checking the resource every 30 seconds for auto-resolve (below)
 
 **What operators must do:**
-1. **Acknowledge** the incident (stops escalation progression):
+1. **Acknowledge** the incident (records who is on it):
    ```bash
-   curl -X POST https://operator:8090/api/v1/incidents/INC-20260319-001/acknowledge \
-     -H "X-API-Key: $API_KEY" \
-     -d '{"acknowledgedBy": "your-email@company.com"}'
+   curl -X POST "https://operator:8090/api/v1/incidents/payment-api-oom-kill-1773900000/acknowledge?namespace=production" \
+     -H "X-API-Key: $API_KEY"
    ```
+   <Warning>
+   Acknowledging only writes the annotations `aiops.chatcli.io/acknowledged`, `-at` and `-by` (the `-by` value is the caller's API-key **role**, not a person; the request body is ignored). It does **not** pause or stop the escalation chain — escalation stops only when the Issue reaches `Resolved`. Snooze (`/snooze`, body `{"duration": "1h"}`) likewise only writes the `aiops.chatcli.io/snoozed-until` annotation; no controller reads it.
+   </Warning>
 
 2. **Investigate and fix** the issue manually
 
 3. **Resolve** the incident via one of three methods:
 
-   **Method 1: REST API** (recommended for automation/scripts)
+   **Method 1: REST API** (recommended for automation/scripts; `operator` role)
    ```bash
-   curl -X POST https://operator:8090/api/v1/incidents/INC-20260319-001/resolve \
+   curl -X POST "https://operator:8090/api/v1/incidents/payment-api-oom-kill-1773900000/resolve?namespace=production" \
      -H "X-API-Key: $API_KEY" \
+     -H "Content-Type: application/json" \
      -d '{"resolution": "Fixed memory leak in payment-service v2.4.1, deployed hotfix manually"}'
    ```
+   Without `?namespace=`, the first Issue with that name in any namespace is used. The call returns `409` if the Issue is already `Resolved`. It sets the status and the annotations `aiops.chatcli.io/resolved-by` (the role), `resolved-at` and `manual-resolution: "true"`.
 
    **Method 2: Web Dashboard**
 
-   Navigate to the incident detail page and click the **"Resolve"** button. Enter the resolution description in the dialog.
+   Navigate to the incident detail page and click the **"Resolve"** button. Enter the resolution note in the prompt (optional).
 
-   **Method 3: Kubernetes Direct** (advanced)
+   **Method 3: Kubernetes Direct** (advanced) — `status` is a subresource, so the patch must target it:
    ```bash
-   kubectl patch issue INC-20260319-001 -n production --type=merge \
+   kubectl patch issue payment-api-oom-kill-1773900000 -n production --subresource=status --type=merge \
      -p '{"status":{"state":"Resolved","resolution":"Manual fix applied"}}'
    ```
 
+<Note>
+A manual resolution (REST, dashboard or `kubectl`) does **not** generate a PostMortem and does not clear the watcher bridge dedup cache — identical alerts stay deduplicated until `dedupTTLMinutes` expires. PostMortems are generated only when a remediation plan completes.
+</Note>
+
 ## Auto-Resolve for Escalated Issues
 
-When an incident reaches `Escalated`, the system continues monitoring the resource every 30 seconds. If the resource recovers (all replicas healthy), the issue is **automatically resolved** with the message:
+When an incident reaches `Escalated`, the system keeps checking the resource every 30 seconds. If the resource recovers, the issue is **automatically resolved** with the message:
 
 > "Auto-resolved: resource recovered while awaiting human intervention"
 
+and the annotations `aiops.chatcli.io/resolved-by: auto-resolve` and `aiops.chatcli.io/auto-resolution: "true"`. "Recovered" means ready replicas ≥ desired (and, for a Deployment, no unavailable replicas). **Only Deployment and StatefulSet targets are checked** — Escalated Issues on any other kind (DaemonSet, Job, CronJob, Node, ...) never auto-resolve and must be resolved manually.
+
 This handles cases where:
-- An operator fixes the issue manually (kubectl rollout undo, etc.) without using the API
-- The resource self-heals (e.g., transient network issue resolves)
+- An operator fixes the issue manually (`kubectl rollout undo`, etc.) without using the API
+- The resource self-heals (e.g., a transient network issue resolves)
 - A CI/CD pipeline deploys a fix while the incident is still open
 
-Auto-resolve can be disabled via the Instance CRD: `spec.aiops.enableAutoResolve: false`
+Auto-resolve (for both `Escalated` and `Contained`) can be disabled via the Instance CRD: `spec.aiops.enableAutoResolve: false`. The Issue then stays in that state until resolved manually.
 
 ## Configurable AIOps Parameters
 
@@ -157,93 +205,101 @@ spec:
   provider: OPENAI
   model: gpt-5.4
   aiops:
-    maxRemediationAttempts: 5    # default: 5, range: 1-10
+    maxRemediationAttempts: 5     # default: 5, range: 1-10
     resolutionCooldownMinutes: 10 # default: 10, range: 0-120
-    dedupTTLMinutes: 60           # default: 60, range: 5-1440
+    dedupTTLMinutes: 30           # default: 30, range: 5-1440
     enableAutoResolve: true       # default: true
+    agenticMaxSteps: 10           # default: 10, range: 3-30
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `maxRemediationAttempts` | 5 | How many times the AI can retry before escalating |
-| `resolutionCooldownMinutes` | 10 | After resolving, how long to suppress new anomalies for the same resource |
-| `dedupTTLMinutes` | 60 | How long the bridge dedup cache retains alert hashes |
-| `enableAutoResolve` | true | Auto-resolve Escalated issues when the resource recovers |
-| `agenticMaxSteps` | 10 | Maximum steps per agentic remediation attempt (range: 3-30) |
+| `maxRemediationAttempts` | 5 | How many remediation attempts before escalating |
+| `resolutionCooldownMinutes` | 10 | After an Issue is resolved, how long new anomalies for the same resource are suppressed. `0` is accepted by the CRD but falls back to the 10-minute default — the cooldown cannot be disabled |
+| `dedupTTLMinutes` | 30 | How long the watcher bridge dedup cache retains alert hashes (the hash includes the resource UID, so a recreated resource is detected immediately) |
+| `enableAutoResolve` | true | Auto-resolve `Escalated` and `Contained` issues when the resource recovers |
+| `agenticMaxSteps` | 10 | Maximum steps per agentic remediation attempt |
+
+<Note>
+These settings are read from the **first Instance** returned by a cluster-wide list (the dedup TTL from the Instance the watcher bridge is connected to). With several Instances, keep their `aiops` sections identical.
+</Note>
 
 <Tip>
-AI auto-generated runbooks (both standard and agentic) automatically inherit `maxRemediationAttempts` from the Instance configuration. Manually created runbooks via YAML or API use the CRD default (`maxAttempts: 3`) unless explicitly specified.
+AI auto-generated runbooks (both standard and agentic) get `maxAttempts` = the Instance's `maxRemediationAttempts`. Manually created runbooks via YAML or API use the CRD default (`maxAttempts: 3`) unless explicitly specified. When a candidate runbook is selected, **its `maxAttempts` replaces the Issue's max attempts** — an incident matched to a manual runbook without `maxAttempts` escalates after 3 attempts, not 5.
 </Tip>
 
 ## Remediation Plan States
 
-Each incident may have multiple remediation plans (one per attempt):
+Each incident may have multiple remediation plans (one per attempt, named `<issue>-plan-<attempt>`):
 
 | State | Description |
 |-------|-------------|
-| `Pending` | Safety validation in progress |
-| `Executing` | Actions being executed sequentially |
+| `Pending` | Approval gates and safety constraint validation |
+| `WaitingApproval` | Parked on an `ApprovalRequest` (`approval-<plan>`) until it is approved, rejected or expires |
+| `Executing` | Actions being executed sequentially (or the agentic loop running) |
 | `Verifying` | Post-action health check (up to 90s) |
-| `Completed` | All actions succeeded and health verified |
-| `Failed` | Action failed, no rollback possible |
-| `RolledBack` | Action failed, successfully rolled back to pre-flight state |
+| `Completed` | Actions succeeded and health verified |
+| `Failed` | Action failed and the resource is not healthy (or no rollback was possible), safety violation, rejected/expired approval, or agentic guardrail hit |
+| `RolledBack` | Action failed and the rollback left the resource healthy, or the verification timed out and a rollback was performed |
 
 ## Agentic Remediation Mode
 
-When no runbook matches, the system uses AI-driven agentic remediation:
+When no runbook matches and the AI suggested no actions, the system uses AI-driven agentic remediation:
 
 1. **AI proposes an action** via the AgenticStep RPC
 2. **Action is executed** and the result is observed
 3. **AI analyzes the observation** and proposes the next action
-4. **Loop continues** until resolved or convergence detected
+4. **Loop continues** until resolved or a guardrail stops it
 
-**Safety guardrails:**
-- **Max steps**: 10 (configurable via `AgenticMaxSteps`)
-- **Max time**: 10 minutes per agentic plan
-- **Convergence detection**:
+**Safety guardrails** (any of them fails the plan):
+- **Max steps**: 10 (configurable via `aiops.agenticMaxSteps`)
+- **Max time**: 10 minutes per agentic plan (the convergence detector already stops it at 8 minutes)
+- **Convergence detection** (counted in `chatcli_operator_agentic_convergence_stops_total`):
   - Last 3 observations identical → force stop
-  - Alternating A→B→A→B pattern → force stop
-  - 5 consecutive failed actions → force stop
+  - Alternating A→B→A→B action pattern → force stop
+  - Last 5 actions all failed → force stop
 
 ## Decision Engine Confidence Thresholds
 
-The decision engine determines whether remediation can proceed automatically:
+The [decision engine](/features/aiops/decision-engine) is **off by default** (`decisionEngine.enabled: true` in the operator chart, i.e. `CHATCLI_OPERATOR_DECISION_ENGINE=true`). It only evaluates plans that no `ApprovalPolicy` or cluster tier already parked. When enabled, it determines whether a plan may run automatically, based on the adjusted confidence:
 
-| Severity | Auto-Approve Threshold | Action |
-|----------|----------------------|--------|
-| Low | Confidence >= 0.95 | Auto-execute |
-| Medium | Confidence >= 0.85 | Auto-execute + notify |
-| High | Confidence >= 0.80 | Requires approval |
-| Critical | Always | Manual approval required |
+| Severity | Condition | Mode |
+|----------|-----------|------|
+| Low | Confidence ≥ 0.95 | `auto` — executes |
+| Medium | Confidence ≥ 0.85 | `auto-notify` — executes |
+| High | Confidence ≥ 0.80 | `approval` — waits for a human |
+| Critical, or below the threshold | Always | `manual` — waits for a human |
 
-**Adjustments**: Historical success rate, pattern match, time of day, and active issue count all modify the base confidence score.
+**Adjustments** to the AIInsight confidence: historical success rate of the first action type (+0.1 / +0.05 / −0.1, with at least 3 plans in 30 days), learned pattern match boost, −0.05 outside 09:00–18:00 UTC, −0.02 per active Issue above 3 (max −0.1), and severity (critical −0.1, high −0.05, low +0.05).
 
-**Circuit breaker**: If 3+ remediations failed in the last hour, auto-remediation is blocked entirely.
+**Circuit breaker**: if 3+ remediations failed or rolled back in the same namespace in the last hour, the plan is blocked and waits for a human.
+
+Plans that wait are parked on an ApprovalRequest under the synthetic policy `decision-engine`: one approver, 30 minutes, then the plan fails as expired.
 
 ## Rollback Engine
 
 The rollback engine provides safety nets at two levels:
 
-1. **Pre-flight snapshot** — captured before ANY actions. Restores the entire resource state.
-2. **Per-action checkpoints** — captured before EACH action. Allows partial rollback.
+1. **Pre-flight snapshot** — captured before ANY action. Automatic rollbacks always restore this snapshot of the target workload.
+2. **Per-action checkpoints** — a snapshot recorded before EACH action (for node actions, a node snapshot). They are kept in `status.actionCheckpoints` for audit and the PostMortem timeline; they are **not** replayed automatically (there is no automatic partial rollback).
 
 **Automatic rollback triggers:**
 - Action execution fails
 - Health verification times out (90 seconds)
 
-**Supported rollback targets:**
-- Deployment: replicas, container images, resource limits
+**What a snapshot restores:**
+- Deployment: replicas, container images, container resources (and HPA min/max)
 - StatefulSet: replicas, images, resources, partition
 - DaemonSet: images, resources, max unavailable
 - Job/CronJob: suspend, deadline, backoff limit, parallelism
-- Node: uncordon (restore schedulable)
+- Node: schedulable state — supported by the engine, but because automatic rollback restores the workload snapshot, a `CordonNode`/`DrainNode` is not undone automatically (use `UncordonNode`)
 
 ## Remediation Action Types
 
-The platform supports **46+ remediation action types** across resource kinds:
+The platform supports **54 typed remediation actions** (plus `Custom`, which is treated as a no-op requiring manual intervention) across resource kinds:
 
-### Deployment (18 actions)
-`ScaleDeployment`, `RollbackDeployment`, `RestartDeployment`, `PatchConfig`, `AdjustResources`, `DeletePod`, `HelmRollback`, `ArgoSyncApp`, `AdjustHPA`, `RestartStatefulSetPod`, `CordonNode`, `DrainNode`, `ResizePVC`, `RotateSecret`, `ExecDiagnostic`, `UpdateIngress`, `PatchNetworkPolicy`, `ApplyManifest`
+### Deployment and cluster-level (19 actions)
+`ScaleDeployment`, `RollbackDeployment`, `RestartDeployment`, `PatchConfig`, `AdjustResources`, `DeletePod`, `HelmRollback`, `ArgoSyncApp`, `AdjustHPA`, `RestartStatefulSetPod`, `CordonNode`, `UncordonNode`, `DrainNode`, `ResizePVC`, `RotateSecret`, `ExecDiagnostic`, `UpdateIngress`, `PatchNetworkPolicy`, `ApplyManifest`
 
 ### StatefulSet (9 actions)
 `ScaleStatefulSet`, `RestartStatefulSet`, `RollbackStatefulSet`, `AdjustStatefulSetResources`, `DeleteStatefulSetPod`, `ForceDeleteStatefulSetPod`, `UpdateStatefulSetStrategy`, `RecreateStatefulSetPVC`, `PartitionStatefulSetUpdate`
@@ -261,25 +317,29 @@ The platform supports **46+ remediation action types** across resource kinds:
 
 ### Node Failure — Remediation Flow
 
-When a node has problems, the watcher detects the condition and emits anomalies automatically:
+When a node has problems, the watcher detects the condition and the bridge emits an Anomaly whose resource kind is `Node`:
 
 ```
 Node MemoryPressure detected
-  → Anomaly CR created (signal: memory_high, severity: critical)
-    → Issue correlated with affected pods
+  → Anomaly CR created (signal: memory_high, resource kind: Node)
+    → Issue created (severity from the risk score; memory_high alone = low)
       → AI analyzes: "Node worker-2 with MemoryPressure, echo-app pods impacted"
-        → Remediation: CordonNode (prevent new pods) + DrainNode (evict existing pods)
+        → Remediation: CordonNode (prevent new pods) + DrainNode (remove existing pods)
           → Kubernetes re-schedules pods on healthy nodes
-            → Verification: pods healthy on new nodes → Resolved
+            → Health verification of the target (see the note below)
 ```
 
-The `CordonNode` and `DrainNode` actions respect PodDisruptionBudgets and perform graceful eviction. Node context (CPU, memory, pod count, conditions) is included in the AI analysis, enabling more precise decisions.
+`DrainNode` cordons the node and then **deletes** its pods with a 30-second grace period (DaemonSet and mirror pods are skipped). It does not use the Eviction API, so **PodDisruptionBudgets are not enforced** — require approval for node actions if that matters. Node context (CPU, memory, pod count, conditions) is included in the AI analysis.
 
-The platform builds a **library of learned strategies** over time. Each successful remediation generates a reusable runbook that can be applied to future incidents with the same root cause.
+<Note>
+Health verification, rollback snapshots and auto-resolve only understand workload kinds (Deployment, StatefulSet, DaemonSet, Job, CronJob). A plan whose target is a `Node` never passes verification: after 90 seconds it ends `Failed` or `RolledBack`, the incident retries until `maxRemediationAttempts`, then escalates, and an escalated Issue on a `Node` never auto-resolves. Expect to resolve node incidents manually.
+</Note>
+
+The platform builds a **library of learned strategies** over time, reusable for future incidents with the same trigger.
 
 ### How Runbooks Are Named
 
-Runbook names include a hash of the AI's root cause analysis, ensuring different causes produce different runbooks:
+Runbooks generated from the AI's suggested actions include a hash (first 6 hex characters of the SHA-256 of the analysis), so different causes produce different runbooks:
 
 ```
 auto-{signal}-{severity}-{kind}-{hash}
@@ -289,6 +349,8 @@ Examples:
   auto-oom-kill-critical-deployment-c7d4e9  (cause: memory limit too low)
   auto-pod-not-ready-low-deployment-e8b3d2  (cause: bad image tag)
 ```
+
+Runbooks learned from a successful agentic plan are named `agentic-{signal}-{severity}-{kind}` (no hash — a later agentic success for the same trigger overwrites it) and keep only the steps that did not fail. Both carry the label `platform.chatcli.io/auto-generated: "true"`.
 
 ### Multi-Runbook Selection
 
@@ -308,39 +370,105 @@ AI analyzes current root cause and responds:
 Selected runbook executed → fast resolution without agentic loop
 ```
 
-If **none** of the candidates match the current root cause, the AI responds with `RUNBOOK_REJECTED`, generates a new strategy from scratch, and a **new runbook is created** with a unique hash — expanding the library for future incidents.
+If **none** of the candidates match the current root cause, the AI responds with `RUNBOOK_REJECTED`; if it suggests actions, a **new runbook is created** with a unique hash — expanding the library for future incidents.
 
 ### Runbook Lifecycle
 
 | Stage | What Happens |
 |-------|-------------|
-| **Created** | Auto-generated after successful AI remediation |
+| **Created** | `auto-*`: when the AI suggests actions and no runbook was selected — **before** the plan runs, so it persists even if that attempt fails. `agentic-*`: after a successful agentic plan |
 | **Matched** | Found by trigger criteria (signal + severity + kind) |
 | **Validated** | AI evaluates if the runbook fits the current root cause |
 | **Executed** | Steps run sequentially with rollback capability |
 | **Library grows** | Each new root cause adds a new runbook to the library |
 
-Over time, the platform becomes faster and more accurate — common failure modes are resolved via runbooks (seconds) instead of full AI analysis (minutes).
+Because `auto-*` runbooks are created before they are proven, review the library (`kubectl get rb -A -l platform.chatcli.io/auto-generated=true`) and delete runbooks that led to failed attempts. Over time, common failure modes are resolved via runbooks (seconds) instead of full AI analysis (minutes).
 
 ## PostMortem Generation
 
-When an incident is resolved (automatically or manually), a PostMortem CR is auto-generated containing:
+When a remediation plan completes — the Issue becomes `Resolved` or `Contained` — a PostMortem CR (`pm-<issue>`, short name `pm`, state `Open`) is generated containing:
 
 - **Timeline** — chronological events from detection to resolution
-- **Root cause analysis** — AI-generated with confidence score
+- **Root cause, summary and impact** — from the AI analysis
 - **Actions executed** — complete remediation history
-- **Impact assessment** — affected pods, services, SLOs
-- **Lessons learned** — AI recommendations for prevention
-- **Git correlation** — recent deployments that may have caused the issue
-- **Cascade analysis** — related incidents across services
+- **Lessons learned and prevention actions** — AI recommendations
+- **Git correlation and GitOps context** — recent changes that may have caused the issue
+- **Cascade chain** — related incidents across services
+- **Trending** — recurrence of similar incidents
 
-PostMortems can be reviewed and closed via the [Review PostMortem](/reference/api/review-postmortem) and [Close PostMortem](/reference/api/close-postmortem) API endpoints.
+Issues resolved manually or by auto-resolve do not get a PostMortem. PostMortems can be reviewed and closed via the [Review PostMortem](/reference/api/review-postmortem) and [Close PostMortem](/reference/api/close-postmortem) API endpoints.
+
+### PostMortems with `requiresHumanAction`
+
+When the parent Issue is `Contained`, **both the Issue and the PostMortem** carry typed `status` fields:
+
+```bash
+# Issue
+kubectl get issue <name> -o jsonpath='{.status.requiresHumanAction}'
+# true
+kubectl get issue <name> -o jsonpath='{.status.requiredAction}'
+# restore the deployment's replicas to the desired count after fixing the root cause...
+
+# PostMortem
+kubectl get postmortem pm-<name> -o jsonpath='{.status.requiresHumanAction}'
+# true
+kubectl get postmortem pm-<name> -o jsonpath='{.status.requiredAction}'
+# (same text)
+```
+
+Guaranteed behaviors:
+
+- If a PostMortem with `requiresHumanAction: true` is set to `Closed` without the annotation `aiops.chatcli.io/human-action-acknowledged` set to a truthy value (`true`, `True`, `yes`, `ack`, `acknowledged`), the `PostMortemReconciler` **reverts it to `Open`** (even after a forced `kubectl patch`)
+- When auto-resolve fires (a human restored the replicas), the controller **clears** both fields on the Issue and sets the condition `RequiresHumanAction: False`. The PostMortem keeps its flag until the human action is acknowledged
+- The REST API exposes the fields as top-level fields of the incident item (`requiresHumanAction`, `requiredAction`, returned under both `spec` and `status` of the response), so dashboards render them without fetching the PostMortem
+
+<Note>
+**Schema history (v1alpha1)** — In 1.122.x these fields lived in `PostMortemSpec` and were `null` at runtime. They now live in `PostMortemStatus` and `IssueStatus`. Helm installs re-apply the CRDs automatically (pre-install/pre-upgrade hook, `crdUpgrade.enabled: true`); with raw manifests, re-apply `config/crd/bases/`.
+</Note>
+
+To acknowledge the action and unblock closing (`operator` role):
+
+```bash
+# Via REST API (namespace defaults to "default" when omitted)
+curl -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  "$AIOPS_URL/api/v1/postmortems/<pm-name>/ack-human-action?namespace=default" \
+  -d '{"acknowledgedBy":"sre-team","note":"rolled back to v1.2.3 and scaled to 3 replicas"}'
+
+# Or via kubectl
+kubectl annotate postmortem <pm-name> -n default \
+  aiops.chatcli.io/human-action-acknowledged=true \
+  aiops.chatcli.io/human-action-acknowledged-by=sre-team
+```
+
+The REST call returns `400` if the PostMortem does not require human action; on success it also clears `status.requiresHumanAction` immediately. In the web dashboard this appears as the **"Ack Human Action"** button on the PostMortem row when `requiresHumanAction=true`.
+
+## Chaos Engineering Correlation
+
+An Issue created while a `ChaosExperiment` targets the **same resource** (kind, name and namespace) — while the experiment is `Running`, or within 2 minutes after it became `Completed` or `Aborted` — automatically receives the labels:
+
+- `platform.chatcli.io/source=chaos-experiment`
+- `platform.chatcli.io/chaos-experiment=<experiment-name>`
+
+These labels change platform behavior:
+
+| Behavior | Production Issue | Chaos-induced Issue |
+|----------|------------------|---------------------|
+| Full AIOps pipeline | ✅ | ✅ |
+| NotificationPolicy notifications | ✅ | ✅ |
+| EscalationPolicy chain (paging) | ✅ | ❌ (skipped entirely) |
+| `chatcli_operator_issue_resolution_duration_seconds` (MTTR) | ✅ | ❌ (excluded) |
+| `analytics/summary.chaosInducedIssues` | - | Counted separately |
+| Label on the generated PostMortem | - | Propagated for filtering |
+
+See [Chaos Engineering](/features/aiops/chaos-engineering) for details on the CR and the controller.
 
 ## SLA Integration
 
-Each incident severity can have an SLA configuration:
+Each incident severity can have an `IncidentSLA`:
 
-- **Response time** — max time from detection to first analysis
-- **Resolution time** — max time from detection to resolution
-- **Business hours** — optionally pause SLA clock outside business hours
-- **Escalation policy** — automatically triggered on SLA breach
+- **Response time** — max time from detection until the Issue is seen in `Analyzing` or `Remediating`
+- **Resolution time** — max time from detection to resolution (an Issue that reaches `Escalated` is also checked against it)
+- **Business hours** — optionally count only time inside business hours
+- **`escalationPolicyRef` / `notificationPolicyRef`** — accepted by the CRD but **not read by any controller**: an SLA breach is recorded (status, metrics, audit) but does not trigger escalation or notifications by itself
+
+See [SLOs & SLAs](/features/aiops/slo-sla) for details.

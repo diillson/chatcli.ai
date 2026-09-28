@@ -5,12 +5,21 @@ description: "Unified management of multiple Kubernetes clusters with cross-clus
 icon: "network-wired"
 ---
 
-**Multi-Cluster Federation** allows the ChatCLI AIOps platform to manage multiple Kubernetes clusters from a single control plane. Incidents are correlated across clusters, cascades are detected automatically, and remediation policies respect each environment's tier.
+**Multi-Cluster Federation** lets a ChatCLI operator see beyond its own cluster. You register the other clusters with a `ClusterRegistration`; the operator health-checks them, correlates new Issues with the Issues running there, flags staging-to-production cascades, and applies a remediation policy based on its own cluster's tier.
 
 <Info>
   Federation does not require a service mesh or external tools. The operator
-  connects directly to each cluster via kubeconfig stored in Secrets.
+  connects directly to each registered cluster with a kubeconfig stored in a Secret.
 </Info>
+
+<Warning>
+  Federation reads other clusters; it does not remediate them. Detection and
+  remediation stay local: each cluster that should heal itself runs its own
+  operator (and its own ChatCLI Instance; only one Instance per cluster drives
+  AIOps). Through the registered kubeconfig the operator only lists nodes,
+  namespaces, Issues and RemediationPlans, and updates remote Issues when it
+  correlates them.
+</Warning>
 
 
 
@@ -37,13 +46,13 @@ Without federation, each cluster is a silo. AIOps loses the ability to:
 - Detect that the same problem affects 5 clusters simultaneously
 - Correlate a staging deploy with a production failure
 - Apply differentiated remediation policies by cluster importance
-- Aggregate health metrics into a global view
+- Aggregate cluster health into a global view
 
 
 
 ## ClusterRegistration CRD
 
-The `ClusterRegistration` CRD is the entry point for adding clusters to the federation.
+The `ClusterRegistration` CRD is the entry point for adding clusters to the federation. Create it in the cluster where the operator runs, in any namespace; the kubeconfig Secret must live in the same namespace.
 
 ### Complete Specification
 
@@ -54,153 +63,87 @@ metadata:
   name: prod-us-east-1
   namespace: chatcli-system
 spec:
-  # Reference to the Secret containing the kubeconfig
+  displayName: prod-us-east-1
+  # Secret in the same namespace; the kubeconfig must be under the key "kubeconfig"
   kubeconfigSecretRef:
     name: cluster-prod-us-east-1-kubeconfig
-    key: kubeconfig
 
   # Cluster metadata
   region: us-east-1
-  environment: production
+  environment: prod       # prod | staging | dev
   tier: critical          # critical | standard | non-critical
 
   # Monitoring configuration
   healthCheckInterval: 30s
-  capabilities:
-    - monitoring
-    - remediation
-    - chaos-engineering
 
-  # Safety limits
+  # Informational (stored, not enforced)
+  capabilities:
+    - metrics-server
+    - prometheus
   maxConcurrentRemediations: 2
 
 status:
-  # Automatically populated by the controller
+  # Populated by the controller
   connected: true
   lastHealthCheck: "2026-03-19T14:30:00Z"
   kubernetesVersion: "v1.29.2"
   nodeCount: 12
   namespaceCount: 34
-  conditions:
-    - type: Connected
-      status: "True"
-      lastTransitionTime: "2026-03-19T10:00:00Z"
-      reason: HealthCheckSucceeded
-      message: "Cluster accessible, 12 nodes, 34 namespaces"
-    - type: RemediationCapable
-      status: "True"
-      lastTransitionTime: "2026-03-19T10:00:00Z"
-      reason: RBACConfigured
-      message: "ServiceAccount with remediation permissions"
+  activeIssues: 2
+  activeRemediations: 1
 ```
 
 ### Spec Fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `kubeconfigSecretRef.name` | string | Yes | Name of the Secret with the kubeconfig |
-| `kubeconfigSecretRef.key` | string | Yes | Key within the Secret (usually `kubeconfig`) |
-| `region` | string | Yes | Geographic region of the cluster |
-| `environment` | string | Yes | Environment: `staging`, `production`, `dr`, `development` |
-| `tier` | string | Yes | Importance: `critical`, `standard`, `non-critical` |
-| `healthCheckInterval` | duration | No | Health check interval (default: `30s`) |
-| `capabilities` | []string | No | Enabled capabilities: `monitoring`, `remediation`, `chaos-engineering` |
-| `maxConcurrentRemediations` | int | No | Maximum concurrent remediations (default: `3`) |
+| `displayName` | string | Yes | Human-readable name; also accepted by `clusterName` for the [tier gate](#remediation-policy-per-tier) |
+| `kubeconfigSecretRef.name` | string | Yes | Secret in the same namespace holding the kubeconfig under the fixed key `kubeconfig` |
+| `region` | string | No | Geographic region of the cluster (informational) |
+| `environment` | string | Yes (default `dev`) | `prod`, `staging` or `dev`. [Cascade detection](#cascade-detection) uses `staging` and `prod` |
+| `tier` | string | Yes (default `standard`) | `critical`, `standard` or `non-critical` |
+| `labels` | map | No | Custom metadata (informational) |
+| `healthCheckInterval` | duration | No | Health check interval (default `30s`; an unparseable value falls back to `30s`) |
+| `capabilities` | []string | No | Free-form list of cluster features, e.g. `metrics-server`, `prometheus`, `istio`. Stored only; no code reads it |
+| `maxConcurrentRemediations` | int | No | Default `3`. Stored only; the operator does not enforce it in current releases |
 
 ### Status Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `connected` | bool | Whether the cluster is accessible |
-| `lastHealthCheck` | timestamp | Last successful health check |
-| `kubernetesVersion` | string | Remote cluster Kubernetes version |
-| `nodeCount` | int | Number of active nodes |
+| `connected` | bool | Whether the last health check succeeded |
+| `lastHealthCheck` | timestamp | Time of the last health check, successful or not |
+| `kubernetesVersion` | string | Kubelet version of the remote cluster's first node |
+| `nodeCount` | int | Number of nodes |
 | `namespaceCount` | int | Number of namespaces |
-| `conditions` | []Condition | Detailed conditions (Connected, RemediationCapable) |
+| `activeIssues` | int | Non-terminal Issues in the remote cluster (0 when its CRDs are not installed) |
+| `activeRemediations` | int | RemediationPlans in `Pending`, `Executing` or `Verifying` in the remote cluster |
+| `conditions` | []Condition | Defined in the schema; the controller does not set any |
 
 
 
 ## How Federation Works
 
-### Kubeconfig Parsing
+### Kubeconfig and client cache
 
-The controller reads the kubeconfig from the referenced Secret and creates a Kubernetes client configured for the remote cluster.
+On each reconcile the FederationReconciler reads `data.kubeconfig` from the Secret named in `kubeconfigSecretRef`, in the ClusterRegistration's namespace, builds a controller-runtime client from it, and caches that client by registration name. The cache is dropped when a health check fails or the registration is deleted, so a rotated kubeconfig is picked up after the next failed check (or an operator restart).
 
-```go
-func (r *FederationReconciler) buildRemoteClient(
-    ctx context.Context,
-    reg *v1alpha1.ClusterRegistration,
-) (kubernetes.Interface, error) {
-    // 1. Fetch the Secret with the kubeconfig
-    secret := &corev1.Secret{}
-    err := r.client.Get(ctx, types.NamespacedName{
-        Name:      reg.Spec.KubeconfigSecretRef.Name,
-        Namespace: reg.Namespace,
-    }, secret)
-    if err != nil {
-        return nil, fmt.Errorf("secret not found: %w", err)
-    }
-
-    // 2. Extract and parse the kubeconfig
-    kubeconfigData := secret.Data[reg.Spec.KubeconfigSecretRef.Key]
-    config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
-    if err != nil {
-        return nil, fmt.Errorf("invalid kubeconfig: %w", err)
-    }
-
-    // 3. Create the client
-    return kubernetes.NewForConfig(config)
-}
-```
-
-### Remote Client Cache
-
-Clients are stored in a `sync.Map` for reuse, avoiding unnecessary reconnections:
-
-```go
-type FederationManager struct {
-    clients    sync.Map  // map[string]kubernetes.Interface
-    mu         sync.RWMutex
-}
-
-func (fm *FederationManager) GetClient(clusterName string) (kubernetes.Interface, bool) {
-    client, ok := fm.clients.Load(clusterName)
-    if !ok {
-        return nil, false
-    }
-    return client.(kubernetes.Interface), true
-}
-
-func (fm *FederationManager) RegisterClient(clusterName string, client kubernetes.Interface) {
-    fm.clients.Store(clusterName, client)
-}
-```
+The kubeconfig identity needs, on the remote cluster: `list` on nodes and namespaces for the health check; `list` on `issues` and `remediationplans` (group `platform.chatcli.io`) for the counters and correlation; and `update` on `issues` for correlation to annotate them.
 
 ### Health Check Loop
 
-The controller executes periodic health checks on each registered cluster:
-
 <Steps>
   <Step title="List Nodes">
-    Executes `List Nodes` on the remote cluster to verify connectivity and count
-    active nodes.
-    ```go
-    nodes, err := remoteClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-    ```
+    Lists the remote nodes to verify connectivity, count them and read the first node's kubelet version.
   </Step>
   <Step title="List Namespaces">
-    Executes `List Namespaces` to count namespaces and verify RBAC
-    permissions.
-    ```go
-    namespaces, err := remoteClient.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-    ```
+    Lists the remote namespaces and counts them.
+  </Step>
+  <Step title="Count AIOps work">
+    Lists remote Issues and RemediationPlans, when those CRDs exist there, to fill `activeIssues` and `activeRemediations`.
   </Step>
   <Step title="Update Status">
-    Updates the `ClusterRegistration.Status` with the results, including
-    `connected`, `nodeCount`, `namespaceCount`, and `kubernetesVersion`.
-  </Step>
-  <Step title="Generate Metrics">
-    Exports Prometheus metrics with the cluster state.
+    Writes `connected`, `lastHealthCheck`, `kubernetesVersion`, `nodeCount`, `namespaceCount`, `activeIssues` and `activeRemediations`, then requeues after `healthCheckInterval`. A failure at any step before this one sets `connected: false` and only refreshes `lastHealthCheck`.
   </Step>
 </Steps>
 
@@ -209,16 +152,14 @@ sequenceDiagram
     participant FC as Federation Controller
     participant K8s as Local K8s API
     participant RC1 as Cluster Prod US
-    participant RC2 as Cluster Prod EU
-    participant RC3 as Cluster Staging
+    participant RC2 as Cluster Staging
 
-    loop every healthCheckInterval
-        FC->>RC1: List Nodes + Namespaces
-        RC1-->>FC: 12 nodes, 34 ns
-        FC->>RC2: List Nodes + Namespaces
-        RC2-->>FC: 8 nodes, 28 ns
-        FC->>RC3: List Nodes + Namespaces
-        RC3-->>FC: 4 nodes, 15 ns
+    loop every healthCheckInterval (per registration)
+        FC->>RC1: List Nodes, Namespaces, Issues, RemediationPlans
+        RC1-->>FC: 12 nodes, 34 ns, 2 active issues
+        FC->>K8s: Update ClusterRegistration.Status
+        FC->>RC2: List Nodes, Namespaces, Issues, RemediationPlans
+        RC2-->>FC: 4 nodes, 15 ns, 0 active issues
         FC->>K8s: Update ClusterRegistration.Status
     end
 ```
@@ -247,7 +188,7 @@ spec:
   signalType: error_rate
 ```
 
-The counter `chatcli_operator_federation_cross_cluster_issues_total` increments once per correlation. Remote Issues that changed underneath the update are skipped on a conflict and picked up on their own next reconcile.
+The counter `chatcli_operator_federation_cross_cluster_issues_total` increments once per correlation. An Issue that changed underneath the update (a conflict) is skipped and not retried; a later correlation, triggered by another new Issue with the same signal, annotates it again with a new id.
 
 <Note>
   The correlation id is an annotation, so find the related Issues with:
@@ -258,13 +199,17 @@ The counter `chatcli_operator_federation_cross_cluster_issues_total` increments 
   ```
 </Note>
 
+<Warning>
+  `GET /api/v1/federation/correlations` does not show these correlations in current releases: it reads the annotations `platform.chatcli.io/correlation-id`, `correlated-clusters` and `elevated-severity`, which nothing writes, and skips Issues without `correlation-id`, so it returns an empty list. Use the `kubectl` query above until the keys are aligned.
+</Warning>
+
 ## Cascade Detection
 
-Cascade detection flags a production Issue whose resource already failed in staging: the same problem is rolling through the environments.
+Cascade detection flags a newly detected Issue whose resource (same name) already failed earlier in a staging cluster: the same problem is rolling through the environments.
 
 ### Staging to Production
 
-The check needs at least one connected registration with `environment: staging` and one with `environment: prod`. For the Issue being detected, the controller lists the Issues on every staging cluster and looks for one on a resource with the **same name** whose `detectedAt` is **earlier** than the local Issue's. The first match annotates the local Issue:
+The check needs at least one connected registration with `environment: staging` and one with `environment: prod`. It runs for every Issue the local operator detects (the local cluster's own environment is not consulted); for that Issue, the controller lists the Issues on every staging cluster and looks for one on a resource with the **same name** whose `detectedAt` is **earlier** than the local Issue's. The first match annotates the local Issue:
 
 ```yaml
 metadata:
@@ -282,63 +227,51 @@ and increments `chatcli_operator_federation_cascade_detected_total`.
 
 ## Global Status Aggregation
 
-The operator maintains an aggregated status of the entire federation, accessible via CRD and API:
+There is no federation status CRD. The aggregated view is computed on request by the operator's REST API from the ClusterRegistrations and the local Issues:
 
-```yaml
-apiVersion: platform.chatcli.io/v1alpha1
-kind: FederationStatus
-metadata:
-  name: global-status
-  namespace: chatcli-system
-status:
-  totalClusters: 5
-  connectedClusters: 4
-  disconnectedClusters:
-    - name: dr-us-west-2
-      lastSeen: "2026-03-19T12:00:00Z"
-      reason: "Network timeout"
-  totalActiveIssues: 12
-  issuesBySeverity:
-    critical: 1
-    high: 3
-    medium: 5
-    low: 3
-  issuesByCluster:
-    prod-us-east-1: 4
-    prod-eu-west-1: 3
-    prod-ap-southeast-1: 2
-    staging-us-east-1: 3
-  crossClusterCorrelations: 2
-  cascadesDetected: 1
-  remediationsInProgress: 3
-  lastUpdated: "2026-03-19T14:35:00Z"
+| Endpoint | Returns |
+|----------|---------|
+| `GET /api/v1/federation/status` (also `GET /api/v1/federation`) | `totalClusters`, `connectedClusters`, `disconnectedClusters`, and `totalActiveIssues` (local Issues not `Resolved` or `Failed`) |
+| `GET /api/v1/federation/clusters?tier=critical` | The registrations, optionally filtered by tier |
+| `GET /api/v1/clusters/global-status` | `totalClusters`, `healthyClusters` (connected), `offlineClusters`, `degradedClusters` (always `0` in current releases) and the cluster list |
+| `GET /api/v1/federation/correlations` | Cross-cluster correlations (see the warning above: empty in current releases) |
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "FederationStatus",
+  "spec": {
+    "totalClusters": 5,
+    "connectedClusters": 4,
+    "disconnectedClusters": 1,
+    "totalActiveIssues": 12
+  }
+}
 ```
 
 <Tabs>
   <Tab title="kubectl">
     ```bash
-    # Federation overview
-    kubectl get federationstatus global-status -n chatcli-system -o yaml
-
-    # List all registered clusters
-    kubectl get clusterregistrations -n chatcli-system
+    # List all registered clusters (CONNECTED column comes from status.connected)
+    kubectl get clusterregistrations -A
 
     # See disconnected clusters
-    kubectl get clusterregistrations -n chatcli-system \
-      -o jsonpath='{range .items[?(@.status.connected==false)]}{.metadata.name}{"\n"}{end}'
+    kubectl get clusterregistrations -A \
+      -o jsonpath='{range .items[?(@.status.connected==false)]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'
     ```
   </Tab>
   <Tab title="REST API">
     ```bash
-    # Global status via API
-    curl -s https://chatcli.example.com/api/v1/federation/status | jq .
+    # The API is served by the operator (Service chatcli-operator, port 8090)
+    kubectl -n chatcli-system port-forward svc/chatcli-operator 8090:8090 &
+
+    # Global status
+    curl -s -H "X-API-Key: $CHATCLI_API_KEY" http://localhost:8090/api/v1/federation/status | jq .
 
     # List clusters filtered by tier
-    curl -s https://chatcli.example.com/api/v1/federation/clusters?tier=critical | jq .
-
-    # Cross-cluster issues
-    curl -s https://chatcli.example.com/api/v1/federation/correlations | jq .
+    curl -s -H "X-API-Key: $CHATCLI_API_KEY" "http://localhost:8090/api/v1/federation/clusters?tier=critical" | jq .
     ```
+    See the [API overview](/reference/api/overview) for API keys and roles (`viewer` is enough for these endpoints).
   </Tab>
 </Tabs>
 
@@ -356,7 +289,7 @@ Each cluster has a remediation policy based on the `tier` of its ClusterRegistra
 | **standard** | critical/high | Manual with approval | Conservatism for high severities |
 | **standard** | medium/low | Auto-remediation | Automation for lower-impact problems |
 | **non-critical** | Any | Auto-remediation | Maximum automation in dev/test environments |
-| unknown tier | Any | Manual with approval | Safe fallback |
+| any other value | Any | Manual with approval | Safe fallback (the CRD enum normally prevents it; the tier is compared case-insensitively) |
 
 ### Wiring
 
@@ -367,7 +300,7 @@ Tell the operator which registration is its own cluster:
 clusterName: prod-us-east-1      # ClusterRegistration name or displayName
 ```
 
-or `CHATCLI_OPERATOR_CLUSTER_NAME` on the Deployment. Empty (the default) disables the tier gate. With it set, every plan that reaches `Pending` and was not parked by an ApprovalPolicy is checked against the table: when the tier says "manual", the plan waits in `WaitingApproval` under the synthetic policy `cluster-tier` (one approver, 30-minute timeout, decided like any ApprovalRequest) and its annotations carry `decision-mode: approval` and the reason, for example `Cluster prod-us-east-1 tier policy "manual" requires approval for high severity`.
+or `CHATCLI_OPERATOR_CLUSTER_NAME` on the Deployment. The operator looks the value up among the ClusterRegistrations of **its own cluster** (any namespace), matching `metadata.name` or `spec.displayName`, so register the local cluster too; only the `tier` is read, so the gate works even while that registration is not `connected`. When no registration matches, the error is logged and plans proceed on the ApprovalPolicies alone. Empty (the default) disables the tier gate. With it set, every plan that reaches `Pending` and was not parked by an ApprovalPolicy is checked against the table: when the tier says "manual", the plan waits in `WaitingApproval` under the synthetic policy `cluster-tier` (one approver, 30-minute timeout, decided like any ApprovalRequest) and its annotations carry `decision-mode: approval` and the reason, for example `Cluster prod-us-east-1 tier policy "manual" requires approval for high severity`.
 
 <Note>
   The tier gate runs **before** the Decision Engine and independently of it: a plan the tier parks is not evaluated for confidence, and a plan the tier lets through is still subject to the engine when the engine is enabled.
@@ -378,17 +311,9 @@ or `CHATCLI_OPERATOR_CLUSTER_NAME` on the Deployment. Empty (the default) disabl
 ### Register a Production Cluster
 
 <CodeGroup>
-```yaml Secret (kubeconfig)
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cluster-prod-us-east-1-kubeconfig
-  namespace: chatcli-system
-type: Opaque
-data:
-  kubeconfig: |
-    # base64 encoded kubeconfig
-    YXBpVmVyc2lvbjogdjEKa2lu...
+```bash Secret (kubeconfig)
+kubectl -n chatcli-system create secret generic cluster-prod-us-east-1-kubeconfig \
+  --from-file=kubeconfig=./prod-us-east-1.kubeconfig
 ```
 
 ```yaml ClusterRegistration
@@ -398,20 +323,16 @@ metadata:
   name: prod-us-east-1
   namespace: chatcli-system
   labels:
-    environment: production
+    environment: prod
     region: us-east-1
 spec:
+  displayName: prod-us-east-1
   kubeconfigSecretRef:
     name: cluster-prod-us-east-1-kubeconfig
-    key: kubeconfig
   region: us-east-1
-  environment: production
+  environment: prod
   tier: critical
   healthCheckInterval: 30s
-  capabilities:
-    - monitoring
-    - remediation
-  maxConcurrentRemediations: 2
 ```
 </CodeGroup>
 
@@ -427,18 +348,13 @@ metadata:
     environment: staging
     region: us-east-1
 spec:
+  displayName: staging-us-east-1
   kubeconfigSecretRef:
     name: cluster-staging-us-east-1-kubeconfig
-    key: kubeconfig
   region: us-east-1
   environment: staging
   tier: non-critical
   healthCheckInterval: 60s
-  capabilities:
-    - monitoring
-    - remediation
-    - chaos-engineering   # Chaos enabled only in staging
-  maxConcurrentRemediations: 5
 ```
 
 ### Complete Multi-Region Setup
@@ -451,15 +367,13 @@ metadata:
   name: prod-us-east-1
   namespace: chatcli-system
 spec:
+  displayName: prod-us-east-1
   kubeconfigSecretRef:
     name: kubeconfig-prod-us
-    key: kubeconfig
   region: us-east-1
-  environment: production
+  environment: prod
   tier: critical
   healthCheckInterval: 15s
-  capabilities: [monitoring, remediation]
-  maxConcurrentRemediations: 2
 ---
 # Production EU
 apiVersion: platform.chatcli.io/v1alpha1
@@ -468,15 +382,13 @@ metadata:
   name: prod-eu-west-1
   namespace: chatcli-system
 spec:
+  displayName: prod-eu-west-1
   kubeconfigSecretRef:
     name: kubeconfig-prod-eu
-    key: kubeconfig
   region: eu-west-1
-  environment: production
+  environment: prod
   tier: critical
   healthCheckInterval: 15s
-  capabilities: [monitoring, remediation]
-  maxConcurrentRemediations: 2
 ---
 # Production APAC
 apiVersion: platform.chatcli.io/v1alpha1
@@ -485,15 +397,13 @@ metadata:
   name: prod-ap-southeast-1
   namespace: chatcli-system
 spec:
+  displayName: prod-ap-southeast-1
   kubeconfigSecretRef:
     name: kubeconfig-prod-ap
-    key: kubeconfig
   region: ap-southeast-1
-  environment: production
+  environment: prod
   tier: critical
   healthCheckInterval: 15s
-  capabilities: [monitoring, remediation]
-  maxConcurrentRemediations: 2
 ---
 # Staging (shared)
 apiVersion: platform.chatcli.io/v1alpha1
@@ -502,32 +412,30 @@ metadata:
   name: staging-global
   namespace: chatcli-system
 spec:
+  displayName: staging-global
   kubeconfigSecretRef:
     name: kubeconfig-staging
-    key: kubeconfig
   region: us-east-1
   environment: staging
   tier: non-critical
   healthCheckInterval: 60s
-  capabilities: [monitoring, remediation, chaos-engineering]
-  maxConcurrentRemediations: 10
 ---
-# DR (Disaster Recovery)
+# DR (Disaster Recovery): the environment enum has no "dr" value
 apiVersion: platform.chatcli.io/v1alpha1
 kind: ClusterRegistration
 metadata:
   name: dr-us-west-2
   namespace: chatcli-system
+  labels:
+    role: dr
 spec:
+  displayName: dr-us-west-2
   kubeconfigSecretRef:
     name: kubeconfig-dr
-    key: kubeconfig
   region: us-west-2
-  environment: dr
+  environment: prod
   tier: standard
   healthCheckInterval: 60s
-  capabilities: [monitoring]
-  maxConcurrentRemediations: 1
 ```
 
 
@@ -536,15 +444,17 @@ spec:
 
 ### Prometheus Metrics
 
+Served on the operator metrics port (8080, `/metrics`):
+
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `federation_clusters_total` | Gauge | `status` | Total clusters by status (connected/disconnected) |
-| `federation_health_check_duration_seconds` | Histogram | `cluster` | Health check time per cluster |
-| `federation_cluster_nodes` | Gauge | `cluster`, `region` | Number of nodes per cluster |
-| `cross_cluster_issues_total` | Counter | `signal_type` | Total cross-cluster correlated issues |
-| `cross_cluster_correlations_active` | Gauge | - | Currently active correlations |
-| `cascade_detected_total` | Counter | `source_tier`, `target_tier` | Total cascades detected |
-| `federation_remediation_policy_applied` | Counter | `tier`, `mode` | Policies applied by tier and mode |
+| `chatcli_operator_federation_clusters_total` | Gauge | `status` (`connected`, `disconnected`) | Incremented once per health-check outcome |
+| `chatcli_operator_federation_cross_cluster_issues_total` | Counter | - | Cross-cluster correlations raised |
+| `chatcli_operator_federation_cascade_detected_total` | Counter | - | Staging-to-production cascades detected |
+
+<Warning>
+  `chatcli_operator_federation_clusters_total` is declared as a gauge but the controller only ever increments it (once per health check, per outcome) and never sets or resets it, so it grows with every check instead of reporting the current number of clusters. Treat it as a counter of health-check outcomes and use `rate()`/`increase()` on it, or read `status.connected` from the ClusterRegistrations for the current state.
+</Warning>
 
 ### Recommended Dashboards
 
@@ -553,31 +463,24 @@ spec:
   {
     "panels": [
       {
-        "title": "Connected Clusters",
+        "title": "Failed Health Checks (5m)",
         "type": "stat",
         "targets": [{
-          "expr": "federation_clusters_total{status='connected'}"
+          "expr": "increase(chatcli_operator_federation_clusters_total{status='disconnected'}[5m])"
         }]
       },
       {
-        "title": "Issues by Cluster",
-        "type": "barchart",
+        "title": "Cross-Cluster Correlations (24h)",
+        "type": "stat",
         "targets": [{
-          "expr": "sum by (cluster) (aiops_active_issues)"
+          "expr": "increase(chatcli_operator_federation_cross_cluster_issues_total[24h])"
         }]
       },
       {
         "title": "Cascades Detected (24h)",
         "type": "stat",
         "targets": [{
-          "expr": "increase(cascade_detected_total[24h])"
-        }]
-      },
-      {
-        "title": "Health Check Latency",
-        "type": "timeseries",
-        "targets": [{
-          "expr": "histogram_quantile(0.95, federation_health_check_duration_seconds_bucket)"
+          "expr": "increase(chatcli_operator_federation_cascade_detected_total[24h])"
         }]
       }
     ]
@@ -591,36 +494,35 @@ spec:
 groups:
   - name: federation
     rules:
-      - alert: ClusterDisconnected
-        expr: federation_clusters_total{status="disconnected"} > 0
+      - alert: ClusterHealthCheckFailing
+        expr: increase(chatcli_operator_federation_clusters_total{status="disconnected"}[5m]) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Federated cluster disconnected"
+          summary: "Federated cluster health checks failing"
           description: >
-            {{ $value }} cluster(s) disconnected for more than 5 minutes.
-            Check network connectivity and credentials.
+            At least one ClusterRegistration failed its health check in the last
+            5 minutes. Check network connectivity and the kubeconfig Secret.
 
       - alert: CrossClusterIncident
-        expr: cross_cluster_correlations_active > 0
-        for: 1m
+        expr: increase(chatcli_operator_federation_cross_cluster_issues_total[10m]) > 0
         labels:
           severity: critical
         annotations:
           summary: "Cross-cluster correlated incident"
           description: >
-            {{ $value }} active cross-cluster correlation(s).
-            Same problem detected in 3+ clusters.
+            The same signal is active in 3+ clusters; the matching Issues were
+            raised to critical.
 
       - alert: CascadeDetected
-        expr: increase(cascade_detected_total[1h]) > 0
+        expr: increase(chatcli_operator_federation_cascade_detected_total[1h]) > 0
         labels:
           severity: warning
         annotations:
           summary: "Staging-to-production cascade detected"
           description: >
-            Problem detected in staging is propagating to production.
+            A resource that failed in staging is now failing here.
             Check if the same deploy was applied in both environments.
 ```
 
@@ -630,50 +532,41 @@ groups:
 
 ```mermaid
 graph TB
-    subgraph "Control Cluster"
-        OP[Federation Controller]
-        PS[Pattern Store]
-        DE[Decision Engine]
-    end
-
-    subgraph "Prod US East"
-        K1[K8s API]
-        W1[Workloads]
+    subgraph "Local cluster"
+        OP[ChatCLI operator]
+        FC[Federation Controller]
+        DE[Decision Engine + tier gate]
+        LI[Local Issues and RemediationPlans]
     end
 
     subgraph "Prod EU West"
         K2[K8s API]
-        W2[Workloads]
+        O2[its own operator]
     end
 
     subgraph "Staging"
         K3[K8s API]
-        W3[Workloads]
+        O3[its own operator]
     end
 
-    OP -->|kubeconfig via Secret| K1
-    OP -->|kubeconfig via Secret| K2
-    OP -->|kubeconfig via Secret| K3
-
-    K1 -->|Issues, Anomalies| OP
-    K2 -->|Issues, Anomalies| OP
-    K3 -->|Issues, Anomalies| OP
-
+    OP --> FC
     OP --> DE
-    DE --> PS
-    DE -->|RemediationPlan| K1
-    DE -->|RemediationPlan| K2
-    DE -->|RemediationPlan| K3
+    DE -->|gates| LI
+    FC -->|kubeconfig via Secret: list nodes, namespaces, Issues| K2
+    FC -->|kubeconfig via Secret: list nodes, namespaces, Issues| K3
+    FC -->|annotate + raise severity on correlation| K2
+    O2 -->|remediates locally| K2
+    O3 -->|remediates locally| K3
 
     style OP fill:#89b4fa,color:#000
     style DE fill:#a6e3a1,color:#000
-    style PS fill:#f9e2af,color:#000
+    style FC fill:#f9e2af,color:#000
 ```
 
 <Tip>
-  The control cluster needs network connectivity to the API server of
-  each remote cluster. In restricted network environments, consider using a
-  bastion host or dedicated VPN for management traffic.
+  The operator needs network connectivity to the API server of each registered
+  cluster. In restricted network environments, consider using a bastion host or
+  dedicated VPN for management traffic.
 </Tip>
 
 
@@ -682,14 +575,13 @@ graph TB
 
 <CardGroup cols={2}>
   <Card title="Decision Engine" icon="brain-circuit" href="/features/aiops/decision-engine">
-    Understand how confidence is calculated and how per-tier policies affect
-    decisions.
+    Understand how confidence is calculated and how it combines with the tier gate.
   </Card>
   <Card title="Chaos Engineering" icon="explosion" href="/features/aiops/chaos-engineering">
-    Run chaos experiments on specific clusters with safety checks per tier.
+    Run controlled chaos experiments to validate remediation.
   </Card>
   <Card title="Audit and Compliance" icon="clipboard-check" href="/features/aiops/audit-compliance">
-    Complete audit trail of cross-cluster actions with correlationID.
+    Audit trail of Issues, approvals and remediations.
   </Card>
   <Card title="AIOps Platform" icon="brain" href="/features/aiops-platform">
     Return to the AIOps platform overview.

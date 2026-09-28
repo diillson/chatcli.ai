@@ -1,13 +1,15 @@
 ---
 title: "SLOs and SLAs"
 sidebarTitle: "SLOs and SLAs"
-description: "Service Level Objectives management with burn rate alerting and SLA compliance for the ChatCLI AIOps platform."
+description: "Service Level Objectives with error budget and burn rate alerting, and incident SLA tracking with business hours, for the ChatCLI AIOps platform."
 icon: "gauge-high"
 ---
 
-The ChatCLI AIOps platform provides native management of **Service Level Objectives (SLOs)** and **Service Level Agreements (SLAs)** via Kubernetes CRDs. The system implements Google SRE's burn rate model for intelligent alerting and tracks SLA compliance with business hours support.
+The ChatCLI AIOps platform manages **Service Level Objectives (SLOs)** and incident **Service Level Agreements (SLAs)** through two Kubernetes CRDs. The SLO controller computes an SLI, an error budget and multi-window burn rates (following the Google SRE model) and opens an `Issue` when a burn-rate window fires. The SLA controller times every `Issue` against response and resolution targets per severity, with optional business hours.
 
-
+<Warning>
+**Read this before you design SLOs.** The SLO controller does **not** query Prometheus. Every SLI is computed from the operator's own `Issue` and `Anomaly` objects (see [How each indicator is measured](#how-each-indicator-is-measured)). `metricSource: prometheus`, `prometheusQuery`, `latencyPercentile` and `latencyThresholdMs` are accepted by the CRD but currently have **no effect**. Use request-based PromQL SLOs in your own Prometheus/Alertmanager setup if you need them; use this CRD for incident-based availability and error-budget tracking of the workloads the operator watches.
+</Warning>
 
 ## SLO vs SLA: Understanding the Difference
 
@@ -16,191 +18,188 @@ The ChatCLI AIOps platform provides native management of **Service Level Objecti
 | **Definition** | **Internal** reliability target for a service | **Formal contract** with customers/stakeholders |
 | **Who defines** | Engineering team | Business + engineering + legal |
 | **Consequence of violation** | Internal alert, deploy freeze, review | Contractual penalties, credits, fines |
-| **Example** | "99.9% availability in 30 days" | "P1 incidents responded to within 5 minutes" |
-| **CRD** | `ServiceLevelObjective` | `IncidentSLA` |
+| **Example** | "99.9% availability in 30 days" | "Critical incidents responded to within 5 minutes" |
+| **CRD** | `ServiceLevelObjective` (short name `slo`) | `IncidentSLA` (short name `sla`) |
 
 <Note>
 Best practice is to define SLOs that are **more stringent** than SLAs. If your SLA guarantees 99.9%, set the SLO at 99.95%. This creates a safety margin (internal error budget) that allows detecting degradations before the SLA is violated.
 </Note>
 
-
-
 ## ServiceLevelObjective CRD
 
-The `ServiceLevelObjective` defines a reliability target for a service, with alerts based on burn rate and error budget tracking.
+The `ServiceLevelObjective` defines a reliability target for a service, with error budget tracking and burn-rate alerts.
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: ServiceLevelObjective
 metadata:
   name: api-gateway-availability
-  namespace: production
+  namespace: production          # must be the namespace of the watched workload
 spec:
-  service: api-gateway
+  serviceName: api-gateway       # for availability: must equal the Issue's spec.resource.name
   description: "API Gateway must maintain 99.9% availability in a 30-day window"
+  enabled: true
 
   indicator:
     type: availability
-    prometheusQuery:
-      goodQuery: 'sum(rate(http_requests_total{service="api-gateway",code=~"2..|3.."}[5m]))'
-      totalQuery: 'sum(rate(http_requests_total{service="api-gateway"}[5m]))'
+    metricSource: issues         # default; the only source actually implemented
 
   target:
     percentage: 99.9
     window: 30d
 
-  burnRateAlerts:
-    - name: page-fast-burn
-      shortWindow: 1h
-      longWindow: 6h
-      burnRateThreshold: 14.4
-      severity: critical
-      notificationPolicy: production-alerts
-
-    - name: ticket-medium-burn
-      shortWindow: 6h
-      longWindow: 3d
-      burnRateThreshold: 6.0
-      severity: high
-      notificationPolicy: production-alerts
-
-    - name: ticket-slow-burn
-      shortWindow: 24h
-      longWindow: 3d
-      burnRateThreshold: 3.0
-      severity: medium
-
-    - name: monitor-gradual-burn
-      shortWindow: 72h
-      longWindow: 30d
-      burnRateThreshold: 1.0
-      severity: low
-
   alertPolicy:
-    multiWindowRequired: true
     pageOnBudgetExhausted: true
-    budgetWarningThresholds: [50, 25, 10, 0]
+    burnRateWindows:
+      - shortWindow: 1h
+        longWindow: 6h
+        burnRateThreshold: 14.4
+        severity: critical
+      - shortWindow: 6h
+        longWindow: 3d
+        burnRateThreshold: 6.0
+        severity: high
+      - shortWindow: 24h
+        longWindow: 3d
+        burnRateThreshold: 3.0
+        severity: medium
+      - shortWindow: 72h
+        longWindow: 30d
+        burnRateThreshold: 1.0
+        severity: low
+```
 
+The controller writes the status (never set it yourself):
+
+```yaml
 status:
-  currentValue: 99.92
-  errorBudgetTotal: 0.001
-  errorBudgetRemaining: 0.0008
-  errorBudgetRemainingPercent: 80.0
-  burnRate: 1.2
+  currentValue: 0.99954            # SLI as a fraction (99.954%)
+  targetMet: true
+  errorBudgetTotal: 0.001          # 1 - target/100
+  errorBudgetRemaining: 0.537      # fraction of the budget left (0.0-1.0)
+  errorBudgetConsumedPercentage: 46.3
+  burnRate1h: 0
+  burnRate6h: 0
+  burnRate24h: 13.9
+  burnRate72h: 4.6
   lastCalculatedAt: "2026-03-19T14:00:00Z"
-  condition: Met
+  activeAlerts: []
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: SLOMet
+      message: "SLI=0.9995, target=99.90%, budget_remaining=53.7%"
 ```
 
 ### Spec Fields
 
 #### Root
 
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `service` | string | **Yes** | Name of the monitored service |
-| `description` | string | No | Human-readable description of the SLO |
-| `indicator` | SLOIndicator | **Yes** | Service Level Indicator (SLI) definition |
-| `target` | SLOTarget | **Yes** | Target and time window |
-| `burnRateAlerts` | []BurnRateWindow | No | Multi-window alert configuration |
-| `alertPolicy` | SLOAlertPolicy | No | General alert policy |
+| Field | Type | Required | Default | Description |
+|-------|------|:--------:|---------|-------------|
+| `serviceName` | string | **Yes** | | Name of the service. Used as the `service` metric label, and by `availability` to match Issues |
+| `description` | string | No | | Human-readable description |
+| `indicator` | SLOIndicator | **Yes** | | What to measure |
+| `target` | SLOTarget | **Yes** | | Target percentage and window |
+| `alertPolicy` | SLOAlertPolicy | No | | Burn-rate windows and budget paging |
+| `enabled` | bool | Yes (defaulted) | `true` | `false` skips the SLO: status is not updated, it is re-checked every 60s |
 
 #### SLOIndicator
 
-Defines **what** to measure. The `type` determines the semantics and required Prometheus queries.
+| Field | Type | Required | Default | Description |
+|-------|------|:--------:|---------|-------------|
+| `type` | enum | **Yes** | | `availability`, `latency`, `error_rate`, `throughput` |
+| `metricSource` | enum | Yes (defaulted) | `issues` | `prometheus`, `watcher`, `issues`. Accepted but not used: every value behaves like `issues` |
+| `prometheusQuery` | string | No | | A PromQL string. **Not executed** (reserved) |
+| `resource` | ResourceRef (`kind`, `name`, `namespace`, all required) | No | | Filters Anomalies by `resource.name` for `latency`, `error_rate`, `throughput`. Also becomes the `spec.resource` of the Issues the SLO opens |
+| `latencyPercentile` | string | No | | e.g. `p99`. **Not used** by the calculation (reserved) |
+| `latencyThresholdMs` | int64 | No | | **Not used** by the calculation (reserved) |
+
+#### How each indicator is measured
+
+All lookups are restricted to the **SLO's own namespace**. Issues and Anomalies are created in the namespace of the affected workload, so the SLO must live there too.
+
+| Type | SLI formula (over `target.window`) | Source objects |
+|------|-----------------------------------|----------------|
+| `availability` | `1 - incident_minutes / window_minutes` | Issues whose `spec.resource.name` equals `serviceName`, or that carry the label `platform.chatcli.io/service=<serviceName>`. Each Issue contributes the minutes from `status.detectedAt` (clipped to the window start) to `status.resolvedAt`, or to *now* while unresolved |
+| `error_rate` | `1 - error_rate_anomalies / all_anomalies` | Anomalies (filtered by `indicator.resource.name` if set). Numerator: `signalType: error_rate` |
+| `latency` | `1 - latency_anomalies / all_anomalies` | Same, numerator `signalType: latency` |
+| `throughput` | `1 - failure_anomalies / all_anomalies` | Same, numerator `error_rate`, `pod_restart`, `oom_kill`, `pod_not_ready`, `deploy_failing` |
+
+What this means in practice:
+
+- **`availability` is the only time-based indicator**, and the one whose error budget maps to "allowed downtime". Minutes from overlapping Issues are **added up**, so two concurrent Issues on the same service count double.
+- The anomaly-based indicators measure the **share of anomalies** of a given kind, not a share of requests. With no anomalies in the window the SLI is `1.0`. If every anomaly in the window is of the counted kind, the SLI is `0`.
+- The Issues the SLO opens itself carry the label `platform.chatcli.io/service=<serviceName>`, so for `availability` **an open SLO violation Issue also adds incident minutes** until it is resolved.
+- A window that cannot be parsed (see below) becomes zero, which makes the SLI `1.0` and every burn rate `0`. The mistake is silent.
+
+#### SLOTarget
+
+| Field | Type | Required | Default | Description |
+|-------|------|:--------:|---------|-------------|
+| `percentage` | float64 | **Yes** | | Target, e.g. `99.9` |
+| `window` | string | Yes (defaulted) | `30d` | Rolling window. Accepts whole days (`7d`, `30d`, `90d`) or Go durations (`24h`, `90m`). Weeks (`1w`) and fractional days (`1.5d`) are **not** supported |
+
+#### SLOAlertPolicy
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `burnRateWindows` | []BurnRateWindow | none | Multi-window burn-rate alerts. Without entries, no burn-rate alert ever fires |
+| `pageOnBudgetExhausted` | bool | `false` | Opens a `critical` Issue when `errorBudgetRemaining` reaches 0 (see the warning under [What fires](#what-fires-when)) |
+| `notificationPolicyRef` | string | | Accepted but **not read** by the controller. Route SLO alerts with a `NotificationPolicy` rule on `signalTypes: [slo_violation]` instead |
+
+#### BurnRateWindow
 
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `type` | string | **Yes** | `availability`, `latency`, `error_rate`, `throughput` |
-| `prometheusQuery` | PrometheusQuerySpec | **Yes** | PromQL queries to calculate the SLI |
-
-**Indicator types:**
-
-| Type | Good Events | Total Events | Calculation |
-|------|------------|--------------|-------------|
-| `availability` | Successful requests (2xx, 3xx) | Total requests | good / total |
-| `latency` | Requests below the latency threshold | Total requests | fast / total |
-| `error_rate` | N/A (inverted) | Error requests | 1 - (errors / total) |
-| `throughput` | Requests processed within budget | Requests received | processed / received |
-
-**PrometheusQuerySpec:**
-
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `goodQuery` | string | **Yes** | PromQL that returns the rate of "good" events |
-| `totalQuery` | string | **Yes** | PromQL that returns the total event rate |
+| `shortWindow` | string | **Yes** | Short window, same format as `target.window` (e.g. `1h`, `30m`) |
+| `longWindow` | string | **Yes** | Long window (e.g. `6h`, `3d`) |
+| `burnRateThreshold` | float64 | **Yes** | The alert fires when the burn rate is **>= threshold in both windows** (always multi-window; there is no single-window mode) |
+| `severity` | enum | **Yes** | `critical`, `high`, `medium`, `low`: severity of the Issue that is opened |
 
 <Tabs>
   <Tab title="Availability">
     ```yaml
+    serviceName: api-gateway      # Issues with spec.resource.name: api-gateway
     indicator:
       type: availability
-      prometheusQuery:
-        goodQuery: 'sum(rate(http_requests_total{service="api-gateway",code=~"2..|3.."}[5m]))'
-        totalQuery: 'sum(rate(http_requests_total{service="api-gateway"}[5m]))'
-    ```
-  </Tab>
-  <Tab title="Latency (P99 under 500ms)">
-    ```yaml
-    indicator:
-      type: latency
-      prometheusQuery:
-        goodQuery: 'sum(rate(http_request_duration_seconds_bucket{service="api-gateway",le="0.5"}[5m]))'
-        totalQuery: 'sum(rate(http_request_duration_seconds_count{service="api-gateway"}[5m]))'
     ```
   </Tab>
   <Tab title="Error Rate">
     ```yaml
     indicator:
       type: error_rate
-      prometheusQuery:
-        goodQuery: 'sum(rate(http_requests_total{service="api-gateway",code!~"5.."}[5m]))'
-        totalQuery: 'sum(rate(http_requests_total{service="api-gateway"}[5m]))'
+      resource:
+        kind: Deployment
+        name: api-gateway
+        namespace: production
     ```
   </Tab>
-  <Tab title="Custom (Throughput)">
+  <Tab title="Latency">
+    ```yaml
+    indicator:
+      type: latency
+      resource:
+        kind: Deployment
+        name: payment-service
+        namespace: payments
+    ```
+  </Tab>
+  <Tab title="Throughput">
     ```yaml
     indicator:
       type: throughput
-      prometheusQuery:
-        goodQuery: 'sum(rate(queue_messages_processed_total{service="worker"}[5m]))'
-        totalQuery: 'sum(rate(queue_messages_received_total{service="worker"}[5m]))'
+      resource:
+        kind: Deployment
+        name: worker
+        namespace: jobs
     ```
   </Tab>
 </Tabs>
 
-#### SLOTarget
-
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `percentage` | float64 | **Yes** | Target percentage (e.g., 99.9) |
-| `window` | duration | **Yes** | Rolling time window (e.g., `30d`, `7d`, `24h`) |
-
-#### BurnRateWindow
-
-Each entry defines an alert window based on burn rate.
-
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `name` | string | **Yes** | Alert identifier name |
-| `shortWindow` | duration | **Yes** | Short observation window |
-| `longWindow` | duration | **Yes** | Long observation window |
-| `burnRateThreshold` | float64 | **Yes** | Burn rate threshold to trigger the alert |
-| `severity` | string | **Yes** | `critical`, `high`, `medium`, `low` |
-| `notificationPolicy` | string | No | NotificationPolicy name for routing |
-
-#### SLOAlertPolicy
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `multiWindowRequired` | bool | `true` | Requires BOTH windows (short AND long) to exceed the threshold |
-| `pageOnBudgetExhausted` | bool | `true` | Sends a critical page when error budget reaches 0% |
-| `budgetWarningThresholds` | []int | `[50, 25, 10, 0]` | Remaining budget percentages that trigger warnings |
-
-
-
 ## How the Calculation Works (Google SRE Model)
 
-The system implements the multi-window, multi-burn-rate alerting model described in Google's **"Site Reliability Engineering"** book.
+The controller reconciles every SLO **every 60 seconds** and also whenever the SLO or one of the Issues it owns changes.
 
 ### Error Budget
 
@@ -213,7 +212,7 @@ Example for a 99.9% SLO:
   Error Budget = 1 - (99.9 / 100) = 0.001 = 0.1%
 ```
 
-In a 30-day window, this means:
+For an `availability` SLO over a 30-day window, this means:
 
 ```text
 Allowed downtime = 30 days x 24h x 60min x 0.001 = 43.2 minutes
@@ -227,6 +226,17 @@ Allowed downtime = 30 days x 24h x 60min x 0.001 = 43.2 minutes
 | 99.95% | 0.05% | 21.6 min |
 | 99.99% | 0.01% | 4.32 min |
 
+The status fields derive from it:
+
+```text
+consumed                      = (1 - SLI) / errorBudgetTotal
+errorBudgetRemaining          = max(0, 1 - consumed)        # fraction of the budget, 0.0-1.0
+errorBudgetConsumedPercentage = consumed x 100              # can exceed 100
+targetMet                     = SLI >= target / 100
+```
+
+A `100` target has a zero budget: the budget is then either fully remaining (SLI = 1) or exhausted.
+
 ### Burn Rate
 
 The burn rate indicates **how fast** the error budget is being consumed.
@@ -234,247 +244,261 @@ The burn rate indicates **how fast** the error budget is being consumed.
 ```text
 Burn Rate = error_rate_in_window / error_budget
 
-Where:
-  error_rate_in_window = 1 - (good_events / total_events) [in the window]
-  error_budget = 1 - (target / 100)
+Where error_rate_in_window is, for the indicator type:
+  availability   incident_minutes_in_window / window_minutes
+  others         counted_anomalies / all_anomalies (in the window)
 ```
 
-<Steps>
-  <Step title="Calculate error rate in the window">
-    Using the Prometheus queries, the ratio of good events vs total in the specified window is calculated.
+The controller always computes and publishes four fixed windows: `burnRate1h`, `burnRate6h`, `burnRate24h` and `burnRate72h`. The windows you list in `burnRateWindows` are computed separately each reconcile, only to decide whether to fire.
 
+<Steps>
+  <Step title="Compute the error rate in each window">
     ```text
-    Example: In the last 1h, there were 10,000 requests, 9,950 successful.
-    error_rate = 1 - (9950 / 10000) = 0.005 = 0.5%
+    Example (availability): a 20-minute incident on api-gateway ended 2 hours ago.
+    Window 6h: 20 / 360 = 0.0556
     ```
   </Step>
-  <Step title="Calculate burn rate">
+  <Step title="Compute the burn rate">
     Divide the error rate by the error budget.
 
     ```text
-    burn_rate = 0.005 / 0.001 = 5.0x
-
-    Interpretation: The budget is being consumed 5x faster than sustainable.
-    At this rate, the 30-day budget would be exhausted in 6 days.
+    burn_rate(6h) = 0.0556 / 0.001 = 55.6x
     ```
   </Step>
-  <Step title="Verify multi-window">
-    To trigger an alert, BOTH windows (short AND long) must exceed the threshold.
+  <Step title="Check both windows">
+    An alert fires only when the burn rate is **>= threshold in the short AND the long window**.
 
     ```text
-    Alert "page-fast-burn" (threshold 14.4x):
-      - Short window (1h): burn_rate = 16.2x  > 14.4  CHECK
-      - Long window (6h):  burn_rate = 15.1x  > 14.4  CHECK
-      -> ALERT FIRED (both exceed)
-
-    If short=16.2x but long=12.0x:
-      -> DOES NOT fire (long below threshold)
-      -> Indicates a temporary spike, not sustained degradation
+    Window 1h/6h (threshold 14.4x):
+      - Short window (1h): 0x    (the incident ended 2h ago)
+      - Long window (6h):  55.6x
+      -> does NOT fire (short window below threshold: the burn is not current)
     ```
   </Step>
-  <Step title="Classify and notify">
-    Based on the configured severity, the alert is routed to the corresponding `NotificationPolicy`.
+  <Step title="Open an Issue">
+    A new alert records an entry in `status.activeAlerts`, increments `chatcli_operator_slo_violations_total`, writes an `slo_violation` AuditEvent and opens an `Issue` (see [What fires](#what-fires-when)). The Issue then goes through the normal incident flow: notifications, escalation, SLA timing.
   </Step>
 </Steps>
 
-### Multi-Window Alerting: Default Thresholds
+### Multi-Window Alerting: Recommended Thresholds
 
-The default thresholds follow Google SRE's recommendation for a 30-day SLO:
+There are **no built-in windows**: nothing fires until you list `burnRateWindows`. For a 30-day SLO, these are the commonly used values:
 
-| Name | Short Window | Long Window | Burn Rate | Severity | Meaning |
-|------|-------------|-------------|-----------|----------|---------|
-| `page-fast-burn` | 1h | 6h | 14.4x | Critical | Budget exhausted in **~2 days**. Requires immediate action. |
-| `ticket-medium-burn` | 6h | 3d | 6.0x | High | Budget exhausted in **~5 days**. Create an urgent ticket. |
-| `ticket-slow-burn` | 24h | 3d | 3.0x | Medium | Budget exhausted in **~10 days**. Investigate and plan. |
-| `monitor-gradual-burn` | 72h | 30d | 1.0x | Low | Budget **exactly at a sustainable pace**. Monitor. |
+| Short Window | Long Window | Burn Rate | Severity | Meaning |
+|-------------|-------------|-----------|----------|---------|
+| 1h | 6h | 14.4x | critical | Budget exhausted in **~2 days**. Requires immediate action. |
+| 6h | 3d | 6.0x | high | Budget exhausted in **~5 days**. Create an urgent ticket. |
+| 24h | 3d | 3.0x | medium | Budget exhausted in **~10 days**. Investigate and plan. |
+| 72h | 30d | 1.0x | low | Budget consumed **exactly at a sustainable pace**. Monitor. |
 
 <Tip>
-The formula to calculate the threshold: `burn_rate_threshold = (window_days / budget_consumption_days)`. For a 30-day SLO where you want to alert when the budget would be exhausted in 2 days: `30 / 2.08 = 14.4x`.
+To derive a threshold: `burn_rate_threshold = window_days / days_until_exhaustion`. For a 30-day SLO where you want to alert when the budget would be exhausted in about 2 days: `30 / 2.08 = 14.4x`.
 </Tip>
+
+<Info>
+These thresholds were designed for request-based SLIs. They fit the time-based `availability` indicator. With the anomaly-ratio indicators, burn rates jump in large steps: one `error_rate` anomaly among 2 in the window gives an error rate of 0.5, i.e. a burn rate of 500x for a 99.9% target. Choose targets and thresholds for those indicators accordingly.
+</Info>
 
 ### Complete Numerical Example
 
-Consider a **99.9% availability** SLO over **30 days** for the `api-gateway` service:
+Consider an `availability` SLO of **99.9%** over **30 days** for `api-gateway`, and one incident: an Issue on `api-gateway` was detected 20 hours ago and resolved 20 minutes later.
 
 ```text
 Configuration:
-  Target: 99.9%
-  Window: 30 days
-  Error Budget: 0.1% = 43.2 minutes of downtime
+  Target: 99.9%   Window: 30d   Error budget: 0.001 = 43.2 minutes
 
-Current situation (measured by Prometheus):
-  Last 24h: 99.85% availability (0.15% error rate)
-  Last 6h:  99.80% availability (0.20% error rate)
-  Last 1h:  99.70% availability (0.30% error rate)
+SLI (30d):   1 - 20 / 43200 = 0.99954
+Consumed:    (1 - 0.99954) / 0.001 = 46.3%
+Remaining:   errorBudgetRemaining = 0.537 (53.7% of the budget)
 
-Burn rate calculation per window:
-  1h:  0.003 / 0.001 = 3.0x
-  6h:  0.002 / 0.001 = 2.0x
-  24h: 0.0015 / 0.001 = 1.5x
+Burn rates:
+  1h:  0 / 60            = 0x      (incident is older than 1h)
+  6h:  0 / 360           = 0x
+  24h: (20/1440) / 0.001 = 13.9x
+  72h: (20/4320) / 0.001 = 4.6x
+  3d:  same as 72h       = 4.6x
+  30d: (20/43200)/0.001  = 0.46x
 
 Alert evaluation:
-  page-fast-burn (14.4x):  1h=3.0x < 14.4  -> DOES NOT fire
-  ticket-medium-burn (6x): 6h=2.0x < 6.0   -> DOES NOT fire
-  ticket-slow-burn (3x):   24h=1.5x < 3.0  -> DOES NOT fire
-  monitor-gradual-burn (1x): both > 1.0     -> FIRES (severity: low)
-
-Result: Slow degradation detected. Not critical, but the budget is
-being consumed 1.5x faster than sustainable. At this rate, the
-43.2-minute budget would be exhausted in 20 days (instead of 30).
-
-Remaining error budget:
-  Consumed so far: ~22 minutes (estimated)
-  Remaining: 43.2 - 22 = 21.2 minutes
-  Remaining percentage: 49.1%
-  -> 50% warning threshold nearly reached
+  1h/6h   (14.4x): 0x, 0x         -> does not fire
+  6h/3d   (6.0x):  0x, 4.6x       -> does not fire
+  24h/3d  (3.0x):  13.9x, 4.6x    -> FIRES (severity: medium)
+  72h/30d (1.0x):  4.6x, 0.46x    -> does not fire
 ```
-
-
 
 ## Error Budget Tracking
 
-The `ServiceLevelObjective` status is periodically updated by the reconciler:
+### Status Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `currentValue` | float64 | Current SLI value (e.g., 99.92%) |
-| `errorBudgetTotal` | float64 | Total budget (e.g., 0.001 for 99.9%) |
-| `errorBudgetRemaining` | float64 | Remaining budget |
-| `errorBudgetRemainingPercent` | float64 | Remaining budget percentage |
-| `burnRate` | float64 | Current burn rate (shortest window) |
-| `lastCalculatedAt` | Time | Last calculation |
-| `condition` | string | `Met` (within SLO), `AtRisk` (budget &lt; 25%), `Violated` (budget exhausted) |
+| `currentValue` | float64 | Current SLI as a **fraction** (e.g. `0.9987` = 99.87%) |
+| `targetMet` | bool | `currentValue >= target/100` |
+| `errorBudgetTotal` | float64 | `1 - target/100` (e.g. `0.001`) |
+| `errorBudgetRemaining` | float64 | Remaining share of the budget, `0.0`-`1.0` |
+| `errorBudgetConsumedPercentage` | float64 | Consumed share, in percent (can exceed 100) |
+| `burnRate1h`, `burnRate6h`, `burnRate24h`, `burnRate72h` | float64 | Burn rate over each fixed window |
+| `lastCalculatedAt` | Time | Last reconcile |
+| `activeAlerts` | []SLOAlert | Firing alerts: `window` (e.g. `1h/6h`, or `budget-exhausted`), `burnRate` (short window), `severity`, `firedAt` |
+| `conditions` | []Condition | `Ready`: `True/SLOMet` or `False/SLONotMet` (message has SLI, target and budget left). `False/SLICalculationFailed` only on an internal calculation error |
 
-**SLO Conditions:**
+There is no `AtRisk` state and no budget warning thresholds (50/25/10%). Build those as Prometheus alerts on `chatcli_operator_slo_error_budget_remaining` (see [below](#prometheus-metrics)).
 
-```mermaid
-stateDiagram-v2
-    [*] --> Met : Budget > 25%
-    Met --> AtRisk : Budget <= 25%
-    AtRisk --> Violated : Budget <= 0%
-    Violated --> AtRisk : Budget recovered > 0%
-    AtRisk --> Met : Budget recovered > 25%
-    Met --> [*]
+### What fires when
+
+| Trigger | What happens |
+|---------|--------------|
+| A `burnRateWindows` entry is >= threshold in both windows, and is not already active | Opens an Issue `slo-<slo>-<short>-<long>-<unix-time>` (name truncated to 63 characters) with the entry's severity. The alert stays in `activeAlerts` while both windows stay over the threshold (no new Issue), and is cleared as soon as one drops below. If it fires again later, a new Issue is opened |
+| `pageOnBudgetExhausted: true` and `errorBudgetRemaining` reaches 0 | Opens a `critical` Issue `slo-<slo>-budget-exhausted-<unix-time>` |
+
+Issues opened by an SLO have `spec.source: watcher`, `spec.signalType: slo_violation`, `spec.resource` = `indicator.resource` (or the SLO itself when it is not set), a `riskScore` based on the budget consumed (50/75/90/100 steps), the labels `platform.chatcli.io/signal=slo_violation` and `platform.chatcli.io/service=<serviceName>`, and the annotations `platform.chatcli.io/slo-name`, `slo-window` and `burn-rate`. The SLO is their owner, so **deleting the SLO deletes them**.
+
+<Warning>
+**Known limitation: budget-exhausted Issues repeat.** The `budget-exhausted` entry is dropped from `activeAlerts` on the next reconcile. While the budget stays at 0 with `pageOnBudgetExhausted: true`, a **new critical Issue is opened on every reconcile** (at least once a minute). Until this is fixed, keep `pageOnBudgetExhausted` off and page on `chatcli_operator_slo_error_budget_remaining <= 0` from Prometheus instead.
+</Warning>
+
+### Checking SLOs
+
+```bash
+kubectl get slo -n production
 ```
 
-**Budget Warning Thresholds:**
+```text
+NAME                       SERVICE       TARGET%   CURRENT             BUDGETREMAINING%    BURNRATE1H   AGE
+api-gateway-availability   api-gateway   99.9      0.999537037037037   46.29629629629629   0            12d
+```
 
-When configured, the system sends notifications upon reaching each threshold:
+<Warning>
+`CURRENT` is a fraction, not a percentage. The `BUDGETREMAINING%` column actually shows `status.errorBudgetConsumedPercentage`, the budget **consumed**. For the remaining budget, read `status.errorBudgetRemaining` (a fraction):
+`kubectl get slo api-gateway-availability -n production -o jsonpath='{.status.errorBudgetRemaining}'`
+</Warning>
 
-| Remaining Budget | Action |
-|-----------------|--------|
-| 50% | Informational notification |
-| 25% | Warning: freeze non-essential deploys |
-| 10% | Alert: full focus on stability |
-| 0% | Critical page (if `pageOnBudgetExhausted: true`) |
+The operator REST API (header `X-API-Key`, role `viewer` or higher) exposes SLOs read-only:
 
+| Endpoint | Returns |
+|----------|---------|
+| `GET /api/v1/slos` | List (`?namespace=`, `?page=`, `?pageSize=` up to 100) |
+| `GET /api/v1/slos/{name}` | One SLO (`?namespace=`; without it, the first match in any namespace) |
+| `GET /api/v1/slos/{name}/budget` | `SLOBudget`: `target`, `window`, `currentValue` and `errorBudgetRemaining` **as percentages**, `errorBudgetTotal` as a fraction |
 
+<Note>
+In the REST responses, `errorBudgetUsed` and `state` are always empty and `burnRate` in `/budget` is always `0`: they read status fields the CRD does not have. Use `errorBudgetRemaining`, or the `burnRate*` fields from `kubectl`/Prometheus.
+</Note>
 
 ## IncidentSLA CRD
 
-The `IncidentSLA` defines response and resolution time contracts by severity, with business hours support and violation tracking.
+An `IncidentSLA` defines the response and resolution targets for **one severity**. Create one object per severity.
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: IncidentSLA
 metadata:
-  name: production-sla
+  name: critical-sla
   namespace: production
 spec:
-  service: api-gateway
-  description: "Production SLA for the API Gateway"
+  severity: critical
+  responseTime: "5m"
+  resolutionTime: "1h"
+```
 
-  responseTimes:
-    - severity: critical
-      maxResponseTime: "5m"
-      maxResolutionTime: "1h"
-    - severity: high
-      maxResponseTime: "15m"
-      maxResolutionTime: "4h"
-    - severity: medium
-      maxResponseTime: "1h"
-      maxResolutionTime: "24h"
-    - severity: low
-      maxResponseTime: "4h"
-      maxResolutionTime: "72h"
+Status written by the controller:
 
-  businessHours:
-    enabled: true
-    timezone: "America/Sao_Paulo"
-    startHour: 9
-    endHour: 18
-    workDays: [1, 2, 3, 4, 5]   # Monday to Friday (0=Sun, 6=Sat)
-    holidays:
-      - date: "2026-01-01"
-        name: "New Year's Day"
-      - date: "2026-04-03"
-        name: "Good Friday"
-      - date: "2026-12-25"
-        name: "Christmas"
-
-  violationPolicy:
-    notificationPolicy: sla-breach-notifications
-    escalationPolicy: p0-escalation
-    autoEscalateOnBreach: true
-
+```yaml
 status:
-  activeIncidents: 2
+  activeViolations: 3
   totalViolations: 3
+  totalIssuesTracked: 120
   compliancePercentage: 97.5
-  violations:
+  averageResponseTime: "2m14s"
+  averageResolutionTime: "38m2s"
+  lastViolationAt: "2026-03-15T14:30:00Z"
+  recentViolations:
     - issueName: "api-gateway-oom-kill-1771276354"
-      severity: critical
-      type: resolution_time
-      exceededBy: "12m"
-      occurredAt: "2026-03-15T14:30:00Z"
-  lastCalculatedAt: "2026-03-19T14:00:00Z"
+      type: resolution
+      elapsed: "1h12m0s"
+      threshold: "1h0m0s"
+      violatedAt: "2026-03-15T14:30:00Z"
+  conditions:
+    - type: SLAViolation
+      status: "True"
+      reason: resolutionViolation
+      message: "Issue api-gateway-oom-kill-1771276354 violated resolution SLA: 1h12m0s > 1h0m0s"
 ```
 
 ### Spec Fields
 
-#### Root
-
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `service` | string | **Yes** | Name of the service covered by the SLA |
-| `description` | string | No | SLA description |
-| `responseTimes` | []ResponseTimeConfig | **Yes** | Maximum times per severity |
-| `businessHours` | BusinessHoursSpec | No | Business hours configuration |
-| `violationPolicy` | ViolationPolicySpec | No | Actions on violation |
+| `severity` | enum | **Yes** | `critical`, `high`, `medium`, `low` |
+| `responseTime` | string | **Yes** | Maximum time from detection to first analysis. Go duration: `s`, `m`, `h` (e.g. `5m`, `1h30m`) |
+| `resolutionTime` | string | **Yes** | Maximum time from detection to resolution. Go duration (e.g. `4h`, `72h`) |
+| `escalationPolicyRef` | string | No | Accepted but **not read**: a breach does not trigger an EscalationPolicy |
+| `notificationPolicyRef` | string | No | Accepted but **not read**: a breach does not send a notification |
+| `businessHoursOnly` | bool | No | Counts only business hours. Takes effect only if `businessHours` is also set |
+| `businessHours` | BusinessHoursSpec | No | Business hours window |
 
-#### ResponseTimeConfig
+<Warning>
+`responseTime` and `resolutionTime` do **not** accept days: `1d` or `3d` is invalid. Use `24h` or `72h`. With an invalid duration the controller logs an error and **ignores that SLA**.
+</Warning>
 
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `severity` | string | **Yes** | `critical`, `high`, `medium`, `low` |
-| `maxResponseTime` | duration | **Yes** | Maximum time for first acknowledgement |
-| `maxResolutionTime` | duration | **Yes** | Maximum time for complete resolution |
+#### Which SLA applies to an Issue
 
-<Info>
-**Response time** is measured as the time between Issue creation (state `Detected`) and the first transition to `Analyzing` or `Remediating`. **Resolution time** is measured between `Detected` and `Resolved`.
-</Info>
+The controller evaluates every `Issue`. It uses the first `IncidentSLA` with the Issue's severity in the **Issue's namespace**. If there is none, it uses the first one with that severity found in **any namespace**. You can therefore keep a cluster-wide default set in one namespace and override it per namespace. Keep a single `IncidentSLA` per severity per namespace: with several, which one wins is not defined.
+
+#### How response and resolution are measured
+
+The start of the clock is the Issue's `status.detectedAt` (or its creation time).
+
+| Measure | When it is checked | Elapsed time |
+|---------|-------------------|--------------|
+| **Response** | Once, the first time the controller sees the Issue in `Analyzing` or `Remediating` | From detection to that moment |
+| **Resolution** | Once, when the Issue reaches `Resolved` | From detection to `status.resolvedAt` |
+| **Resolution** | Once, when the Issue reaches `Escalated` or `Failed` | From detection to that moment |
+
+The timing has limits you should know about:
+
+- **Breaches are detected on state transitions, not by a running timer.** An Issue that stays in `Detected` past `responseTime` is not flagged until it moves to `Analyzing`/`Remediating`. An open Issue past `resolutionTime` is not flagged until it becomes `Resolved`, `Escalated` or `Failed`.
+- An Issue that never passes through `Analyzing` or `Remediating` never gets a response check.
+- `Contained` is not a terminal state: the resolution clock keeps running until `Resolved`/`Escalated`/`Failed`.
+- An Issue is timed only once. If an `Escalated` Issue is resolved later, it is not re-evaluated.
+- The controller marks the Issue with the annotations `platform.chatcli.io/sla-response-checked`, `platform.chatcli.io/sla-resolution-checked` and, on a breach, `platform.chatcli.io/sla-violated` (`response`, `resolution` or both).
+
+#### What a breach does
+
+Each breach:
+
+- appends a record to `status.recentViolations` (only the last 50 are kept),
+- increments `totalViolations`, `activeViolations` and `chatcli_operator_sla_violations_total{severity,type}`,
+- sets `lastViolationAt` and the condition `SLAViolation=True` (reason `responseViolation` or `resolutionViolation`),
+- writes an `sla_breach` [AuditEvent](/features/aiops/audit-compliance).
+
+It does **not** notify anyone or escalate by itself. To be alerted, alert on `chatcli_operator_sla_violations_total` in Prometheus.
+
+<Note>
+`activeViolations` is only ever incremented, never decreased. In practice it equals `totalViolations`.
+</Note>
 
 #### BusinessHoursSpec
 
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `enabled` | bool | **Yes** | Enable counting only during business hours |
-| `timezone` | string | **Yes** | IANA timezone (e.g., `America/Sao_Paulo`) |
-| `startHour` | int | **Yes** | Start hour (0-23) |
-| `endHour` | int | **Yes** | End hour (0-23) |
-| `workDays` | []int | **Yes** | Work days (0=Sunday, 6=Saturday) |
-| `holidays` | []Holiday | No | Holidays (clock paused on these days) |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `timezone` | string | `UTC` | IANA timezone (e.g. `America/Sao_Paulo`). An unknown timezone falls back to UTC |
+| `startHour` | int (0-23) | `9` | Start hour (whole hours) |
+| `endHour` | int (0-23) | `18` | End hour, exclusive. Must be greater than `startHour` (overnight windows count zero time) |
+| `workDays` | []string | `Monday` … `Friday` | English day names, capitalized: `Monday`, `Tuesday`, … `Sunday` |
+
+There is no holiday calendar: the clock runs on every listed weekday.
 
 #### How the Business Hours Clock Works
 
-The SLA clock only counts during business hours. Outside of business hours, the clock is automatically paused.
+With `businessHoursOnly: true` and `businessHours` set, only time inside the window counts. Outside it the clock is paused.
 
 <Steps>
   <Step title="Incident detected">
-    Issue created at 17:45 (Friday). Clock starts.
+    Issue detected at 17:45 (Friday).
 
     ```text
-    Business hours: 09:00-18:00 (Mon-Fri), timezone America/Sao_Paulo
+    Business hours: 09:00-18:00 (Monday-Friday), timezone America/Sao_Paulo
     ```
   </Step>
   <Step title="Clock counts 15 minutes (Friday)">
@@ -482,7 +506,7 @@ The SLA clock only counts during business hours. Outside of business hours, the 
     Clock **pauses** at 18:00 (end of business hours).
   </Step>
   <Step title="Weekend: clock paused">
-    All of Saturday and Sunday: clock remains paused.
+    Saturday and Sunday are not in `workDays`.
     Accumulated SLA time: **15 minutes**.
   </Step>
   <Step title="Monday: clock resumes">
@@ -493,12 +517,12 @@ The SLA clock only counts during business hours. Outside of business hours, the 
     - **Total SLA: 105 minutes (1h45)**
   </Step>
   <Step title="Compliance evaluation">
-    For `critical` severity with `maxResolutionTime: 1h`:
-    - SLA time spent: 1h45 = 105 minutes
+    With a `critical` SLA of `resolutionTime: 1h`:
+    - SLA time spent: 105 minutes
     - Limit: 60 minutes
-    - **VIOLATION**: exceeded by 45 minutes
+    - **VIOLATION**
 
-    For `high` severity with `maxResolutionTime: 4h`:
+    With a `high` SLA of `resolutionTime: 4h`:
     - SLA time spent: 105 minutes
     - Limit: 240 minutes
     - **WITHIN SLA**
@@ -506,39 +530,36 @@ The SLA clock only counts during business hours. Outside of business hours, the 
 </Steps>
 
 <Warning>
-For `critical` incidents, consider disabling business hours (`enabled: false`) and using a 24/7 clock. Critical production issues should not wait for the next business day.
+For `critical` incidents, consider leaving `businessHoursOnly` off and using a 24/7 clock. Critical production issues should not wait for the next business day. Business hours are set per `IncidentSLA`, so each severity can have its own choice.
 </Warning>
-
-#### ViolationPolicySpec
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `notificationPolicy` | string | NotificationPolicy to send violation alerts |
-| `escalationPolicy` | string | EscalationPolicy to escalate violations |
-| `autoEscalateOnBreach` | bool | Automatically escalate when SLA is violated |
 
 #### CompliancePercentage Calculation
 
 ```text
-CompliancePercentage = ((total_incidents - violations) / total_incidents) * 100
+CompliancePercentage = ((totalIssuesTracked - totalViolations) / totalIssuesTracked) * 100
 
 Example:
-  Total incidents in the period: 120
+  Issues tracked: 120
   Violations: 3
   Compliance = ((120 - 3) / 120) * 100 = 97.5%
 ```
 
-Compliance is calculated **per severity** and **aggregated**:
+- `totalIssuesTracked` counts Issues when they **close** (`Resolved`, `Escalated` or `Failed`). `totalViolations` counts **breaches**: an Issue that breaches both response and resolution counts twice. Compliance is clamped at 0 and is 100 while nothing has been tracked.
+- Each `IncidentSLA` has its own compliance, which is also its severity's compliance (`chatcli_operator_sla_compliance_percentage{severity}`). The counters are cumulative since the object was created: there is no rolling period.
+- `averageResponseTime` and `averageResolutionTime` are recomputed when an Issue is resolved. They cover **all Issues of that severity in the cluster**, not just the SLA's namespace. The response time is taken from the Issue's `Analyzing` condition.
 
-| Severity | Incidents | Violations | Compliance |
-|----------|-----------|------------|------------|
-| Critical | 5 | 1 | 80.0% |
-| High | 15 | 2 | 86.7% |
-| Medium | 40 | 0 | 100.0% |
-| Low | 60 | 0 | 100.0% |
-| **Total** | **120** | **3** | **97.5%** |
+<Info>
+The compliance report at `GET /api/v1/analytics/compliance` (default window: 7 days) computes its SLA section **from Issue states alone**, independently of `IncidentSLA` objects: it counts every `Escalated` Issue as a resolution violation and always reports 0 response violations. To see per-SLA figures, read the `IncidentSLA` status. `GET /api/v1/policies/sla` lists the `IncidentSLA` objects (read-only, role `viewer`).
+</Info>
 
+```bash
+kubectl get sla -A
+```
 
+```text
+NAMESPACE    NAME           SEVERITY   RESPONSETIME   RESOLUTIONTIME   COMPLIANCE%   VIOLATIONS   AGE
+production   critical-sla   critical   5m             1h               97.5          3            30d
+```
 
 ## Complete YAML Examples
 
@@ -551,126 +572,111 @@ metadata:
   name: api-gateway-availability-slo
   namespace: production
 spec:
-  service: api-gateway
-  description: "99.9% API Gateway availability measured by HTTP success rate"
+  serviceName: api-gateway
+  description: "99.9% API Gateway availability, measured as time without an open Issue"
+  enabled: true
 
   indicator:
     type: availability
-    prometheusQuery:
-      goodQuery: |
-        sum(rate(http_requests_total{
-          service="api-gateway",
-          code=~"2..|3.."
-        }[5m]))
-      totalQuery: |
-        sum(rate(http_requests_total{
-          service="api-gateway"
-        }[5m]))
 
   target:
     percentage: 99.9
     window: 30d
 
-  burnRateAlerts:
-    - name: page-immediate
-      shortWindow: 1h
-      longWindow: 6h
-      burnRateThreshold: 14.4
-      severity: critical
-      notificationPolicy: production-alerts
-
-    - name: ticket-urgent
-      shortWindow: 6h
-      longWindow: 3d
-      burnRateThreshold: 6.0
-      severity: high
-      notificationPolicy: production-alerts
-
-    - name: ticket-normal
-      shortWindow: 24h
-      longWindow: 3d
-      burnRateThreshold: 3.0
-      severity: medium
-
-    - name: monitor
-      shortWindow: 72h
-      longWindow: 30d
-      burnRateThreshold: 1.0
-      severity: low
-
   alertPolicy:
-    multiWindowRequired: true
-    pageOnBudgetExhausted: true
-    budgetWarningThresholds: [50, 25, 10, 0]
+    # See "Known limitation: budget-exhausted Issues repeat" before enabling
+    pageOnBudgetExhausted: false
+    burnRateWindows:
+      - shortWindow: 1h
+        longWindow: 6h
+        burnRateThreshold: 14.4
+        severity: critical
+      - shortWindow: 6h
+        longWindow: 3d
+        burnRateThreshold: 6.0
+        severity: high
+      - shortWindow: 24h
+        longWindow: 3d
+        burnRateThreshold: 3.0
+        severity: medium
+      - shortWindow: 72h
+        longWindow: 30d
+        burnRateThreshold: 1.0
+        severity: low
 ```
 
-### SLA P1=5min Response / 1h Resolution (Business Hours)
+Route the Issues it opens with a `NotificationPolicy` rule (see [Notifications](/features/aiops/notifications)):
+
+```yaml
+  rules:
+    - name: slo-burn
+      signalTypes: [slo_violation]
+      channels: [slack-sre]
+```
+
+### Incident SLAs: Critical 5min/1h (24/7), Others in Business Hours
+
+One `IncidentSLA` per severity:
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: IncidentSLA
 metadata:
-  name: api-gateway-production-sla
+  name: critical-sla
   namespace: production
 spec:
-  service: api-gateway
-  description: "Production SLA per enterprise customer contract"
-
-  responseTimes:
-    - severity: critical
-      maxResponseTime: "5m"
-      maxResolutionTime: "1h"
-    - severity: high
-      maxResponseTime: "15m"
-      maxResolutionTime: "4h"
-    - severity: medium
-      maxResponseTime: "2h"
-      maxResolutionTime: "24h"
-    - severity: low
-      maxResponseTime: "8h"
-      maxResolutionTime: "72h"
-
+  severity: critical
+  responseTime: "5m"
+  resolutionTime: "1h"
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: high-sla
+  namespace: production
+spec:
+  severity: high
+  responseTime: "15m"
+  resolutionTime: "4h"
+  businessHoursOnly: true
   businessHours:
-    enabled: true
     timezone: "America/Sao_Paulo"
     startHour: 9
     endHour: 18
-    workDays: [1, 2, 3, 4, 5]
-    holidays:
-      - date: "2026-01-01"
-        name: "New Year's Day"
-      - date: "2026-02-16"
-        name: "Carnival"
-      - date: "2026-02-17"
-        name: "Carnival"
-      - date: "2026-04-03"
-        name: "Good Friday"
-      - date: "2026-04-21"
-        name: "Tiradentes Day"
-      - date: "2026-05-01"
-        name: "Labor Day"
-      - date: "2026-09-07"
-        name: "Independence Day"
-      - date: "2026-10-12"
-        name: "Our Lady of Aparecida"
-      - date: "2026-11-02"
-        name: "All Souls' Day"
-      - date: "2026-11-15"
-        name: "Republic Proclamation Day"
-      - date: "2026-12-25"
-        name: "Christmas"
-
-  violationPolicy:
-    notificationPolicy: sla-breach-notifications
-    escalationPolicy: p0-escalation
-    autoEscalateOnBreach: true
+    workDays: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: medium-sla
+  namespace: production
+spec:
+  severity: medium
+  responseTime: "2h"
+  resolutionTime: "24h"
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: low-sla
+  namespace: production
+spec:
+  severity: low
+  responseTime: "8h"
+  resolutionTime: "72h"          # "3d" would be rejected by the controller
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
 ```
 
 <Note>
-For `critical` severity, even with business hours enabled, consider creating a separate rule with `businessHours.enabled: false`. P1 issues typically require 24/7 response.
+`medium-sla` and `low-sla` rely on the `businessHours` defaults (09:00-18:00, Monday to Friday). The object must still be present: `businessHoursOnly: true` without `businessHours` falls back to a 24/7 clock.
 </Note>
 
-### SLO with Custom PrometheusQuery (Latency P99)
+### Latency SLO for One Deployment (Anomaly-Based)
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
@@ -679,117 +685,95 @@ metadata:
   name: payment-service-latency-slo
   namespace: payments
 spec:
-  service: payment-service
-  description: "99.5% of Payment Service requests must complete in under 500ms"
+  serviceName: payment-service
+  description: "Share of latency anomalies among all anomalies of payment-service"
+  enabled: true
 
   indicator:
     type: latency
-    prometheusQuery:
-      goodQuery: |
-        sum(rate(http_request_duration_seconds_bucket{
-          service="payment-service",
-          le="0.5"
-        }[5m]))
-      totalQuery: |
-        sum(rate(http_request_duration_seconds_count{
-          service="payment-service"
-        }[5m]))
+    resource:
+      kind: Deployment
+      name: payment-service
+      namespace: payments
 
   target:
-    percentage: 99.5
+    percentage: 95
     window: 7d
 
-  burnRateAlerts:
-    - name: page-latency-spike
-      shortWindow: 30m
-      longWindow: 3h
-      burnRateThreshold: 14.4
-      severity: critical
-      notificationPolicy: payments-alerts
-
-    - name: ticket-latency-degradation
-      shortWindow: 3h
-      longWindow: 1d
-      burnRateThreshold: 6.0
-      severity: high
-
-    - name: monitor-latency-trend
-      shortWindow: 12h
-      longWindow: 7d
-      burnRateThreshold: 1.0
-      severity: low
-
   alertPolicy:
-    multiWindowRequired: true
-    pageOnBudgetExhausted: true
-    budgetWarningThresholds: [25, 10, 0]
+    burnRateWindows:
+      - shortWindow: 30m
+        longWindow: 3h
+        burnRateThreshold: 10
+        severity: high
 ```
 
-
+The SLI counts Anomalies with `signalType: latency` (raised by the watcher from `HighLatency`/`Latency` alerts) against all Anomalies of `payment-service` in the window.
 
 ## Grafana Dashboards
 
-The AIOps platform provides 4 pre-configured Grafana dashboards for SLO and SLA visualization:
+The repository ships 4 Grafana dashboards in `deploy/grafana/`, built on the operator metrics:
 
 <CardGroup cols={2}>
-  <Card title="SLO Overview" icon="chart-line">
-    Unified panel with all SLOs, current values, remaining error budget, and burn rate. Includes a burn rate heatmap by service.
+  <Card title="SLO Burn Rate & SLA Compliance" icon="chart-line">
+    `slo-burn-rate.json`: error budget remaining, current SLI, burn rate per fixed window (1h/6h/24h/72h) against the 14.4/6/3/1x reference lines, time until budget exhaustion, SLA compliance, response/resolution time distribution and violations by type.
   </Card>
-  <Card title="Error Budget Burn-Down" icon="chart-area">
-    Error budget burn-down chart over time. Shows trends and exhaustion projections. Reference lines for each warning threshold.
+  <Card title="Remediation Stats & Operator Health" icon="chart-area">
+    `remediation-stats.json`: remediation statistics, plus an SLA section with compliance and p95 response/resolution time by severity.
   </Card>
-  <Card title="SLA Compliance Report" icon="file-chart-line">
-    Compliance report by severity and period. Table with each incident, response/resolution times, and compliance status. Exportable to PDF.
+  <Card title="AIOps Overview" icon="file-chart-line">
+    `aiops-overview.json`: platform-wide view of issues, anomalies and remediations.
   </Card>
-  <Card title="Incident Timeline" icon="timeline-arrow">
-    Incident timeline with detection, analysis, remediation, and resolution. Visual correlation with SLO burn rate and SLA clock.
+  <Card title="Incident Timeline & Workflows" icon="timeline-arrow">
+    `incident-timeline.json`: incident flow from detection through analysis, remediation and resolution.
   </Card>
 </CardGroup>
 
-**Importing the dashboards:**
+**Importing the dashboards** (from a checkout of the chatcli repository):
 
 ```bash
-# The dashboards are available as ConfigMaps
-kubectl apply -f operator/config/grafana/dashboards/
+# As a ConfigMap for the Grafana sidecar (label grafana_dashboard=1)
+kubectl create configmap chatcli-grafana-dashboards -n monitoring \
+  --from-file=deploy/grafana/aiops-overview.json \
+  --from-file=deploy/grafana/slo-burn-rate.json \
+  --from-file=deploy/grafana/incident-timeline.json \
+  --from-file=deploy/grafana/remediation-stats.json
+kubectl label configmap chatcli-grafana-dashboards -n monitoring grafana_dashboard=1
 
-# Or import via the Grafana API
-for f in operator/config/grafana/dashboards/*.json; do
-  curl -X POST -H "Content-Type: application/json" \
+# Or through the Grafana HTTP API (the files are bare dashboards, so wrap them)
+for f in deploy/grafana/*.json; do
+  jq '{dashboard: ., overwrite: true}' "$f" | curl -X POST \
+    -H "Content-Type: application/json" \
     -H "Authorization: Bearer $GRAFANA_API_KEY" \
-    -d @"$f" \
-    "https://grafana.company.com/api/dashboards/db"
+    -d @- "https://grafana.example.com/api/dashboards/db"
 done
 ```
 
-
-
 ## Prometheus Metrics
 
-The SLO and SLA system exposes detailed metrics:
+The operator exposes these metrics on its metrics port (`8080`, path `/metrics`).
 
 ### SLO Metrics
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `chatcli_slo_current_value` | Gauge | `slo`, `service`, `namespace`, `indicator_type` | Current SLI value (e.g., 99.92) |
-| `chatcli_slo_target_value` | Gauge | `slo`, `service` | Configured target (e.g., 99.9) |
-| `chatcli_slo_error_budget_total` | Gauge | `slo`, `service` | Total error budget (e.g., 0.001) |
-| `chatcli_slo_error_budget_remaining` | Gauge | `slo`, `service`, `namespace` | Remaining error budget |
-| `chatcli_slo_error_budget_remaining_percent` | Gauge | `slo`, `service` | Remaining budget percentage |
-| `chatcli_slo_burn_rate` | Gauge | `slo`, `service`, `window` | Burn rate per window |
-| `chatcli_slo_alerts_fired_total` | Counter | `slo`, `service`, `severity`, `alert_name` | Total burn rate alerts fired |
-| `chatcli_slo_condition` | Gauge | `slo`, `service`, `condition` | Current state (1=active): `Met`, `AtRisk`, `Violated` |
+| `chatcli_operator_slo_current_value` | Gauge | `service`, `slo_name` | Current SLI as a fraction (e.g. `0.9992`) |
+| `chatcli_operator_slo_error_budget_remaining` | Gauge | `service`, `slo_name` | Remaining share of the error budget, `0.0`-`1.0` |
+| `chatcli_operator_slo_burn_rate` | Gauge | `service`, `slo_name`, `window` | Burn rate; `window` is `1h`, `6h`, `24h` or `72h` (the custom `burnRateWindows` are not exported) |
+| `chatcli_operator_slo_violations_total` | Counter | `service`, `slo_name`, `severity` | Burn-rate alerts fired plus budget-exhausted pages |
 
 ### SLA Metrics
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `chatcli_sla_violations_total` | Counter | `sla`, `service`, `severity`, `violation_type` | Total SLA violations |
-| `chatcli_sla_compliance_percentage` | Gauge | `sla`, `service`, `severity` | Current compliance percentage |
-| `chatcli_sla_response_time_seconds` | Histogram | `sla`, `service`, `severity` | Response time distribution |
-| `chatcli_sla_resolution_time_seconds` | Histogram | `sla`, `service`, `severity` | Resolution time distribution |
-| `chatcli_sla_active_incidents` | Gauge | `sla`, `service` | Currently active incidents |
-| `chatcli_sla_business_hours_active` | Gauge | `sla`, `service` | 1 if within business hours, 0 if outside |
+| `chatcli_operator_sla_violations_total` | Counter | `severity`, `type` (`response`, `resolution`) | SLA breaches |
+| `chatcli_operator_sla_compliance_percentage` | Gauge | `severity` | Compliance of the `IncidentSLA` for that severity |
+| `chatcli_operator_sla_response_time_seconds` | Histogram | `severity` | Detection to first analysis (observed at the response check) |
+| `chatcli_operator_sla_resolution_time_seconds` | Histogram | `severity` | Detection to resolution (observed for `Resolved` Issues only) |
+
+<Note>
+The gauges are only updated while the SLO or SLA is reconciled. Deleting an SLO does not remove its last values from `/metrics` until the operator restarts.
+</Note>
 
 **Recommended Prometheus alerts:**
 
@@ -798,41 +782,46 @@ groups:
   - name: chatcli-slo-sla
     rules:
       - alert: SLOBudgetExhausted
-        expr: chatcli_slo_error_budget_remaining_percent <= 0
+        expr: chatcli_operator_slo_error_budget_remaining <= 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "Error budget exhausted for SLO {{ $labels.slo }}"
+          summary: "Error budget exhausted for SLO {{ $labels.slo_name }}"
           description: "Service {{ $labels.service }} has exhausted its error budget. No additional downtime is allowed."
 
       - alert: SLOBudgetLow
-        expr: chatcli_slo_error_budget_remaining_percent <= 10 and chatcli_slo_error_budget_remaining_percent > 0
+        expr: chatcli_operator_slo_error_budget_remaining <= 0.10 and chatcli_operator_slo_error_budget_remaining > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Low error budget ({{ $value }}%) for SLO {{ $labels.slo }}"
+          summary: "Low error budget ({{ $value | humanizePercentage }}) for SLO {{ $labels.slo_name }}"
 
       - alert: SLAComplianceBelow95
-        expr: chatcli_sla_compliance_percentage < 95
+        expr: chatcli_operator_sla_compliance_percentage < 95
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "SLA compliance below 95% for {{ $labels.service }}"
+          summary: "SLA compliance below 95% for {{ $labels.severity }} incidents"
           description: "Current compliance: {{ $value }}%. Review recent incidents and take corrective action."
 
+      - alert: SLABreached
+        expr: increase(chatcli_operator_sla_violations_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.type }} SLA breached for a {{ $labels.severity }} incident"
+
       - alert: SLAResponseTimeExceeded
-        expr: histogram_quantile(0.95, rate(chatcli_sla_response_time_seconds_bucket[1h])) > 300
+        expr: histogram_quantile(0.95, sum by (le, severity) (rate(chatcli_operator_sla_response_time_seconds_bucket[1h]))) > 300
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "P95 SLA response time exceeds 5 minutes"
+          summary: "P95 SLA response time exceeds 5 minutes for {{ $labels.severity }} incidents"
 ```
-
-
 
 ## Next Steps
 

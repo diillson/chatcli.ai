@@ -20,16 +20,16 @@ O **Motor de Decisão** é o componente central que determina _quando_ e _como_ 
 ```mermaid
 flowchart TD
     A[AIInsight CR] -->|confiança base| B[Motor de Decisão]
-    B --> C{Ajustes de Confiança}
+    B --> J{Circuit Breaker}
+    J -->|aberto| K[Espera: blocked]
+    J -->|fechado| C{Ajustes de Confiança}
     C --> D[Taxa de Sucesso Histórica]
     C --> E[Pattern Match]
     C --> F[Horário do Dia]
     C --> G[Issues Ativas]
     C --> H[Modificador de Severidade]
     D & E & F & G & H --> I[Confiança Final]
-    I --> J{Circuit Breaker}
-    J -->|aberto| K[Espera: blocked]
-    J -->|fechado| L{Threshold de Decisão}
+    I --> L{Threshold de Decisão}
     L -->|>=0.95 + low| M[Auto-Remediação]
     L -->|>=0.85 + medium| N[Auto + Notificação]
     L -->|>=0.80 + high| O[Espera: approval]
@@ -64,7 +64,13 @@ metadata:
     platform.chatcli.io/decision-reason: "Auto-approved with notification: confidence 0.91 + medium severity"
 ```
 
-Um plano que precisa esperar fica em `WaitingApproval` sob a política sintética `decision-engine`: um ApprovalRequest com `policyRef: decision-engine`, um aprovador exigido e timeout de 30 minutos, decidido como qualquer outro (dashboard, annotation `platform.chatcli.io/approve` ou API REST). Nenhum objeto ApprovalPolicy é necessário.
+Um plano que precisa esperar fica em `WaitingApproval` sob a política sintética `decision-engine`: um ApprovalRequest com `policyRef: decision-engine`, um aprovador exigido e timeout de 30 minutos, decidido como qualquer outro (dashboard, API REST ou a annotation `platform.chatcli.io/approve` / `platform.chatcli.io/reject` com o valor `<aprovador>:<motivo>`). Nenhum objeto ApprovalPolicy é necessário.
+
+<Note>
+  Só o caminho da annotation registra quem decidiu e por quê em `status.decisions`. Uma decisão tomada pela API REST ou pelo dashboard muda o estado do request (o plano roda ou falha como esperado), mas nas versões atuais o nome do aprovador e o motivo não são persistidos: o schema do status do ApprovalRequest não tem campos para eles.
+</Note>
+
+O motor lê a confiança base do AIInsight chamado `<issue>-insight`. Se esse AIInsight não existir, a confiança base é `0` e o plano termina como `manual`. O AIInsight vem do servidor ChatCLI ao qual o operator está conectado; só uma Instance por cluster dirige o AIOps (o operator usa a primeira Instance pronta que encontra no cluster inteiro).
 
 
 
@@ -113,7 +119,7 @@ Planos agênticos não carregam ações pré-planejadas, então este fator não 
 
 ### 2. Pattern Match (Correspondência de Padrão)
 
-Quando o [Pattern Store](#pattern-store) guarda um padrão resolvido com o mesmo tipo de sinal, tipo de recurso e severidade, o `ConfidenceBoost` armazenado dele é somado. O boost é aprendido por padrão a partir de resoluções passadas; não há valor fixo.
+Quando o [Pattern Store](#pattern-store) do namespace da Issue guarda um padrão com o mesmo tipo de sinal, tipo de recurso e severidade que já foi resolvido com sucesso **pelo menos duas vezes**, o `confidenceBoost` armazenado dele é somado. O boost é aprendido por padrão: `successCount / (successCount + failureCount) × 0.15`, então nunca passa de **+0,15**.
 
 ### 3. Horário do Dia (Time of Day)
 
@@ -247,326 +253,128 @@ O estado é derivado dos planos a cada avaliação, não guardado em memória, e
 
 ## Pattern Store
 
-O Pattern Store é o sistema de aprendizado de padrões da plataforma. Ele permite que a AIOps "lembre" de incidentes passados e use essa memória para tomar decisões mais informadas.
+O Pattern Store é o sistema de aprendizado de padrões da plataforma. Ele permite que o AIOps "lembre" como incidentes passados terminaram e devolva essa memória ao ajuste de pattern match (fator 2 acima).
 
-### Fingerprinting SHA256
+### Fingerprint
 
-Cada padrão é identificado por uma fingerprint única calculada como:
+Cada padrão é identificado por um fingerprint do tipo de sinal, do tipo de recurso e da severidade da Issue, em minúsculas:
 
 ```
-SHA256(signalType | resourceKind | severity)
+hex( SHA256( lower(signalType) | lower(resourceKind) | lower(severity) )[:12] )
 ```
 
-**Exemplos de fingerprints:**
-
-| Signal Type | Resource Kind | Severity | Fingerprint (truncada) |
-|------------|--------------|----------|----------------------|
-| `CrashLoopBackOff` | `Deployment` | `high` | `a3f8c2...` |
-| `OOMKilled` | `Pod` | `medium` | `7b1d9e...` |
-| `FailedScheduling` | `Pod` | `low` | `c4e6a1...` |
-| `ImagePullBackOff` | `Deployment` | `high` | `2d8f5b...` |
+O resultado é uma string hexadecimal de 24 caracteres. Duas Issues compartilham um padrão exatamente quando esses três valores coincidem; o nome do recurso não entra na conta.
 
 ### Armazenamento em ConfigMap
 
-Os padrões são persistidos em um `ConfigMap` dedicado no namespace do operator:
+Os padrões ficam num ConfigMap chamado `chatcli-pattern-store` **no namespace da Issue** (um por namespace que já teve remediações), criado pelo operator no primeiro uso. Cada chave de `data` é um fingerprint e o valor é o padrão em JSON:
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: chatcli-pattern-store
-  namespace: chatcli-system
+  namespace: production
   labels:
+    app.kubernetes.io/managed-by: chatcli-operator
     app.kubernetes.io/component: pattern-store
-    platform.chatcli.io/managed-by: decision-engine
 data:
-  patterns.json: |
-    {
-      "a3f8c2...": {
-        "signalType": "CrashLoopBackOff",
-        "resourceKind": "Deployment",
-        "severity": "high",
-        "totalOccurrences": 12,
-        "successfulResolutions": 10,
-        "lastResolution": {
-          "action": "Rollback",
-          "timestamp": "2026-03-18T14:30:00Z",
-          "durationSeconds": 45
-        },
-        "averageResolutionTime": "38s"
-      }
-    }
+  3f9a0c1d2e4b5a6978c0d1e2: |
+    {"fingerprint":"3f9a0c1d2e4b5a6978c0d1e2","signalType":"oom_kill","resourceKind":"Deployment","severity":"high","successfulActions":["AdjustResources","RestartDeployment"],"successCount":10,"failureCount":2,"averageResolutionSecs":38,"lastSeenAt":"2026-03-18T14:30:00Z","confidenceBoost":0.125}
 ```
 
-### RecordResolution e RecordFailure
+### Quando os padrões são registrados
 
-<CodeGroup>
-```go RecordResolution
-func (ps *PatternStore) RecordResolution(fingerprint string, action string) {
-    ps.mu.Lock()
-    defer ps.mu.Unlock()
+O RemediationReconciler atualiza o padrão quando um plano chega a um estado terminal:
 
-    pattern, exists := ps.patterns[fingerprint]
-    if !exists {
-        pattern = &Pattern{Fingerprint: fingerprint}
-        ps.patterns[fingerprint] = pattern
-    }
+| Resultado do plano | Efeito no padrão |
+|--------------------|------------------|
+| `Completed` | `successCount` +1; os tipos de ação do plano entram em `successfulActions` (em planos agênticos, as ações cuja observação não começou com `FAILED:`); `averageResolutionSecs` é atualizado a partir de `detectedAt` → `resolvedAt` da Issue quando ambos existem |
+| `Failed` ou `RolledBack` | `failureCount` +1 |
 
-    pattern.TotalOccurrences++
-    pattern.SuccessfulResolutions++
-    pattern.LastResolution = &Resolution{
-        Action:    action,
-        Timestamp: time.Now(),
-    }
-
-    ps.persistToConfigMap()
-}
-```
-
-```go RecordFailure
-func (ps *PatternStore) RecordFailure(fingerprint string, reason string) {
-    ps.mu.Lock()
-    defer ps.mu.Unlock()
-
-    pattern, exists := ps.patterns[fingerprint]
-    if !exists {
-        pattern = &Pattern{Fingerprint: fingerprint}
-        ps.patterns[fingerprint] = pattern
-    }
-
-    pattern.TotalOccurrences++
-    pattern.LastFailureReason = reason
-
-    ps.persistToConfigMap()
-}
-```
-</CodeGroup>
+Os dois caminhos recalculam `confidenceBoost` e atualizam `lastSeenAt`.
 
 ### Cálculo do Confidence Boost
 
-O boost de confiança derivado do Pattern Store é calculado diretamente a partir da taxa de sucesso:
-
 ```
-ConfidenceBoost = successRate * 0.15
+confidenceBoost = successCount / (successCount + failureCount) × 0.15
 ```
 
-| Taxa de Sucesso | Confidence Boost | Exemplo |
-|----------------|------------------|---------|
-| 100% (10/10) | +0.150 | Todos os rollbacks bem-sucedidos |
-| 80% (8/10) | +0.120 | Maioria dos ajustes de recursos funcionou |
-| 50% (5/10) | +0.075 | Resultados mistos |
-| 20% (2/10) | +0.030 | A maioria falhou |
+O boost só é aplicado quando `successCount ≥ 2`.
 
-### Cenário: Incidente Similar Recente
+| Sucessos / total | Confidence Boost |
+|------------------|------------------|
+| 10 / 10 | +0,150 |
+| 8 / 10 | +0,120 |
+| 5 / 10 | +0,075 |
+| 2 / 10 | +0,030 |
+| 1 / 1 | 0 (menos de 2 sucessos) |
 
-<Accordion title="'Incidente similar resolvido 3 dias atrás com rollback'">
-  Quando o Pattern Store encontra uma correspondência, o motor adiciona contexto
-  ao `AIInsight` e ao `RemediationPlan`:
-
-  ```yaml
-  status:
-    patternMatch:
-      found: true
-      fingerprint: "a3f8c2..."
-      previousResolution:
-        action: "Rollback"
-        daysAgo: 3
-        wasSuccessful: true
-        message: "Incidente similar resolvido 3 dias atrás com rollback"
-      confidenceBoost: 0.15
-      successRate: 0.83
-  ```
-
-  Essa informação é exibida no `Issue` CR para que operadores possam ver
-  rapidamente que o problema já foi resolvido antes e como.
-</Accordion>
+<Note>
+  Um pattern match só aparece pelo efeito no veredito: o valor final na annotation `platform.chatcli.io/confidence` do plano. O operator não grava detalhes do padrão na Issue, no AIInsight nem no RemediationPlan.
+</Note>
 
 
 
 ## Enriquecimento de Causa Raiz (RCA)
 
-Antes de tomar qualquer decisão, o motor enriquece o contexto do incidente com dados adicionais do cluster. Esse enriquecimento alimenta tanto o LLM (para melhor diagnóstico) quanto o motor de decisão (para ajustes mais precisos).
+Antes de pedir a análise ao servidor ChatCLI, o controller de AIInsight coleta contexto extra do cluster sobre a Issue e o anexa ao prompt da análise como um bloco de texto (limitado a 4.000 caracteres). Ele alimenta o **diagnóstico do LLM** e, por meio dele, o `confidence` do AIInsight; o motor de decisão não o lê diretamente, e ele não é gravado como campo estruturado em nenhum CR.
 
-### DeploymentChange Detection
+O enriquecedor olha **30 minutos** para trás a partir do `detectedAt` da Issue (ou da sua criação):
 
-O motor verifica se houve uma mudança de deploy recente comparando revisões de ReplicaSets:
+| Sinal | Como é coletado |
+|-------|-----------------|
+| Mudanças de deploy | ReplicaSets pertencentes ao Deployment indicado no recurso da Issue, ordenados pela annotation `deployment.kubernetes.io/revision`. Cada revisão criada na janela é reportada com o número, a imagem do primeiro container antes e depois e a annotation `kubernetes.io/change-cause`. |
+| Mudanças de configuração | Events do namespace sobre um `ConfigMap` com reason `Updated` ou `Modified` na janela. Só o nome do ConfigMap e o horário são reportados (sem chaves nem valores). Secrets não são verificados. |
+| Issues relacionadas | Outras Issues não terminais do mesmo namespace (nome, severidade, recurso, estado). |
+| Saúde dos Services | Services do namespace cujo selector casa com os labels do pod template do Deployment, com a contagem de endpoints prontos vinda das EndpointSlices; um Service sem nenhum endpoint pronto é reportado como não saudável. São os Services na frente da carga afetada, não as dependências upstream dela. |
+| Correlação temporal | Toda mudança de deploy ou de ConfigMap ocorrida **até 10 minutos** antes da detecção, por exemplo `Deployment revision 6 changed 3m0s before incident (image: api-server:v2.3.1 -> api-server:v2.4.0)`. |
 
-```go
-func (r *RCAEnricher) DetectDeploymentChange(ctx context.Context,
-    deployment *appsv1.Deployment) (*DeploymentChange, error) {
+O bloco termina com uma lista fixa de "possíveis causas", nesta ordem e só quando o sinal correspondente existe: mudança de deploy recente, mudança de ConfigMap recente, cada Service não saudável, Issues ativas relacionadas ou, quando nada disso se aplica, `No obvious external cause detected — may be resource exhaustion or application bug`. A lista é uma dica heurística para o LLM, não um ranking pontuado.
 
-    // Lista ReplicaSets do deployment
-    rsList, _ := r.client.AppsV1().ReplicaSets(deployment.Namespace).List(ctx,
-        metav1.ListOptions{
-            LabelSelector: labels.SelectorFromSet(deployment.Spec.Selector.MatchLabels).String(),
-        })
+```text
+## Root Cause Analysis Context
 
-    // Compara revisões (annotation deployment.kubernetes.io/revision)
-    current, previous := findCurrentAndPrevious(rsList.Items)
+### Temporal Correlations
+Deployment revision 6 changed 3m0s before incident (image: api-server:v2.3.1 -> api-server:v2.4.0)
 
-    if current != nil && previous != nil {
-        return &DeploymentChange{
-            RevisionBefore: previous.Annotations["deployment.kubernetes.io/revision"],
-            RevisionAfter:  current.Annotations["deployment.kubernetes.io/revision"],
-            ImageBefore:    previous.Spec.Template.Spec.Containers[0].Image,
-            ImageAfter:     current.Spec.Template.Spec.Containers[0].Image,
-            Timestamp:      current.CreationTimestamp.Time,
-        }, nil
-    }
-    return nil, nil
-}
-```
+### Possible Causes (ranked)
+1. Recent deployment change detected — possible bad release
+2. 1 related active issues in same namespace — possible systemic problem
 
-**Resultado do enriquecimento:**
+### Recent Deployment Changes
+- Revision 6 at 10:15:00: api-server:v2.3.1 → api-server:v2.4.0 (by release pipeline)
 
-```yaml
-rcaEnrichment:
-  deploymentChange:
-    detected: true
-    revisionBefore: "5"
-    revisionAfter: "6"
-    imageBefore: "api-server:v2.3.1"
-    imageAfter: "api-server:v2.4.0"
-    timestamp: "2026-03-19T10:15:00Z"
-```
-
-### ConfigChange Detection
-
-O motor busca eventos do Kubernetes relacionados a atualizações de ConfigMaps e Secrets:
-
-```yaml
-rcaEnrichment:
-  configChanges:
-    - resource: "ConfigMap/api-config"
-      field: "database.maxConnections"
-      timestamp: "2026-03-19T10:12:00Z"
-      reason: "Updated via kubectl"
-```
-
-### Related Issues
-
-Lista issues ativas no mesmo namespace que podem estar correlacionadas:
-
-```yaml
-rcaEnrichment:
-  relatedIssues:
-    - name: issue-high-latency-redis
-      severity: medium
-      signalType: HighLatency
-      resource: deployment/redis-cache
-    - name: issue-memory-pressure-node2
-      severity: high
-      signalType: MemoryPressure
-      resource: node/worker-2
-```
-
-### Dependency Status
-
-Verifica a saúde dos Services e Endpoints dos quais o recurso afetado depende:
-
-```yaml
-rcaEnrichment:
-  dependencyStatus:
-    - service: database-svc
-      endpointsReady: 3
-      endpointsTotal: 3
-      healthy: true
-    - service: redis-svc
-      endpointsReady: 0
-      endpointsTotal: 2
-      healthy: false
-      reason: "Nenhum endpoint pronto"
-```
-
-### Time Correlation
-
-O motor calcula a correlação temporal entre mudanças detectadas e o início do incidente:
-
-```yaml
-rcaEnrichment:
-  timeCorrelation:
-    deploymentChange:
-      minutesBefore: 3
-      message: "Deploy mudou 3 min antes do incidente"
-      correlationStrength: "strong"
-    configChange:
-      minutesBefore: 12
-      message: "ConfigMap atualizado 12 min antes do incidente"
-      correlationStrength: "moderate"
-```
-
-<Note>
-  Correlação temporal forte (&lt; 5 min) eleva automaticamente a causa para o topo
-  da lista de `PossibleCauses`, pois a probabilidade de relação causal é alta.
-</Note>
-
-### PossibleCauses Ranking
-
-Todas as causas possíveis são ranqueadas por probabilidade com base nos dados de enriquecimento:
-
-```yaml
-rcaEnrichment:
-  possibleCauses:
-    - rank: 1
-      cause: "Nova versão da imagem (v2.4.0) introduziu memory leak"
-      confidence: 0.85
-      evidence:
-        - "Deploy ocorreu 3 min antes do primeiro OOMKilled"
-        - "Imagem mudou de v2.3.1 para v2.4.0"
-        - "Padrão similar resolvido com rollback há 5 dias"
-    - rank: 2
-      cause: "Memory limit insuficiente para carga atual"
-      confidence: 0.45
-      evidence:
-        - "Uso de memória crescente nas últimas 2 horas"
-        - "Sem mudança recente nos limits"
-    - rank: 3
-      cause: "Dependência redis-svc degradada causando retry storm"
-      confidence: 0.30
-      evidence:
-        - "redis-svc com 0/2 endpoints prontos"
-        - "Correlação temporal fraca"
+### Related Active Issues
+- redis-cache-latency [medium] Deployment/redis-cache state=Analyzing
 ```
 
 
 
 ## Detector de Convergência
 
-O Detector de Convergência é projetado para o **loop agêntico** de remediação. Ele monitora as observações do agente para determinar se a situação está melhorando, estagnada ou piorando.
+O Detector de Convergência protege o **loop agêntico** de remediação. Ele inspeciona o `spec.agenticHistory` do plano (ação e observação de cada passo) para parar loops travados, oscilando, falhando repetidamente ou prestes a estourar o timeout, em vez de deixá-los queimar os passos restantes.
 
 ### IsConverged
 
-Verifica se as últimas **3 observações** são idênticas, indicando que o sistema atingiu um estado estável (para melhor ou pior).
+Verdadeiro quando os últimos **3 passos** do histórico agêntico têm a mesma observação (comparada sem espaços nas pontas, em minúsculas e não vazia): o loop não está mudando mais nada, para melhor ou para pior.
 
 ```go
-func (cd *ConvergenceDetector) IsConverged(observations []string) bool {
-    if len(observations) < 3 {
-        return false
-    }
-    last3 := observations[len(observations)-3:]
-    return last3[0] == last3[1] && last3[1] == last3[2]
-}
+func (cd *ConvergenceDetector) IsConverged(history []platformv1alpha1.AgenticStep) (bool, string)
 ```
 
 ### IsOscillating
 
-Detecta padrões de oscilação **A-B-A-B** onde o sistema alterna entre dois estados sem progresso real.
+Verdadeiro quando as **ações** dos últimos 4 passos alternam entre dois tipos de ação diferentes, A → B → A → B (por exemplo `ScaleDeployment`, `RestartDeployment`, `ScaleDeployment`, `RestartDeployment`). Passos sem ação quebram o padrão.
 
 ```go
-func (cd *ConvergenceDetector) IsOscillating(observations []string) bool {
-    if len(observations) < 4 {
-        return false
-    }
-    last4 := observations[len(observations)-4:]
-    // Padrão A→B→A→B
-    return last4[0] == last4[2] && last4[1] == last4[3] && last4[0] != last4[1]
-}
+func (cd *ConvergenceDetector) IsOscillating(history []platformv1alpha1.AgenticStep) (bool, string)
 ```
 
 <Warning>
-  Oscilação é um sinal forte de que a ação de remediação está criando o problema
-  que tenta resolver. Quando detectada, o loop agêntico é interrompido
-  imediatamente e o incidente é escalado para intervenção humana.
+  Oscilação é um sinal forte de que a remediação está desfazendo a si mesma. O loop
+  para nesse passo e o plano falha; a Issue segue então o caminho normal de nova
+  tentativa ou escalonamento (veja abaixo).
 </Warning>
 
 ### ShouldStop
@@ -574,41 +382,33 @@ func (cd *ConvergenceDetector) IsOscillating(observations []string) bool {
 O RemediationReconciler chama o detector antes de cada passo agêntico, depois dos limites rígidos (máximo de passos, timeout de 10 minutos):
 
 ```go
-func (cd *ConvergenceDetector) ShouldStop(history []AgenticStep, elapsed time.Duration) (bool, string)
+func (cd *ConvergenceDetector) ShouldStop(history []platformv1alpha1.AgenticStep, elapsed time.Duration) (bool, string)
 ```
 
 | Critério | Condição | Motivo registrado |
 |----------|----------|-------------------|
-| Convergência | as últimas 3 observações são idênticas | `Converged: Last 3 observations identical: …` |
-| Oscilação | as últimas 4 ações alternam A, B, A, B | `Oscillating: between A and B` |
-| Perto do timeout | mais de 8 minutos decorridos (limite 10) | `Approaching timeout: 8m12s elapsed (limit: 10m)` |
-| Falha repetida | as últimas 5 ações observaram `FAILED:` | `Last 5 actions all failed` |
+| Convergência | as últimas 3 observações são idênticas | `Converged: Last 3 observations identical: "<observação, 80 primeiros caracteres>"` |
+| Oscilação | as últimas 4 ações alternam A, B, A, B | `Oscillating: Oscillating between <A> and <B>` |
+| Timeout se aproximando | mais de 8 minutos decorridos (limite 10) | `Approaching timeout: 8m12s elapsed (limit: 10m)` |
+| Falha repetida | os últimos 5 passos tiveram ação e observação começando com `FAILED:` | `Last 5 actions all failed` |
 
-Uma parada falha o plano com `status.result` igual a `Agentic loop stopped: <motivo> (estimated progress NN%)` e incrementa `chatcli_operator_agentic_convergence_stops_total{reason}` com `converged`, `oscillating`, `timeout` ou `failures`. A Issue então tenta de novo com a próxima tentativa ou escalona, exatamente como após qualquer plano falho.
+Uma parada falha o plano com `status.result` igual a `Agentic loop stopped: <motivo> (estimated progress NN%)` e incrementa `chatcli_operator_agentic_convergence_stops_total{reason}` com `converged`, `oscillating`, `timeout` ou `failures`. A Issue então tenta de novo na próxima tentativa ou escala, exatamente como depois de qualquer plano que falhou.
 
 ### EstimateProgress
 
-Estima o progresso do loop agêntico de 0.0 a 1.0, usado para feedback visual e logging:
+Estima o progresso do loop agêntico de 0,0 a 1,0; o valor só aparece na mensagem de parada acima.
 
 ```go
-func (cd *ConvergenceDetector) EstimateProgress(
-    currentStep int,
-    maxSteps int,
-    lastObservation string,
-    targetState string,
-) float64 {
-    // Progresso base pelo número de steps
-    stepProgress := float64(currentStep) / float64(maxSteps)
-
-    // Ajuste se a observação indica melhoria
-    if strings.Contains(lastObservation, "healthy") ||
-       strings.Contains(lastObservation, "running") {
-        return math.Min(1.0, stepProgress + 0.2)
-    }
-
-    return stepProgress
-}
+func (cd *ConvergenceDetector) EstimateProgress(history []platformv1alpha1.AgenticStep) float64
 ```
+
+| Parte | Valor |
+|-------|-------|
+| Base | `0,7 × (passos com ação cuja observação não começa com FAILED:) / (passos com ação)` |
+| Bônus | `+0,3` quando a última observação contém `SUCCESS`, `healthy` ou `ready` (diferencia maiúsculas) |
+| Nenhuma ação ainda | `0,1` (histórico vazio: `0,0`) |
+
+O resultado é limitado a `1,0`.
 
 
 
@@ -616,9 +416,9 @@ func (cd *ConvergenceDetector) EstimateProgress(
 
 ```mermaid
 flowchart TD
-    START([Issue em Analyzing]) --> INSIGHT[AIInsight respondido pelo servidor]
-    INSIGHT --> RCA[Enriquecimento RCA]
-    RCA --> PLAN[RemediationPlan Pending]
+    START([Issue em Analyzing]) --> RCA[Prompt do AIInsight com contexto RCA]
+    RCA --> INSIGHT[AIInsight respondido pelo servidor]
+    INSIGHT --> PLAN[RemediationPlan Pending]
     PLAN --> POLICY{ApprovalPolicy<br/>casa?}
     POLICY -->|manual / quorum| PARK[WaitingApproval]
     POLICY -->|sem match ou auto| TIER{Tier do cluster<br/>exige aprovação?}
@@ -690,7 +490,7 @@ groups:
     Valide as decisões do motor com experimentos de chaos controlados.
   </Card>
   <Card title="Auditoria e Compliance" icon="clipboard-check" href="/pt/features/aiops/audit-compliance">
-    Cada decisão gera um AuditEvent imutável para rastreabilidade.
+    Planos em espera, decisões de aprovação e início, sucesso e falha de remediações são registrados como AuditEvents.
   </Card>
   <Card title="AIOps Platform" icon="brain" href="/pt/features/aiops-platform">
     Retorne à visão geral completa da plataforma AIOps.

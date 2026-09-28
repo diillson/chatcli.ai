@@ -1,44 +1,42 @@
 ---
 title: "Resolve Incident"
 openapi: "POST /incidents/{name}/resolve"
-description: "Manually resolves an incident — essential when the system escalates to human action or when an operator confirms the issue is fixed"
+description: "Manually resolves an incident — used when the platform escalates to human action or when an operator confirms the issue is fixed"
 icon: "circle-check"
 ---
 
 <ParamField path="name" type="string" required>
-  Unique incident name (e.g., `INC-20260319-001`)
+  Name of the Issue resource (e.g., `payment-service-oom-kill-1773933600`)
 </ParamField>
 
-<ParamField query="namespace" type="string" default="default">
-  Kubernetes namespace of the incident
+<ParamField query="namespace" type="string">
+  Namespace of the incident. When omitted, every namespace is searched and the first incident with that name is resolved — pass it explicitly when names can repeat across namespaces.
 </ParamField>
 
 <ParamField body="resolution" type="string">
-  Description of how the incident was resolved. If omitted, defaults to `"Manually resolved via dashboard"`.
+  Description of how the incident was resolved. If omitted (or the body is empty), defaults to `"Manually resolved via dashboard"`.
 
-  Best practice: always provide a meaningful resolution message for postmortem and audit trail.
+  Best practice: always provide a meaningful resolution message for the audit trail.
 </ParamField>
 
 ## When to Use This Endpoint
 
-This endpoint is critical in the following scenarios:
-
 ### 1. Escalated Incidents (Human Action Required)
 
-When the AIOps platform exhausts all automatic remediation attempts (default: 3 retries), the incident transitions to the **Escalated** state. At this point:
+When automatic remediation is exhausted — `maxRemediationAttempts` attempts (Instance `spec.aiops.maxRemediationAttempts`, default 5, or the matching Runbook's `maxAttempts`) — the incident moves to **Escalated**. From there:
 
-- The notification system alerts the on-call team via configured channels (Slack, PagerDuty, etc.)
-- The escalation policy progresses through levels (L1 → L2 → L3) based on timeouts
-- **No further automatic remediation will be attempted**
-- The incident remains in `Escalated` state until a human resolves it via this endpoint, the web dashboard, or the CLI
+- Configured notification and escalation policies alert the on-call team
+- **No further automatic remediation is attempted**
+- If auto-resolve is enabled (Instance `spec.aiops.enableAutoResolve`, default `true`), the operator re-checks the resource every 30 seconds and resolves the incident itself once all replicas are healthy
+- Otherwise the incident stays `Escalated` until someone resolves it through this endpoint or the web dashboard
 
 ### 2. Manual Verification After Auto-Remediation
 
-Even when automatic remediation succeeds, operators may want to manually verify and close the incident with additional context.
+Even when automatic remediation succeeds, operators may want to close the incident with their own resolution text.
 
 ### 3. False Positives
 
-When an incident is detected but the operator determines it's a false positive, use this endpoint with a resolution like `"False positive — metric spike caused by scheduled batch job"`.
+When an incident turns out to be a false positive, resolve it with a resolution such as `"False positive — metric spike caused by scheduled batch job"`.
 
 ## Resolution Flow for Escalated Incidents
 
@@ -47,66 +45,117 @@ Incident Detected
       ↓
   AI Analysis → Runbook/Agentic Remediation
       ↓                    ↓
-  Success → Resolved    Failure (retry up to 3x)
+  Success → Resolved    Failure (retry up to maxRemediationAttempts)
                            ↓
-                    All retries exhausted
+                    All attempts exhausted
                            ↓
                       ESCALATED ← You are here
                            ↓
          ┌─────────────────┼──────────────────┐
          ↓                 ↓                  ↓
-    API Resolve      Dashboard Button     CLI Command
-  POST /resolve      "Resolve" btn      (future release)
+    API Resolve      Dashboard button    Auto-resolve
+  POST /resolve        "Resolve"       (resource healthy)
          ↓                 ↓                  ↓
          └─────────────────┼──────────────────┘
                            ↓
                     State: Resolved
-                    PostMortem generated
-                    Dedup cache cleared
-                    Audit event recorded
 ```
 
-## What Happens After Resolution
+## What Happens on Resolution
 
-1. **State Change**: The incident transitions from `Escalated` (or any active state) to `Resolved`
-2. **Annotations Added**:
-   - `aiops.chatcli.io/resolved-by` — the authenticated role/user
+1. **State change**: any state except `Resolved` (including `Escalated`, `Failed` and in-progress states) becomes `Resolved`; `status.resolution` and `status.resolvedAt` are set. Resolving an already resolved incident returns `409`.
+2. **Annotations added**:
+   - `aiops.chatcli.io/resolved-by` — the **role** of the calling API key (`operator` or `admin`)
    - `aiops.chatcli.io/resolved-at` — resolution timestamp
-   - `aiops.chatcli.io/manual-resolution` — set to `"true"`
-3. **Dedup Cache Cleared**: The resource's deduplication entry is invalidated, allowing new anomalies to be detected for the same resource
-4. **PostMortem Generated**: An automatic postmortem is created with the resolution details
-5. **Audit Event**: An immutable audit event is recorded for compliance
+   - `aiops.chatcli.io/manual-resolution` — `"true"`
+3. `Resolved` is terminal: the Issue controller stops processing the incident.
+
+<Warning>
+A manual resolve does **not**: generate a PostMortem (PostMortems are created only when a RemediationPlan finishes), record an AuditEvent, stop a RemediationPlan that is already running, or clear the watcher's deduplication entry for the resource (the hook exists but is not wired in the operator), so a recurring anomaly on the same resource can stay deduplicated until the entry expires (Instance `spec.aiops.dedupTTLMinutes`, default 30).
+</Warning>
 
 <ResponseExample>
 ```json Response 200
 {
   "apiVersion": "v1",
   "kind": "Incident",
-  "metadata": {
-    "name": "INC-20260319-001",
-    "namespace": "production",
-    "annotations": {
-      "aiops.chatcli.io/resolved-by": "operator",
-      "aiops.chatcli.io/resolved-at": "2026-03-19T16:45:00Z",
-      "aiops.chatcli.io/manual-resolution": "true"
-    }
-  },
   "spec": {
-    "resourceRef": {
+    "name": "payment-service-oom-kill-1773933600",
+    "namespace": "production",
+    "severity": "high",
+    "source": "watcher",
+    "signalType": "oom_kill",
+    "resource": {
       "kind": "Deployment",
       "name": "payment-service",
       "namespace": "production"
     },
-    "severity": "critical",
-    "signalType": "oom_kill"
+    "description": "Auto-detected oom_kill anomaly: container restarted after OOMKill (value=5, threshold=3)",
+    "riskScore": 65,
+    "state": "Resolved",
+    "detectedAt": "2026-03-19T15:20:00Z",
+    "resolvedAt": "2026-03-19T16:45:00Z",
+    "resolution": "Memory leak fixed in payment-service v2.4.1 hotfix, deployed manually. Stable for 15 minutes.",
+    "remediationAttempts": 5,
+    "maxRemediationAttempts": 5,
+    "creationTimestamp": "2026-03-19T15:20:00Z",
+    "labels": {
+      "platform.chatcli.io/inc-id": "INC-20260319-001",
+      "platform.chatcli.io/resource": "payment-service",
+      "platform.chatcli.io/signal": "oom_kill"
+    },
+    "annotations": {
+      "aiops.chatcli.io/manual-resolution": "true",
+      "aiops.chatcli.io/resolved-at": "2026-03-19T16:45:00Z",
+      "aiops.chatcli.io/resolved-by": "operator"
+    }
   },
   "status": {
+    "name": "payment-service-oom-kill-1773933600",
+    "namespace": "production",
+    "severity": "high",
+    "source": "watcher",
+    "signalType": "oom_kill",
+    "resource": {
+      "kind": "Deployment",
+      "name": "payment-service",
+      "namespace": "production"
+    },
+    "description": "Auto-detected oom_kill anomaly: container restarted after OOMKill (value=5, threshold=3)",
+    "riskScore": 65,
     "state": "Resolved",
-    "resolution": "Memory leak fixed in payment-service v2.4.1 hotfix deployed manually. Verified stable for 15 minutes.",
+    "detectedAt": "2026-03-19T15:20:00Z",
     "resolvedAt": "2026-03-19T16:45:00Z",
-    "detectedAt": "2026-03-19T14:30:00Z",
-    "remediationAttempts": 3,
-    "escalatedAt": "2026-03-19T15:15:00Z"
+    "resolution": "Memory leak fixed in payment-service v2.4.1 hotfix, deployed manually. Stable for 15 minutes.",
+    "remediationAttempts": 5,
+    "maxRemediationAttempts": 5,
+    "creationTimestamp": "2026-03-19T15:20:00Z",
+    "labels": {
+      "platform.chatcli.io/inc-id": "INC-20260319-001",
+      "platform.chatcli.io/resource": "payment-service",
+      "platform.chatcli.io/signal": "oom_kill"
+    },
+    "annotations": {
+      "aiops.chatcli.io/manual-resolution": "true",
+      "aiops.chatcli.io/resolved-at": "2026-03-19T16:45:00Z",
+      "aiops.chatcli.io/resolved-by": "operator"
+    }
+  },
+  "resourceMeta": {
+    "name": "payment-service-oom-kill-1773933600",
+    "namespace": "production",
+    "uid": "5b2d7c1e-3f4a-4e8b-9c6d-1a2b3c4d5e6f",
+    "creationTimestamp": "2026-03-19T15:20:00Z",
+    "labels": {
+      "platform.chatcli.io/inc-id": "INC-20260319-001",
+      "platform.chatcli.io/resource": "payment-service",
+      "platform.chatcli.io/signal": "oom_kill"
+    },
+    "annotations": {
+      "aiops.chatcli.io/manual-resolution": "true",
+      "aiops.chatcli.io/resolved-at": "2026-03-19T16:45:00Z",
+      "aiops.chatcli.io/resolved-by": "operator"
+    }
   }
 }
 ```
@@ -117,11 +166,9 @@ Incident Detected
 {
   "apiVersion": "v1",
   "kind": "Error",
-  "error": {
-    "code": 404,
-    "message": "Incident not found",
-    "details": "No incident named 'INC-20260319-999' found in namespace 'production'"
-  }
+  "error": "Not Found",
+  "code": 404,
+  "message": "issue not found: issues.platform.chatcli.io \"payment-service-oom-kill-1773000000\" not found"
 }
 ```
 </ResponseExample>
@@ -131,11 +178,9 @@ Incident Detected
 {
   "apiVersion": "v1",
   "kind": "Error",
-  "error": {
-    "code": 409,
-    "message": "Incident already resolved",
-    "details": "The incident 'INC-20260319-001' was already resolved at 2026-03-19T16:45:00Z"
-  }
+  "error": "Conflict",
+  "code": 409,
+  "message": "issue is already resolved"
 }
 ```
 </ResponseExample>

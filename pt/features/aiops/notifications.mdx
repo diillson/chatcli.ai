@@ -5,24 +5,23 @@ description: "Sistema de notificações multi-canal e escalação automática pa
 icon: "bell"
 ---
 
-O sistema de notificações da plataforma AIOps permite que alertas, mudanças de estado de Issues e violações de SLA sejam comunicados automaticamente para as equipes corretas, nos canais corretos, no momento correto. Combinado com políticas de escalação, garante que nenhum incidente crítico passe despercebido.
+O sistema de notificações da plataforma AIOps envia as mudanças de estado das Issues para as equipes certas, nos canais certos (Slack, PagerDuty, OpsGenie, email, webhooks genéricos e Microsoft Teams). As políticas de escalação acrescentam uma cadeia de níveis temporizada para as Issues que a remediação automática não conseguiu resolver.
 
-
+Tudo o que esta página descreve é feito por um único controller do operator, o **controller de notificação** (`NotificationReconciler`), que observa os recursos `Issue`. `NotificationPolicy` e `EscalationPolicy` não têm controller próprio: o controller de notificação as lê sempre que uma Issue muda.
 
 ## Visão Geral
 
 ```mermaid
 graph TD
     subgraph "Pipeline AIOps"
-        ISS[Issue CR] -->|state change| NE[NotificationEngine]
-        SLO[SLO Violation] -->|budget exhausted| NE
-        RP[RemediationPlan] -->|failed / escalated| NE
+        ISS[Issue CR] -->|mudança de estado| NC[Controller de notificação]
+        SLO[ServiceLevelObjective] -->|cria Issue<br/>signalType slo_violation| ISS
     end
 
-    subgraph "NotificationEngine"
-        NE -->|match rules| NP[NotificationPolicy]
-        NP -->|throttle check| TC[ThrottleController]
-        TC -->|deduplicated| DISPATCH[Dispatcher]
+    subgraph "Controller de notificação"
+        NC -->|toda policy habilitada,<br/>todos os namespaces| NP[Regras da NotificationPolicy]
+        NP -->|por Issue + canal| TC[Janela de dedup + maxPerHour]
+        TC --> DISPATCH[Envio pelo canal]
     end
 
     subgraph "Canais"
@@ -35,232 +34,294 @@ graph TD
     end
 
     subgraph "Escalação"
-        NE -->|unacknowledged| EP[EscalationPolicy]
-        EP -->|timeout L1| L2[Level 2]
-        L2 -->|timeout L2| L3[Level 3]
+        NC -->|Issue chega a Escalated| EP[EscalationPolicy]
+        EP -->|timeoutMinutes do nível| L2[Próximo nível]
+        L2 -->|notifyChannels| DISPATCH
     end
 
     style ISS fill:#fab387,color:#000
     style SLO fill:#f38ba8,color:#000
-    style RP fill:#a6e3a1,color:#000
-    style NE fill:#89b4fa,color:#000
+    style NC fill:#89b4fa,color:#000
     style DISPATCH fill:#cba6f7,color:#000
 ```
 
-O `NotificationEngine` é acionado sempre que:
+### O que dispara uma notificação
 
-| Evento | Descrição |
-|--------|-----------|
-| **Issue state change** | Transicao de estado (Detected, Analyzing, Remediating, Resolved, Escalated) |
-| **SLO burn rate alert** | Burn rate excede threshold em janelas short+long |
-| **SLA violation** | Tempo de resposta ou resolução excedeu o limite |
-| **Remediation failure** | RemediationPlan falhou e atingiu max attempts |
-| **Approval request** | ApprovalRequest criado aguardando aprovação |
+O único gatilho é uma **mudança de `status.state` em uma Issue**. O controller guarda o último estado tratado na annotation `platform.chatcli.io/last-notified-state` da Issue e avalia as policies uma vez para cada estado novo: `Detected`, `Analyzing`, `Remediating`, `Contained`, `Resolved`, `Escalated`, `Failed`.
 
+Outros eventos só chegam a um canal se virarem uma mudança de estado de Issue:
 
+| Evento | O que acontece de fato |
+|--------|------------------------|
+| **Alerta de burn rate / budget esgotado de SLO** | O controller de SLO cria uma Issue com `signalType: slo_violation` (veja [SLOs e SLAs](/pt/features/aiops/slo-sla)). Essa Issue é notificada como qualquer outra. |
+| **Violação de SLA** | **Nenhuma notificação.** O controller de SLA registra a violação no status do `IncidentSLA` e na annotation `platform.chatcli.io/sla-violated` da Issue. |
+| **Falha de remediação** | Aparece apenas pelos estados de Issue que ela provoca (`Remediating` → `Analyzing` para uma nova tentativa, `Escalated` quando as tentativas acabam). |
+| **ApprovalRequest criado** | **Nenhuma notificação.** Aprovações pendentes aparecem no dashboard, na API REST e em `kubectl get approvalrequests`. |
 
-## NotificationPolicy CRD
+<Warning>
+`IncidentSLA.spec.notificationPolicyRef`, `IncidentSLA.spec.escalationPolicyRef` e `ServiceLevelObjective.spec.alertPolicy.notificationPolicyRef` existem nos CRDs, mas nenhum controller os lê. O roteamento é decidido apenas pelas `rules` das suas NotificationPolicies. Para rotear alertas de SLO, filtre por `signalTypes: [slo_violation]`.
+</Warning>
 
-O `NotificationPolicy` define **quais eventos** disparam notificações, **para quais canais**, e com quais **regras de throttling**.
+<Note>
+Issues criadas por um `ChaosExperiment` (label `platform.chatcli.io/source: chaos-experiment`) continuam gerando as notificações normais de mudança de estado. Elas **nunca iniciam uma escalação**, então um exercício de chaos nunca aciona ninguém por meio de uma EscalationPolicy.
+</Note>
+
+## CRD NotificationPolicy
+
+Uma `NotificationPolicy` (short name `np`) declara um conjunto de **canais** nomeados, uma lista de **regras** que escolhem canais pelo nome, **throttling** e **templates** opcionais de mensagem.
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: NotificationPolicy
 metadata:
   name: production-alerts
-  namespace: production
+  namespace: chatcli-system
 spec:
+  enabled: true
+  channels:
+    - name: slack-critical
+      type: slack
+      config:
+        channel: "#incidents-critical"
+      secretRef:
+        name: slack-webhook            # chave do Secret: webhook_url
+    - name: pagerduty-sre
+      type: pagerduty
+      config: {}
+      secretRef:
+        name: pagerduty-routing        # chave do Secret: routing_key
+    - name: opsgenie-sre
+      type: opsgenie
+      config:
+        tags: "production,aiops"
+        responders: '[{"type":"team","name":"platform-sre"}]'
+      secretRef:
+        name: opsgenie-api             # chave do Secret: api_key
+    - name: email-sre
+      type: email
+      config:
+        smtp_host: smtp.example.com
+        smtp_port: "587"
+        from: "aiops@example.com"
+        to: "sre-team@example.com,platform-leads@example.com"
+      secretRef:
+        name: smtp-credentials         # chaves do Secret: smtp_user, smtp_password
+    - name: events-webhook
+      type: webhook
+      config:
+        url: "https://events.example.com/aiops"
+        headers: '{"X-Source":"chatcli-aiops","X-Environment":"production"}'
+      secretRef:
+        name: webhook-hmac             # chave do Secret: secret
+    - name: teams-infra
+      type: teams
+      config: {}
+      secretRef:
+        name: teams-webhook            # chave do Secret: webhook_url
+
   rules:
     - name: critical-incidents
-      match:
-        severities: [critical, high]
-        signalTypes: [oom_kill, deploy_failing, error_rate]
-        namespaces: [production, payments]
-        resourceKinds: [Deployment, StatefulSet]
-        states: [Detected, Escalated]
-      channels:
-        - type: slack
-          config:
-            webhook_url: "https://hooks.slack.com/services/T00/B00/xxxxx"
-            channel: "#incidents-critical"
-            mention: "@oncall-sre"
-        - type: pagerduty
-          config:
-            routing_key: "R0xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-            severity_mapping:
-              critical: critical
-              high: error
-        - type: opsgenie
-          config:
-            api_key: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-            priority_mapping:
-              critical: P1
-              high: P2
-            responders:
-              - type: team
-                name: platform-sre
-            tags: [production, aiops]
+      severities: [critical, high]
+      signalTypes: [oom_kill, deploy_failing, error_rate]
+      namespaces: [production, payments]
+      resourceKinds: [Deployment, StatefulSet]
+      states: [Detected, Escalated, Resolved]
+      channels: [slack-critical, pagerduty-sre, opsgenie-sre]
 
-    - name: low-severity-digest
-      match:
-        severities: [medium, low]
-        states: [Resolved]
-      channels:
-        - type: email
-          config:
-            smtp_host: smtp.company.com
-            smtp_port: 587
-            from: "aiops@company.com"
-            to: ["sre-team@company.com"]
-            subject_template: "[ChatCLI AIOps] {{.Severity}} - {{.ResourceName}}"
-            tls_skip_verify: false
+    - name: low-severity-resolved
+      severities: [medium, low]
+      states: [Resolved]
+      channels: [email-sre]
 
     - name: all-events-webhook
-      match:
-        severities: [critical, high, medium, low]
-      channels:
-        - type: webhook
-          config:
-            url: "https://internal-api.company.com/aiops/events"
-            secret: "whsec_xxxxxxxxxxxxxxxxxxxxxxxx"
-            headers:
-              X-Source: chatcli-aiops
-              X-Environment: production
+      channels: [events-webhook]
 
     - name: teams-infra
-      match:
-        severities: [critical, high]
-        namespaces: [infrastructure]
-      channels:
-        - type: teams
-          config:
-            webhook_url: "https://outlook.office.com/webhook/xxx/IncomingWebhook/yyy/zzz"
+      severities: [critical, high]
+      namespaces: [infrastructure]
+      channels: [teams-infra]
 
   throttle:
     deduplicationWindow: "5m"
-    maxPerHour: 60
-    groupBy: [namespace, resourceName, severity]
+    maxPerHour: 10
+
+  templates:
+    issue_created: "{{.Severity}} {{.SignalType}} em {{.Resource}} ({{.Namespace}}): {{.Description}}"
+    issue_resolved: "{{.Resource}} em {{.Namespace}} voltou ao normal."
 ```
+
+Os Secrets referenciados acima ficam no **mesmo namespace da policy**:
+
+```bash
+kubectl -n chatcli-system create secret generic slack-webhook \
+  --from-literal=webhook_url='https://hooks.slack.com/services/T000/B000/XXXX'
+kubectl -n chatcli-system create secret generic smtp-credentials \
+  --from-literal=smtp_user='aiops@example.com' --from-literal=smtp_password='<senha>'
+```
+
+### Como as policies são aplicadas
+
+- **Toda policy habilitada, de qualquer namespace**, é avaliada para **toda Issue** do cluster. O namespace da policy não limita o seu alcance. Para isso, use o filtro `namespaces` da regra.
+- Dentro de uma policy, **toda regra que casar** envia para os seus canais. O mesmo canal pode receber a mesma Issue duas vezes se duas regras casarem, mas a janela de dedup (abaixo) normalmente suprime o segundo envio.
+- Uma regra que cita um canal ausente em `spec.channels` é ignorada com a linha de log `channel not found in policy`.
 
 ### Campos do Spec
 
-#### NotificationRule
+#### NotificationPolicySpec
 
-Cada regra define um par **match + channels**. Múltiplas regras podem ser definidas em uma mesma policy.
+| Campo | Tipo | Obrigatório | Padrão | Descrição |
+|-------|------|:-----------:|--------|-----------|
+| `channels` | []NotificationChannel | **Sim** | | Canais para os quais a policy pode entregar |
+| `rules` | []NotificationRule | **Sim** | | Quando e para onde enviar |
+| `throttle` | ThrottleConfig | Não | | Limitação de taxa |
+| `templates` | map[string]string | Não | | Corpo de mensagem customizado por chave de evento |
+| `enabled` | bool | Não | `true` | Policies desabilitadas são ignoradas |
+
+#### NotificationChannel
 
 | Campo | Tipo | Obrigatório | Descrição |
 |-------|------|:-----------:|-----------|
-| `name` | string | **Sim** | Nome único da regra dentro da policy |
-| `match` | NotificationMatch | **Sim** | Critérios de matching |
-| `channels` | []ChannelConfig | **Sim** | Lista de canais de destino |
+| `name` | string | **Sim** | Nome ao qual as regras (e os níveis de escalação) se referem |
+| `type` | enum | **Sim** | `slack`, `pagerduty`, `opsgenie`, `email`, `webhook`, `teams` |
+| `config` | map[string]string | **Sim** | Chaves específicas do canal (veja cada canal abaixo). Use `config: {}` quando tudo vier do `secretRef`. |
+| `secretRef.name` | string | Não | Secret no namespace da policy. **Todas as chaves** do Secret são mescladas em `config` e sobrescrevem as chaves de mesmo nome. |
 
-#### NotificationMatch
+<Warning>
+`config` é um **mapa de strings**. Números, booleanos, listas e mapas precisam ser escritos como strings: `smtp_port: "587"`, `tls_skip_verify: "true"`, `to: "a@example.com,b@example.com"`, `headers: '{"X-Env":"prod"}'`. Um `587` sem aspas ou uma lista YAML é rejeitado pelo API server.
+</Warning>
 
-Todos os campos são opcionais. Se omitido, funciona como wildcard (match all). Quando múltiplos campos são definidos, a lógica é **AND** entre campos e **OR** dentro de cada campo.
+<Warning>
+`GET /api/v1/policies/notification` na API REST do operator devolve o `spec` completo, incluindo `config`, para qualquer chave com a role `viewer`. Mantenha URLs de webhook, routing keys, API keys e senhas no Secret do `secretRef`, e não em `config`.
+</Warning>
+
+#### NotificationRule
+
+Os filtros ficam direto na regra (não existe bloco `match`). Um filtro omitido ou vazio casa com tudo. A lógica é **AND** entre filtros e **OR** dentro de cada filtro.
 
 | Campo | Tipo | Descrição |
 |-------|------|-----------|
-| `severities` | []string | `critical`, `high`, `medium`, `low` |
-| `signalTypes` | []string | `oom_kill`, `pod_restart`, `pod_not_ready`, `deploy_failing`, `error_rate`, `latency_spike` |
-| `namespaces` | []string | Namespaces K8s a monitorar |
-| `resourceKinds` | []string | `Deployment`, `StatefulSet`, `DaemonSet` |
-| `states` | []string | `Detected`, `Analyzing`, `Remediating`, `Resolved`, `Escalated`, `Failed` |
+| `name` | string | **Obrigatório.** Nome da regra (usado nos logs) |
+| `severities` | []enum | `critical`, `high`, `medium`, `low` |
+| `signalTypes` | []string | Comparado com o `spec.signalType` da Issue, por exemplo `oom_kill`, `pod_restart`, `pod_not_ready`, `deploy_failing`, `error_rate`, `crashloop_backoff`, `slo_violation` |
+| `namespaces` | []string | Comparado com o namespace do **recurso afetado** (`spec.resource.namespace`), não com o namespace da própria Issue |
+| `resourceKinds` | []string | Comparado com `spec.resource.kind`, por exemplo `Deployment`, `StatefulSet`, `DaemonSet` |
+| `states` | []enum | `Detected`, `Analyzing`, `Remediating`, `Contained`, `Resolved`, `Escalated`, `Failed` |
+| `channels` | []string | **Obrigatório.** Nomes de canais de `spec.channels` |
 
 <Tip>
-Combine `severities` com `states` para controle fino. Exemplo: notifique `critical` apenas em `Detected` e `Escalated`, evitando ruido de transicoes intermediarias.
+Sempre defina `states`. Sem ele, toda transição da Issue (`Detected` → `Analyzing` → `Remediating` → ...) é candidata. Inclua também `Resolved` nos canais de PagerDuty e OpsGenie: é isso que resolve ou fecha o alerta do lado deles.
 </Tip>
 
 #### ThrottleConfig
 
-Controla a frequência e deduplicação de notificações para evitar alert fatigue.
-
-| Campo | Tipo | Padrão | Descrição |
-|-------|------|--------|-----------|
-| `deduplicationWindow` | duration | `5m` | Janela temporal para deduplicação. Notificações idênticas dentro desta janela são suprimidas. |
-| `maxPerHour` | int | `120` | Máximo de notificações por hora por policy. Excedentes são enfileirados. |
-| `groupBy` | []string | `[namespace, resourceName]` | Campos usados para agrupar notificações. Notificações do mesmo grupo são consolidadas. |
+| Campo | Tipo | Padrão | O que o código faz |
+|-------|------|--------|--------------------|
+| `deduplicationWindow` | string de duração | `5m` | Depois de um envio bem-sucedido, novos envios **da mesma Issue para o mesmo nome de canal** são descartados até a janela passar. Interpretado com `time.ParseDuration` do Go (`30s`, `5m`, `2h`). Um valor inválido como `1d` cai silenciosamente para `5m`. |
+| `maxPerHour` | int | `10` | No máximo esta quantidade de envios bem-sucedidos **por Issue, por nome de canal, por hora cheia**. `0` ou valor negativo equivale a `10`. |
+| `groupingWindow` | string de duração | `1m` | **Não implementado.** Aceito pelo CRD e ignorado pelo controller. Não existe agrupamento nem digest. |
 
 ```text
-Dedup key = hash(policy_name + rule_name + groupBy_values + severity)
-
-Exemplo com groupBy=[namespace, resourceName, severity]:
-  key = hash("production-alerts" + "critical-incidents" + "production" + "api-gateway" + "critical")
+Chave do throttle = <namespace da issue>/<nome da issue>/<nome do canal>
 ```
 
 <Warning>
-Definir `maxPerHour` muito baixo (ex: 5) pode suprimir alertas criticos. Use valores >= 30 para policies que cobrem severidades `critical` e `high`. O throttle nunca bloqueia a primeira notificação de um novo incidente.
+Notificações barradas pelo throttle são **descartadas, não enfileiradas**, e o estado mesmo assim é marcado como tratado, então ele nunca é enviado depois. Com a janela padrão de `5m`, uma Issue que passa por `Detected` → `Analyzing` → `Remediating` → `Resolved` em menos de cinco minutos envia **apenas o primeiro estado que casar** para cada canal. No PagerDuty e no OpsGenie, isso pode significar que o evento `Resolved` (resolve/close) é descartado e o alerta fica aberto. Para canais que precisam ver toda transição, use uma janela curta, como `30s`.
+
+O estado do throttle fica **na memória do operator**: ele é zerado quando o operator reinicia. A janela é contada por **nome** de canal, então duas policies que usam o mesmo nome de canal a compartilham.
 </Warning>
 
+#### Templates
 
+`templates` substitui o **corpo da mensagem** (o título e o assunto do email não mudam). A chave é escolhida pelo novo estado:
+
+| Estado da Issue | Chave do template |
+|-----------------|-------------------|
+| `Detected` (e qualquer estado não listado abaixo, como `Analyzing` ou `Contained`) | `issue_created` |
+| `Remediating` | `remediation_started` |
+| `Resolved` | `issue_resolved` |
+| `Escalated` | `issue_escalated` |
+| `Failed` | `remediation_failed` |
+
+A chave `remediation_completed` é aceita, mas nunca usada. Os templates **não** são `text/template` do Go: é uma simples substituição de placeholders, e só estes tokens exatos são trocados: `{{.Name}}` (nome da Issue), `{{.Namespace}}`, `{{.Severity}}`, `{{.State}}`, `{{.Resource}}` (`Kind/nome`), `{{.Description}}`, `{{.Source}}`, `{{.SignalType}}`, `{{.RiskScore}}`. Qualquer outra coisa (condicionais, funções, outros campos) é enviada literalmente.
+
+Sem template, o corpo é o `spec.description` da Issue, ou `Issue <name> on <Kind>/<name> transitioned to <State>.` quando a descrição está vazia.
+
+### Conteúdo da mensagem
+
+Todos os canais recebem a mesma mensagem:
+
+- **Título**: `<emoji da severidade> [<SEVERIDADE>] <namespace>/<nome do recurso> — <Estado>`, por exemplo `🔴 [CRITICAL] production/api-gateway — Detected`.
+- **Corpo**: o template ou a descrição (veja acima).
+- **Campos**: `Source`, `SignalType`, `RiskScore`, mais `CorrelationID`, `RemediationAttempts` (`n/max`) e `Resolution` quando estão preenchidos.
+- **Cor** por severidade: critical `#FF0000`, high `#FF8C00`, medium `#FFD700`, low `#00CC00`.
+
+A mensagem não inclui a análise da IA, o plano de remediação nem link para dashboard. Todo canal HTTP usa timeout de 30 segundos e faz **uma única tentativa**, sem retries.
+
+### Status
+
+| Campo | Descrição |
+|-------|-----------|
+| `status.totalSent` / `status.failedCount` | Contadores de entregas com sucesso e com falha |
+| `status.lastNotifiedAt` | Horário da última entrega com sucesso |
+| `status.recentDeliveries` | As últimas 20 tentativas (`channel`, `sentAt`, `success`, `error`) |
+| `status.conditions[Ready]` | `True/DeliverySucceeded` ou `False/DeliveryFailed` com o último erro |
+
+Notificações de escalação não entram nesse status. Toda tentativa de entrega, inclusive as de escalação, também é registrada como um `AuditEvent` com `eventType: notification_sent` (veja [Auditoria e Compliance](/pt/features/aiops/audit-compliance)).
+
+```bash
+kubectl get np -A
+# NAME                ENABLED   CHANNELS   SENT   FAILED   AGE
+# production-alerts   true      <none>     42     1        3d
+kubectl get np production-alerts -n chatcli-system -o jsonpath='{.status.recentDeliveries}'
+```
+
+<Note>
+A coluna `CHANNELS` sempre mostra `<none>`: ela aponta para o array `spec.channels`, mas foi declarada como coluna inteira, que o Kubernetes não consegue exibir.
+</Note>
 
 ## Canais de Notificação
 
 ### 1. Slack
 
-Envia notificações via Slack Incoming Webhooks usando **Block Kit** para rich formatting.
+Publica em um **Incoming Webhook** do Slack usando Block Kit.
 
 <Accordion title="Configuração completa do Slack">
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `webhook_url` | string | **Sim** | URL do Incoming Webhook do Slack |
-| `channel` | string | Não | Override do canal (requer webhook com permissao) |
-| `mention` | string | Não | Mencao (@user, @here, @channel, @oncall-group) |
-| `username` | string | Não | Nome do bot (padrão: `ChatCLI AIOps`) |
-| `icon_emoji` | string | Não | Emoji do bot (padrão: `:robot_face:`) |
+| Chave | Obrigatório | Descrição |
+|-------|:-----------:|-----------|
+| `webhook_url` | **Sim** | URL do Incoming Webhook |
+| `channel` | Não | Enviado como `channel` no payload. Webhooks criados por um app do Slack publicam no próprio canal e ignoram este valor. |
+| `username` | Não | Enviado como `username` no payload |
 
-**Cores por severidade no Block Kit:**
+Nenhuma outra chave é lida (não existe opção de menção nem de ícone). Para mencionar um grupo, coloque a menção em um template, por exemplo `issue_created: "<!subteam^S0123ABC> {{.Description}}"`.
 
-| Severidade | Cor (hex) | Visual |
-|-----------|-----------|--------|
-| Critical | `#E74C3C` | Vermelho intenso |
-| High | `#E67E22` | Laranja |
-| Medium | `#F1C40F` | Amarelo |
-| Low | `#2ECC71` | Verde |
-
-**Payload Block Kit enviado:**
+**Payload enviado:**
 
 ```json
 {
   "channel": "#incidents-critical",
-  "username": "ChatCLI AIOps",
-  "icon_emoji": ":robot_face:",
   "blocks": [
-    {
-      "type": "header",
-      "text": {
-        "type": "plain_text",
-        "text": "CRITICAL: OOMKilled on api-gateway"
-      }
-    },
+    {"type": "header", "text": {"type": "plain_text", "text": "🔴 [CRITICAL] production/api-gateway — Detected"}},
     {
       "type": "section",
+      "text": {"type": "mrkdwn", "text": "OOMKilled: container exceeded its 512Mi memory limit"},
       "fields": [
-        {"type": "mrkdwn", "text": "*Namespace:*\nproduction"},
-        {"type": "mrkdwn", "text": "*Resource:*\nDeployment/api-gateway"},
-        {"type": "mrkdwn", "text": "*Signal:*\noom_kill"},
-        {"type": "mrkdwn", "text": "*Risk Score:*\n85/100"},
-        {"type": "mrkdwn", "text": "*State:*\nDetected"},
-        {"type": "mrkdwn", "text": "*Confidence:*\n0.92"}
+        {"type": "mrkdwn", "text": "*Severity:* 🔴 critical"},
+        {"type": "mrkdwn", "text": "*Resource:* Deployment/api-gateway"},
+        {"type": "mrkdwn", "text": "*Namespace:* production"},
+        {"type": "mrkdwn", "text": "*State:* Detected"},
+        {"type": "mrkdwn", "text": "*SignalType:* oom_kill"},
+        {"type": "mrkdwn", "text": "*RiskScore:* 85"},
+        {"type": "mrkdwn", "text": "*Source:* watcher"}
       ]
     },
-    {
-      "type": "section",
-      "text": {
-        "type": "mrkdwn",
-        "text": "*Analysis:*\nMemory limit (512Mi) insufficient for current workload..."
-      }
-    },
-    {
-      "type": "context",
-      "elements": [
-        {"type": "mrkdwn", "text": "Issue: `api-gateway-oom-kill-1771276354` | <https://grafana.company.com/d/aiops|Dashboard>"}
-      ]
-    }
+    {"type": "context", "elements": [{"type": "mrkdwn", "text": "Issue: *api-gateway-oom-kill-1771276354* | 2026-03-19T14:30:00Z"}]}
   ],
-  "attachments": [{"color": "#E74C3C"}]
+  "attachments": [{"color": "#FF0000", "blocks": []}]
 }
 ```
+
+Os campos extras (`SignalType`, `RiskScore`, ...) vêm de um mapa, então a ordem pode mudar entre mensagens.
 
 </Accordion>
 
@@ -268,192 +329,163 @@ Envia notificações via Slack Incoming Webhooks usando **Block Kit** para rich 
 
 ```yaml
 channels:
-  - type: slack
+  - name: slack
+    type: slack
     config:
-      webhook_url: "https://hooks.slack.com/services/T00/B00/xxxxx"
+      webhook_url: "https://hooks.slack.com/services/T000/B000/XXXX"
+rules:
+  - name: everything-to-slack
+    states: [Detected, Escalated, Resolved]
+    channels: [slack]
 ```
 
 ### 2. PagerDuty
 
-Integra com PagerDuty via **Events API v2** para gerenciamento de incidentes on-call.
+Envia eventos para a **Events API v2** do PagerDuty (`https://events.pagerduty.com/v2/enqueue`; o endpoint é fixo).
 
 <Accordion title="Configuração completa do PagerDuty">
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `routing_key` | string | **Sim** | Integration Key do serviço PagerDuty (Events API v2) |
-| `severity_mapping` | map | Não | Mapeamento de severidades ChatCLI para PagerDuty |
-| `dedup_key_template` | string | Não | Template para dedup_key (padrão: `{{.IssueName}}`) |
-| `custom_details` | map | Não | Campos extras no payload |
+| Chave | Obrigatório | Descrição |
+|-------|:-----------:|-----------|
+| `routing_key` | **Sim** | Integration Key de uma integração Events API v2 |
 
-**Mapeamento de severidades padrão:**
+Nenhuma outra chave é lida. O mapeamento de severidade e a dedup key são fixos (a chave `severity_map` citada na descrição do campo no CRD não está implementada):
 
-| ChatCLI | PagerDuty | Comportamento |
-|---------|-----------|---------------|
-| `critical` | `critical` | Aciona on-call imediatamente |
-| `high` | `error` | Alta prioridade |
-| `medium` | `warning` | Prioridade moderada |
-| `low` | `info` | Informativo |
+| ChatCLI | PagerDuty |
+|---------|-----------|
+| `critical` | `critical` |
+| `high` | `error` |
+| `medium` | `warning` |
+| `low` | `info` |
 
-**Deduplicação:**
+**Deduplicação:** o `dedup_key` é sempre `chatcli-<namespace do recurso>-<nome da issue>`, então todo estado notificado de uma Issue atualiza o mesmo alerta no PagerDuty.
 
-O `dedup_key` garante que atualizações de um mesmo incidente não criem alertas duplicados no PagerDuty. O padrão usa o nome do Issue, mas pode ser customizado:
-
-```yaml
-dedup_key_template: "{{.Namespace}}-{{.ResourceName}}-{{.SignalType}}"
-```
-
-**Payload enviado (Events API v2):**
+**Payload enviado:**
 
 ```json
 {
-  "routing_key": "R0xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "routing_key": "<routing_key>",
   "event_action": "trigger",
-  "dedup_key": "api-gateway-oom-kill-1771276354",
+  "dedup_key": "chatcli-production-api-gateway-oom-kill-1771276354",
   "payload": {
-    "summary": "[CRITICAL] OOMKilled on production/api-gateway",
+    "summary": "🔴 [CRITICAL] production/api-gateway — Detected",
+    "source": "chatcli/production/Deployment/api-gateway",
     "severity": "critical",
-    "source": "chatcli-aiops",
-    "component": "api-gateway",
+    "timestamp": "2026-03-19T14:30:00Z",
+    "component": "Deployment/api-gateway",
     "group": "production",
-    "class": "oom_kill",
+    "class": "critical",
     "custom_details": {
-      "risk_score": 85,
-      "confidence": 0.92,
-      "analysis": "Memory limit (512Mi) insufficient...",
-      "issue_name": "api-gateway-oom-kill-1771276354",
-      "remediation_plan": "RestartDeployment + AdjustResources"
+      "resource": "Deployment/api-gateway",
+      "namespace": "production",
+      "state": "Detected",
+      "severity": "critical",
+      "Source": "watcher",
+      "SignalType": "oom_kill",
+      "RiskScore": "85"
     }
   }
 }
 ```
 
-**Resolução automatica:** Quando o Issue transiciona para `Resolved`, o NotificationEngine envia `event_action: resolve` com o mesmo `dedup_key`, fechando o incidente no PagerDuty automaticamente.
+**Resolução automática:** quando uma notificação é enviada para o estado `Resolved`, o evento usa `event_action: resolve` com o mesmo `dedup_key`. Isso só acontece se alguma regra enviar `Resolved` para este canal e o envio não for barrado pelo throttle (veja o aviso sobre throttle acima).
 
 </Accordion>
 
 ### 3. OpsGenie
 
-Integra com OpsGenie para alertas e on-call management com prioridades P1-P4.
+Cria alertas pela Alert API do OpsGenie (`https://api.opsgenie.com/v2/alerts`; o endpoint é fixo, então contas na instância EU não são suportadas).
 
 <Accordion title="Configuração completa do OpsGenie">
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `api_key` | string | **Sim** | API Key do OpsGenie |
-| `api_url` | string | Não | URL da API (padrão: `https://api.opsgenie.com`) |
-| `priority_mapping` | map | Não | Mapeamento de severidades para prioridades |
-| `responders` | []Responder | Não | Times ou usuários responsáveis |
-| `tags` | []string | Não | Tags para categorizar alertas |
-| `visible_to` | []Responder | Não | Quem pode ver o alerta |
-| `actions` | []string | Não | Ações customizadas no alerta |
+| Chave | Obrigatório | Descrição |
+|-------|:-----------:|-----------|
+| `api_key` | **Sim** | API key, enviada como `Authorization: GenieKey <api_key>` |
+| `tags` | Não | String separada por vírgulas, por exemplo `"production,aiops"` |
+| `responders` | Não | Uma **string JSON** com uma lista de objetos de responder. JSON inválido é ignorado silenciosamente. |
 
-**Mapeamento de prioridades padrão:**
+**Mapeamento de prioridade (fixo):** `critical` → `P1`, `high` → `P2`, `medium` → `P3`, `low` → `P4`.
 
-| ChatCLI | OpsGenie | Descrição |
-|---------|----------|-----------|
-| `critical` | `P1` | Crítico - aciona on-call imediatamente |
-| `high` | `P2` | Alta prioridade |
-| `medium` | `P3` | Prioridade moderada |
-| `low` | `P4` | Baixa prioridade |
-
-**Responder types:**
+**Responders:**
 
 ```yaml
-responders:
-  - type: team       # Time inteiro
-    name: platform-sre
-  - type: user       # Usuário específico
-    username: edilson@company.com
-  - type: escalation # Política de escalação do OpsGenie
-    name: sre-escalation
-  - type: schedule   # Schedule de on-call
-    name: sre-oncall
+config:
+  responders: '[{"type":"team","name":"platform-sre"},{"type":"user","username":"oncall@example.com"},{"type":"escalation","name":"sre-escalation"},{"type":"schedule","name":"sre-oncall"}]'
 ```
+
+O `alias` do alerta é `chatcli-<namespace do recurso>-<nome da issue>`, o `source` é `ChatCLI AIOps`, o `entity` é o recurso, e `details` traz `resource`, `namespace`, `severity`, `state` e `issue`.
+
+**Fechamento automático:** para o estado `Resolved`, o canal fecha o alerta pelo alias em vez de criar um novo (mesmas condições do PagerDuty).
 
 </Accordion>
 
 ### 4. Email
 
-Envia notificações via SMTP com suporte a STARTTLS e templates HTML.
+Envia um email HTML via SMTP.
 
 <Accordion title="Configuração completa do Email">
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `smtp_host` | string | **Sim** | Host do servidor SMTP |
-| `smtp_port` | int | **Sim** | Porta SMTP (587 para STARTTLS, 465 para SSL) |
-| `from` | string | **Sim** | Endereço do remetente |
-| `to` | []string | **Sim** | Lista de destinatarios |
-| `cc` | []string | Não | Copia |
-| `bcc` | []string | Não | Copia oculta |
-| `username` | string | Não | Credencial SMTP (se auth requerida) |
-| `password_secret` | SecretRef | Não | Referência ao Secret com a senha SMTP |
-| `subject_template` | string | Não | Template Go para o assunto |
-| `tls_skip_verify` | bool | Não | Pular verificação TLS (padrão: `false`) |
-| `html_template` | string | Não | Template HTML customizado (Go template) |
+| Chave | Obrigatório | Descrição |
+|-------|:-----------:|-----------|
+| `smtp_host` | **Sim** | Host do servidor SMTP |
+| `smtp_port` | **Sim** | Porta, como string (`"587"`, `"25"`) |
+| `from` | **Sim** | Endereço do remetente |
+| `to` | **Sim** | Destinatários separados por vírgula |
+| `smtp_user` | Não | Habilita autenticação SMTP `PLAIN` |
+| `smtp_password` | Não | Senha do `smtp_user` (mantenha no Secret) |
+| `tls_skip_verify` | Não | `"true"` pula a verificação do certificado no STARTTLS |
 
-**Variáveis disponíveis nos templates:**
+Não existem opções de `cc`, `bcc`, assunto ou template HTML. O assunto é sempre `[<SEVERIDADE>] <título>` e o corpo é um layout HTML fixo com a tabela de campos.
 
-| Variável | Descrição |
-|----------|-----------|
-| `{{.Severity}}` | Severidade do alerta |
-| `{{.ResourceName}}` | Nome do recurso K8s |
-| `{{.Namespace}}` | Namespace |
-| `{{.SignalType}}` | Tipo do sinal |
-| `{{.State}}` | Estado atual do Issue |
-| `{{.RiskScore}}` | Risk score (0-100) |
-| `{{.Analysis}}` | Análise da IA |
-| `{{.IssueName}}` | Nome do Issue CR |
-| `{{.Timestamp}}` | Timestamp ISO 8601 |
+**Comportamento de TLS:**
 
-**Exemplo com STARTTLS:**
+- A conexão começa em texto puro. O STARTTLS é usado **apenas se o servidor anunciá-lo**.
+- TLS implícito (porta `465`) **não é suportado**.
+- Se o servidor não oferecer STARTTLS e `smtp_user` estiver definido, a autenticação falha (o Go se recusa a enviar credenciais `PLAIN` por conexão sem criptografia, exceto para `localhost`).
+- A conexão SMTP não tem timeout próprio, então um servidor inacessível pode segurar o reconcile até o timeout de TCP do sistema operacional.
+
+**Exemplo:**
 
 ```yaml
 channels:
-  - type: email
+  - name: email-sre
+    type: email
     config:
-      smtp_host: smtp.company.com
-      smtp_port: 587
-      from: "aiops@company.com"
-      to: ["sre-team@company.com", "platform-leads@company.com"]
-      cc: ["vp-engineering@company.com"]
-      username: "aiops@company.com"
-      password_secret:
-        name: smtp-credentials
-        key: password
-      subject_template: "[{{.Severity}}] {{.SignalType}} on {{.Namespace}}/{{.ResourceName}}"
-      tls_skip_verify: false
+      smtp_host: smtp.example.com
+      smtp_port: "587"
+      from: "aiops@example.com"
+      to: "sre-team@example.com,platform-leads@example.com"
+    secretRef:
+      name: smtp-credentials   # chaves: smtp_user, smtp_password
 ```
 
 </Accordion>
 
 <Warning>
-Nunca coloque credenciais SMTP diretamente no YAML da NotificationPolicy. Use sempre `password_secret` apontando para um Kubernetes Secret.
+Nunca coloque credenciais SMTP diretamente no YAML da NotificationPolicy. Coloque `smtp_user` e `smtp_password` em um Secret e referencie-o com `secretRef`.
 </Warning>
 
 ### 5. Webhook
 
-Envia notificações para endpoints HTTP arbitrarios com assinatura HMAC-SHA256.
+Envia a mensagem como JSON para qualquer endpoint HTTP, com assinatura HMAC-SHA256 opcional.
 
 <Accordion title="Configuração completa do Webhook">
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `url` | string | **Sim** | URL do endpoint de destino |
-| `secret` | string | Não | Chave para assinatura HMAC-SHA256 |
-| `headers` | map | Não | Headers HTTP customizados |
-| `method` | string | Não | Método HTTP (padrão: `POST`) |
-| `timeout` | duration | Não | Timeout da requisição (padrão: `10s`) |
-| `retry_count` | int | Não | Número de retries em caso de falha (padrão: `3`) |
-| `retry_interval` | duration | Não | Intervalo entre retries (padrão: `5s`) |
+| Chave | Obrigatório | Descrição |
+|-------|:-----------:|-----------|
+| `url` | **Sim** | URL de destino |
+| `method` | Não | Método HTTP (padrão `POST`) |
+| `headers` | Não | Uma **string com objeto JSON** de headers extras, por exemplo `'{"X-Source":"chatcli-aiops"}'`. JSON inválido é ignorado silenciosamente. |
+| `secret` | Não | Chave para a assinatura HMAC-SHA256 |
+
+Toda requisição leva `Content-Type: application/json` e `User-Agent: ChatCLI-AIOps/1.0`. O timeout é de 30 segundos e não há retries.
 
 **Assinatura HMAC-SHA256:**
 
-Quando `secret` é definido, toda requisição inclui o header `X-ChatCLI-Signature` com a assinatura HMAC-SHA256 do body:
+Quando `secret` está definido, a requisição leva o header `X-Signature-256` com o HMAC-SHA256 do body bruto:
 
 ```text
-X-ChatCLI-Signature: sha256=<hex(HMAC-SHA256(secret, body))>
+X-Signature-256: sha256=<hex(HMAC-SHA256(secret, body))>
 ```
 
 **Validação no receptor:**
@@ -472,29 +504,20 @@ def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
 
 ```json
 {
-  "event_type": "issue.state_changed",
-  "timestamp": "2026-03-19T14:30:00Z",
-  "issue": {
-    "name": "api-gateway-oom-kill-1771276354",
-    "namespace": "production",
-    "severity": "critical",
-    "state": "Detected",
-    "signal_type": "oom_kill",
-    "risk_score": 85,
-    "resource": {
-      "kind": "Deployment",
-      "name": "api-gateway"
-    }
+  "title": "🔴 [CRITICAL] production/api-gateway — Detected",
+  "body": "OOMKilled: container exceeded its 512Mi memory limit",
+  "severity": "critical",
+  "issueName": "api-gateway-oom-kill-1771276354",
+  "namespace": "production",
+  "resource": "Deployment/api-gateway",
+  "state": "Detected",
+  "timestamp": "2026-03-19T14:30:00.123456789Z",
+  "fields": {
+    "Source": "watcher",
+    "SignalType": "oom_kill",
+    "RiskScore": "85"
   },
-  "analysis": {
-    "text": "Memory limit (512Mi) insufficient...",
-    "confidence": 0.92,
-    "recommendations": ["Increase memory limit to 1Gi"]
-  },
-  "remediation": {
-    "plan_name": "api-gateway-oom-kill-plan-1",
-    "actions": ["RestartDeployment", "AdjustResources"]
-  }
+  "color": "#FF0000"
 }
 ```
 
@@ -502,359 +525,283 @@ def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
 
 ### 6. Microsoft Teams
 
-Envia notificações para canais do Microsoft Teams via **Adaptive Cards** e Incoming Webhooks.
+Publica um **Adaptive Card** (versão 1.4) em uma URL de webhook do Teams.
 
 <Accordion title="Configuração completa do Microsoft Teams">
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `webhook_url` | string | **Sim** | URL do Incoming Webhook do Teams |
-| `title_template` | string | Não | Template para o titulo do card |
-| `theme_color` | string | Não | Cor do tema (hex, sem `#`) |
+| Chave | Obrigatório | Descrição |
+|-------|:-----------:|-----------|
+| `webhook_url` | **Sim** | URL do webhook do Teams |
 
-**Adaptive Card gerado:**
+Nenhuma outra chave é lida.
 
-O NotificationEngine monta um Adaptive Card com secoes de:
-- Header com severidade colorida
-- Detalhes do recurso (namespace, kind, name)
-- Análise da IA (se disponível)
-- Ações sugeridas
-- Link para o dashboard Grafana
+**Card gerado:**
 
-**Cores por severidade no card:**
+- Um título grande em negrito (o título da mensagem)
+- O texto do corpo
+- Um FactSet com `Severity`, `Resource`, `Namespace`, `State`, `Issue` e os campos extras
+- Um rodapé com o horário de geração
 
-| Severidade | theme_color |
-|-----------|-------------|
-| Critical | `E74C3C` |
-| High | `E67E22` |
-| Medium | `F1C40F` |
-| Low | `2ECC71` |
+A mensagem também leva `themeColor` com a cor da severidade sem `#` (`FF0000`, `FF8C00`, `FFD700`, `00CC00`).
 
 </Accordion>
 
+## CRD EscalationPolicy
 
-
-## EscalationPolicy CRD
-
-A `EscalationPolicy` define a cadeia de escalação automática quando um alerta não é reconhecido (acknowledged) dentro do timeout definido.
+Uma `EscalationPolicy` (short name `ep`) é uma cadeia ordenada de níveis. Ela é usada quando uma Issue entra no estado **`Escalated`**, que o controller de Issue define quando a remediação automática desiste (por exemplo, quando todas as tentativas de remediação falharam).
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: EscalationPolicy
 metadata:
   name: production-escalation
-  namespace: production
+  namespace: chatcli-system
 spec:
-  match:
-    severities: [critical, high]
-    namespaces: [production, payments]
+  enabled: true
+  severities: [critical, high]
   levels:
-    - name: L1 - On-Call SRE
-      timeout: "5m"
+    - name: L1-OnCall
+      timeoutMinutes: 5
       targets:
-        - type: channel
-          channel:
-            type: slack
-            config:
-              webhook_url: "https://hooks.slack.com/services/T00/B00/l1-hook"
-              channel: "#sre-oncall"
-              mention: "@oncall-sre"
-        - type: channel
-          channel:
-            type: pagerduty
-            config:
-              routing_key: "R0-l1-routing-key"
-
-    - name: L2 - SRE Lead + Platform Team
-      timeout: "15m"
-      targets:
-        - type: user
-          user: "sre-lead@company.com"
-        - type: team
-          team: "platform-engineering"
-        - type: channel
-          channel:
-            type: opsgenie
-            config:
-              api_key: "xxxxxxxx"
-              priority_mapping:
-                critical: P1
-                high: P1
-
-    - name: L3 - VP Engineering + Incident Commander
-      timeout: "30m"
-      targets:
-        - type: user
-          user: "vp-eng@company.com"
         - type: oncall
-          oncall:
-            schedule: "incident-commander"
-            provider: opsgenie
-        - type: channel
-          channel:
-            type: email
-            config:
-              smtp_host: smtp.company.com
-              smtp_port: 587
-              from: "aiops-critical@company.com"
-              to: ["exec-team@company.com"]
+          name: sre-primary
+      notifyChannels: [slack-critical, pagerduty-sre]
 
-  repeatInterval: "30m"
-  maxRepeats: 3
+    - name: L2-SeniorSRE
+      timeoutMinutes: 15
+      targets:
+        - type: user
+          name: sre-lead@example.com
+        - type: team
+          name: platform-engineering
+      notifyChannels: [opsgenie-sre, email-sre]
+
+    - name: L3-Management
+      timeoutMinutes: 30
+      targets:
+        - type: team
+          name: engineering-leadership
+      notifyChannels: [email-sre]
 ```
 
 ### Campos do Spec
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `match` | EscalationMatch | **Sim** | Critérios para aplicar esta escalação |
-| `levels` | []EscalationLevel | **Sim** | Cadeia ordenada de níveis de escalação |
-| `repeatInterval` | duration | Não | Intervalo para repetir o último nível (padrão: `30m`) |
-| `maxRepeats` | int | Não | Máximo de repetições do último nível (padrão: `3`) |
+| Campo | Tipo | Obrigatório | Padrão | Descrição |
+|-------|------|:-----------:|--------|-----------|
+| `levels` | []EscalationLevel | **Sim** | | Cadeia ordenada, primeiro nível primeiro |
+| `severities` | []enum | Não | todas | Severidades de Issue às quais a policy se aplica |
+| `defaultPolicy` | bool | Não | `false` | Usada quando nenhuma policy casa pela severidade |
+| `enabled` | bool | Não | `true` | Policies desabilitadas são ignoradas |
 
 #### EscalationLevel
 
-| Campo | Tipo | Obrigatório | Descrição |
-|-------|------|:-----------:|-----------|
-| `name` | string | **Sim** | Nome descritivo do nível |
-| `timeout` | duration | **Sim** | Tempo sem acknowledgement antes de escalar para o próximo nível |
-| `targets` | []EscalationTarget | **Sim** | Destinos da notificação neste nível |
+| Campo | Tipo | Obrigatório | Padrão | Descrição |
+|-------|------|:-----------:|--------|-----------|
+| `name` | string | **Sim** | | Nome do nível (aparece na mensagem e no label da métrica) |
+| `timeoutMinutes` | int | **Sim** | `15` | Minutos neste nível antes de passar para o próximo |
+| `targets` | []EscalationTarget | **Sim** | | Quem é responsável neste nível |
+| `notifyChannels` | []string | Não | | **Nomes** de canais das NotificationPolicies. É a única forma de um nível entregar alguma coisa. |
+| `repeatIntervalMinutes` | int | Não | `0` | **Não implementado.** Aceito e nunca lido. Os níveis não são renotificados. |
 
 #### EscalationTarget
 
 | Campo | Tipo | Descrição |
 |-------|------|-----------|
-| `type` | string | `channel`, `user`, `team`, `oncall` |
-| `channel` | ChannelConfig | Configuração do canal (quando type=channel) |
-| `user` | string | Email do usuário (quando type=user) |
-| `team` | string | Nome do time (quando type=team) |
-| `oncall` | OnCallRef | Referência ao schedule de on-call (quando type=oncall) |
+| `type` | enum | `channel`, `user`, `team`, `oncall` |
+| `name` | string | Email do usuário, nome do time, nome do canal ou nome da escala de plantão |
+
+<Warning>
+**Os targets são apenas informativos.** O operator não contata usuários, times nem escalas de plantão. Ele escreve a lista (por exemplo `oncall:sre-primary, user:sre-lead@example.com`) na mensagem de escalação e envia essa mensagem para os `notifyChannels` do nível. Um nível sem `notifyChannels` não notifica ninguém.
+</Warning>
 
 ### Como a Escalação Funciona
 
+1. **Início.** Quando uma Issue muda para `Escalated` (e não foi induzida por chaos), o controller escolhe uma policy: a **primeira policy habilitada, de qualquer namespace**, cujo `severities` contém a severidade da Issue, ou que não tem `severities`. Uma policy com `defaultPolicy: true` só é usada quando nenhuma casou. Se nada for encontrado, não há escalação (linha de log `no escalation policy found for issue`).
+2. **Nível 1** é notificado na hora. A Issue recebe as annotations abaixo e o status da policy ganha uma entrada em `activeEscalations`.
+3. **Avanço.** Quando o `timeoutMinutes` do nível atual passa, o próximo nível é notificado com o título `<emoji> ESCALATION [<SEVERIDADE>] <issue> — Level <n>: <nome do nível>`.
+4. **Último nível.** A cadeia para ali. Nada é repetido.
+5. **Fim.** A escalação só termina quando a Issue chega a `Resolved`: as três annotations são removidas. Não existe etapa de reconhecimento (veja abaixo).
+
+As mensagens de escalação são enviadas para todo canal, em qualquer NotificationPolicy habilitada, cujo nome esteja em `notifyChannels` (os Secrets são lidos do namespace dessa policy). Elas não passam pelas regras, pelo throttle nem pelos templates.
+
 ```mermaid
 sequenceDiagram
-    participant NE as NotificationEngine
+    participant IC as Controller de Issue
+    participant NC as Controller de notificação
     participant EP as EscalationPolicy
-    participant L1 as Level 1 (On-Call)
-    participant L2 as Level 2 (SRE Lead)
-    participant L3 as Level 3 (VP Eng)
-    participant ISS as Issue CR
+    participant CH as notifyChannels
 
-    NE->>EP: Issue crítico não acknowledged
-    EP->>L1: Notifica L1 (Slack + PagerDuty)
-    Note over EP,L1: Timer: 5 minutos
-
-    alt Acknowledged em menos de 5min
-        L1-->>EP: ACK (annotation no Issue)
-        EP->>EP: Escalação parada
-    else Timeout 5min
-        EP->>L2: Escala para L2 (OpsGenie P1 + email SRE Lead)
-        Note over EP,L2: Timer: 15 minutos
-
-        alt Acknowledged em menos de 15min
-            L2-->>EP: ACK
-            EP->>EP: Escalação parada
-        else Timeout 15min
-            EP->>L3: Escala para L3 (Email VP + Incident Commander)
-            Note over EP,L3: Timer: 30 minutos (repeatInterval)
-
-            loop Até maxRepeats (3x)
-                EP->>L3: Re-notifica L3
-            end
-        end
-    end
-
-    EP->>ISS: Atualiza annotation com nível atual
+    IC->>NC: estado da Issue → Escalated
+    NC->>EP: primeira policy habilitada que casa com a severidade
+    NC->>CH: mensagem do Nível 1
+    Note over NC: annotations: nível 0, horário, policy
+    NC->>NC: requeue após timeoutMinutes
+    NC->>CH: mensagem do Nível 2
+    Note over NC,CH: ...até o último nível
+    IC->>NC: estado da Issue → Resolved
+    NC->>NC: annotations de escalação removidas
 ```
 
-**Tracking via annotations:**
-
-O `EscalationPolicy` reconciler rastreia o estado da escalação usando annotations no Issue CR:
+**Annotations da Issue usadas no acompanhamento:**
 
 | Annotation | Descrição |
 |------------|-----------|
-| `platform.chatcli.io/escalation-level` | Nível atual (0=L1, 1=L2, 2=L3) |
-| `platform.chatcli.io/escalation-started-at` | Timestamp do início da escalação |
-| `platform.chatcli.io/escalation-acknowledged` | `true` quando reconhecido |
-| `platform.chatcli.io/escalation-acknowledged-by` | Quem reconheceu |
-| `platform.chatcli.io/escalation-repeat-count` | Contagem de repetições do último nível |
-
-**Acknowledgement:**
-
-Para parar a cadeia de escalação, o on-call deve reconhecer o alerta:
+| `platform.chatcli.io/escalation-level` | Índice do nível atual (`0` = primeiro nível) |
+| `platform.chatcli.io/escalation-time` | Horário RFC 3339 em que o nível atual foi atingido |
+| `platform.chatcli.io/escalation-policy` | Nome da EscalationPolicy em uso |
 
 ```bash
-kubectl annotate issue api-gateway-oom-kill-1771276354 \
-  platform.chatcli.io/escalation-acknowledged=true \
-  platform.chatcli.io/escalation-acknowledged-by=edilson
+kubectl get issue <nome> -n <namespace> -o jsonpath='{.metadata.annotations}'
+kubectl get ep -A
+kubectl get ep production-escalation -n chatcli-system -o jsonpath='{.status.activeEscalations}'
 ```
 
-Ou via PagerDuty/OpsGenie (o webhook de retorno atualiza a annotation automaticamente).
+A coluna `LEVELS` do `kubectl get ep` sempre mostra `<none>`, pelo mesmo motivo da coluna `CHANNELS` da NotificationPolicy. As entradas de `status.activeEscalations` nunca são removidas quando a Issue é resolvida, e `acknowledgedAt`/`acknowledgedBy` nunca são preenchidos.
 
+### Reconhecimento e como encerrar uma escalação
 
+**Não existe mecanismo de reconhecimento** que interrompa a cadeia:
+
+- `POST /api/v1/incidents/{name}/acknowledge` (role operator, header `X-API-Key`) apenas adiciona as annotations `aiops.chatcli.io/acknowledged`, `aiops.chatcli.io/acknowledged-at` e `aiops.chatcli.io/acknowledged-by` (a role de quem chamou). A lógica de escalação não as lê.
+- `POST /api/v1/incidents/{name}/snooze` apenas registra `aiops.chatcli.io/snoozed-until`. Notificações e escalação o ignoram.
+- Reconhecer no PagerDuty ou no OpsGenie não tem efeito no cluster: não existe webhook de retorno.
+
+Para encerrar uma escalação, **resolva a Issue**, por exemplo com `POST /api/v1/incidents/{name}/resolve` (role operator) ou pelo dashboard. Isso também envia as notificações de `Resolved` que resolvem o evento no PagerDuty e fecham o alerta no OpsGenie.
+
+<Warning>
+**Limitação conhecida: a mudança de nível não é salva.** Quando um nível expira, o controller envia a mensagem do próximo nível, mas não persiste as novas annotations `escalation-level` / `escalation-time`, a menos que o estado da Issue mude no mesmo momento. Na prática, depois do primeiro timeout **a mensagem do segundo nível é reenviada sempre que o `timeoutMinutes` desse nível passa** (e também em outras atualizações da Issue), e os níveis além do segundo não são alcançados. Até isso ser corrigido, desenhe policies com dois níveis e coloque todos que precisam ser acionados nos `notifyChannels` do segundo nível. A métrica `escalation_level_reached` conta cada reenvio.
+</Warning>
 
 ## Exemplos Completos
 
-### Política de Notificação: Slack + PagerDuty
+### Notification Policy: Slack + PagerDuty
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: NotificationPolicy
 metadata:
   name: critical-alerts-multi-channel
-  namespace: production
+  namespace: chatcli-system
 spec:
+  channels:
+    - name: slack-p0
+      type: slack
+      config: {}
+      secretRef: {name: slack-p0-webhook}         # webhook_url
+    - name: slack-incidents
+      type: slack
+      config: {}
+      secretRef: {name: slack-incidents-webhook}  # webhook_url
+    - name: pagerduty-critical
+      type: pagerduty
+      config: {}
+      secretRef: {name: pagerduty-critical}       # routing_key
+
   rules:
     - name: critical-to-slack-and-pagerduty
-      match:
-        severities: [critical]
-        states: [Detected, Escalated]
-      channels:
-        - type: slack
-          config:
-            webhook_url: "https://hooks.slack.com/services/T00/B00/critical-hook"
-            channel: "#p0-incidents"
-            mention: "@here"
-        - type: pagerduty
-          config:
-            routing_key: "R0-critical-routing-key"
-            severity_mapping:
-              critical: critical
+      severities: [critical]
+      states: [Detected, Escalated, Resolved]
+      channels: [slack-p0, pagerduty-critical]
 
     - name: high-to-slack
-      match:
-        severities: [high]
-        states: [Detected, Remediating, Escalated]
-      channels:
-        - type: slack
-          config:
-            webhook_url: "https://hooks.slack.com/services/T00/B00/high-hook"
-            channel: "#incidents"
+      severities: [high]
+      states: [Detected, Remediating, Escalated]
+      channels: [slack-incidents]
 
     - name: resolved-to-slack
-      match:
-        states: [Resolved]
-      channels:
-        - type: slack
-          config:
-            webhook_url: "https://hooks.slack.com/services/T00/B00/resolved-hook"
-            channel: "#incidents"
+      states: [Resolved]
+      channels: [slack-incidents]
 
   throttle:
-    deduplicationWindow: "3m"
-    maxPerHour: 100
-    groupBy: [namespace, resourceName]
+    deduplicationWindow: "30s"
+    maxPerHour: 20
 ```
 
-### Política de Escalação L1 -> L2 -> L3
+A janela curta de `30s` torna bem menos provável que o evento `Resolved` (que resolve o incidente no PagerDuty) seja descartado depois de uma recuperação rápida.
+
+### Escalation Policy com dois níveis
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: EscalationPolicy
 metadata:
   name: p0-escalation
-  namespace: production
+  namespace: chatcli-system
 spec:
-  match:
-    severities: [critical]
+  severities: [critical]
   levels:
-    - name: L1 - Primary On-Call
-      timeout: "5m"
-      targets:
-        - type: channel
-          channel:
-            type: pagerduty
-            config:
-              routing_key: "R0-primary-oncall"
-        - type: channel
-          channel:
-            type: slack
-            config:
-              webhook_url: "https://hooks.slack.com/services/T00/B00/oncall"
-              channel: "#sre-oncall"
-              mention: "@oncall-primary"
-
-    - name: L2 - Secondary On-Call + SRE Manager
-      timeout: "10m"
+    - name: L1-PrimaryOnCall
+      timeoutMinutes: 5
       targets:
         - type: oncall
-          oncall:
-            schedule: "secondary-oncall"
-            provider: pagerduty
-        - type: user
-          user: "sre-manager@company.com"
-        - type: channel
-          channel:
-            type: opsgenie
-            config:
-              api_key: "xxx"
-              priority_mapping:
-                critical: P1
+          name: primary-oncall
+      notifyChannels: [pagerduty-critical, slack-p0]
 
-    - name: L3 - Engineering Leadership
-      timeout: "20m"
+    - name: L2-SecondaryOnCall-and-Manager
+      timeoutMinutes: 15
+      targets:
+        - type: oncall
+          name: secondary-oncall
+        - type: user
+          name: sre-manager@example.com
+      notifyChannels: [slack-p0, email-leadership]
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: EscalationPolicy
+metadata:
+  name: catch-all-escalation
+  namespace: chatcli-system
+spec:
+  defaultPolicy: true
+  severities: [high, medium, low]
+  levels:
+    - name: L1-Team
+      timeoutMinutes: 30
       targets:
         - type: team
-          team: engineering-leadership
-        - type: channel
-          channel:
-            type: email
-            config:
-              smtp_host: smtp.company.com
-              smtp_port: 587
-              from: "aiops-escalation@company.com"
-              to: ["cto@company.com", "vp-eng@company.com"]
-              subject_template: "[P0 ESCALATED] {{.ResourceName}} - {{.SignalType}} não resolvido"
-
-  repeatInterval: "15m"
-  maxRepeats: 5
+          name: platform-sre
+      notifyChannels: [slack-incidents]
 ```
 
-### Email para SLA Breaches
+`email-leadership` precisa ser um canal definido em alguma NotificationPolicy. Por causa da limitação acima, a mensagem do segundo nível se repete a cada 15 minutos até a Issue ser resolvida.
+
+### Alertas de violação de SLO
+
+Os alertas de burn rate e de budget esgotado de SLO chegam como Issues com `signalType: slo_violation` e `source: watcher`:
 
 ```yaml
 apiVersion: platform.chatcli.io/v1alpha1
 kind: NotificationPolicy
 metadata:
-  name: sla-breach-notifications
-  namespace: production
+  name: slo-notifications
+  namespace: chatcli-system
 spec:
+  channels:
+    - name: email-service-owners
+      type: email
+      config:
+        smtp_host: smtp.example.com
+        smtp_port: "587"
+        from: "slo-alerts@example.com"
+        to: "sre-team@example.com,service-owners@example.com"
+      secretRef: {name: smtp-credentials}    # smtp_user, smtp_password
+    - name: slack-slo
+      type: slack
+      config:
+        channel: "#slo-violations"
+      secretRef: {name: slack-slo-webhook}   # webhook_url
   rules:
-    - name: sla-violation-email
-      match:
-        severities: [critical, high]
-        signalTypes: [sla_violation]
-      channels:
-        - type: email
-          config:
-            smtp_host: smtp.company.com
-            smtp_port: 587
-            from: "sla-alerts@company.com"
-            to:
-              - "sre-team@company.com"
-              - "service-owners@company.com"
-            cc:
-              - "vp-eng@company.com"
-            username: "sla-alerts@company.com"
-            password_secret:
-              name: smtp-credentials
-              key: password
-            subject_template: "[SLA BREACH] {{.Severity}} - {{.Namespace}}/{{.ResourceName}} exceeds SLA"
-            tls_skip_verify: false
-        - type: slack
-          config:
-            webhook_url: "https://hooks.slack.com/services/T00/B00/sla-hook"
-            channel: "#sla-violations"
-            mention: "@service-owners"
-
+    - name: slo-violations
+      severities: [critical, high]
+      signalTypes: [slo_violation]
+      states: [Detected, Resolved]
+      channels: [email-service-owners, slack-slo]
   throttle:
     deduplicationWindow: "30m"
-    maxPerHour: 20
-    groupBy: [namespace, resourceName]
+    maxPerHour: 5
+  templates:
+    issue_created: "Alerta de SLO: {{.Description}}"
 ```
-
-
 
 ## Troubleshooting
 
@@ -862,88 +809,93 @@ spec:
   <Accordion title="Notificações não estão sendo enviadas">
     **Checklist de diagnóstico:**
 
-    1. Verifique se a `NotificationPolicy` existe no namespace correto:
+    1. Verifique se a policy existe e está habilitada (policies de qualquer namespace se aplicam):
     ```bash
-    kubectl get notificationpolicies -A
+    kubectl get np -A
     ```
 
-    2. Verifique os logs do operator para erros de dispatch:
+    2. Veja o status da policy em busca de erros de entrega:
     ```bash
-    kubectl logs -l app=chatcli-operator -n chatcli-system | grep "notification"
+    kubectl get np <policy> -n <namespace> -o jsonpath='{.status.recentDeliveries}'
     ```
 
-    3. Confirme que o matching está correto:
+    3. Verifique os logs do operator (`rule matched`, `notification sent`, `failed to send notification`, `channel not found in policy`, `failed to resolve channel config`):
     ```bash
-    kubectl get issues -n production -o yaml | grep -A5 "severity\|state\|signalType"
+    kubectl logs -n chatcli-system deploy/chatcli-operator | grep -i notification
     ```
 
-    4. Verifique se o throttle não está suprimindo:
+    4. Compare a Issue com os filtros da regra. Lembre que `namespaces` é comparado com `spec.resource.namespace`:
     ```bash
-    kubectl logs -l app=chatcli-operator -n chatcli-system | grep "throttled\|deduplicated"
+    kubectl get issue <nome> -n <namespace> \
+      -o jsonpath='{.spec.severity} {.spec.signalType} {.spec.resource.kind} {.spec.resource.namespace} {.status.state}{"\n"}'
     ```
+
+    5. Verifique se o throttle descartou o envio (linha de log `notification throttled`). Outro estado da mesma Issue pode ter sido enviado para aquele canal dentro do `deduplicationWindow`.
+
+    6. Se `platform.chatcli.io/last-notified-state` já é igual ao estado atual, esse estado já foi tratado e não é avaliado de novo.
+  </Accordion>
+
+  <Accordion title="A policy é rejeitada pelo kubectl apply">
+    - Todo valor de `config` precisa ser string: coloque aspas em números (`smtp_port: "587"`) e booleanos (`tls_skip_verify: "true"`), e escreva listas como strings separadas por vírgula.
+    - Todo canal precisa de `name`, `type` e `config` (use `config: {}` quando os valores vierem do `secretRef`).
+    - Os filtros ficam direto na regra; um bloco `match:` não faz parte do schema.
   </Accordion>
 
   <Accordion title="Slack retorna erro 404 ou invalid_payload">
-    - Confirme que o `webhook_url` está correto e o app Slack está instalado no workspace
-    - Verifique se o canal existe e o bot tem permissao de postar
+    - Confirme que o `webhook_url` está correto e que o app do Slack continua instalado no workspace
     - Teste o webhook manualmente:
     ```bash
     curl -X POST -H 'Content-type: application/json' \
       --data '{"text":"Teste ChatCLI AIOps"}' \
-      "https://hooks.slack.com/services/T00/B00/xxxxx"
+      "https://hooks.slack.com/services/T000/B000/XXXX"
     ```
   </Accordion>
 
-  <Accordion title="PagerDuty não cria incidentes">
-    - Confirme que o `routing_key` e uma Integration Key (não API Key)
-    - Verifique se o serviço no PagerDuty está ativo
-    - Valide o payload no PagerDuty Event Debugger
-    - Confirme que o evento não está sendo deduplicado pelo `dedup_key`
+  <Accordion title="PagerDuty não cria ou não resolve incidentes">
+    - Confirme que o `routing_key` é uma Integration Key da Events API v2 (não uma chave da REST API)
+    - Confirme que o serviço no PagerDuty está ativo e confira o payload no PagerDuty Event Debugger
+    - Se os incidentes nunca são resolvidos, garanta que alguma regra envia `Resolved` para o canal e que o throttle não o descartou (use um `deduplicationWindow` curto)
   </Accordion>
 
   <Accordion title="Emails não chegam">
-    - Verifique conectividade SMTP:
+    - Teste a conectividade SMTP de dentro do cluster:
     ```bash
-    kubectl exec -it deploy/chatcli-operator -n chatcli-system -- \
-      nc -zv smtp.company.com 587
+    kubectl run smtp-check -n chatcli-system --rm -it --restart=Never \
+      --image=curlimages/curl -- curl -v --max-time 5 telnet://smtp.example.com:587
     ```
-    - Confirme credenciais no Secret referenciado em `password_secret`
-    - Verifique se `tls_skip_verify: false` e o certificado do servidor e valido
-    - Cheque a pasta de spam dos destinatarios
+    - Use uma porta que ofereça STARTTLS (`587`, `25`); TLS implícito na `465` não é suportado
+    - Confirme que o Secret tem as chaves `smtp_user` e `smtp_password` (e não `username`/`password`)
+    - Cheque a pasta de spam dos destinatários
   </Accordion>
 
-  <Accordion title="Escalação não avança de nível">
-    - Verifique annotations do Issue:
-    ```bash
-    kubectl get issue &lt;nome&gt; -o yaml | grep "escalation"
-    ```
-    - Confirme que `escalation-acknowledged` não está setado como `true`
-    - Verifique os logs do EscalationPolicy reconciler
-    - Confirme que o `timeout` do nível não e maior que o tempo desde a criacao
+  <Accordion title="A escalação não começa ou não avança">
+    - A escalação só começa quando a Issue entra em `Escalated`. Confira com `kubectl get issue <nome> -o jsonpath='{.status.state}'`.
+    - Issues induzidas por chaos nunca escalam.
+    - Verifique as annotations `platform.chatcli.io/escalation-level`, `escalation-time` e `escalation-policy`.
+    - Garanta que cada nível tenha `notifyChannels` com nomes que existem em uma NotificationPolicy habilitada.
+    - Procure `escalation initiated`, `escalation advanced` e `no escalation policy found for issue` nos logs do operator.
+    - Níveis além do segundo não são alcançados (veja a limitação conhecida acima).
   </Accordion>
 
   <Accordion title="Webhook retorna erro de assinatura">
-    - Confirme que o `secret` na policy e o mesmo usado no receptor para verificação
-    - Verifique se o receptor está lendo o body raw antes de parsear JSON
+    - Leia a assinatura do header `X-Signature-256`
+    - Confirme que o `secret` no Secret da policy é o mesmo usado pelo receptor
+    - Calcule o HMAC sobre o body bruto, antes de fazer o parse do JSON
     - Use `hmac.compare_digest` (ou equivalente) para evitar timing attacks
   </Accordion>
 </AccordionGroup>
 
+## Métricas Prometheus
 
+O operator expõe estas métricas no seu endpoint de métricas (porta `8080`, caminho `/metrics`):
 
-## Prometheus Metrics
-
-O sistema de notificações expõe métricas para observabilidade completa:
-
-| Metrica | Tipo | Labels | Descrição |
+| Métrica | Tipo | Labels | Descrição |
 |---------|------|--------|-----------|
-| `chatcli_notifications_sent_total` | Counter | `channel`, `severity`, `rule`, `namespace` | Total de notificações enviadas com sucesso |
-| `chatcli_notifications_failed_total` | Counter | `channel`, `severity`, `rule`, `error_type` | Total de notificações que falharam |
-| `chatcli_notifications_throttled_total` | Counter | `rule`, `reason` | Notificações suprimidas por throttle ou dedup |
-| `chatcli_notification_dispatch_duration_seconds` | Histogram | `channel` | Latencia do envio por canal |
-| `chatcli_escalation_level_reached` | Gauge | `policy`, `namespace` | Nível de escalação atual por policy |
-| `chatcli_escalation_acknowledged_total` | Counter | `policy`, `level` | Total de escalações reconhecidas por nível |
-| `chatcli_escalation_timeout_total` | Counter | `policy`, `level` | Total de timeouts de escalação por nível |
+| `chatcli_operator_notifications_sent_total` | Counter | `channel_type`, `severity`, `result` | Tentativas de envio, com `result` = `success` ou `failure` |
+| `chatcli_operator_notifications_failed_total` | Counter | `channel_type`, `reason` | Falhas, com `reason` = `config_resolve` (Secret ilegível), `sender_create` (tipo desconhecido) ou `send` |
+| `chatcli_operator_escalation_level_reached` | Counter | `policy`, `level` | Incrementa toda vez que um nível de escalação é notificado; `level` é o **nome** do nível |
+
+Não há métricas de notificações barradas pelo throttle nem de latência de envio. O throttle só aparece nos logs (`notification throttled`).
 
 **Alertas Prometheus recomendados:**
 
@@ -952,42 +904,31 @@ groups:
   - name: chatcli-notifications
     rules:
       - alert: NotificationChannelFailing
-        expr: rate(chatcli_notifications_failed_total[5m]) > 0.1
+        expr: sum by (channel_type, reason) (increase(chatcli_operator_notifications_failed_total[10m])) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Canal de notificação {{ $labels.channel }} com falhas"
-          description: "Taxa de falha > 0.1/s nos ultimos 5 minutos"
+          summary: "Canal de notificação {{ $labels.channel_type }} com falhas ({{ $labels.reason }})"
+          description: "Pelo menos uma notificação falhou nos últimos 10 minutos"
 
-      - alert: EscalationReachedL3
-        expr: chatcli_escalation_level_reached >= 2
-        for: 1m
+      - alert: EscalationActive
+        expr: sum by (policy, level) (increase(chatcli_operator_escalation_level_reached[15m])) > 0
         labels:
           severity: critical
         annotations:
-          summary: "Escalação atingiu L3 para policy {{ $labels.policy }}"
-          description: "Incidente não reconhecido atingiu o último nível de escalação"
-
-      - alert: HighThrottleRate
-        expr: rate(chatcli_notifications_throttled_total[10m]) > 1
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Alta taxa de throttling na rule {{ $labels.rule }}"
+          summary: "Nível de escalação {{ $labels.level }} notificado na policy {{ $labels.policy }}"
+          description: "Uma Issue chegou ao estado Escalated e está percorrendo a cadeia de escalação"
 ```
 
-
-
-## Próximo Passo
+## Próximos Passos
 
 <CardGroup cols={2}>
   <Card title="SLOs e SLAs" icon="gauge-high" href="/pt/features/aiops/slo-sla">
-    Gestão de Service Level Objectives com burn rate alerting
+    Gestão de Service Level Objectives com alertas de burn rate
   </Card>
   <Card title="Workflow de Aprovação" icon="shield-check" href="/pt/features/aiops/approval-workflow">
-    Controle de mudancas com approval policies e blast radius
+    Controle de mudanças com approval policies e blast radius
   </Card>
   <Card title="AIOps Platform" icon="brain" href="/pt/features/aiops-platform">
     Deep-dive na arquitetura AIOps

@@ -5,26 +5,26 @@ description: "API REST do ChatCLI AIOps Platform — incidents, SLOs, runbooks, 
 icon: "compass"
 ---
 
-A **API REST** do ChatCLI AIOps Platform fornece acesso programático completo a todas as funcionalidades da plataforma. Construída sobre padrões **Kubernetes-like** (apiVersion + kind + metadata + spec + status), com autenticação via API key e rate limiting por role.
+A **API REST** do ChatCLI AIOps Platform é servida pelo operator e dá acesso programático aos recursos de AIOps (Issues, RemediationPlans, AIInsights, Runbooks, ApprovalRequests, SLOs, PostMortems, AuditEvents, ClusterRegistrations e policies). As respostas seguem padrões **Kubernetes-like** (apiVersion + kind + metadata/resourceMeta + spec + status), com autenticação via API key, três roles e rate limit por cliente.
 
 <CardGroup cols={3}>
   <Card title="Incidents" icon="siren-on" href="/pt/reference/api/list-incidents">
     Detecção, ack, snooze, timeline, remediação e resolução
   </Card>
   <Card title="Runbooks" icon="book-open" href="/pt/reference/api/list-runbooks">
-    CRUD completo de planos de remediação
+    CRUD completo de runbooks
   </Card>
   <Card title="Analytics" icon="chart-line" href="/pt/reference/api/analytics-summary">
-    MTTD, MTTR, trends, top resources, capacity, compliance
+    MTTD, MTTR, trends, top resources, capacity, compliance, custo
   </Card>
   <Card title="SLOs" icon="gauge" href="/pt/reference/api/list-slos">
-    Targets, error budget, burn rate e histórico
+    Targets, error budget e burn rate
   </Card>
   <Card title="Federation" icon="network-wired" href="/pt/reference/api/federation-status">
-    Status multi-cluster, correlações cross-tier
+    Status multi-cluster, correlações entre clusters
   </Card>
   <Card title="Health" icon="heart-pulse" href="/pt/reference/api/health-endpoints">
-    Liveness e readiness probes
+    Endpoints de liveness e readiness
   </Card>
 </CardGroup>
 
@@ -36,25 +36,38 @@ A **API REST** do ChatCLI AIOps Platform fornece acesso programático completo a
 http://<operator-host>:8090/api/v1
 ```
 
+A API (e o dashboard web em `/`) escuta no pod do **operator**, porta **8090**, exposta como porta `api` do Service **`chatcli-operator`** no namespace do operator (`chatcli-system` por padrão). Ela **não** é servida pelo Service de uma `Instance` (esse é o servidor gRPC na 50051).
+
+```bash
+kubectl -n chatcli-system port-forward svc/chatcli-operator 8090:8090
+curl -H "X-API-Key: $KEY" http://localhost:8090/api/v1/incidents
+```
+
 <Info>
-A porta padrão é **8090** mas pode ser alterada via Helm (`--set apiPort=...`). Em produção, exponha atrás de um Ingress com TLS.
+A porta vem do value `api.port` do chart (padrão `8090`), que define a variável de ambiente `CHATCLI_AIOPS_PORT` do operator. Para servir **HTTPS** (TLS 1.3 no mínimo), defina `CHATCLI_AIOPS_TLS_CERT` e `CHATCLI_AIOPS_TLS_KEY` com arquivos de certificado e chave dentro do container do operator (chart: `security.apiTLS.certFile` / `security.apiTLS.keyFile`). O chart do operator não tem value `extraVolumes`, então os arquivos precisam chegar por outro meio (por exemplo, um patch no Deployment); a alternativa é terminar o TLS em um Ingress ou gateway na frente do Service. Sem as duas variáveis, a API é HTTP puro.
 </Info>
+
+<Note>
+**Várias réplicas do operator.** Até a 1.211.2, a API REST e o dashboard rodam só na réplica **líder**: as demais passam na readiness probe (que fica na porta 8081), mas não escutam na 8090, então um Service com várias réplicas pode mandar a requisição para um pod que recusa a conexão. Mantenha `replicaCount: 1` ou faça port-forward para o líder. A partir da versão seguinte à 1.211.2, todas as réplicas servem a API e o dashboard.
+</Note>
 
 ---
 
-## Fluxo de uma requisição
+## Fluxo de requisição
 
 ```mermaid
 flowchart LR
-  Client[Cliente<br/>curl / SDK / CI] -->|X-API-Key| Auth{Auth<br/>middleware}
-  Auth -->|inválida| E401[401 Unauthorized]
-  Auth -->|válida| Rate{Rate<br/>limiter}
+  Client[Cliente<br/>curl / SDK / CI] --> CORS{Política<br/>CORS}
+  CORS -->|preflight permitido| P204[204 No Content]
+  CORS --> Rate{Rate limiter<br/>por endereço do cliente}
   Rate -->|excedido| E429[429 Too Many Requests]
-  Rate -->|ok| RBAC{RBAC<br/>role check}
-  RBAC -->|sem permissão| E403[403 Forbidden]
+  Rate -->|ok| Auth{Checagem<br/>X-API-Key}
+  Auth -->|ausente / inválida| E401[401 Unauthorized]
+  Auth -->|válida| RBAC{Checagem de role<br/>por endpoint}
+  RBAC -->|insuficiente| E403[403 Forbidden]
   RBAC -->|autorizado| Handler[Handler<br/>do endpoint]
-  Handler -->|sucesso| Resp[2xx Response<br/>JSON Kubernetes-like]
-  Handler -->|erro| Err[4xx/5xx<br/>Error envelope]
+  Handler -->|sucesso| Resp[Resposta 2xx<br/>JSON Kubernetes-like]
+  Handler -->|erro| Err[4xx/5xx<br/>Envelope de erro]
 
   classDef ok fill:#10B981,stroke:#059669,color:#fff
   classDef err fill:#EF4444,stroke:#DC2626,color:#fff
@@ -62,8 +75,8 @@ flowchart LR
   classDef client fill:#2563EB,stroke:#1E40AF,color:#fff
 
   class Client client
-  class Auth,Rate,RBAC gate
-  class Resp,Handler ok
+  class CORS,Auth,Rate,RBAC gate
+  class Resp,Handler,P204 ok
   class E401,E429,E403,Err err
 ```
 
@@ -71,34 +84,35 @@ flowchart LR
 
 ## Autenticação
 
-Todas as requisições devem incluir o header `X-API-Key` com uma chave válida:
+Toda requisição em `/api/` precisa do header `X-API-Key` com uma chave válida:
 
 <CodeGroup>
 ```bash curl
-curl -H "X-API-Key: ck_live_abc123" \
-  http://operator:8090/api/v1/incidents
+curl -H "X-API-Key: $CHATCLI_API_KEY" \
+  http://localhost:8090/api/v1/incidents
 ```
 
 ```python Python
+import os
 import requests
 
 resp = requests.get(
-    "http://operator:8090/api/v1/incidents",
-    headers={"X-API-Key": "ck_live_abc123"},
+    "http://localhost:8090/api/v1/incidents",
+    headers={"X-API-Key": os.environ["CHATCLI_API_KEY"]},
 )
 incidents = resp.json()["items"]
 ```
 
 ```go Go
-req, _ := http.NewRequest("GET", "http://operator:8090/api/v1/incidents", nil)
-req.Header.Set("X-API-Key", "ck_live_abc123")
+req, _ := http.NewRequest("GET", "http://localhost:8090/api/v1/incidents", nil)
+req.Header.Set("X-API-Key", os.Getenv("CHATCLI_API_KEY"))
 resp, _ := http.DefaultClient.Do(req)
 defer resp.Body.Close()
 ```
 
 ```javascript Node.js
-const resp = await fetch("http://operator:8090/api/v1/incidents", {
-  headers: { "X-API-Key": "ck_live_abc123" },
+const resp = await fetch("http://localhost:8090/api/v1/incidents", {
+  headers: { "X-API-Key": process.env.CHATCLI_API_KEY },
 });
 const { items } = await resp.json();
 ```
@@ -106,70 +120,94 @@ const { items } = await resp.json();
 
 ### Roles
 
+As roles seguem a ordem **`viewer` < `operator` < `admin`**; cada endpoint exige uma role mínima (veja a [tabela de endpoints](#endpoints)). Essas três strings são as únicas roles válidas: uma chave com qualquer outra role (por exemplo `superadmin` ou `readonly`) é aceita como chave, mas recebe **403** em todos os endpoints.
+
 <CardGroup cols={3}>
   <Card title="viewer" icon="eye">
-    **Somente leitura.** GET em todos os endpoints. Ideal para dashboards e ferramentas de observabilidade.
+    **Somente leitura.** Todos os endpoints GET. Ideal para dashboards e ferramentas de observabilidade.
   </Card>
   <Card title="operator" icon="user-shield">
-    **Operação diária.** GET + POST de ações (acknowledge, approve, reject). NOC, SRE e on-call.
+    **Operação diária.** Tudo o que `viewer` faz, mais as ações POST (acknowledge, snooze, resolve, approve, reject, review/close/feedback de postmortem) e criar/atualizar runbooks.
   </Card>
   <Card title="admin" icon="user-gear">
-    **Acesso total.** GET, POST, PUT, DELETE. CI/CD, automações privilegiadas e ferramentas de gestão.
+    **Acesso total.** Tudo o que `operator` faz, mais `DELETE /runbooks/{name}`.
   </Card>
 </CardGroup>
 
-As chaves de API são configuradas no ConfigMap do operator:
+### Configurando as API keys
+
+As chaves são lidas do **namespace do operator** (`chatcli-system` por padrão), nesta ordem:
+
+1. Secret **`chatcli-operator-secrets`**, chave **`api-keys`** (recomendado)
+2. ConfigMap **`chatcli-operator-config`**, chave **`api-keys`** (fallback, usado só quando o Secret não existe)
+
+O valor é uma lista YAML de entradas `{key, role, description}`. **Nenhum chart ou manifesto cria esse objeto** — é você quem cria:
 
 ```yaml
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
-  name: chatcli-operator-config
+  name: chatcli-operator-secrets
   namespace: chatcli-system
-data:
+type: Opaque
+stringData:
   api-keys: |
-    - key: "ck_live_abc123..."
+    - key: "<chave-admin-aleatoria>"
       role: admin
-      description: "CI/CD Pipeline"
-    - key: "ck_live_def456..."
+      description: "Pipeline de CI/CD"
+    - key: "<chave-operator-aleatoria>"
       role: operator
-      description: "NOC Team"
-    - key: "ck_live_ghi789..."
+      description: "Time de plantão"
+    - key: "<chave-viewer-aleatoria>"
       role: viewer
-      description: "Grafana dashboard"
+      description: "Dashboard do Grafana"
 ```
 
+```bash
+# Gerar uma chave
+openssl rand -hex 32
+```
+
+O operator consulta o Secret e o ConfigMap a cada **30 segundos** e recarrega as chaves sem reiniciar: incluir ou remover uma entrada vale em cerca de 30 s.
+
+<Warning>
+**Nenhuma chave configurada = toda chamada em `/api/` retorna `401`.** Se nenhum dos dois objetos tiver uma chave válida, a API fica fechada (fail-closed). Já `CHATCLI_OPERATOR_DEV_MODE=true` no operator (chart: `security.devMode: true`) deixa toda requisição passar **como `admin`, sem chave** — só para desenvolvimento local, **nunca em produção**.
+
+Apagar o Secret e o ConfigMap não limpa as chaves já carregadas (fora do dev mode elas continuam válidas até o operator reiniciar). Para revogar chaves, edite a lista no próprio objeto.
+</Warning>
+
 <Tip>
-Em ambiente de desenvolvimento, se o ConfigMap `chatcli-api-keys` não existir, o operator roda em **dev mode sem auth** — útil para testes locais, **nunca em produção**.
+**Teste sem cluster.** No diretório `operator/` do repositório, `make dash-preview` serve o dashboard e esta API sobre dados sintéticos em `http://127.0.0.1:8085/`, com a API key `preview` (role admin). Troque o endereço com `DASHPREVIEW_ADDR`.
 </Tip>
 
 ---
 
 ## Rate limiting
 
-| Role | Limite | Janela |
-|:-----|:-------|:-------|
-| `viewer` | 100 req | por minuto |
-| `operator` | 500 req | por minuto |
-| `admin` | 1000 req | por minuto |
+A API aceita **30 requisições por minuto por endereço de cliente** (token bucket, rajadas de até 30, reposto continuamente a 0,5 req/s). O limite é o mesmo para todas as roles e chaves.
 
-Headers de rate limit retornados em cada resposta:
+Ao estourar, o operator retorna `429 Too Many Requests` com o header `Retry-After: 60` e o envelope de erro padrão. Nenhum header `X-RateLimit-*` é enviado. Implemente backoff nos clientes de produção e mantenha dashboards ou coletores que consultam muitos endpoints dentro do orçamento.
 
-```http
-X-RateLimit-Limit: 500
-X-RateLimit-Remaining: 487
-X-RateLimit-Reset: 1710864000
-```
+---
 
-<Warning>
-Quando o limite é excedido, o operator retorna `429 Too Many Requests` com header `Retry-After` (em segundos). Implemente backoff exponencial em clients de produção.
-</Warning>
+## CORS
+
+Requisições cross-origin de navegador são **negadas por padrão**: nenhum header CORS é enviado até uma origem ser configurada. Configure com variáveis de ambiente no operator (ou os values equivalentes do chart em `security.*`):
+
+| Variável | Value do chart | Significado |
+|:---------|:---------------|:------------|
+| `CHATCLI_CORS_ALLOWED_ORIGINS` | `security.corsAllowedOrigins` (lista) | Origens permitidas separadas por vírgula, ou `*` |
+| `CHATCLI_CORS_ORIGIN` | `security.corsOrigin` | Uma única origem permitida (somada à lista) |
+| `CHATCLI_CORS_ALLOWED_METHODS` | `security.corsAllowedMethods` | Métodos permitidos (padrão `GET, POST, PUT, DELETE, OPTIONS`) |
+| `CHATCLI_CORS_ALLOW_CREDENTIALS` | `security.corsAllowCredentials` | `true` para permitir credenciais |
+
+Os headers de requisição permitidos são `Content-Type`, `X-API-Key` e `Authorization`; a resposta de preflight fica em cache por 1 hora. O dashboard servido pelo próprio operator é same-origin e não precisa de configuração de CORS.
 
 ---
 
 ## Formato de resposta
 
-Todas as respostas seguem o padrão **Kubernetes-like**:
+Todas as respostas seguem um padrão **Kubernetes-like**:
 
 <Tabs>
   <Tab title="Lista">
@@ -183,38 +221,41 @@ Todas as respostas seguem o padrão **Kubernetes-like**:
         "pageSize": 20
       },
       "items": [
-        { "..." : "..." }
+        { "...": "..." }
       ]
     }
     ```
   </Tab>
-  <Tab title="Recurso individual">
+  <Tab title="Recurso único">
     ```json
     {
       "apiVersion": "v1",
       "kind": "Incident",
-      "metadata": {
-        "name": "INC-20260319-001",
-        "namespace": "production",
-        "createdAt": "2026-03-19T15:20:00Z"
-      },
       "spec":   { "...": "..." },
-      "status": { "...": "..." }
+      "status": { "...": "..." },
+      "resourceMeta": {
+        "name": "api-server-oomkilled-8f2c1",
+        "namespace": "production",
+        "uid": "5b2d7c1e-3f4a-4e8b-9c6d-1a2b3c4d5e6f",
+        "creationTimestamp": "2026-03-19T15:20:00Z",
+        "labels": {},
+        "annotations": {}
+      }
     }
     ```
+    Quais de `spec`, `status` e `resourceMeta` aparecem depende do endpoint; cada página de endpoint mostra o formato exato. Campos vazios são omitidos.
   </Tab>
   <Tab title="Erro">
     ```json
     {
       "apiVersion": "v1",
       "kind": "Error",
-      "error": {
-        "code": 401,
-        "message": "API key inválida ou ausente",
-        "details": "Inclua o header X-API-Key com uma chave válida"
-      }
+      "error": "Unauthorized",
+      "code": 401,
+      "message": "missing API key in X-API-Key header"
     }
     ```
+    `error` é o texto do status HTTP, `code` o status HTTP e `message` o detalhe.
   </Tab>
 </Tabs>
 
@@ -224,57 +265,86 @@ Todas as respostas seguem o padrão **Kubernetes-like**:
 
 | Código | Significado | Quando acontece |
 |:-------|:------------|:----------------|
-| `400` | Bad Request | Parâmetros ausentes ou mal formatados |
-| `401` | Unauthorized | `X-API-Key` ausente ou inválida |
-| `403` | Forbidden | Role insuficiente para a operação |
-| `404` | Not Found | Recurso não existe |
-| `409` | Conflict | Recurso já existe ou estado inválido para a operação |
+| `400` | Bad Request | Corpo JSON malformado ou campo do corpo inválido/ausente |
+| `401` | Unauthorized | `X-API-Key` ausente ou inválida, ou nenhuma chave configurada |
+| `403` | Forbidden | Role abaixo da mínima do endpoint, ou role desconhecida |
+| `404` | Not Found | Recurso não existe, ou combinação de path/método desconhecida |
+| `405` | Method Not Allowed | Requisição não-GET em um grupo somente leitura (`analytics`, `clusters`, `policies`, `audit`, `federation`) |
+| `409` | Conflict | Estado inválido para a operação (por exemplo, resolver um incident já resolvido), modificação concorrente ou falha ao criar runbook |
 | `429` | Too Many Requests | Rate limit excedido — veja `Retry-After` |
-| `500` | Internal Server Error | Falha no operator — investigue logs |
+| `500` | Internal Server Error | Falha na API do Kubernetes — verifique os logs do operator |
 
 ---
 
 ## Paginação
 
-Endpoints que retornam listas suportam paginação via query parameters:
+Os endpoints de lista suportam paginação via query parameters:
 
 <ParamField query="page" type="integer" default="1">
   Número da página (começa em 1)
 </ParamField>
 
 <ParamField query="pageSize" type="integer" default="20">
-  Itens por página (máximo: **100**)
+  Itens por página (valores acima de **100** são limitados a 100)
 </ParamField>
 
 ```bash
 curl -H "X-API-Key: $KEY" \
-  "http://operator:8090/api/v1/incidents?page=2&pageSize=50"
+  "http://localhost:8090/api/v1/incidents?page=2&pageSize=50"
 ```
 
-A resposta inclui `metadata.totalCount` para você calcular o número total de páginas.
+A resposta inclui `metadata.totalCount` para você calcular o total de páginas. Valores inválidos voltam aos padrões.
+
+A maioria das listas aceita `namespace` (omitido = todos os namespaces). Incidents, postmortems, eventos de auditoria e os endpoints de analytics também aceitam os filtros de tempo `from` / `to` (RFC 3339, por exemplo `2026-03-19T00:00:00Z`), aplicados ao horário de criação do recurso (o horário do evento, na auditoria). Datas que não fazem parse são ignoradas.
+
+---
+
+## Endpoints
+
+Todos os paths são relativos a `/api/v1`.
+
+| Método | Path | Role mínima |
+|:-------|:-----|:------------|
+| GET | `/incidents`, `/incidents/{name}` | viewer |
+| GET | `/incidents/{name}/timeline`, `/incidents/{name}/remediation` | viewer |
+| POST | `/incidents/{name}/acknowledge`, `/snooze`, `/resolve` | operator |
+| GET | `/aiinsights`, `/aiinsights/{name}` | viewer |
+| GET | `/remediations`, `/remediations/{name}` | viewer |
+| GET | `/runbooks`, `/runbooks/{name}` | viewer |
+| POST | `/runbooks` | operator |
+| PUT | `/runbooks/{name}` | operator |
+| DELETE | `/runbooks/{name}` | admin |
+| GET | `/approvals`, `/approvals/{name}` | viewer |
+| POST | `/approvals/{name}/approve`, `/approvals/{name}/reject` | operator |
+| GET | `/slos`, `/slos/{name}`, `/slos/{name}/budget` | viewer |
+| GET | `/postmortems`, `/postmortems/{name}` | viewer |
+| POST | `/postmortems/{name}/review`, `/close`, `/feedback`, `/ack-human-action` | operator |
+| GET | `/analytics/summary`, `mttd`, `mttr`, `trends`, `top-resources`, `remediation-stats`, `compliance`, `capacity`, `cost` | viewer |
+| GET | `/clusters`, `/clusters/global-status`, `/clusters/{name}` | viewer |
+| GET | `/policies/{approval\|notification\|escalation\|sla}`, `/policies/{kind}/{name}` | viewer |
+| GET | `/federation`, `/federation/status`, `/federation/clusters`, `/federation/correlations` | viewer |
+| GET | `/audit`, `/audit/export` | viewer |
+
+`/healthz` e `/readyz` (fora de `/api/v1`) não exigem chave — veja [Health endpoints](/pt/reference/api/health-endpoints).
 
 ---
 
 ## Versionamento
 
-A API utiliza versionamento via path (`/api/v1/`). Versões futuras serão adicionadas como `/api/v2/` mantendo **compatibilidade retroativa** com v1.
-
-<Info>
-Mudanças breaking-change só ocorrem entre versões maiores. Dentro de uma versão, apenas adições compatíveis (novos campos opcionais, novos endpoints) são publicadas.
-</Info>
+A API usa versionamento por path (`/api/v1/`). Hoje só existe a `v1`.
 
 ---
 
 ## Próximos passos
 
 <CardGroup cols={2}>
-  <Card title="AIOps Platform — visão geral" icon="brain" href="/pt/features/aiops-platform">
+  <Card title="Visão geral do AIOps Platform" icon="brain" href="/pt/features/aiops-platform">
     Como a plataforma detecta, analisa e remedia incidentes
   </Card>
-  <Card title="Operator Kubernetes" icon="dharmachakra" href="/pt/features/k8s-operator">
+  <Card title="Kubernetes Operator" icon="dharmachakra" href="/pt/features/k8s-operator">
     Deploy do operator, CRDs e configuração
   </Card>
-  <Card title="Incident lifecycle" icon="siren-on" href="/pt/features/aiops/incident-lifecycle">
+  <Card title="Ciclo de vida do incidente" icon="siren-on" href="/pt/features/aiops/incident-lifecycle">
     Fluxo completo: detecção → análise → remediação → resolução
   </Card>
   <Card title="AIOps em produção" icon="rocket" href="/pt/cookbook/aiops-production-setup">

@@ -32,11 +32,26 @@ This page covers the internal architecture in depth. For configuration and usage
   <Card title="Chaos Engineering" icon="explosion" href="/features/aiops/chaos-engineering">
     ChaosExperiment with safety checks
   </Card>
+  <Card title="Decision Engine" icon="brain-circuit" href="/features/aiops/decision-engine">
+    Opt-in confidence gate and circuit breaker
+  </Card>
+  <Card title="Web Dashboard" icon="gauge" href="/features/aiops/web-dashboard">
+    Embedded UI on the operator's port 8090
+  </Card>
 </CardGroup>
 
 ### REST API & Dashboard
 
-In addition to gRPC, the operator now exposes a **REST HTTP API** on port `:8090` with **30+ endpoints** covering incidents, SLOs, runbooks, approvals, postmortems, analytics, clusters and audit. Authentication is via `X-API-Key` with role mapping (viewer/operator/admin), rate limited at 100 req/min per key. A **Web Dashboard** is embedded and served at `/`.
+The operator also exposes a **REST HTTP API** on port `8090` (chart value `api.port`, env `CHATCLI_AIOPS_PORT`), reached through the Service `chatcli-operator` in the operator namespace (not the Instance Service). Its 40+ endpoints cover incidents, AI insights, remediations, runbooks, approvals, SLOs, post-mortems, analytics (including LLM cost), clusters, federation, policies and audit. A **Web Dashboard** is embedded and served at `/` on the same port.
+
+- **Authentication:** header `X-API-Key`. Keys are read from the Secret `chatcli-operator-secrets`, key `api-keys` (fallback: ConfigMap `chatcli-operator-config`), in the operator namespace, as a YAML list of `{key, role, description}`. Roles are `viewer` < `operator` < `admin`; any other role string is denied. Changes are picked up within about 30 seconds. No chart creates this Secret: with no keys configured every `/api/` call returns `401`, unless `CHATCLI_OPERATOR_DEV_MODE=true` (admin without a key, development only).
+- **Rate limit:** 30 requests per minute per client address (`429` with `Retry-After: 60`).
+- **CORS:** deny-all unless `CHATCLI_CORS_ALLOWED_ORIGINS` / `CHATCLI_CORS_ORIGIN` are set. **TLS:** set `CHATCLI_AIOPS_TLS_CERT` and `CHATCLI_AIOPS_TLS_KEY` to serve HTTPS (TLS 1.3).
+- **Local preview:** `make dash-preview` in `operator/` serves the dashboard over synthetic data, no cluster needed, at `http://127.0.0.1:8085` with the API key `preview`.
+
+<Note>
+  In 1.211.2 and earlier the REST API and dashboard run only on the **leader** replica: with `replicaCount > 1`, non-leader pods pass readiness but do not listen on 8090. Starting with the release after 1.211.2, every replica serves the API and dashboard.
+</Note>
 
 For the complete reference, see the [API Reference](/reference/api/overview).
 
@@ -80,7 +95,7 @@ sequenceDiagram
     AIR->>K8s: Updates AIInsight.Status
 
     IR->>K8s: Checks AIInsight ready
-    alt Manual Runbook exists
+    alt Matching Runbook exists (manual or previously generated)
         IR->>K8s: Creates RemediationPlan (from manual Runbook)
     else AI has suggested actions
         IR->>K8s: Generates auto Runbook (reusable)
@@ -91,6 +106,7 @@ sequenceDiagram
     end
 
     RR->>K8s: Watch RemediationPlan CRs
+    Note over RR,K8s: Gates before execution: ApprovalPolicy, cluster tier, decision engine (opt-in)
 
     alt Standard mode (Runbook)
         RR->>K8s: Executes actions (54 types: Deployment/StatefulSet/DaemonSet/Job/CronJob + GitOps/Infra/Storage/Security/Network)
@@ -108,9 +124,11 @@ sequenceDiagram
 
     IR->>K8s: Checks result
     alt Success
-        IR->>K8s: Issue -> Resolved + invalidates dedup
+        IR->>K8s: Issue -> Resolved + PostMortem CR + invalidates dedup
     else Agentic success
-        IR->>K8s: Issue -> Resolved + PostMortem CR + auto Runbook
+        IR->>K8s: Issue -> Resolved + PostMortem CR + agentic Runbook
+    else Containment action applied
+        IR->>K8s: Issue -> Contained (requiresHumanAction) + PostMortem CR
     else Failure + remaining attempts
         IR->>K8s: Issue -> Analyzing (re-analysis with failure context)
         AIR->>Server: Re-analysis with failure_context
@@ -136,33 +154,36 @@ The WatcherBridge is the pipeline entry point. It implements the controller-runt
 | `consumeStream()` | Holds the StreamAlerts stream open, turns each alert into an Anomaly, reopens after 60s of silence |
 | `poll()` | Queries GetAlerts once (fallback for a server without StreamAlerts, or `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll`) |
 | `discoverAndConnect()` | Discovers server via Instance CRs in the cluster |
-| `createAnomaly()` | Converts alert -> Anomaly CR with reference labels |
-| `alertHash()` | SHA256(type\|deployment\|namespace) for dedup |
+| `createAnomaly()` | Converts alert -> Anomaly CR (name `watcher-<type>-<deployment>-<timestamp>`, in the alert's namespace) with reference labels |
+| `alertHash()` | SHA256(type\|deployment\|namespace\|resource UID) for dedup |
 | `InvalidateDedupForResource()` | Removes dedup entries for a deployment+namespace |
 | `sanitizeK8sName()` | Ensures valid names for K8s objects (63 chars, lowercase, no special characters) |
 
 **SHA256 Dedup:**
 
 ```text
-hash = SHA256(alertType | deployment | namespace)
+hash = SHA256(alertType | deployment | namespace | resourceUID)
 ```
 
 - **No temporal component**: A continuous problem (e.g., CrashLoopBackOff) generates only one Anomaly
-- **TTL**: 2 hours -- expired hashes are pruned automatically
-- **Invalidation**: When an Issue reaches a terminal state (Resolved/Escalated), dedup entries for the affected resource are invalidated, allowing immediate recurrence detection
+- **Resource UID**: a deleted and recreated workload gets a new UID, so its alerts are not swallowed by the old entry
+- **TTL**: 30 minutes by default (Instance `spec.aiops.dedupTTLMinutes`, 5–1440) -- expired hashes are pruned automatically
+- **Invalidation**: When an Issue is resolved, contained or escalated, dedup entries for the affected resource are invalidated, allowing immediate recurrence detection
 - **Result**: Avoids duplicates during an active problem; detects recurrence after resolution
 
 **Server Discovery:**
 
 <Steps>
-  <Step title="Lists Instance CRs in the cluster">
+  <Step title="Lists Instance CRs in the whole cluster">
   </Step>
   <Step title="Selects the first Instance with Status.Ready=true">
+    Only one Instance per cluster drives AIOps: the bridge (and the AIInsight and Remediation reconcilers, which share its client) talk to the first ready Instance it finds.
   </Step>
-  <Step title="Connects via gRPC insecure (10s timeout)">
+  <Step title="Connects over gRPC with TLS 1.3">
+    Target `dns:///<name>.<namespace>.svc.cluster.local:<port>`, with the credential and CA taken from the Instance spec. TLS is mandatory: the Instance needs `spec.server.tls.enabled: true` and a certificate valid for that name.
   </Step>
   <Step title="Retry">
-    If the connection fails, retries on the next poll cycle.
+    If the connection fails, retries on the next poll cycle (30s). After 3 silent stream attempts the bridge drops the connection and rediscovers the Instance.
   </Step>
 </Steps>
 
@@ -176,12 +197,17 @@ Watches Anomaly CRs and correlates them into Issues.
   <Step title="Receives Anomaly CR">
     Newly created Anomaly with `Status.Correlated = false`.
   </Step>
-  <Step title="Groups anomalies">
-    Calls `CorrelationEngine.FindRelatedAnomalies()` to group.
+  <Step title="Attaches to an active Issue">
+    If a non-terminal Issue already exists for the same resource (kind, name, namespace), the Anomaly is attached to it; the Issue's risk score is recalculated from the anomalies still uncorrelated and only ever goes up.
   </Step>
-  <Step title="Calculates risk score and severity">
+  <Step title="Suppression checks">
+    Skips the Anomaly when the same resource was resolved within the resolution cooldown (Instance `spec.aiops.resolutionCooldownMinutes`, default 10) or when the noise reducer flags it (repetitive, flapping, seasonal).
   </Step>
-  <Step title="Creates or updates Issue CR">
+  <Step title="Groups anomalies and calculates risk score and severity">
+    Calls `CorrelationEngine.FindRelatedAnomalies()` for uncorrelated anomalies on the same resource within 10 minutes.
+  </Step>
+  <Step title="Creates the Issue CR">
+    Name `<resource>-<signal>-<unix time>`, with labels `platform.chatcli.io/inc-id` (`INC-YYYYMMDD-NNN`), `platform.chatcli.io/resource` and `platform.chatcli.io/signal`.
   </Step>
   <Step title="Marks Anomaly as correlated">
     Sets `Correlated = true` with reference to the Issue.
@@ -196,41 +222,40 @@ Correlation engine that groups anomalies into incidents.
 
 ```text
 For each new anomaly:
-  1. Generates incident_id = hash(resource_kind + resource_name + namespace + signal_type)
-  2. Searches for existing Issue with the same incident_id
-  3. If exists -> adds anomaly to Issue, recalculates risk score
-  4. If not exists -> creates new Issue
+  1. Looks for a non-terminal Issue on the same resource (kind + name + namespace)
+  2. If one exists -> attaches the anomaly (risk score recalculated, never lowered)
+  3. Otherwise -> sums the weights of the uncorrelated anomalies on that resource
+     from the last 10 minutes and creates a new Issue
+  4. The incident ID INC-YYYYMMDD-NNN is a per-namespace, per-day sequence (label, not the Issue name)
 ```
 
-**Risk Scoring:**
+**Risk Scoring** (sum of weights, capped at 100):
 
-| Signal | Weight | Justification |
-|--------|--------|---------------|
-| `oom_kill` | 30 | Indicates severe memory problem |
-| `error_rate` | 25 | Direct impact on users |
-| `deploy_failing` | 25 | Service unavailability |
-| `latency_spike` | 20 | Performance degradation |
-| `pod_restart` | 20 | Pod instability |
-| `pod_not_ready` | 20 | Reduced capacity |
+| Signal | Weight |
+|--------|--------|
+| `oom_kill` | 40 |
+| `error_rate` | 30 |
+| `pod_restart` | 25 |
+| `deploy_failing` | 25 |
+| `latency` | 20 |
+| `pod_not_ready` | 20 |
+| `cpu_high` | 15 |
+| `memory_high` | 15 |
+| any other signal | 10 |
 
 **Severity Classification:**
 
 ```text
+signal oom_kill  -> Critical (always)
 risk_score >= 80 -> Critical
 risk_score >= 60 -> High
-risk_score >= 40 -> Medium
-risk_score <  40 -> Low
+risk_score >= 30 -> Medium
+risk_score <  30 -> Low
 ```
 
-**Example**: A deployment with `oom_kill` (30) + `pod_restart` (20) = risk 50 -> **Medium**. If adding `error_rate` (25) = risk 75 -> **High**.
+**Example**: a Deployment with `pod_restart` (25) + `memory_high` (15) = risk 40 -> **Medium**. Adding `error_rate` (30) = risk 70 -> **High**. An Issue opened by an `oom_kill` anomaly is **Critical** whatever the score.
 
-**Source Mapping:**
-
-| Anomaly Source | Issue Source |
-|---------------|-------------|
-| `watcher` | `watcher` |
-| `prometheus` | `prometheus` |
-| `manual` | `manual` |
+**Source Mapping:** the Issue source mirrors the Anomaly source (`watcher`, `prometheus`, `events`, `logs`, `webhook`); an unknown source maps to `prometheus`.
 
 ### 4. IssueReconciler (`issue_controller.go`)
 
@@ -271,21 +296,27 @@ stateDiagram-v2
     }
 
     R --> Resolved : RemediationPlan completed (invalidates dedup)
+    R --> Contained : Completed plan applied a containment action
     R --> A : Retry (re-analysis with failure context)
     R --> Escalated : Max attempts (invalidates dedup)
+    Contained --> Resolved : Human restored the workload
+    Escalated --> Resolved : Resource recovered (enableAutoResolve)
 
-    note right of Resolved : Agentic resolution generates\nPostMortem CR + Runbook
+    note right of Resolved : Every completed plan generates a PostMortem CR;\nagentic plans also generate a Runbook
 
     Resolved --> [*]
     Escalated --> [*]
 ```
 
+`Contained` means the plan silenced the workload (for example `ScaleDeployment` to 0 with `containment=true`) without fixing it: the Issue carries `status.requiresHumanAction: true` and `status.requiredAction`, and it moves to `Resolved` only once the workload is restored. `Escalated` Issues are re-checked every 30 seconds and auto-resolve when the resource is healthy again, unless the Instance sets `spec.aiops.enableAutoResolve: false`. `Failed` is terminal.
+
 <AccordionGroup>
   <Accordion title="handleDetected()">
-    1. Sets `detectedAt` and `maxRemediationAttempts` (default: 5, configurable via Instance `aiops.maxRemediationAttempts`)
-    2. Creates AIInsight CR with owner reference (Issue -> AIInsight)
+    1. Sets `detectedAt` and `maxRemediationAttempts` (default: 5, configurable via Instance `aiops.maxRemediationAttempts`; read from the first Instance in the cluster)
+    2. Creates AIInsight CR `<issue>-insight` with owner reference (Issue -> AIInsight), annotated with the candidate Runbooks
     3. Transitions to `Analyzing`
-    4. Requeues after 10 seconds
+    4. Runs the federation checks (cascade detection, cross-cluster correlation), best effort
+    5. Requeues after 10 seconds
   </Accordion>
   <Accordion title="handleAnalyzing()">
     1. Checks if AIInsight has `Analysis` populated
@@ -299,18 +330,19 @@ stateDiagram-v2
     - **Tier 1**: SignalType + Severity + ResourceKind (exact match, preferred)
     - **Tier 2**: Severity + ResourceKind (fallback when signal doesn't match)
     - `SignalType` resolved from: `issue.Spec.SignalType` -> fallback `issue.Labels["platform.chatcli.io/signal"]`
+    - Runbooks are searched in **every namespace**, not only the Issue's
   </Accordion>
   <Accordion title="generateRunbookFromAI()">
     - Materializes `SuggestedActions` from AI as a reusable Runbook CR
-    - Name: `auto-{signal}-{severity}-{kind}` (sanitized)
+    - Name: `auto-{signal}-{severity}-{kind}-{hash}` (sanitized; `hash` = first 6 hex chars of the SHA256 of the analysis, so different root causes produce different Runbooks)
     - Labels: `platform.chatcli.io/auto-generated=true`
     - Trigger: SignalType + Severity + ResourceKind (for future reuse)
     - Uses `CreateOrUpdate` for idempotency
   </Accordion>
   <Accordion title="handleRemediating()">
     1. Finds the most recent RemediationPlan (`findLatestRemediationPlan`)
-    2. If `Completed` -> Issue `Resolved` + invalidates dedup for the resource
-       - If agentic plan: generates **PostMortem CR** (timeline, root cause, impact, lessons) + **reusable Runbook** from successful steps
+    2. If `Completed` -> Issue `Resolved` (or `Contained` when the plan applied a containment action) + **PostMortem CR** (timeline, root cause, impact, lessons) + invalidates dedup for the resource
+       - If agentic plan: also generates a **reusable Runbook** from successful steps
     3. If `Failed` and remaining attempts -> **re-analysis**: collects failure evidence (`collectFailureEvidence`), clears AIInsight analysis, returns to `Analyzing` state with failure context
     4. If `Failed` and max attempts -> `Escalated` + invalidates dedup for the resource
   </Accordion>
@@ -320,14 +352,15 @@ stateDiagram-v2
 - Each retry triggers AI re-analysis with context from previous failures
 - AI receives `previous_failure_context` with evidence from failed attempts
 - The prompt instructs: "Do not repeat the same actions. Analyze why they failed and suggest a fundamentally different approach"
-- Generates new auto-generated Runbook with different strategy (name includes attempt)
+- Generates a new auto-generated Runbook when the new analysis differs (the name carries a hash of the analysis)
 
 **Remediation Priority:**
 
 ```text
-1. Existing manual Runbook (tiered match: SignalType+Severity+Kind -> Severity+Kind)
+1. Existing Runbook (tiered match: SignalType+Severity+Kind -> Severity+Kind)
 2. AI auto-generated Runbook (materialized as reusable CR)
-3. Escalation (last resort)
+3. Agentic plan (AI decides each step)
+4. Escalation after maxRemediationAttempts failed attempts
 ```
 
 ### 5. AIInsightReconciler (`aiinsight_controller.go`)
@@ -365,7 +398,7 @@ Watches AIInsight CRs and calls the `AnalyzeIssue` RPC to populate the analysis.
 
 **KubernetesContextBuilder (`k8s_context.go`):**
 
-Collects real cluster context for **Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and HPAs** (max 12000 chars):
+Collects real cluster context for **Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and HPAs** (max 15000 chars):
 - **Resource Status**: replicas, conditions, containers, images + resources (each type has a dedicated context builder)
 - **StatefulSet**: replicas, update strategy, partition, PodManagementPolicy, VolumeClaimTemplates
 - **DaemonSet**: desired/current/ready/available/unavailable, nodeSelector, tolerations
@@ -450,9 +483,9 @@ Impact prediction before action execution:
 
 Executes the actions defined in a RemediationPlan.
 
-**Supported Actions (54 types across 9 categories):**
+**Supported Actions (54 types, plus `Custom`, which is always rejected):**
 
-**Deployment / Generic (19 actions):**
+**Deployment / Generic (19 actions + `Custom`):**
 
 | Category | Type | What It Does | Key Parameters |
 |----------|------|-------------|----------------|
@@ -467,6 +500,7 @@ Executes the actions defined in a RemediationPlan.
 | GitOps | `ArgoSyncApp` | Trigger ArgoCD sync | `revision` |
 | Autoscaling | `AdjustHPA` | Modifies HPA min/max/target | `minReplicas`, `maxReplicas`, `targetCPUUtilization` |
 | Infra | `CordonNode` | Marks node unschedulable | `node` |
+| Infra | `UncordonNode` | Marks node schedulable again | `node` |
 | Infra | `DrainNode` | Cordons and evicts pods from node | `node` |
 | Storage | `ResizePVC` | Expands PVC (no shrinking) | `pvc`, `size` |
 | Security | `RotateSecret` | Updates Secret values or copies from source | `secret`, `sourceSecret` or `key=value` |
@@ -532,7 +566,7 @@ Executes the actions defined in a RemediationPlan.
 | `ReplaceCronJobTemplate` | Replaces jobTemplate from ConfigMap JSON | `configmap`, `key` |
 
 <Warning>
-**Safety Checks (pre-execution):** Scale to 0 replicas blocked (Deployment and StatefulSet). AdjustResources limit cannot be less than request (all resource types). DeletePod/DeleteStatefulSetPod refuses if only 1 pod exists. ForceDeleteStatefulSetPod requires explicit pod name. RecreateStatefulSetPVC requires `confirm=true`. Custom actions are blocked. Blast radius prediction checks PDB violations, resource quotas, and affected services before execution — now generalized for all workload types via `getPodTemplateLabels`.
+**Safety Checks (pre-execution):** Scale to 0 replicas blocked (Deployment and StatefulSet) unless the action carries `containment=true`, which marks a deliberate stop-the-bleeding step and moves the Issue to `Contained`. AdjustResources limit cannot be less than request (all resource types). DeletePod/DeleteStatefulSetPod refuses if only 1 pod exists. ForceDeleteStatefulSetPod requires explicit pod name. RecreateStatefulSetPVC requires `confirm=true`. Custom actions are blocked. Blast radius prediction checks PDB violations, resource quotas, and affected services before execution — now generalized for all workload types via `getPodTemplateLabels`.
 
 **Automatic Rollback (post-failure):** Before any action, a structured `ResourceSnapshot` captures the complete resource state. For Deployments: replicas, images, CPU/memory, HPA. For StatefulSets: replicas, containers, updateStrategy, partition. For DaemonSets: containers, updateStrategy, maxUnavailable. For Jobs: suspend, parallelism, backoffLimit, activeDeadlineSeconds, containers. For CronJobs: suspend, schedule, concurrencyPolicy, history limits, containers. If an action fails or health verification expires (90s), the `RollbackEngine` automatically restores the resource to the pre-remediation state. Works for Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Nodes, and HPAs.
 </Warning>
@@ -560,21 +594,26 @@ Each reconcile = 1 step of the agentic loop:
   4. If resolved=true -> Verifying (+ annotations with PostMortem data)
   5. If next_action -> execute -> record observation -> requeue 5s
   6. If observation-only -> record -> requeue 10s
-  Safety: max 10 steps, timeout 10 minutes
+  7. If next_action diverges from the AIInsight without a divergence_reason
+     -> recorded as rejected, not executed, the AI is asked again
+  Safety: max steps (Instance aiops.agenticMaxSteps, default 10), timeout 10 minutes,
+  convergence detector (repeated observations, A-B-A-B oscillation, 5 failures in a row,
+  more than 8 minutes elapsed) fails the plan early
 ```
 
 ### 7. ServerClient (`grpc_client.go`)
 
-Shared gRPC client between WatcherBridge and AIInsightReconciler.
+Shared gRPC client between the WatcherBridge, the AIInsightReconciler and the RemediationReconciler.
 
 | Method | Description |
 |--------|-------------|
 | `NewServerClient()` | Creates instance (no connection) |
-| `Connect(addr)` | Connects via gRPC insecure (10s timeout) |
-| `GetAlerts(namespace)` | Fetches alerts from the watcher |
+| `Connect(addr, opts)` | Connects over gRPC with TLS 1.3 (always) and the Instance credential; keepalive 30s/5s |
+| `GetAlerts(ctx)` | Fetches the active alerts from the watcher |
 | `StreamAlerts(ctx, includeCurrent)` | Opens the alert stream; lives as long as ctx |
 | `AnalyzeIssue(req)` | Sends issue for AI analysis |
 | `AgenticStep(req)` | Executes one step of the agentic loop (context + history -> next action) |
+| `Health()` / `GetServerInfo()` | Probe and authenticated info call |
 | `IsConnected()` | Checks if connection is active |
 | `Close()` | Closes gRPC connection |
 
@@ -588,14 +627,21 @@ The server pushes K8s Watcher alerts over `StreamAlerts` (server streaming with 
 
 ```protobuf
 rpc GetAlerts(GetAlertsRequest) returns (GetAlertsResponse);
+rpc StreamAlerts(StreamAlertsRequest) returns (stream StreamAlertsResponse);
 
-message AlertInfo {
-  string alert_type = 1;    // HighRestartCount, OOMKilled, PodNotReady, DeploymentFailing
-  string deployment = 2;
-  string namespace = 3;
-  string message = 4;
-  string severity = 5;
-  int64 timestamp = 6;
+message WatcherAlert {
+  string type = 1;            // HighRestartCount, OOMKilled, PodNotReady, DeploymentFailing, ...
+  string severity = 2;        // info, warning, critical
+  string message = 3;
+  string object = 4;          // e.g. pod name
+  string namespace = 5;
+  string deployment = 6;
+  int64 timestamp_unix = 7;
+}
+
+message GetAlertsRequest {
+  string namespace = 1;       // optional filter
+  string deployment = 2;      // optional filter
 }
 ```
 
@@ -617,11 +663,12 @@ message SuggestedAction {
 
 message AnalyzeIssueResponse {
   string analysis = 1;
-  float confidence = 2;
+  float confidence = 2;       // 0.0 to 1.0
   repeated string recommendations = 3;
-  string provider = 4;
-  string model = 5;
+  string model = 4;
+  string provider = 5;
   repeated SuggestedAction suggested_actions = 6;
+  TokenUsage usage = 7;       // feeds the cost ledger
 }
 ```
 
@@ -630,7 +677,7 @@ message AnalyzeIssueResponse {
 The server builds a prompt that includes:
 
 1. Issue context (name, namespace, resource, severity, risk score, description)
-2. List of **19 available actions** organized by category (Workload, GitOps, Autoscaling, Infra, Storage, Security, Networking, Advanced)
+2. The action catalog (the 54 action types, with their parameters and resource-kind rules)
 3. Instructions to return structured JSON with `analysis`, `confidence`, `recommendations`, and `actions` fields
 
 **Response Parsing:**
@@ -662,6 +709,11 @@ message AgenticStepRequest {
   repeated AgenticHistoryEntry history = 12;
   int32 max_steps = 13;
   int32 current_step = 14;
+  // Prior AIInsight guidance, so the loop cannot silently contradict its own analysis
+  string insight_analysis = 15;
+  float insight_confidence = 16;
+  repeated string insight_recommendations = 17;
+  repeated SuggestedAction insight_suggested_actions = 18;
 }
 
 message AgenticStepResponse {
@@ -674,6 +726,9 @@ message AgenticStepResponse {
   string impact = 6;
   repeated string lessons_learned = 7;
   repeated string prevention_actions = 8;
+  bool diverges_from_insight = 9;     // next_action contradicts the AIInsight
+  string divergence_reason = 10;      // justification when diverging on purpose
+  TokenUsage usage = 11;
 }
 ```
 
@@ -683,27 +738,27 @@ The server builds a structured prompt with:
 
 1. **Role + Issue details**: incident context (type, severity, resource)
 2. **Kubernetes context**: real cluster state (refreshed at each step via KubernetesContextBuilder)
-3. **Tool definitions**: 18 available mutating actions + "Observe" (no action, wait for next context)
+3. **Tool definitions**: the action catalog + "Observe" (no action, wait for next context)
 4. **Conversation history**: each previous step formatted with reasoning -> action -> observation
 5. **Instructions**: respond JSON, budget (step N of M), safety rules
 
-When `resolved=true`, the response includes data for PostMortem generation (summary, root_cause, impact, lessons_learned, prevention_actions).
+When `resolved=true`, the response includes data for PostMortem generation (summary, root_cause, impact, lessons_learned, prevention_actions). When `diverges_from_insight` is true and `divergence_reason` is empty, the operator records the step as rejected and does not execute the proposed action.
 
 
 
 ## PostMortem Generation
 
-When **any remediation** resolves an Issue (standard or agentic), the `IssueReconciler` automatically generates:
+When **any remediation plan completes** (standard or agentic, including a containment that leaves the Issue `Contained`), the `IssueReconciler` automatically generates:
 
 ### PostMortem CR
 
-Created via `generatePostMortem()`:
+Created via `generatePostMortem()`, named `pm-<issue>` in the Issue's namespace:
 
 | Field | Source |
 |-------|--------|
-| `timeline` | Issue.DetectedAt + each step from AgenticHistory + resolved |
-| `actionsExecuted` | Steps with Action != nil (includes result) |
-| `summary` | Annotation `platform.chatcli.io/postmortem-summary` (AI-generated) |
+| `timeline` | `detected` event + one `action_executed`/`action_failed` event per action (agentic steps or plan actions) + `resolved` event |
+| `actionsExecuted` | Agentic steps with an action, or the plan's actions (includes result) |
+| `summary` | Annotation `platform.chatcli.io/postmortem-summary` (AI-generated; falls back to the AIInsight analysis) |
 | `rootCause` | Annotation `platform.chatcli.io/root-cause` |
 | `impact` | Annotation `platform.chatcli.io/impact` |
 | `lessonsLearned` | Annotation `platform.chatcli.io/lessons-learned` |
@@ -731,32 +786,40 @@ Created via `generateAgenticRunbook()`:
 
 ## Operator Prometheus Metrics
 
-The operator exposes Prometheus metrics for observability:
+The operator exposes Prometheus metrics on its metrics port (`8080`, plain HTTP, path `/metrics`; chart `serviceMonitor.enabled` creates a ServiceMonitor). The pipeline metrics:
 
 | Metric | Type | Description |
 |--------|------|-------------|
+| `chatcli_operator_anomalies_processed_total` | Counter | Anomalies processed, by outcome (new Issue, attached, suppressed) |
+| `chatcli_operator_issues_created_by_correlation_total` | Counter | Issues created by the correlation engine |
 | `chatcli_operator_issues_total` | Counter | Total issues by severity and state |
-| `chatcli_operator_issue_resolution_duration_seconds` | Histogram | Duration from detection to resolution |
+| `chatcli_operator_issue_resolution_duration_seconds` | Histogram | Duration from detection to resolution (chaos-induced Issues excluded) |
 | `chatcli_operator_active_issues` | Gauge | Number of unresolved issues |
+| `chatcli_operator_remediations_total` | Counter | Remediation actions by `action_type` and `result` |
+| `chatcli_operator_remediation_duration_seconds` | Histogram | Remediation plan execution time |
+| `chatcli_operator_decision_engine_evaluations_total` | Counter | Decision engine verdicts by `mode` (only when the engine is enabled) |
+| `chatcli_operator_decision_engine_circuit_breaker_state` | Gauge | `1` while a namespace's circuit breaker is open |
+| `chatcli_operator_agentic_convergence_stops_total` | Counter | Agentic loops stopped by the convergence detector, by `reason` |
+
+Approvals, SLA/SLO, notifications, escalation, federation and chaos experiments have their own `chatcli_operator_*` metrics, listed on their pages; controller-runtime adds its default reconcile metrics.
 
 
 
 ## Tests
 
-The operator has 130 tests (185 with subtests) covering all components:
+The operator's unit tests run over the controller-runtime fake client and cover every component on this page:
 
-| Component | Tests | Coverage |
-|-----------|-------|---------|
-| InstanceReconciler | 15 | CRUD, watcher, persistence, replicas, RBAC, deletion, deepcopy |
-| AnomalyReconciler | 4 | Creation, correlation, attachment to existing Issue |
-| IssueReconciler | 12 | State machine, AI fallback, retry, agentic plan, PostMortem generation |
-| RemediationReconciler | 38 | All 54 action types (Deployment + StatefulSet + DaemonSet + Job + CronJob), safety constraints, agentic loop, rollback, verification |
-| AIInsightReconciler | 12 | Connectivity, mock RPC, analysis parsing, withAuth, TLS/token |
-| PostMortemReconciler | 2 | State initialization, terminal state |
-| WatcherBridge | 22 | Alert mapping, SHA256 dedup, hash, pruning, Anomaly creation, buildConnectionOpts (TLS, token, both) |
-| CorrelationEngine | 4 | Risk scoring, severity, incident ID, related anomalies |
-| Pipeline (E2E) | 3 | Complete flow: Anomaly->Issue->Insight->Plan->Resolved, escalation, correlation |
-| MapActionType | 6+17 | All 54 string->enum mappings including StatefulSet, DaemonSet, Job, CronJob actions |
+| Component | Coverage |
+|-----------|---------|
+| InstanceReconciler | CRUD, watcher, persistence, replicas, RBAC, deletion, auth pre-check, server probe |
+| AnomalyReconciler | Creation, correlation, attachment to existing Issue |
+| IssueReconciler | State machine, AI fallback, retry, agentic plan, containment, PostMortem generation |
+| RemediationReconciler | All 54 action types (Deployment + StatefulSet + DaemonSet + Job + CronJob), safety constraints, agentic loop, rollback, verification, decision engine and tier gates |
+| AIInsightReconciler | Connectivity, mock RPC, analysis parsing, credentials |
+| PostMortemReconciler | State initialization, terminal state |
+| WatcherBridge | Alert mapping, SHA256 dedup, pruning, Anomaly creation, stream and poll transports, connection options |
+| CorrelationEngine | Risk scoring, severity, incident ID, related anomalies |
+| MapActionType | All string -> enum mappings |
 
 ### Run Tests
 
@@ -779,6 +842,7 @@ graph TD
     INST -->|owns| CM[ConfigMap]
     INST -->|owns| SA[ServiceAccount]
     INST -->|owns| PVC[PVC]
+    INST -->|owns| RB[Role / RoleBinding]
 
     ISS[Issue CR] -->|owns| INSIGHT[AIInsight CR]
     ISS -->|owns| PLAN[RemediationPlan CR]
@@ -791,7 +855,7 @@ graph TD
     style PM fill:#cba6f7,color:#000
 ```
 
-- **Instance** is the owner of all Kubernetes resources it creates (Deployment, Service, ConfigMap, SA, PVC)
+- **Instance** is the owner of the namespaced resources it creates (Deployment, Service, ConfigMaps, SA, PVC, watcher Role/RoleBinding); a cross-namespace watcher ClusterRoleBinding is removed by the Instance finalizer instead
 - **Issue** is the owner of AIInsight, RemediationPlan, and PostMortem (cascade delete)
 - Anomalies are independent (no owner) to preserve history
 
@@ -804,28 +868,68 @@ graph TD
     ```bash
     helm install chatcli-operator \
       oci://ghcr.io/diillson/charts/chatcli-operator \
+      --version 1.211.2 \
       --namespace chatcli-system --create-namespace
     ```
   </Step>
-  <Step title="Create Secret with API keys">
-    Create the Secret with the API keys for your chosen LLM provider.
+  <Step title="Create the Secrets the Instance needs">
+    - the LLM provider keys (for example `ANTHROPIC_API_KEY`), referenced by `spec.apiKeys.name`
+    - a server token (or JWT material): an in-cluster server listens on `0.0.0.0` and refuses to run without a credential, and the operator does not create the Deployment without one (`AuthenticationConfigured=False`)
+    - a TLS Secret (`tls.crt`, `tls.key`, optionally `ca.crt`) valid for `<instance>.<namespace>.svc.cluster.local`: the operator always dials the server over TLS 1.3
+
+    ```bash
+    kubectl create namespace chatcli
+    kubectl -n chatcli create secret generic chatcli-api-keys --from-literal=ANTHROPIC_API_KEY=<your-key>
+    kubectl -n chatcli create secret generic chatcli-server-token --from-literal=token="$(openssl rand -hex 32)"
+    kubectl -n chatcli create secret tls chatcli-tls --cert=tls.crt --key=tls.key
+    ```
   </Step>
   <Step title="Create Instance CR">
-    Create the Instance CR with `watcher.enabled: true` and configured targets.
+    ```yaml
+    apiVersion: platform.chatcli.io/v1alpha1
+    kind: Instance
+    metadata:
+      name: chatcli
+      namespace: chatcli
+    spec:
+      provider: CLAUDEAI
+      apiKeys:
+        name: chatcli-api-keys
+      server:
+        tls:
+          enabled: true
+          secretName: chatcli-tls
+        token:
+          name: chatcli-server-token
+          key: token
+      watcher:
+        enabled: true
+        targets:
+          - name: my-app
+            kind: Deployment
+            namespace: production
+    ```
+
+    A watcher target outside the Instance namespace needs the pre-provisioned ClusterRole `chatcli-watcher` (created by the chart).
+
+    Create **one** Instance for AIOps per cluster: the pipeline connects to the first ready Instance it finds, cluster-wide.
   </Step>
   <Step title="Verify server">
-    `kubectl get instances` -- confirm that the ChatCLI server is running.
+    `kubectl get instances -A` -- `READY` must be `true`; check the conditions `AuthenticationConfigured` and `ServerReachable` with `kubectl describe instance chatcli -n chatcli`.
   </Step>
   <Step title="Verify AIOps pipeline">
     - `kubectl get anomalies -A` -- anomalies being detected
     - `kubectl get issues -A` -- issues being created
     - `kubectl get aiinsights -A` -- AI analyzing
   </Step>
+  <Step title="(Optional) Enable the dashboard and REST API">
+    Create the Secret `chatcli-operator-secrets` (key `api-keys`) in `chatcli-system`, then `kubectl -n chatcli-system port-forward svc/chatcli-operator 8090:8090` and open `http://localhost:8090`.
+  </Step>
   <Step title="(Optional) Create manual Runbooks">
     Create manual Runbooks for specific scenarios.
   </Step>
   <Step title="Monitor metrics">
-    Monitor operator metrics via Prometheus.
+    Monitor operator metrics via Prometheus (`serviceMonitor.enabled=true` in the chart).
   </Step>
 </Steps>
 
