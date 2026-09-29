@@ -133,7 +133,7 @@ The operator pod is Ready once its `/readyz` (port 8081) answers. Until you crea
   | `api.port` / `metrics.port` / `health.port` | `8090` / `8080` / `8081` | REST+dashboard, Prometheus metrics, probes |
   | `service.type` | `ClusterIP` | Type of the `chatcli-operator` Service |
   | `prometheusUrl` | `""` | Prometheus the operator queries for metrics during incident analysis (`PROMETHEUS_URL`) |
-  | `alertTransport` | `stream` | `stream` (StreamAlerts; a server without it, older than 1.211.0, is polled and the stream retried every 10 minutes) or `poll` (GetAlerts every 30s) |
+  | `alertTransport` | `stream` | `stream` (StreamAlerts; a server without it, older than 1.211.0, is polled, and the stream is retried every 10 minutes or as soon as that server goes away) or `poll` (GetAlerts every 30s) |
   | `decisionEngine.enabled` | `false` | Confidence and circuit-breaker gate before a plan executes ([Decision Engine](/features/aiops/decision-engine)) |
   | `clusterName` | `""` | Name of this cluster's ClusterRegistration; its tier decides which severities wait for a human. A name no registration carries sends every plan to manual approval |
   | `apiKeys.create` / `apiKeys.entries` | `false` / `[]` | Render the dashboard key Secret `chatcli-operator-secrets` from `{key, role, description}` entries |
@@ -392,7 +392,7 @@ The walkthrough creates an Instance named `chatcli` in the namespace `chatcli`. 
 
 A ready Instance is probed again every five minutes, so `ServerReachable` and `VERSION` follow a server that was upgraded, restarted or lost its credential. `status.serverProbeTime` moves when the outcome changes and otherwise at most once per interval (no status write loop).
 
-A failed probe is retried on the same five-minute schedule, not sooner, so a `False` recorded while the pods were being replaced can outlive the rollout by up to five minutes. Any change to the Instance, an annotation included, reconciles and probes it at once without rolling the pods:
+A ready Instance whose last probe failed is probed again after 30 seconds instead, so a `False` recorded while the pods were being replaced clears shortly after the rollout. Any change to the Instance, an annotation included, also reconciles and probes it at once without rolling the pods:
 
 ```bash
 kubectl -n chatcli annotate instance chatcli chatcli.io/reprobe="$(date +%s)" --overwrite
@@ -537,7 +537,7 @@ spec:
 
 What happens next:
 
-1. **Detection.** The WatcherBridge (on the operator leader) keeps the server's `StreamAlerts` stream open (heartbeat every 15s; a server without the RPC, older than 1.211.0, is polled with `GetAlerts` every 30s and the stream is retried every 10 minutes; `alertTransport: poll` forces polling) and creates `Anomaly` resources, deduplicated for `aiops.dedupTTLMinutes` (default 30).
+1. **Detection.** The WatcherBridge (on the operator leader) keeps the server's `StreamAlerts` stream open (heartbeat every 15s; a server without the RPC, older than 1.211.0, is polled with `GetAlerts` every 30s, and the stream is retried every 10 minutes or as soon as that server goes away; `alertTransport: poll` forces polling) and creates `Anomaly` resources, deduplicated for `aiops.dedupTTLMinutes` (default 30).
 2. **Correlation.** Anomalies on the same resource are grouped into an `Issue` with a risk score and severity.
 3. **Analysis.** An `AIInsight` is created and the server's `AnalyzeIssue` RPC asks the LLM for a root cause, enriched with Kubernetes context, logs, metrics, GitOps state and linked source code.
 4. **Remediation.** A `RemediationPlan` runs a matching Runbook, an AI-generated runbook, or an agentic observe-decide-act loop (`AgenticStep` RPC), with 54 typed actions (plus `Custom`, which the safety checks reject), a pre-action snapshot and automatic rollback. ApprovalPolicies, the decision engine and the cluster tier can park a plan for a human.
@@ -1036,8 +1036,8 @@ An upgrade replaces the operator and, for every Instance that follows the operat
 1. **CRDs.** The pre-upgrade hook Job re-applies the 17 CRDs (`kubectl apply --server-side`) before anything else changes.
 2. **Operator.** The operator Deployment rolls: the new pod becomes Ready before the old one stops, so the dashboard and REST API stay up. The controllers restart on the new pod.
 3. **Instances.** The new operator re-renders every Instance. An Instance without `spec.image.tag` gets the new server image, and any change to the pod template rolls its pods. With `persistence.enabled` the strategy is `Recreate`: the old pods stop before the new ones start, so each such Instance has a short outage.
-4. **Probe.** The operator probes each server again. A probe that lands inside the rollout can record `ServerReachable=False` / `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, even though the new pods serve fine a moment later. A failed probe is retried on the regular [five-minute schedule](#instance-conditions); annotate the Instance to re-probe at once.
-5. **Alerts.** The WatcherBridge reconnects. If it reaches a server older than 1.211.0, which has no `StreamAlerts` (typically an old pod that is still running), it logs `Server has no StreamAlerts RPC; polling GetAlerts` and polls every 30 seconds for 10 minutes before it tries the stream again. No alert is lost meanwhile. To switch to the stream right away once the servers have rolled, restart the operator: `kubectl -n chatcli-system rollout restart deploy/chatcli-operator`.
+4. **Probe.** The operator probes each server again. A probe that lands inside the rollout can record `ServerReachable=False` / `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, even though the new pods serve fine a moment later. A failed probe is [retried after 30 seconds](#instance-conditions), so the condition turns `True` shortly after the rollout.
+5. **Alerts.** The WatcherBridge reconnects. If it reaches a server older than 1.211.0, which has no `StreamAlerts` (typically an old pod that is still running), it logs `Server has no StreamAlerts RPC; polling GetAlerts` and polls every 30 seconds. When that old pod goes away, the next poll fails with `Unavailable`, the bridge logs `Server unavailable while polling; retrying the alert stream on reconnect` and opens the stream on the new server. No alert is lost meanwhile.
 
 ### Verify
 
@@ -1050,14 +1050,14 @@ kubectl -n chatcli get instance chatcli \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
 
-All five conditions should read `True`. If `ServerReachable` still shows the `False` captured during the rollout, wait for the next probe or re-probe with the annotation above.
+All five conditions should read `True`. If `ServerReachable` still shows the `False` captured during the rollout, wait about 30 seconds for the retry.
 
 ### Crossing these releases
 
 | Coming from | What changes | What to do |
 |-------------|--------------|------------|
 | Before 1.199.0 | The `GITHUB_MODELS` provider was removed. The CRD rejects it in `spec.fallback.providers[].name`, so after the CRD hook runs an Instance that lists it there fails its next write; in `spec.provider` the CRD still accepts it, but the server no longer has that provider | Move `spec.provider` and every fallback entry to another provider **before** upgrading |
-| Before 1.211.0 | The server gains `StreamAlerts` | Expect up to 10 minutes of polling right after the upgrade (step 5 above) |
+| Before 1.211.0 | The server gains `StreamAlerts` | Nothing: the bridge polls while an old pod answers and switches to the stream once it is gone (step 5 above) |
 | 1.211.x or earlier | The pod template gains the startup, readiness and liveness probes and the `chatcli.io/credentials-hash` annotation | Every Instance's pods roll once, even with `spec.image.tag` set; plan it like a server rollout |
 
 ### Uninstall
@@ -1076,8 +1076,8 @@ Delete the Instances first, while the operator still runs: their finalizer (`pla
 | `ServerReachable=False`, `reading secret "...": ...` or `key "..." not found in secret "..."` | A Secret the operator reads is missing or has another key | Create it or fix `key` |
 | `ServerReachable=False`, `... verifies RS256 tokens (jwtPublicKeyRef) and the operator has no credential to present` | RS256 without an operator credential | Set `operatorTokenRef` or `operatorClientCertSecretName` |
 | `ServerReachable=False` / `NotServing` | The server is shutting down | Transient during rollouts; otherwise read the server log |
-| `ServerReachable=False`, `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, while `Available=True` and `VERSION` already shows the new release | The probe ran while the pods were being replaced; a failed probe is retried only on the five-minute schedule | Wait for the next probe, or re-probe now: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite` |
-| Operator log `Server has no StreamAlerts RPC; polling GetAlerts` right after an upgrade | The WatcherBridge reached a server older than 1.211.0 (an old pod still running) and polls for 10 minutes before retrying the stream | Nothing is lost; wait, or `kubectl -n chatcli-system rollout restart deploy/chatcli-operator` once the servers have rolled |
+| `ServerReachable=False`, `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, while `Available=True` and `VERSION` already shows the new release | The probe ran while the pods were being replaced | Transient: a failed probe is retried after 30 seconds. To re-probe now: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite`. If it stays `False`, the new pods are not answering: read the server log |
+| Operator log `Server has no StreamAlerts RPC; polling GetAlerts` right after an upgrade | The WatcherBridge reached a server older than 1.211.0 (an old pod still running) | Nothing to do: it switches to the stream as soon as that pod is gone. If the log keeps repeating, the Instance still runs an old server: check `VERSION` and `spec.image.tag` |
 | An Instance update is rejected with `spec.fallback.providers[0].name: Unsupported value: "GITHUB_MODELS"` after an upgrade | The provider was removed in 1.199.0 and the CRD no longer admits it in the fallback chain | Replace the entry (and `spec.provider`, if it names `GITHUB_MODELS`) with a supported provider |
 | `AuthenticationConfigured=False` / `CredentialMissing`, no Deployment | No credential on a reachable bind | Set one of the fields the message lists |
 | `TLSConfigured=False` / `SecretNameMissing`, no Deployment | `tls.enabled` without `secretName` | Set `spec.server.tls.secretName` |

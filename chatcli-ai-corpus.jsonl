@@ -1420,7 +1420,7 @@ Available=True DeploymentReady: All replicas are ready
 ServerReachable=True Serving: server <version> serving (CLAUDEAI/claude-sonnet-5)
 ```
 
-The `VERSION` column of `kubectl get instance` shows the server version the operator last read. A ready Instance is re-probed every five minutes, so allow up to five minutes for `ServerReachable` to reflect a change.
+The `VERSION` column of `kubectl get instance` shows the server version the operator last read. A ready Instance is re-probed every five minutes, so allow up to five minutes for `ServerReachable` to reflect a change; after a failed probe it is retried every 30 seconds.
 
 ## 4. Link source repositories (optional)
 
@@ -1958,7 +1958,7 @@ See [Chaos Engineering](/features/aiops/chaos-engineering) for every type, param
 | `ServerReachable=False`, `x509: certificate signed by unknown authority` | No `ca.crt` in the Secret, and the CA is not public | Add `ca.crt` (cert-manager with a CA issuer writes it) |
 | `ServerReachable=False`, `server info (credential check)` and `Unauthenticated` | The operator's credential is rejected | Check `OperatorCredentialConfigured`; an RS256-only (`jwtPublicKeyRef`) server needs `operatorTokenRef` or `operatorClientCertSecretName` |
 | `Unauthenticated: authentication failed` and the server log shows `auth failure rate limit exceeded` | Something on the operator's host failed authentication more than 5 times in a minute and exhausted that host's failure budget (burst 5, then one every 12 seconds; only failed authentications count, valid credentials are never throttled) | Find the caller with the wrong or expired credential; the budget refills on its own |
-| `ServerReachable=False` (`ProbeFailed`, `DeadlineExceeded` or `connection refused`) right after a rollout, while the pods are Ready | The probe ran while the pods were being replaced; a failed probe is retried only every five minutes | Wait, or re-probe at once: [Instance conditions](/features/k8s-operator#instance-conditions) |
+| `ServerReachable=False` (`ProbeFailed`, `DeadlineExceeded` or `connection refused`) right after a rollout, while the pods are Ready | The probe ran while the pods were being replaced | Transient: a failed probe is retried after 30 seconds; see [Instance conditions](/features/k8s-operator#instance-conditions) |
 | `ServerReachable=Unknown` (`DeploymentNotReady`) | No pod is ready | `kubectl -n chatcli describe pod`; check the probes on `/healthz` (port 9090) |
 | Some pods `ContainerCreating` with `Multi-Attach error` | RWO sessions PVC with `replicas > 1` | Disable persistence or use one replica (step 3) |
 | Operator logs `no ready Instance found` | No Instance is `Ready` yet | Fix the Instance first |
@@ -13275,13 +13275,15 @@ This page covers the internal architecture in depth. For configuration and usage
   
     Opt-in confidence gate and circuit breaker
   
+    Capacity forecast, noise reduction, LLM cost per incident
+  
     Embedded UI on the operator's port 8090
   
 ### REST API & Dashboard
 
 The operator also exposes a **REST HTTP API** on port `8090` (chart value `api.port`, env `CHATCLI_AIOPS_PORT`), reached through the Service `chatcli-operator` in the operator namespace (not the Instance Service). Its 40+ endpoints cover incidents, AI insights, remediations, runbooks, approvals, SLOs, post-mortems, analytics (including LLM cost), clusters, federation, policies and audit. A **Web Dashboard** is embedded and served at `/` on the same port.
 
-- **Authentication:** header `X-API-Key`. Keys are read from the Secret `chatcli-operator-secrets`, key `api-keys` (fallback: ConfigMap `chatcli-operator-config`), in the operator namespace, as a YAML list of `{key, role, description}`. Roles are `viewer` < `operator` < `admin`; any other role string is denied. Changes are picked up within about 30 seconds; an `api-keys` entry that is not valid YAML keeps the last valid key set in force, and a Secret without the entry falls back to the ConfigMap. No chart creates this Secret: with no keys configured every `/api/` call returns `401`, unless `CHATCLI_OPERATOR_DEV_MODE=true` (admin without a key, development only).
+- **Authentication:** header `X-API-Key`. Keys are read from the Secret `chatcli-operator-secrets`, key `api-keys` (fallback: ConfigMap `chatcli-operator-config`), in the operator namespace, as a YAML list of `{key, role, description}`. Roles are `viewer` < `operator` < `admin`; any other role string is denied. Changes are picked up within about 30 seconds; an `api-keys` entry that is not valid YAML keeps the last valid key set in force, and a Secret without the entry falls back to the ConfigMap. Create it yourself, or let the operator chart render it (`apiKeys.create: true` with `apiKeys.entries`). With no keys configured every `/api/` call returns `401`, unless `CHATCLI_OPERATOR_DEV_MODE=true` (admin without a key, development only).
 - **Rate limit:** 30 requests per minute per client host without a valid API key, 600 per minute per valid key (`429` with `Retry-After`).
 - **CORS:** deny-all unless `CHATCLI_CORS_ALLOWED_ORIGINS` / `CHATCLI_CORS_ORIGIN` are set. **TLS:** set `CHATCLI_AIOPS_TLS_CERT` and `CHATCLI_AIOPS_TLS_KEY` to serve HTTPS (TLS 1.3).
 - **Local preview:** `make dash-preview` in `operator/` serves the dashboard over synthetic data, no cluster needed, at `http://127.0.0.1:8085` with the API key `preview`.
@@ -13311,7 +13313,7 @@ sequenceDiagram
         Server-->>WB: alert (heartbeat every 15s when quiet)
         WB->>K8s: Creates Anomaly CR (dedup SHA256)
     end
-    Note over WB,Server: Server without StreamAlerts (before 1.211.0): GetAlerts every 30s, stream retried every 10 min
+    Note over WB,Server: Server without StreamAlerts (before 1.211.0): GetAlerts every 30s, stream retried every 10 min or once that server goes away
 
     AR->>K8s: Watch Anomaly CRs
     AR->>CE: Correlates anomalies
@@ -13385,7 +13387,7 @@ The WatcherBridge is the pipeline entry point. It implements the controller-runt
 |----------|-------------|
 | `Start()` | Keeps the bridge attached to a ready Instance: stream first, polling fallback, cancelable context |
 | `consumeStream()` | Holds the StreamAlerts stream open, turns each alert into an Anomaly, reopens after 60s of silence |
-| `poll()` | Queries GetAlerts once (fallback for a server without StreamAlerts, retried as a stream every 10 minutes, or `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll`) |
+| `poll()` | Queries GetAlerts once (fallback for a server without StreamAlerts, retried as a stream every 10 minutes or once that server stops answering, or `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll`) |
 | `discoverAndConnect()` | Discovers server via Instance CRs in the cluster |
 | `createAnomaly()` | Converts alert -> Anomaly CR (name `watcher-<type>-<deployment>-<timestamp>`, in the alert's namespace) with reference labels |
 | `alertHash()` | SHA256(type\|deployment\|namespace\|resource UID) for dedup |
@@ -21788,7 +21790,7 @@ The operator pod is Ready once its `/readyz` (port 8081) answers. Until you crea
   | `api.port` / `metrics.port` / `health.port` | `8090` / `8080` / `8081` | REST+dashboard, Prometheus metrics, probes |
   | `service.type` | `ClusterIP` | Type of the `chatcli-operator` Service |
   | `prometheusUrl` | `""` | Prometheus the operator queries for metrics during incident analysis (`PROMETHEUS_URL`) |
-  | `alertTransport` | `stream` | `stream` (StreamAlerts; a server without it, older than 1.211.0, is polled and the stream retried every 10 minutes) or `poll` (GetAlerts every 30s) |
+  | `alertTransport` | `stream` | `stream` (StreamAlerts; a server without it, older than 1.211.0, is polled, and the stream is retried every 10 minutes or as soon as that server goes away) or `poll` (GetAlerts every 30s) |
   | `decisionEngine.enabled` | `false` | Confidence and circuit-breaker gate before a plan executes ([Decision Engine](/features/aiops/decision-engine)) |
   | `clusterName` | `""` | Name of this cluster's ClusterRegistration; its tier decides which severities wait for a human. A name no registration carries sends every plan to manual approval |
   | `apiKeys.create` / `apiKeys.entries` | `false` / `[]` | Render the dashboard key Secret `chatcli-operator-secrets` from `{key, role, description}` entries |
@@ -22031,7 +22033,7 @@ The walkthrough creates an Instance named `chatcli` in the namespace `chatcli`. 
 
 A ready Instance is probed again every five minutes, so `ServerReachable` and `VERSION` follow a server that was upgraded, restarted or lost its credential. `status.serverProbeTime` moves when the outcome changes and otherwise at most once per interval (no status write loop).
 
-A failed probe is retried on the same five-minute schedule, not sooner, so a `False` recorded while the pods were being replaced can outlive the rollout by up to five minutes. Any change to the Instance, an annotation included, reconciles and probes it at once without rolling the pods:
+A ready Instance whose last probe failed is probed again after 30 seconds instead, so a `False` recorded while the pods were being replaced clears shortly after the rollout. Any change to the Instance, an annotation included, also reconciles and probes it at once without rolling the pods:
 
 ```bash
 kubectl -n chatcli annotate instance chatcli chatcli.io/reprobe="$(date +%s)" --overwrite
@@ -22171,7 +22173,7 @@ spec:
 
 What happens next:
 
-1. **Detection.** The WatcherBridge (on the operator leader) keeps the server's `StreamAlerts` stream open (heartbeat every 15s; a server without the RPC, older than 1.211.0, is polled with `GetAlerts` every 30s and the stream is retried every 10 minutes; `alertTransport: poll` forces polling) and creates `Anomaly` resources, deduplicated for `aiops.dedupTTLMinutes` (default 30).
+1. **Detection.** The WatcherBridge (on the operator leader) keeps the server's `StreamAlerts` stream open (heartbeat every 15s; a server without the RPC, older than 1.211.0, is polled with `GetAlerts` every 30s, and the stream is retried every 10 minutes or as soon as that server goes away; `alertTransport: poll` forces polling) and creates `Anomaly` resources, deduplicated for `aiops.dedupTTLMinutes` (default 30).
 2. **Correlation.** Anomalies on the same resource are grouped into an `Issue` with a risk score and severity.
 3. **Analysis.** An `AIInsight` is created and the server's `AnalyzeIssue` RPC asks the LLM for a root cause, enriched with Kubernetes context, logs, metrics, GitOps state and linked source code.
 4. **Remediation.** A `RemediationPlan` runs a matching Runbook, an AI-generated runbook, or an agentic observe-decide-act loop (`AgenticStep` RPC), with 54 typed actions (plus `Custom`, which the safety checks reject), a pre-action snapshot and automatic rollback. ApprovalPolicies, the decision engine and the cluster tier can park a plan for a human.
@@ -22655,8 +22657,8 @@ An upgrade replaces the operator and, for every Instance that follows the operat
 1. **CRDs.** The pre-upgrade hook Job re-applies the 17 CRDs (`kubectl apply --server-side`) before anything else changes.
 2. **Operator.** The operator Deployment rolls: the new pod becomes Ready before the old one stops, so the dashboard and REST API stay up. The controllers restart on the new pod.
 3. **Instances.** The new operator re-renders every Instance. An Instance without `spec.image.tag` gets the new server image, and any change to the pod template rolls its pods. With `persistence.enabled` the strategy is `Recreate`: the old pods stop before the new ones start, so each such Instance has a short outage.
-4. **Probe.** The operator probes each server again. A probe that lands inside the rollout can record `ServerReachable=False` / `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, even though the new pods serve fine a moment later. A failed probe is retried on the regular [five-minute schedule](#instance-conditions); annotate the Instance to re-probe at once.
-5. **Alerts.** The WatcherBridge reconnects. If it reaches a server older than 1.211.0, which has no `StreamAlerts` (typically an old pod that is still running), it logs `Server has no StreamAlerts RPC; polling GetAlerts` and polls every 30 seconds for 10 minutes before it tries the stream again. No alert is lost meanwhile. To switch to the stream right away once the servers have rolled, restart the operator: `kubectl -n chatcli-system rollout restart deploy/chatcli-operator`.
+4. **Probe.** The operator probes each server again. A probe that lands inside the rollout can record `ServerReachable=False` / `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, even though the new pods serve fine a moment later. A failed probe is [retried after 30 seconds](#instance-conditions), so the condition turns `True` shortly after the rollout.
+5. **Alerts.** The WatcherBridge reconnects. If it reaches a server older than 1.211.0, which has no `StreamAlerts` (typically an old pod that is still running), it logs `Server has no StreamAlerts RPC; polling GetAlerts` and polls every 30 seconds. When that old pod goes away, the next poll fails with `Unavailable`, the bridge logs `Server unavailable while polling; retrying the alert stream on reconnect` and opens the stream on the new server. No alert is lost meanwhile.
 
 ### Verify
 
@@ -22669,7 +22671,7 @@ kubectl -n chatcli get instance chatcli \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
 
-All five conditions should read `True`. If `ServerReachable` still shows the `False` captured during the rollout, wait for the next probe or re-probe with the annotation above.
+All five conditions should read `True`. If `ServerReachable` still shows the `False` captured during the rollout, wait about 30 seconds for the retry.
 
 
 ### Crossing these releases
@@ -22677,7 +22679,7 @@ All five conditions should read `True`. If `ServerReachable` still shows the `Fa
 | Coming from | What changes | What to do |
 |-------------|--------------|------------|
 | Before 1.199.0 | The `GITHUB_MODELS` provider was removed. The CRD rejects it in `spec.fallback.providers[].name`, so after the CRD hook runs an Instance that lists it there fails its next write; in `spec.provider` the CRD still accepts it, but the server no longer has that provider | Move `spec.provider` and every fallback entry to another provider **before** upgrading |
-| Before 1.211.0 | The server gains `StreamAlerts` | Expect up to 10 minutes of polling right after the upgrade (step 5 above) |
+| Before 1.211.0 | The server gains `StreamAlerts` | Nothing: the bridge polls while an old pod answers and switches to the stream once it is gone (step 5 above) |
 | 1.211.x or earlier | The pod template gains the startup, readiness and liveness probes and the `chatcli.io/credentials-hash` annotation | Every Instance's pods roll once, even with `spec.image.tag` set; plan it like a server rollout |
 
 ### Uninstall
@@ -22696,8 +22698,8 @@ Delete the Instances first, while the operator still runs: their finalizer (`pla
 | `ServerReachable=False`, `reading secret "...": ...` or `key "..." not found in secret "..."` | A Secret the operator reads is missing or has another key | Create it or fix `key` |
 | `ServerReachable=False`, `... verifies RS256 tokens (jwtPublicKeyRef) and the operator has no credential to present` | RS256 without an operator credential | Set `operatorTokenRef` or `operatorClientCertSecretName` |
 | `ServerReachable=False` / `NotServing` | The server is shutting down | Transient during rollouts; otherwise read the server log |
-| `ServerReachable=False`, `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, while `Available=True` and `VERSION` already shows the new release | The probe ran while the pods were being replaced; a failed probe is retried only on the five-minute schedule | Wait for the next probe, or re-probe now: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite` |
-| Operator log `Server has no StreamAlerts RPC; polling GetAlerts` right after an upgrade | The WatcherBridge reached a server older than 1.211.0 (an old pod still running) and polls for 10 minutes before retrying the stream | Nothing is lost; wait, or `kubectl -n chatcli-system rollout restart deploy/chatcli-operator` once the servers have rolled |
+| `ServerReachable=False`, `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, while `Available=True` and `VERSION` already shows the new release | The probe ran while the pods were being replaced | Transient: a failed probe is retried after 30 seconds. To re-probe now: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite`. If it stays `False`, the new pods are not answering: read the server log |
+| Operator log `Server has no StreamAlerts RPC; polling GetAlerts` right after an upgrade | The WatcherBridge reached a server older than 1.211.0 (an old pod still running) | Nothing to do: it switches to the stream as soon as that pod is gone. If the log keeps repeating, the Instance still runs an old server: check `VERSION` and `spec.image.tag` |
 | An Instance update is rejected with `spec.fallback.providers[0].name: Unsupported value: "GITHUB_MODELS"` after an upgrade | The provider was removed in 1.199.0 and the CRD no longer admits it in the fallback chain | Replace the entry (and `spec.provider`, if it names `GITHUB_MODELS`) with a supported provider |
 | `AuthenticationConfigured=False` / `CredentialMissing`, no Deployment | No credential on a reachable bind | Set one of the fields the message lists |
 | `TLSConfigured=False` / `SecretNameMissing`, no Deployment | `tls.enabled` without `secretName` | Set `spec.server.tls.secretName` |
@@ -32455,7 +32457,7 @@ security:
     keyFile: /etc/chatcli-operator/grpc/tls.key  # CHATCLI_GRPC_TLS_KEY
 ```
 
-The Instance reports what it found in its status conditions: `TLSConfigured` is `False` (and no Deployment is created) when TLS is enabled without a Secret name, `AuthenticationConfigured` is `False` when a reachable server has no credential, `OperatorCredentialConfigured` says which credential the operator presents, and `ServerReachable` reports the last probe, repeated every five minutes (a failed probe too, so a `False` recorded during a rollout can linger; see [Instance conditions](/features/k8s-operator#instance-conditions)). Rotating any Secret an Instance references rolls its pods.
+The Instance reports what it found in its status conditions: `TLSConfigured` is `False` (and no Deployment is created) when TLS is enabled without a Secret name, `AuthenticationConfigured` is `False` when a reachable server has no credential, `OperatorCredentialConfigured` says which credential the operator presents, and `ServerReachable` reports the last probe, repeated every five minutes, or every 30 seconds after a failed probe (see [Instance conditions](/features/k8s-operator#instance-conditions)). Rotating any Secret an Instance references rolls its pods.
 
 ---
 
@@ -39558,7 +39560,7 @@ Available=True DeploymentReady: All replicas are ready
 ServerReachable=True Serving: server <version> serving (CLAUDEAI/claude-sonnet-5)
 ```
 
-A coluna `VERSION` de `kubectl get instance` mostra a versão do servidor que o operator leu por último. Uma Instance pronta é sondada de novo a cada cinco minutos, então espere até cinco minutos para `ServerReachable` refletir uma mudança.
+A coluna `VERSION` de `kubectl get instance` mostra a versão do servidor que o operator leu por último. Uma Instance pronta é sondada de novo a cada cinco minutos, então espere até cinco minutos para `ServerReachable` refletir uma mudança; depois de uma sondagem que falha, ela é repetida a cada 30 segundos.
 
 ## 4. Vincular repositórios de código (opcional)
 
@@ -40096,7 +40098,7 @@ Veja [Chaos Engineering](/pt/features/aiops/chaos-engineering) para todos os tip
 | `ServerReachable=False`, `x509: certificate signed by unknown authority` | Sem `ca.crt` no Secret, e a CA não é pública | Acrescente o `ca.crt` (o cert-manager com issuer de CA grava sozinho) |
 | `ServerReachable=False`, `server info (credential check)` e `Unauthenticated` | A credencial do operator é recusada | Confira `OperatorCredentialConfigured`; um servidor só com RS256 (`jwtPublicKeyRef`) precisa de `operatorTokenRef` ou `operatorClientCertSecretName` |
 | `Unauthenticated: authentication failed` e o log do servidor mostra `auth failure rate limit exceeded` | Algo no host do operator falhou a autenticação mais de 5 vezes num minuto e esgotou a cota de falhas desse host (rajada de 5, depois uma a cada 12 segundos; só autenticações que falham contam, credenciais válidas nunca são limitadas) | Encontre o chamador com credencial errada ou expirada; a cota repõe sozinha |
-| `ServerReachable=False` (`ProbeFailed`, `DeadlineExceeded` ou `connection refused`) logo depois de um rollout, com os pods Ready | A sondagem rodou enquanto os pods eram trocados; uma sondagem que falha só é repetida a cada cinco minutos | Espere, ou sonde na hora: [Condições da Instance](/pt/features/k8s-operator#condições-da-instance) |
+| `ServerReachable=False` (`ProbeFailed`, `DeadlineExceeded` ou `connection refused`) logo depois de um rollout, com os pods Ready | A sondagem rodou enquanto os pods eram trocados | Passageiro: uma sondagem que falha é repetida em 30 segundos; veja [Condições da Instance](/pt/features/k8s-operator#condições-da-instance) |
 | `ServerReachable=Unknown` (`DeploymentNotReady`) | Nenhum pod está pronto | `kubectl -n chatcli describe pod`; confira as probes em `/healthz` (porta 9090) |
 | Alguns pods em `ContainerCreating` com `Multi-Attach error` | PVC de sessões RWO com `replicas > 1` | Desligue a persistência ou use uma réplica (passo 3) |
 | O operator loga `no ready Instance found` | Nenhuma Instance está `Ready` ainda | Corrija a Instance primeiro |
@@ -51408,6 +51410,41 @@ A **Plataforma AIOps** do ChatCLI é um sistema autônomo que detecta problemas 
 
 Esta página cobre a arquitetura interna em profundidade. Para configuração e exemplos de uso, veja [K8s Operator](/pt/features/k8s-operator).
 
+## Componentes da Plataforma v2
+
+    NotificationPolicy e EscalationPolicy
+  
+    ServiceLevelObjective e IncidentSLA
+  
+    ApprovalPolicy e ApprovalRequest
+  
+    ClusterRegistration e federação
+  
+    AuditEvent (trilha imutável)
+  
+    ChaosExperiment com safety checks
+  
+    Gate de confiança e circuit breaker, opt-in
+  
+    Previsão de capacidade, redução de ruído, custo de LLM por incidente
+  
+    UI embutida na porta 8090 do operator
+  
+### REST API e Dashboard
+
+O operator expõe uma **API REST HTTP** na porta `8090` (valor `api.port` do chart, env `CHATCLI_AIOPS_PORT`), acessada pelo Service `chatcli-operator` no namespace do operator (não pelo Service da Instance). São mais de 40 endpoints cobrindo incidents, AI insights, remediações, runbooks, aprovações, SLOs, post-mortems, analytics (incluindo custo de LLM), clusters, federação, políticas e auditoria. Um **Web Dashboard** embutido é servido em `/` na mesma porta.
+
+- **Autenticação:** header `X-API-Key`. As chaves vêm do Secret `chatcli-operator-secrets`, chave `api-keys` (fallback: ConfigMap `chatcli-operator-config`), no namespace do operator, como uma lista YAML de `{key, role, description}`. Os papéis são `viewer` < `operator` < `admin`; qualquer outro valor de role é negado. Alterações são aplicadas em cerca de 30 segundos; uma entrada `api-keys` que não é YAML válido mantém em vigor o último conjunto de chaves válido, e um Secret sem a entrada cai para o ConfigMap. Crie-o você mesmo, ou deixe o chart do operator renderizá-lo (`apiKeys.create: true` com `apiKeys.entries`). Sem chaves configuradas, toda chamada em `/api/` retorna `401`, a menos que `CHATCLI_OPERATOR_DEV_MODE=true` (admin sem chave, só para desenvolvimento).
+- **Rate limit:** 30 requisições por minuto por host de cliente sem API key válida, 600 por minuto por chave válida (`429` com `Retry-After`).
+- **CORS:** deny-all, a menos que `CHATCLI_CORS_ALLOWED_ORIGINS` / `CHATCLI_CORS_ORIGIN` estejam definidos. **TLS:** defina `CHATCLI_AIOPS_TLS_CERT` e `CHATCLI_AIOPS_TLS_KEY` para servir HTTPS (TLS 1.3).
+- **Preview local:** `make dash-preview` em `operator/` serve o dashboard com dados sintéticos, sem cluster, em `http://127.0.0.1:8085` com a API key `preview`.
+
+  Toda réplica do operator serve a API REST e o dashboard na 8090, então `replicaCount > 1` funciona atrás do Service sem fixar as requisições na líder.
+
+Para referência completa da API, consulte a [API Reference](/pt/reference/api/overview).
+
+Quatro dashboards Grafana (JSON) estão em `deploy/grafana/`. O `dashboards-configmap.yaml` de lá traz só os dois ServiceMonitors (operator e servidor, este selecionando `app.kubernetes.io/name: chatcli`), não os dashboards: crie o ConfigMap nomeando cada arquivo JSON (veja [Web Dashboard](/pt/features/aiops/web-dashboard)) ou importe os JSONs manualmente.
+
 ## Visão Geral do Pipeline
 
 ```mermaid
@@ -51427,7 +51464,7 @@ sequenceDiagram
         Server-->>WB: alerta (heartbeat a cada 15s quando quieto)
         WB->>K8s: Cria Anomaly CR (dedup SHA256)
     end
-    Note over WB,Server: Servidor sem StreamAlerts (antes da 1.211.0): GetAlerts a cada 30s, stream tentado de novo a cada 10 min
+    Note over WB,Server: Servidor sem StreamAlerts (antes da 1.211.0): GetAlerts a cada 30s, stream tentado de novo a cada 10 min ou quando esse servidor sai
 
     AR->>K8s: Watch Anomaly CRs
     AR->>CE: Correlaciona anomalias
@@ -51489,43 +51526,6 @@ sequenceDiagram
     end
 ```
 
-## Componentes da Plataforma v2
-
-A plataforma AIOps foi expandida com componentes enterprise-grade:
-
-    6 canais (Slack, PagerDuty, OpsGenie, Email, Webhook, Teams) com throttling e escalação automática L1→L2→L3.
-  
-    Burn rate alerting multi-janela (Google SRE model), error budget tracking, business hours com timezone.
-  
-    Auto/manual/quorum, blast radius, change windows, integração com Decision Engine.
-  
-    Opt-in: confiança ajustada por 5 fatores, circuit breaker, pattern learning.
-  
-    Correlação cross-cluster, cascade detection, políticas por tier.
-  
-    7 tipos de experimento com safety checks, recovery verification, DryRun.
-  
-    Trilha de AuditEvent, API com 3 papéis (viewer/operator/admin), relatórios de compliance (MTTD/MTTR).
-  
-    Forecast com regressão linear, noise reduction, custo de LLM por incidente.
-  
-    UI embutida na porta 8090 do operator.
-  
-### REST API e Dashboard
-
-O operator expõe uma **API REST HTTP** na porta `8090` (valor `api.port` do chart, env `CHATCLI_AIOPS_PORT`), acessada pelo Service `chatcli-operator` no namespace do operator (não pelo Service da Instance). São mais de 40 endpoints cobrindo incidents, AI insights, remediações, runbooks, aprovações, SLOs, post-mortems, analytics (incluindo custo de LLM), clusters, federação, políticas e auditoria. Um **Web Dashboard** embutido é servido em `/` na mesma porta.
-
-- **Autenticação:** header `X-API-Key`. As chaves vêm do Secret `chatcli-operator-secrets`, chave `api-keys` (fallback: ConfigMap `chatcli-operator-config`), no namespace do operator, como uma lista YAML de `{key, role, description}`. Os papéis são `viewer` < `operator` < `admin`; qualquer outro valor de role é negado. Alterações são aplicadas em cerca de 30 segundos; uma entrada `api-keys` que não é YAML válido mantém em vigor o último conjunto de chaves válido, e um Secret sem a entrada cai para o ConfigMap. Nenhum chart cria esse Secret: sem chaves configuradas, toda chamada em `/api/` retorna `401`, a menos que `CHATCLI_OPERATOR_DEV_MODE=true` (admin sem chave, só para desenvolvimento).
-- **Rate limit:** 30 requisições por minuto por host de cliente sem API key válida, 600 por minuto por chave válida (`429` com `Retry-After`).
-- **CORS:** deny-all, a menos que `CHATCLI_CORS_ALLOWED_ORIGINS` / `CHATCLI_CORS_ORIGIN` estejam definidos. **TLS:** defina `CHATCLI_AIOPS_TLS_CERT` e `CHATCLI_AIOPS_TLS_KEY` para servir HTTPS (TLS 1.3).
-- **Preview local:** `make dash-preview` em `operator/` serve o dashboard com dados sintéticos, sem cluster, em `http://127.0.0.1:8085` com a API key `preview`.
-
-  Toda réplica do operator serve a API REST e o dashboard na 8090, então `replicaCount > 1` funciona atrás do Service sem fixar as requisições na líder.
-
-Para referência completa da API, consulte a [API Reference](/pt/reference/api/overview).
-
-Quatro dashboards Grafana (JSON) estão em `deploy/grafana/`. O `dashboards-configmap.yaml` de lá traz só os dois ServiceMonitors (operator e servidor, este selecionando `app.kubernetes.io/name: chatcli`), não os dashboards: crie o ConfigMap nomeando cada arquivo JSON (veja [Web Dashboard](/pt/features/aiops/web-dashboard)) ou importe os JSONs manualmente.
-
 ## Componentes Internos
 
 ### 1. WatcherBridge (`watcher_bridge.go`)
@@ -51538,7 +51538,7 @@ O WatcherBridge é o ponto de entrada do pipeline. Implementa a interface `manag
 |--------|-----------|
 | `Start()` | Mantém a bridge ligada a uma Instance pronta: stream primeiro, fallback por polling, context cancelável |
 | `consumeStream()` | Mantém o stream StreamAlerts aberto, transforma cada alerta em Anomaly, reabre após 60s de silêncio |
-| `poll()` | Consulta GetAlerts uma vez (fallback para servidor sem StreamAlerts, com o stream tentado de novo a cada 10 minutos, ou `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll`) |
+| `poll()` | Consulta GetAlerts uma vez (fallback para servidor sem StreamAlerts, com o stream tentado de novo a cada 10 minutos ou quando esse servidor para de responder, ou `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll`) |
 | `discoverAndConnect()` | Descobre servidor via Instance CRs no cluster |
 | `createAnomaly()` | Converte alert → Anomaly CR (nome `watcher-<tipo>-<deployment>-<timestamp>`, no namespace do alerta) com labels de referência |
 | `alertHash()` | SHA256(type\|deployment\|namespace\|UID do recurso) para dedup |
@@ -52248,7 +52248,9 @@ graph TD
             namespace: production
     ```
 
-    Um target do watcher fora do namespace da Instance usa a ClusterRole pré-provisionada `chatcli-watcher` (criada pelo chart). Crie **uma** Instance para o AIOps por cluster: o pipeline se conecta à primeira Instance pronta que encontrar, no cluster inteiro.
+    Um target do watcher fora do namespace da Instance usa a ClusterRole pré-provisionada `chatcli-watcher` (criada pelo chart).
+
+    Crie **uma** Instance para o AIOps por cluster: o pipeline se conecta à primeira Instance pronta que encontrar, no cluster inteiro.
   
     `kubectl get instances -A` -- `READY` precisa estar `true`; confira as conditions `AuthenticationConfigured` e `ServerReachable` com `kubectl describe instance chatcli -n chatcli`.
   
@@ -60002,7 +60004,7 @@ O pod do operator fica Ready quando o `/readyz` (porta 8081) responde. Até voc�
   | `api.port` / `metrics.port` / `health.port` | `8090` / `8080` / `8081` | REST+dashboard, métricas Prometheus, probes |
   | `service.type` | `ClusterIP` | Tipo do Service `chatcli-operator` |
   | `prometheusUrl` | `""` | Prometheus que o operator consulta durante a análise de incidentes (`PROMETHEUS_URL`) |
-  | `alertTransport` | `stream` | `stream` (StreamAlerts; um servidor sem essa RPC, anterior à 1.211.0, é consultado por polling e o stream é tentado de novo a cada 10 minutos) ou `poll` (GetAlerts a cada 30s) |
+  | `alertTransport` | `stream` | `stream` (StreamAlerts; um servidor sem essa RPC, anterior à 1.211.0, é consultado por polling, e o stream é tentado de novo a cada 10 minutos ou assim que esse servidor sai) ou `poll` (GetAlerts a cada 30s) |
   | `decisionEngine.enabled` | `false` | Filtro de confiança e circuit breaker antes de um plano executar ([Decision Engine](/pt/features/aiops/decision-engine)) |
   | `clusterName` | `""` | Nome do ClusterRegistration deste cluster; o tier dele decide quais severidades esperam um humano. Um nome que nenhum registro carrega manda todo plano para aprovação manual |
   | `apiKeys.create` / `apiKeys.entries` | `false` / `[]` | Gera o Secret de keys do dashboard `chatcli-operator-secrets` a partir de entradas `{key, role, description}` |
@@ -60245,7 +60247,7 @@ O passo a passo cria uma Instance chamada `chatcli` no namespace `chatcli`. O op
 
 Uma Instance pronta é sondada de novo a cada cinco minutos, então `ServerReachable` e `VERSION` acompanham um servidor que foi atualizado, reiniciado ou perdeu a credencial. O `status.serverProbeTime` muda quando o resultado muda e, fora isso, no máximo uma vez por intervalo (sem loop de escrita de status).
 
-Uma sondagem que falha é repetida no mesmo ciclo de cinco minutos, não antes, então um `False` gravado enquanto os pods eram trocados pode sobreviver ao rollout por até cinco minutos. Qualquer mudança na Instance, inclusive uma anotação, dispara a reconciliação e a sondagem na hora, sem reiniciar os pods:
+Uma Instance pronta cuja última sondagem falhou é sondada de novo em 30 segundos, então um `False` gravado enquanto os pods eram trocados some logo depois do rollout. Qualquer mudança na Instance, inclusive uma anotação, também dispara a reconciliação e a sondagem na hora, sem reiniciar os pods:
 
 ```bash
 kubectl -n chatcli annotate instance chatcli chatcli.io/reprobe="$(date +%s)" --overwrite
@@ -60385,7 +60387,7 @@ spec:
 
 O que acontece em seguida:
 
-1. **Detecção.** O WatcherBridge (no líder do operator) mantém aberto o stream `StreamAlerts` do servidor (heartbeat a cada 15s; um servidor sem essa RPC, anterior à 1.211.0, é consultado com `GetAlerts` a cada 30s e o stream é tentado de novo a cada 10 minutos; `alertTransport: poll` força o polling) e cria recursos `Anomaly`, deduplicados por `aiops.dedupTTLMinutes` (padrão 30).
+1. **Detecção.** O WatcherBridge (no líder do operator) mantém aberto o stream `StreamAlerts` do servidor (heartbeat a cada 15s; um servidor sem essa RPC, anterior à 1.211.0, é consultado com `GetAlerts` a cada 30s, e o stream é tentado de novo a cada 10 minutos ou assim que esse servidor sai; `alertTransport: poll` força o polling) e cria recursos `Anomaly`, deduplicados por `aiops.dedupTTLMinutes` (padrão 30).
 2. **Correlação.** Anomalias no mesmo recurso são agrupadas numa `Issue` com risk score e severidade.
 3. **Análise.** Um `AIInsight` é criado e a RPC `AnalyzeIssue` do servidor pede ao LLM a causa raiz, enriquecida com contexto do Kubernetes, logs, métricas, estado de GitOps e código-fonte vinculado.
 4. **Remediação.** Um `RemediationPlan` executa um Runbook compatível, um runbook gerado pela IA ou um loop agêntico observar-decidir-agir (RPC `AgenticStep`), com 54 ações tipadas (mais `Custom`, que as verificações de segurança rejeitam), snapshot antes das ações e rollback automático. ApprovalPolicies, o decision engine e o tier do cluster podem segurar um plano para um humano.
@@ -60870,8 +60872,8 @@ Um upgrade troca o operator e, em toda Instance que segue a release do operator 
 1. **CRDs.** O Job de hook pre-upgrade reaplica os 17 CRDs (`kubectl apply --server-side`) antes de qualquer outra mudança.
 2. **Operator.** O Deployment do operator faz rollout: o pod novo fica Ready antes de o antigo parar, então o dashboard e a API REST continuam no ar. Os controllers reiniciam no pod novo.
 3. **Instances.** O operator novo renderiza de novo cada Instance. Uma Instance sem `spec.image.tag` recebe a imagem nova do servidor, e qualquer mudança no template do pod reinicia os pods dela. Com `persistence.enabled` a estratégia é `Recreate`: os pods antigos param antes de os novos subirem, então cada Instance assim fica um breve período fora do ar.
-4. **Sondagem.** O operator sonda cada servidor de novo. Uma sondagem que cai no meio do rollout pode gravar `ServerReachable=False` / `ProbeFailed` com `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` ou `i/o timeout`, mesmo que os pods novos já sirvam normalmente logo depois. Uma sondagem que falha é repetida no [ciclo normal de cinco minutos](#condições-da-instance); anote a Instance para sondar na hora.
-5. **Alertas.** O WatcherBridge reconecta. Se ele alcança um servidor anterior à 1.211.0, que não tem `StreamAlerts` (tipicamente um pod antigo ainda rodando), ele loga `Server has no StreamAlerts RPC; polling GetAlerts` e faz polling a cada 30 segundos por 10 minutos antes de tentar o stream de novo. Nenhum alerta se perde nesse meio-tempo. Para passar ao stream na hora, depois que os servidores terminarem o rollout, reinicie o operator: `kubectl -n chatcli-system rollout restart deploy/chatcli-operator`.
+4. **Sondagem.** O operator sonda cada servidor de novo. Uma sondagem que cai no meio do rollout pode gravar `ServerReachable=False` / `ProbeFailed` com `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` ou `i/o timeout`, mesmo que os pods novos já sirvam normalmente logo depois. Uma sondagem que falha é [repetida em 30 segundos](#condições-da-instance), então a condição vira `True` logo depois do rollout.
+5. **Alertas.** O WatcherBridge reconecta. Se ele alcança um servidor anterior à 1.211.0, que não tem `StreamAlerts` (tipicamente um pod antigo ainda rodando), ele loga `Server has no StreamAlerts RPC; polling GetAlerts` e faz polling a cada 30 segundos. Quando esse pod antigo sai, o próximo polling falha com `Unavailable`, o bridge loga `Server unavailable while polling; retrying the alert stream on reconnect` e abre o stream no servidor novo. Nenhum alerta se perde nesse meio-tempo.
 
 ### Verificar
 
@@ -60884,14 +60886,14 @@ kubectl -n chatcli get instance chatcli \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
 
-As cinco condições devem estar `True`. Se o `ServerReachable` ainda mostra o `False` gravado durante o rollout, espere a próxima sondagem ou sonde de novo com a anotação acima.
+As cinco condições devem estar `True`. Se o `ServerReachable` ainda mostra o `False` gravado durante o rollout, espere uns 30 segundos pela nova tentativa.
 
 ### Atravessando estas releases
 
 | Vindo de | O que muda | O que fazer |
 |----------|------------|-------------|
 | Antes da 1.199.0 | O provider `GITHUB_MODELS` foi removido. O CRD o recusa em `spec.fallback.providers[].name`, então, depois que o hook de CRDs roda, uma Instance que o lista ali falha na próxima escrita; em `spec.provider` o CRD ainda o aceita, mas o servidor não tem mais esse provider | Troque o `spec.provider` e toda entrada de fallback por outro provider **antes** do upgrade |
-| Antes da 1.211.0 | O servidor ganha o `StreamAlerts` | Espere até 10 minutos de polling logo depois do upgrade (passo 5 acima) |
+| Antes da 1.211.0 | O servidor ganha o `StreamAlerts` | Nada: o bridge faz polling enquanto um pod antigo responde e passa ao stream quando ele sai (passo 5 acima) |
 | 1.211.x ou anterior | O template do pod ganha as probes de startup, readiness e liveness e a anotação `chatcli.io/credentials-hash` | Os pods de toda Instance reiniciam uma vez, mesmo com `spec.image.tag` definido; planeje como um rollout do servidor |
 
 ### Desinstalar
@@ -60910,8 +60912,8 @@ Apague as Instances primeiro, com o operator ainda rodando: o finalizer delas (`
 | `ServerReachable=False`, `reading secret "...": ...` ou `key "..." not found in secret "..."` | Um Secret que o operator lê está ausente ou tem outra chave | Crie-o ou corrija `key` |
 | `ServerReachable=False`, `... verifies RS256 tokens (jwtPublicKeyRef) and the operator has no credential to present` | RS256 sem credencial para o operator | Defina `operatorTokenRef` ou `operatorClientCertSecretName` |
 | `ServerReachable=False` / `NotServing` | O servidor está desligando | Passageiro em rollouts; fora isso, leia o log do servidor |
-| `ServerReachable=False`, `ProbeFailed` com `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` ou `i/o timeout`, enquanto `Available=True` e `VERSION` já mostra a release nova | A sondagem rodou enquanto os pods eram trocados; uma sondagem que falha só é repetida no ciclo de cinco minutos | Espere a próxima sondagem, ou sonde agora: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite` |
-| Log do operator `Server has no StreamAlerts RPC; polling GetAlerts` logo depois de um upgrade | O WatcherBridge alcançou um servidor anterior à 1.211.0 (um pod antigo ainda rodando) e faz polling por 10 minutos antes de tentar o stream de novo | Nada se perde; espere, ou `kubectl -n chatcli-system rollout restart deploy/chatcli-operator` depois que os servidores terminarem o rollout |
+| `ServerReachable=False`, `ProbeFailed` com `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` ou `i/o timeout`, enquanto `Available=True` e `VERSION` já mostra a release nova | A sondagem rodou enquanto os pods eram trocados | Passageiro: uma sondagem que falha é repetida em 30 segundos. Para sondar agora: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite`. Se continuar `False`, os pods novos não estão respondendo: leia o log do servidor |
+| Log do operator `Server has no StreamAlerts RPC; polling GetAlerts` logo depois de um upgrade | O WatcherBridge alcançou um servidor anterior à 1.211.0 (um pod antigo ainda rodando) | Nada a fazer: ele passa ao stream assim que esse pod sai. Se o log continuar se repetindo, a Instance ainda roda um servidor antigo: confira `VERSION` e `spec.image.tag` |
 | Uma atualização da Instance é recusada com `spec.fallback.providers[0].name: Unsupported value: "GITHUB_MODELS"` depois de um upgrade | O provider foi removido na 1.199.0 e o CRD não o aceita mais na cadeia de fallback | Troque a entrada (e o `spec.provider`, se ele for `GITHUB_MODELS`) por um provider suportado |
 | `AuthenticationConfigured=False` / `CredentialMissing`, sem Deployment | Nenhuma credencial num bind alcançável | Defina um dos campos listados na mensagem |
 | `TLSConfigured=False` / `SecretNameMissing`, sem Deployment | `tls.enabled` sem `secretName` | Defina `spec.server.tls.secretName` |
@@ -70703,7 +70705,7 @@ security:
     keyFile: /etc/chatcli-operator/grpc/tls.key  # CHATCLI_GRPC_TLS_KEY
 ```
 
-A Instance mostra o que encontrou nas conditions do status: `TLSConfigured` fica `False` (e nenhum Deployment é criado) quando o TLS está ligado sem nome de Secret, `AuthenticationConfigured` fica `False` quando um servidor alcançável não tem credencial, `OperatorCredentialConfigured` diz qual credencial o operator apresenta e `ServerReachable` traz a última sonda, repetida a cada cinco minutos (inclusive a que falhou, então um `False` gravado durante um rollout pode persistir; veja [Condições da Instance](/pt/features/k8s-operator#condições-da-instance)). Rotacionar qualquer Secret referenciado por uma Instance reinicia os pods dela.
+A Instance mostra o que encontrou nas conditions do status: `TLSConfigured` fica `False` (e nenhum Deployment é criado) quando o TLS está ligado sem nome de Secret, `AuthenticationConfigured` fica `False` quando um servidor alcançável não tem credencial, `OperatorCredentialConfigured` diz qual credencial o operator apresenta e `ServerReachable` traz a última sonda, repetida a cada cinco minutos, ou a cada 30 segundos depois de uma sondagem que falhou (veja [Condições da Instance](/pt/features/k8s-operator#condições-da-instance)). Rotacionar qualquer Secret referenciado por uma Instance reinicia os pods dela.
 
 ---
 
@@ -83594,7 +83596,7 @@ A REST API e o dashboard web autenticam pelo header `X-API-Key`. As chaves são 
 | Variável | Descrição | Padrão |
 | --- | --- | --- |
 | `CHATCLI_OPERATOR_DEV_MODE` | `true` aceita toda chamada à REST/dashboard como `admin` enquanto **nenhuma** API key estiver configurada (existindo uma chave, as chaves passam a valer). Lida com semântica booleana, sem diferenciar maiúsculas: `true`, `TRUE`, `1` e `t` a ligam, qualquer outro valor (inclusive ausente) a deixa desligada; a checagem de auth, o rate limiter e o log de startup usam essa mesma leitura. Só para desenvolvimento. Helm: `security.devMode`. | `false` |
-| `CHATCLI_OPERATOR_ALERT_TRANSPORT` | Como a WatcherBridge recebe alertas: `stream` (StreamAlerts; polling enquanto o servidor não o tem, com o stream tentado de novo a cada 10 minutos) ou `poll` (a cada 30s). Qualquer outro valor derruba o operator na inicialização. Helm: `alertTransport`. | `stream` |
+| `CHATCLI_OPERATOR_ALERT_TRANSPORT` | Como a WatcherBridge recebe alertas: `stream` (StreamAlerts; polling enquanto o servidor não o tem, com o stream tentado de novo a cada 10 minutos ou assim que esse servidor sai) ou `poll` (a cada 30s). Qualquer outro valor derruba o operator na inicialização. Helm: `alertTransport`. | `stream` |
 | `CHATCLI_OPERATOR_DECISION_ENGINE` | `true` submete todo RemediationPlan à confiança ajustada da IA, à severidade e a um circuit breaker por namespace. Helm: `decisionEngine.enabled`. | `false` |
 | `CHATCLI_OPERATOR_CLUSTER_NAME` | Nome da ClusterRegistration deste cluster; o tier dela decide quais severidades esperam por um humano. Um nome que nenhuma ClusterRegistration carrega manda todo plano para aprovação manual. Helm: `clusterName`. | vazio (desligado) |
 | `CHATCLI_AIOPS_PORT` | Porta da REST API e do dashboard web (servidos em todas as réplicas do operator). Helm: `api.port`. | `8090` |
@@ -92464,7 +92466,7 @@ The REST API and web dashboard authenticate with the `X-API-Key` header. Keys ar
 | Variable | Description | Default |
 | --- | --- | --- |
 | `CHATCLI_OPERATOR_DEV_MODE` | `true` admits every REST/dashboard call as `admin` while **no** API key is configured (once a key exists, keys are enforced). Read with boolean semantics, case-insensitively: `true`, `TRUE`, `1` and `t` turn it on, anything else (unset included) leaves it off; the auth check, the rate limiter and the startup log share this one parse. Development only. Helm: `security.devMode`. | `false` |
-| `CHATCLI_OPERATOR_ALERT_TRANSPORT` | How the WatcherBridge receives alerts: `stream` (StreamAlerts; polling while the server lacks it, with the stream retried every 10 minutes) or `poll` (every 30s). Any other value stops the operator at startup. Helm: `alertTransport`. | `stream` |
+| `CHATCLI_OPERATOR_ALERT_TRANSPORT` | How the WatcherBridge receives alerts: `stream` (StreamAlerts; polling while the server lacks it, with the stream retried every 10 minutes or as soon as that server goes away) or `poll` (every 30s). Any other value stops the operator at startup. Helm: `alertTransport`. | `stream` |
 | `CHATCLI_OPERATOR_DECISION_ENGINE` | `true` gates every RemediationPlan on adjusted AI confidence, severity and a per-namespace circuit breaker. Helm: `decisionEngine.enabled`. | `false` |
 | `CHATCLI_OPERATOR_CLUSTER_NAME` | This cluster's ClusterRegistration name; its tier decides which severities wait for a human. A name no ClusterRegistration carries sends every plan to manual approval. Helm: `clusterName`. | empty (off) |
 | `CHATCLI_AIOPS_PORT` | Port of the REST API and web dashboard (served on every operator replica). Helm: `api.port`. | `8090` |
