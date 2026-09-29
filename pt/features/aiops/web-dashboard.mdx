@@ -1,7 +1,7 @@
 ---
 title: "Web Dashboard e Grafana"
 sidebarTitle: "Dashboard & Grafana"
-description: "Dashboard web embutido e dashboards Grafana pré-configurados para observabilidade."
+description: "O dashboard web embutido no operator (API keys, publicação atrás de um Ingress) e dashboards Grafana pré-configurados para observabilidade."
 icon: "chart-mixed"
 ---
 
@@ -532,7 +532,7 @@ Exemplos de queries PromQL para dashboards ou alertas:
 
 
 
-## Acesso ao Dashboard
+## Acessar e publicar o dashboard
 
 <Steps>
   <Step title="Verificar o operator">
@@ -553,7 +553,7 @@ Exemplos de queries PromQL para dashboards ou alertas:
     Abra `http://127.0.0.1:8085/` e entre com a API key `preview`, que carrega o papel admin para que aprovações, revisões e feedback de post-mortem possam ser exercitados. O seed cobre todas as abas: issues em todos os estados, um AI insight, planos de remediação, uma aprovação pendente, um post-mortem, SLOs, clusters, eventos de auditoria e runbooks com passos. Defina `DASHPREVIEW_ADDR` para trocar o endereço. A ferramenta vive em `operator/hack/dashpreview` e nunca faz parte da imagem do operator.
   </Step>
   <Step title="Configurar as API Keys">
-    O operator lê as API keys do Secret `chatcli-operator-secrets` (chave `api-keys`) no próprio namespace, com fallback para o ConfigMap `chatcli-operator-config` (mesma chave). Nenhum chart o cria. O valor é uma lista YAML; as roles são `viewer`, `operator` e `admin` (qualquer outra role é negada):
+    O operator lê as API keys do Secret `chatcli-operator-secrets` (chave `api-keys`) no próprio namespace, com fallback para o ConfigMap `chatcli-operator-config` (mesma chave). Crie-o você mesmo como abaixo, ou deixe o chart do operator renderizá-lo (`apiKeys.create: true` com `apiKeys.entries`; as keys ficam então guardadas na release do Helm, então não faça os dois). O valor é uma lista YAML; as roles são `viewer`, `operator` e `admin` (qualquer outra role é negada):
 
     ```bash
     # Gere cada chave com, por exemplo, `openssl rand -hex 32`
@@ -571,6 +571,13 @@ Exemplos de queries PromQL para dashboards ou alertas:
     ```
 
     Mudanças são aplicadas em cerca de 30 segundos, sem restart. Uma edição que deixa YAML inválido mantém em vigor o último conjunto de chaves válido (o operator registra o erro no log). Sem nenhuma chave configurada, toda chamada a `/api/` devolve `401` (a página carrega, mas não consegue entrar).
+
+    Para ler as keys de volta, por exemplo para entrar a partir de um navegador novo:
+
+    ```bash
+    kubectl -n chatcli-system get secret chatcli-operator-secrets \
+      -o jsonpath='{.data.api-keys}' | base64 -d
+    ```
   </Step>
   <Step title="Port-forward (desenvolvimento)">
     Para acesso local durante desenvolvimento:
@@ -581,8 +588,8 @@ Exemplos de queries PromQL para dashboards ou alertas:
 
     Acesse: `http://localhost:8090/`
   </Step>
-  <Step title="Ingress (produção)">
-    Para acesso em produção, configure um Ingress na frente do Service do operator:
+  <Step title="Publicar com um Ingress (produção)">
+    Sirva o dashboard na **raiz de um host só dele**. A página chama `/api/v1/...` e `/healthz` com caminhos absolutos, então sob um sub-path (`/chatcli` com rewrite ou strip-path) a página carrega mas todos os painéis falham; rotear `/api/v1` à parte no host compartilhado só esconde o problema e publica a API em todos os hosts daquele controller.
 
     ```yaml
     apiVersion: networking.k8s.io/v1
@@ -590,9 +597,8 @@ Exemplos de queries PromQL para dashboards ou alertas:
     metadata:
       name: chatcli-dashboard
       namespace: chatcli-system
-      annotations:
-        nginx.ingress.kubernetes.io/ssl-redirect: "true"
     spec:
+      ingressClassName: nginx        # a classe do seu controller: nginx, kong, traefik...
       tls:
         - hosts: ["aiops.example.com"]
           secretName: aiops-tls
@@ -604,12 +610,19 @@ Exemplos de queries PromQL para dashboards ou alertas:
                 pathType: Prefix
                 backend:
                   service:
-                    name: chatcli-operator
+                    name: chatcli-operator   # <release>-chatcli-operator com outro nome de release
                     port:
-                      number: 8090
+                      name: api              # 8090
     ```
 
-    Para servir HTTPS direto do operator (TLS 1.3), defina `CHATCLI_AIOPS_TLS_CERT` e `CHATCLI_AIOPS_TLS_KEY` com arquivos de certificado e chave dentro do container do operator. A API REST permite 30 requisições por minuto por host de cliente para requisições sem API key válida e 600 por minuto por chave válida; o tráfego do dashboard carrega a chave, então navegadores atrás de um mesmo Ingress não dividem a cota. Chamadas cross-origin são negadas a menos que liberadas com `CHATCLI_CORS_ALLOWED_ORIGINS` (chart `security.corsAllowedOrigins`); o dashboard em si é same-origin e não precisa de configuração de CORS.
+    - **Qualquer controller:** a regra acima não precisa de anotação do controller. Não adicione reescrita de caminho (`nginx.ingress.kubernetes.io/rewrite-target`, `konghq.com/strip-path`, um middleware `StripPrefix` do Traefik): com `path: /` não há nada a remover.
+    - **TLS:** termine no Ingress como acima, ou sirva HTTPS (TLS 1.3) direto do operator com `security.apiTLS.certFile`/`keyFile` do chart (`CHATCLI_AIOPS_TLS_CERT`/`CHATCLI_AIOPS_TLS_KEY`), montando o certificado com `extraVolumes`/`extraVolumeMounts`. Um backend que serve TLS precisa da configuração de protocolo de backend do controller (no ingress-nginx, `nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"`).
+    - **Cluster local (kind, k3d, Docker Desktop):** quando o ingress controller atende em `localhost`, use um nome sob `.localhost`, por exemplo `host: aiops.localhost`, e tire o bloco `tls`. Navegadores, `curl`, macOS e `systemd-resolved` mandam todo nome `*.localhost` para o endereço de loopback, então não é preciso DNS nem entrada no `/etc/hosts`.
+    - **Métricas:** não publique a porta de métricas (8080) pelo mesmo Ingress: ela é HTTP puro, sem autenticação.
+    - **Rate limit:** 30 requisições por minuto por host de cliente para requisições sem API key válida, 600 por minuto por key válida. Atrás de um Ingress toda requisição sem key vem do controller, então elas dividem uma cota só; o tráfego do dashboard carrega a key, então navegadores logados não dividem.
+    - **CORS:** chamadas cross-origin são negadas a menos que liberadas com `security.corsAllowedOrigins` (`CHATCLI_CORS_ALLOWED_ORIGINS`); o dashboard em si é same-origin e não precisa de configuração de CORS.
+
+    Confira: `curl -s https://aiops.example.com/healthz` responde `{"status":"ok",...}`, e `curl -s -o /dev/null -w '%{http_code}' https://aiops.example.com/api/v1/incidents` responde `401` sem key.
   </Step>
 </Steps>
 
