@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Regenerates the ChatCLI banner on the introduction pages (EN and pt) from
+# Regenerates the ChatCLI banner on the home pages (EN and pt) from
 # the logo the CLI prints at startup (cli/welcome.go, printLogo), as an SVG
 # whose colors come from style.css. Run from the docs root:
 #   CHATCLI_REPO=/path/to/chatcli python3 scripts/gen-intro-banner.py
@@ -15,12 +15,20 @@ X1,X2=2,4           # double-line offsets across a cell
 Y1,Y2=3.5,6.5
 cols=max(len(l) for l in lines); rows=len(lines)
 def f(v): return ('%g'%v)
+def mix(t):
+    # coral -> orange (at 55%) -> amber, the stops defined in style.css
+    if t<=0.55: a,b,u='--cb-a','--cb-b',t/0.55
+    else: a,b,u='--cb-b','--cb-c',(t-0.55)/0.45
+    return 'color-mix(in oklch, var(%s) %d%%, var(%s))'%(a,round((1-u)*100),b)
 fills=[]; edges=[]
 for r,line in enumerate(lines):
-    for m in re.finditer(r'█+', line):
-        c,n=m.start(),len(m.group(0))
-        # a hair of overlap so adjacent rows never show an anti-aliasing seam
-        fills.append('<rect x="%s" y="%s" width="%s" height="%s" />'%(f(c*W),f(r*H-0.05),f(n*W),f(H+0.1)))
+    for c,ch in enumerate(line):
+        if ch!='█': continue
+        # One cell per column, colored by its column like the CLI's
+        # left-to-right gradient. Mintlify strips <linearGradient> from inline
+        # SVG, so each cell mixes the theme's stops (style.css) itself.
+        # A hair of overlap so adjacent cells never show an anti-aliasing seam.
+        fills.append('<rect x="%s" y="%s" width="%s" height="%s" style={{fill: "%s"}} />'%(f(c*W-0.05),f(r*H-0.05),f(W+0.1),f(H+0.1),mix(c/(cols-1))))
     for c,ch in enumerate(line):
         x,y=c*W,r*H
         P=lambda pts:'<path d="M%s" />'%' L'.join('%s %s'%(f(x+a),f(y+b)) for a,b in pts)
@@ -41,11 +49,15 @@ svg='''<div data-chatcli-banner="" className="chatcli-banner">
 %s
     </g>
   </svg>
-</div>'''%(vb,'\n'.join('      '+e for e in edges),'\n'.join('      '+e for e in fills))
-for p in ('introduction.mdx','pt/introduction.mdx'):
+</div>
+<div className="cb-prompt" aria-hidden="true"><span className="cb-prompt-sign">$</span> chatcli<span className="cb-cursor" /></div>'''%(vb,'\n'.join('      '+e for e in edges),'\n'.join('      '+e for e in fills))
+for p in ('index.mdx','pt/index.mdx'):
     s=open(p,encoding='utf-8').read()
     i=s.index('<div role="img" aria-label="ChatCLI"') if '<div role="img" aria-label="ChatCLI"' in s else s.index('<div data-chatcli-banner=""')
     j=s.index('\n</div>\n',i)+len('\n</div>')
+    # the prompt line under the art is part of the generated block
+    if s.startswith('\n<div className="cb-prompt"',j):
+        j=s.index('</div>',j+1)+len('</div>')
     s=s[:i]+svg+s[j:]
     open(p,'w',encoding='utf-8').write(s)
 print('banner: %d rects, %d strokes, viewBox %s' % (len(fills), len(edges), vb))

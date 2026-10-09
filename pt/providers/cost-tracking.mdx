@@ -1,0 +1,387 @@
+---
+title: "Cost Tracking"
+sidebarTitle: "Cost Tracking"
+description: "Rastreie custos de token por sessão em todos os modos, com dados reais de API, orçamento, persistência e subcomandos do /cost"
+icon: "money-bill-trend-up"
+---
+
+O **Cost Tracking** do ChatCLI monitora o consumo de tokens e estima custos em tempo real durante suas sessões, usando dados reais de uso da API de todos os providers que os reportam. Você inspeciona a sessão viva com `/cost`, fecha e reinicia o período de contabilidade com `/cost reset`, revisa sessões passadas com `/cost last` e `/cost sessions`, exporta snapshots legíveis por máquina com `/cost export`, e configura limites de gasto — incluindo um hard stop opcional.
+
+---
+
+## Comando /cost
+
+`/cost` renderiza o resumo da sessão viva; quatro subcomandos gerenciam o período de contabilidade:
+
+| Comando | O que faz |
+|:--------|:----------|
+| `/cost` | Resumo da sessão viva: tokens, cache, custos por modelo, orçamento |
+| `/cost reset` | Fecha e persiste o período atual, começa um novo do zero |
+| `/cost last` | Mostra o snapshot persistido anterior (aceita também `--last`, `-l`) |
+| `/cost sessions` | Lista snapshots recentes, do mais novo para o mais antigo |
+| `/cost export [caminho]` | Grava o snapshot atual em JSON (por padrão no cost store) |
+
+O resumo é renderizado como um painel em caixa (os valores abaixo são autoconsistentes para `claude-sonnet-5`):
+
+```text
+╭─ $ Session cost ─────────────────────────────────────
+│  Provider:  CLAUDEAI
+│  Model:     claude-sonnet-5
+│  Duration:  23m15s
+│  Requests:  14
+│  Source:    dados reais da API
+│
+│  Tokens:
+│    Input:    45.2K   ████████████████████
+│    Output:   12.8K   █████
+│    Total:    58.0K
+│    Processados: 98.2K  (input + leituras de cache + escritas de cache + output)
+│
+│  Cache Tokens:
+│    Created:  2.1K
+│    Read:     38.1K
+│  Economia do cache:
+│    Desconto de leitura:  $0.1029   (38.1K leituras cobradas abaixo do preço de input)
+│    Prêmio de escrita:    -$0.0016  (2.1K escritas cobradas acima do preço de input)
+│    Economia líquida:     $0.1013
+│    Sem cache:            $0.4482   real $0.3469 · 23% economizado
+│
+│  Cache de prompt: 14 requisições · 91% do input vindo do cache · 0 misses instáveis · 0 expirados · 1 rebuilds esperados quente (TTL 5m, última atividade há 40s)
+│  razão write/read 0.06 (escritas sobre leituras de cache; um prefixo que só cresce fica bem abaixo de 1)
+│
+│  Cost:
+│    claudeai/claude-sonnet-5: (API)
+│      Input:   $0.1356
+│      Output:  $0.1920
+│      Cache:   $0.0193
+│
+│    Total:   $0.3469
+╰──────────────────────────────────────────────────────
+```
+
+<Info>
+A linha **Source** reporta se a sessão tem uso real de API; cada linha de modelo no breakdown de custo carrega adicionalmente sua própria tag — `(API)` para contagens reportadas pelo provider, `(estimativa)` para estimativa por caracteres — porque uma sessão pode misturar as duas. Reasoning tokens (o-series / GPT-5 / thinking do Gemini) ganham uma linha informativa própria quando presentes; já estão cobrados dentro de Output.
+</Info>
+
+Modelos que **não casaram com nenhuma entrada da tabela de preços** não são descartados em silêncio: o `/cost` os lista explicitamente (`Sem tabela de preço para: provider/modelo — esse gasto NÃO está no total.`), então um total sub-reportado sempre fica visível como tal.
+
+---
+
+## Cache de Prompt por Provedor
+
+O ChatCLI monta toda requisição com a parte que não muda entre turnos primeiro (system prompt, contextos anexados, catálogo de tools) e pede ao provedor para cacheá-la onde a API oferece um mecanismo para isso. A linha **Cache de prompt** do `/cost` e o `cache NN%` do rodapé do chat/agent são neutros de provedor: são calculados a partir dos campos de cache que cada provedor reporta, nos dois esquemas de contagem (Anthropic/Bedrock contam leituras de cache *além* do input; OpenAI/Gemini/Grok/Kimi contam como *subconjunto* do prompt).
+
+- **requisições** — quantas chamadas reportaram atividade de cache.
+- **% do input vindo do cache** — parcela do input da sessão servida pelo cache.
+- **misses instáveis** — requisições que perderam o prefixo quando ele deveria estar quente. Cada requisição é julgada contra o que a anterior do mesmo provedor deixou legível: na Anthropic e no Bedrock tudo o que a anterior leu mais o que escreveu; na OpenAI, Gemini, xAI e Kimi o prompt inteiro da anterior. Ler de volta bem menos que isso (abaixo de 90%, ou 80% nos caches por bloco do esquema subconjunto) é a assinatura de um prefixo estável que mudou (troca de modelo/effort, conjunto de tools MCP, anexo atualizado). Uma escrita grande ou um prompt grande sozinhos nunca são miss — é assim que um tool result grande ou um arquivo colado aparecem num prefixo perfeitamente estável. Três misses instáveis seguidos imprimem um aviso único.
+- **atribuição** — o cache de prompt de todo provider é chaveado por prefixo sobre as mesmas regiões na mesma ordem: definições de tools, blocos system, mensagens. Antes de cada requisição o ChatCLI faz o fingerprint dessas regiões e compara a lista com a da requisição anterior, então um prefixo perdido é creditado à primeira região que mudou: `conjunto de tools mudou`, `bloco system N mudou`, `mensagem N (tool result / bloco de skills / turn context / mensagem do usuário …) mudou`, `histórico encolheu`. Uma perda numa requisição que só cresceu no fim é reportada como `nenhuma mudança na requisição (lado do servidor ou tempo de vida)` em vez de culpar o prompt. O `/cost` imprime a tabela (`prefixos perdidos por causa`) e os últimos cinco eventos (`#7 rebuild esperado · tempo de vida do cache promovido para 1h`). Quando o `auto` promove o tempo de vida para uma hora depois de uma expiração observada, a linha de saúde diz quando (`promovido para 1h em +13m`), e a única reescrita que os marcadores novos forçam na requisição seguinte é declarada e atribuída à promoção em vez de contada como instabilidade.
+- **faixas** — a linha de saúde, os contadores de miss e a razão write/read descrevem **só a conversa principal**. O prompt de extração do memory worker e o loop próprio de um worker de squad compartilham o provider mas não o prefixo, então suas requisições entram em faixas próprias: contam em todo número de tokens e dólares, mas nunca como prefixo perdido da sua conversa. Seus buckets brutos de cache continuam no log por requisição.
+- **expirados** — o prefixo foi perdido depois de uma pausa que o cache não sobreviveu (mais de 5 minutos ocioso, menos de uma hora). Contado à parte porque não diz nada sobre a estabilidade do prefixo; é também a evidência que a [promoção para o TTL de uma hora](/pt/context/prefix-curation) usa.
+- **por provedor** — "primeira requisição" e a razão de acertos são por provedor (cada um tem seu cache e seu schema), então trocar de provedor nunca gasta a "primeira" do outro, e a razão mostrada é a do último provedor usado. Nos provedores de schema-subconjunto (OpenAI, Gemini, xAI, Kimi) um prompt no mínimo cacheável ou acima, servido com `cached_tokens: 0` depois da primeira requisição daquele provedor, conta como miss — então o alerta de 3 misses funciona neles também. O Bedrock reporta o TTL que o marcador de fato carregou (1h em Claude 4.5+ quando configurado).
+- **rebuilds esperados** — misses causados pelo próprio ChatCLI ao mudar o prefixo de propósito: reescrever a conversa (auto-compact, `/compact`, microcompact, skill aging, recovery de overflow, edições de contexto do provedor) ou trocar o que o prefixo contém (`/switch` de provedor ou modelo, `/agent attach|detach`, `/context attach|detach`, `/session load|attach`, start/stop/restart/reload/login/logout de servidor MCP, `pin|unpin` de skill), além de reescrever a conversa (auto-compact, `/compact`, microcompact, envelhecimento de skills). Não é problema.
+- **quente / frio** — se a última atividade ainda está dentro do TTL do cache.
+
+| Provedor | Mecanismo de cache na requisição | Telemetria |
+| --- | --- | --- |
+| Anthropic (API key, token, OAuth) | `cache_control` nos blocos de system, na última definição de tool e um **breakpoint rolante na última mensagem de user/tool-result** (a própria conversa vira prefixo cacheável); `CHATCLI_PROMPT_CACHE_TTL=1h` para o tempo de vida estendido | Split de leitura/escrita, incl. a parcela de escrita de 1 hora precificada a 2× |
+| AWS Bedrock — Claude (InvokeModel, Mantle) | Mesmos marcadores, um único tempo de vida no bloco de system e no breakpoint do histórico (a Anthropic exige que breakpoints mais longos venham antes dos mais curtos); `cache_control.ttl=1h` em Claude 4.5+ quando `CHATCLI_PROMPT_CACHE_TTL` resolve para `1h` (Claude 3.x e 4.0/4.1 ficam no padrão de 5 minutos do wire) | ✅ incl. a parcela de escrita de 1 hora |
+| AWS Bedrock — Converse (Amazon Nova, Claude via Converse) | `cachePoint` após os blocos de system e na última mensagem do user, com `ttl: 1h` sob a mesma regra de Claude 4.5+; os demais vendors do Converse rejeitam o bloco e seguem automáticos | ✅ (`TokenUsage` cache read/write, split de 1 hora em `cacheDetails`) |
+| OpenAI (Chat Completions, streaming, tools, Responses API) | `prompt_cache_key` derivado do system prompt para que todo turno de uma sessão caia no mesmo shard de cache; o cache em si é automático (≥ 1.024 tokens); em gpt-5.5 / gpt-5.5-pro `prompt_cache_retention: 24h` quando `CHATCLI_PROMPT_CACHE_TTL` resolve para `1h` (gpt-5.6+ migrou para `prompt_cache_options`, cujo único ttl é 30m — nada é enviado) | ✅ (`cached_tokens`) |
+| OpenRouter | `cache_control` em system e na última mensagem do user para modelos `anthropic/` (com o `ttl` configurado) e `google/` (5 minutos, fixo no upstream); `prompt_cache_key` para modelos `openai/`; no máximo quatro blocos `cache_control` por requisição (limite do upstream); os demais vendors cacheiam automaticamente | ✅ |
+| Google Gemini | Cache implícito (automático no 2.5+, favorecido pelo prefixo estável-primeiro). **`cachedContents` explícito** opt-in com `CHATCLI_PROMPT_CACHE_EXPLICIT=true`: a system instruction vira um recurso de cache referenciado por todo turno (veja abaixo) | ✅ (`cachedContentTokenCount`, leituras em cache a 10% do input) |
+| xAI Grok, Z.AI GLM, Moonshot Kimi, MiniMax, GitHub Copilot, DeepSeek (via OpenRouter) | Cache automático do lado do provedor em prefixos repetidos; xAI, Z.AI, Moonshot, MiniMax (caminho compatível com OpenAI) e Copilot também recebem `prompt_cache_key` (ignorado onde o upstream não roteia por ele; a família OpenAI do Bedrock é um upstream com schema validado e não recebe; a API compatível com Anthropic do MiniMax não documenta `cache_control`); a API não tem campo na requisição | ✅ onde a API reporta `cached_tokens` |
+| Ollama | Reuso local do KV cache em prefixos idênticos | — |
+| StackSpot, OpenAI Assistants, Devin CLI | Threads gerenciadas no servidor / sem API de cache | O Devin reporta seu split de cache; os demais — |
+
+### Prefixo byte-estável e a mensagem de contexto do turno
+
+Todo provider cacheia por prefixo, então um system message que muda entre turnos faz todo breakpoint depois dele errar. O ChatCLI mantém o system message **byte-estável na sessão**: tudo que muda por turno — a data (resolução de dia), o recall proativo de memória e de sessões, skills auto-ativadas e manuais, pushes de canais MCP, o snapshot do watcher, passagens recuperadas — vai numa única mensagem com papel de usuário marcada `turn_context`, colocada logo antes do seu turno e persistida com a conversa, então a próxima requisição repete bytes idênticos até o breakpoint anterior. Chat, as superfícies RPC e agent/coder compartilham o mecanismo; a mensagem injetada é rotulada nas exportações e ignorada pela extração de memória e pelos hints de recall. O `prompt_cache_key` da OpenAI hasheia só as partes estáveis marcadas para cache, e o budget do prefixo congela sua razão chars/token por sessão para que seções cacheadas não dobrem e desdobrem entre turnos.
+
+### Recursos explícitos de cache (Gemini)
+
+O cache implícito é gratuito e automático. O Gemini também expõe o cache como **recurso** (`cachedContents`), com desconto garantido em toda leitura e cobrado como **storage por token-hora** (Flash $1,00/M/h, Pro $4,50/M/h, 3.x Flash $0,50/M/h). Como essa cobrança nunca aparece na resposta, é opt-in: `CHATCLI_PROMPT_CACHE_EXPLICIT=true`. A política é conservadora de propósito:
+
+- O recurso carrega a **system instruction inteira**; a requisição o referencia e omite `system_instruction`.
+- Só prompts de cerca de **4K+ tokens** se qualificam, e o mesmo prompt precisa aparecer em **duas requisições consecutivas** antes de criar o recurso — um one-shot nunca paga storage.
+- O tempo de vida é `CHATCLI_PROMPT_CACHE_TTL` (`5m`, `1h` ou `auto`), estendido quando resta menos da metade; o recurso é apagado quando o prompt muda e no encerramento.
+- Recurso rejeitado pela API (expirado, apagado, abaixo do piso) é descartado e o turno é **reenviado inline** — um cache nunca derruba um turno. Recusas colocam o prompt em backoff por 10 minutos, e uma resposta "too small" ensina o piso.
+- `/cost` mostra o storage comprado (`Storage de cache: N recurso(s) · $x`) e o soma no total da sessão; o valor é persistido com o snapshot de custo.
+
+### Custo de embeddings
+
+Toda chamada de embedding do provedor configurado (retrieval de conhecimento e aquecimentos, vetores de memória, HyDE) é medida: os tokens são estimados por caracteres na tarifa de lista do provedor por milhão de tokens, e o `/cost` imprime `Embeddings: N chamada(s) · ~T tokens (estimados por caracteres) · $x`. Ollama mede a $0. O valor entra no total da sessão e persiste com o snapshot.
+
+### Gasto em background e atribuição
+
+Toda requisição é contabilizada na chamada que a fez. O usage do sumarizador de Nível 2 é lido da própria chamada (um engine de contexto externo, um retorno antecipado ou uma falha não contabilizam nada; um resumo repetido cobra as duas chamadas). O memory worker (extração, rollups, compactação de memória) roda no próprio cliente — `CHATCLI_COMPACT_MODEL` quando definido, senão uma instância dedicada do modelo da sessão — e por isso nunca sobrescreve o usage do turno interativo; respeita `CHATCLI_BUDGET_HARD_STOP` como qualquer outro chamador e o `/cost` imprime `Memory worker: N chamada(s) · $x`. Uma resposta em streaming que termina sem bloco de usage é contabilizada como estimativa por caracteres (marcada como tal) em vez de sair de graça, e os providers zeram o usage antes de cada requisição para que uma resposta sem usage nunca re-contabilize a chamada anterior. Tokens de thinking do Gemini (`thoughtsTokenCount`) são cobrados por cima da contagem de candidates; tokens de reasoning da OpenAI já estão dentro de `completion_tokens` e ficam só informativos.
+
+### Custo de compactação
+
+O `/cost` também imprime `Compactações: N (nível 3: M) · sumarizador $x` depois que o histórico foi compactado: quantas vezes, quantas caíram no Nível 3 (truncagem de emergência) e o que o sumarizador do Nível 2 consumiu. A requisição do sumarizador é uma requisição real na rota da sessão (ou em `CHATCLI_COMPACT_MODEL`), então entra nos totais da sessão como qualquer turno; os contadores persistem com a sessão. Veja [context recovery](/pt/context/context-recovery#o-que-cada-nível-garante) para o back-off que para de pagar o sumarizador quando ele não converge.
+
+O context caching da Moonshot/Kimi é **totalmente automático** na plataforma atual (sem ids de cache nem API de gerenciamento; a requisição anterior precisa passar de 256 tokens de prompt), então nada é criado lá — o split `cached_tokens` é o que o tracker precifica.
+
+---
+
+## Contagem de tokens por provedor
+
+O `ctx %` do rodapé, o orçamento de compactação e o `/context status` compartilham **uma única estimativa** com quatro categorias — system prompt, histórico, definições de tools nativas e reserva da resposta (`max_tokens` como enviado, limitado a um quarto da janela) — o mesmo detalhamento que o `/context` do Claude Code mostra. O rodapé mostra a reserva à parte — `ctx 2% (+14% reserva)` — para uma conversa nova nunca parecer uma janela capada: o primeiro número é o que já ocupa a janela, o segundo é o espaço que a próxima requisição precisa deixar livre para a resposta (os provedores exigem `entrada + max_tokens ≤ janela`; um `/max-tokens` menor encolhe a reserva). O `/context status` imprime as duas últimas linhas, e o compactador reserva o prompt e as definições de tools ao lado do histórico que mede. O orçamento de passagens recuperadas escala com a janela (no máximo 24K chars, 15% da janela em chars, piso de 4K). A razão chars/token por trás dessa estimativa, da projeção do `/context status` e do orçamento de compactação é aprendida do **usage real** de todos os provedores (a mesma cobertura de 14 provedores da tabela abaixo), então é exata após o primeiro turno em qualquer lugar. Provedores que também expõem uma **API de contagem**, e a família GPT por um **tokenizer local**, ancoram a razão antes de a requisição sair — uma contagem gratuita a cada 8 turnos de chat e no `/context status`, que então mostra o tamanho do histórico vivo contado pelo provedor:
+
+| Provedor | Mecanismo de contagem | Uso |
+| --- | --- | --- |
+| **GPT em todo lugar** — OpenAI (Chat Completions, Responses), Copilot, OpenRouter `openai/*`, família OpenAI no Bedrock | tokenizer local com o encoding BPE do próprio modelo (`o200k_base` para 4o/4.1/4.5/5.x e série o, `cl100k_base` para GPT-4/3.5); o vocabulário é baixado uma vez do blob público da OpenAI e cacheado em `~/.chatcli/tokenizers` (sem chave, nada embutido no binário), aquecido no boot em sessões GPT; cache frio carrega em background e nunca segura um turno | calibração exata, `/context status` |
+| Anthropic (API key, token, OAuth) | `POST /v1/messages/count_tokens` — mesmas mensagens, blocos de system e marcadores de cache do envio | calibração exata, `/context status` |
+| Google Gemini | `models/{model}:countTokens` com o `generateContentRequest` completo | calibração exata, `/context status` |
+| AWS Bedrock | `CountTokens` (input Converse para a família Converse, corpo InvokeModel para Claude; GPT pelo tokenizer local) | calibração exata, `/context status` |
+| Moonshot Kimi | `POST /v1/tokenizers/estimate-token-count` | calibração exata, `/context status` |
+| Z.AI GLM | `POST /api/paas/v4/tokenizer` (endpoint do coding plan respeitado) | calibração exata, `/context status` |
+| xAI, MiniMax, Ollama, StackSpot, Devin, modelos não-GPT no OpenRouter | sem API de contagem publicada | razão calibrada por usage (exata por turno via `prompt_tokens`) |
+
+Uma contagem que falha ou demora (limite de 10 s) nunca afeta um turno: a razão aprendida simplesmente permanece.
+
+As razões aprendidas são **persistidas** em `~/.chatcli/calibration.json` (escrita atômica, descarregada na saída) e recarregadas no próximo start, então um processo novo não recomeça em 4 chars por token. Sob o [gateway](/pt/gateway/chat-gateway) o arquivo fica sob a raiz de cada tenant, então tenants nunca compartilham razões. Toda estimativa da CLI lê a mesma razão aprendida: o budget de processamento de arquivos, `/metrics`, `/context list` e o feedback do attach, o rodapé de economia de compressão, o budget de compactação e o chunker, validador e digests do gerenciador de contexto.
+
+## Dados Reais de API — Cobertura por Provider
+
+O tracker prefere o uso real da resposta do provider e só cai em estimativa por caracteres (`chars/4`, marcada `IsReal=false`) quando o provider não reporta nada:
+
+| Provider | Uso real | Notas |
+|:---------|:---------|:------|
+| OpenAI (Chat Completions, streaming, Responses API, Assistants) | ✅ | `stream_options: {include_usage: true}` em streams; `response.completed` na Responses; detalhes de cache + reasoning |
+| Anthropic (API key e OAuth, buffered, stream e caminho de tools) | ✅ | Tokens de criação/leitura de cache; estado por cliente, sem atribuição cruzada entre clientes paralelos |
+| AWS Bedrock (InvokeModel, Converse, família OpenAI-compatível, endpoint Mantle) | ✅ | O Converse reporta `TokenUsage` tipado, incluindo cache read/write |
+| Google Gemini | ✅ | Captura também `cachedContentTokenCount` (cache) e `thoughtsTokenCount` (reasoning) |
+| xAI, Z.AI, MiniMax, Moonshot, Copilot | ✅ | Caminhos buffered e de tools nativas |
+| OpenRouter | ✅ | Registra também `usage.cost` — o **valor realmente cobrado**, autoritativo sobre as tabelas locais |
+| Ollama, StackSpot | ✅ (tokens) | Contagens reais de token, custo $0 por design (backends não tarifados) |
+| Devin CLI | ✅ | Cada turno pede ao CLI a trajetória ATIF (`--export`) e lê de volta os `input_tokens` / `output_tokens` / split de cache reais — do bloco de métricas nativo do Devin ou do bloco padrão ATIF que os builds enterprise emitem, onde a escrita de cache de um backend Anthropic chega em `extra.cache_creation_input_tokens` e a contagem de prompt já inclui a parte cacheada (o tracker precifica essa parte uma vez, na tarifa de cache); um build antigo sem `--export` é detectado uma vez e cai na estimativa (`DEVIN_CLI_USAGE_EXPORT=false` desliga) |
+| Cadeia de fallback | ✅ | O uso é encaminhado a partir de — e atribuído a — a entrada que de fato serviu o request |
+
+### Modos cobertos
+
+Toda chamada LLM que uma sessão faz é contabilizada e atribuída ao modelo que de fato a serviu (incluindo hints de skill e overrides de rota do `@model`):
+
+- **Chat** — streaming, buffered e o caminho de exceção de tools do `/ask`
+- **Agent / Coder** — cada turno ReAct, mais os **workers/subagents despachados** (o cliente de cada worker registra cada chamada LLM ao vivo, sob o provider+modelo do próprio worker — e o hard stop de orçamento gateia cada chamada)
+- **Painéis MoA** — caminhos native-tools, XML e plain, atribuídos por participante
+- **One-shot (`-p`)**, turnos **RPC/Gateway/ACP** e **execuções agendadas** (o scheduler roda em client dedicado e recebe de volta números de tokens/custo — uma estimativa autocontida de propósito, imune a corridas com turnos interativos)
+
+---
+
+## Tabelas de Preço
+
+Preços em USD por 1M de tokens, espelhando `cli/cost_tracker.go` (pinado por `cost_tracker_pricing_test.go`). O match é por substring do id do modelo, mais específico primeiro.
+
+### Anthropic (cache write = 1,25× input, cache read = 10% do input — 5% no Opus 5.5 e no Sonnet 5.5, 2,5% no Fable 5.1)
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| claude-fable-5-1 (cache read $0.25) | $10.00 | $50.00 |
+| claude-fable-5 (cache read $1.00) | $10.00 | $50.00 |
+| claude-opus-5-5 (cache read $0.20; fast mode $8/$40 não modelado) | $4.00 | $20.00 |
+| claude-opus-5 | $5.00 | $25.00 |
+| claude-opus-4-5 / 4-6 / 4-7 / 4-8 | $5.00 | $25.00 |
+| claude-opus (4.1 e anteriores, legado) | $15.00 | $75.00 |
+| claude-sonnet-5-5 (cache read $0.10) | $2.00 | $10.00 |
+| claude-sonnet-5 (preço de lista permanente) | $2.00 | $10.00 |
+| claude-sonnet (4.5 / 4.6 e anteriores) | $3.00 | $15.00 |
+| claude-haiku-5-5 (cache read $0.01; prompt acima de 100K: todas as linhas 5× — $0.50 / $2.50, cache read $0.05) | $0.10 | $0.50 |
+| claude-haiku-4-5 | $1.00 | $5.00 |
+| claude-haiku (legado) | $0.25 | $1.25 |
+
+### OpenAI (cache read = 50% do input e sem sobretaxa de write, salvo indicação)
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| gpt-6.1-sol (cache write 1.25×, read 5%) | $2.00 | $10.00 |
+| gpt-6-astra (cache write 1.25×, read 10%; >272K input: 2× input / 1,5× output, modelado por chamada) | $10.00 | $50.00 |
+| gpt-6-sol (cache write 1.25×, read 10%) | $2.00 | $10.00 |
+| gpt-6-luna (cache write 1.25×, read 10%) | $0.10 | $0.50 |
+| gpt-5.6 (Sol / alias de família — desde 21/ago/2026, promoção pelo menos até 21/nov/2026) | $4.00 | $20.00 |
+| gpt-5.6-terra | $2.00 | $12.00 |
+| gpt-5.6-luna | $0.20 | $1.20 |
+| gpt-5.5-pro | $30.00 | $180.00 |
+| gpt-5.5 (cache read 10%) | $5.00 | $30.00 |
+| gpt-5.4-pro | $30.00 | $180.00 |
+| gpt-5.4-mini | $0.75 | $4.50 |
+| gpt-5.4-nano | $0.20 | $1.25 |
+| gpt-5.4 (cache read 10%) | $2.50 | $15.00 |
+| gpt-5.3-codex | $1.75 | $14.00 |
+| gpt-5.2-pro | $21.00 | $168.00 |
+| gpt-5.2 | $1.75 | $14.00 |
+| gpt-5-pro | $15.00 | $120.00 |
+| gpt-5-mini | $0.25 | $2.00 |
+| gpt-5-nano | $0.05 | $0.40 |
+| gpt-5 / gpt-5.1 | $1.25 | $10.00 |
+| gpt-4.1 | $2.00 | $8.00 |
+| gpt-4o | $2.50 | $10.00 |
+| gpt-4o-mini | $0.15 | $0.60 |
+| gpt-4-turbo | $10.00 | $30.00 |
+| gpt-4 | $30.00 | $60.00 |
+| gpt-3.5 | $0.50 | $1.50 |
+| o3-mini / o4-mini | $1.10 | $4.40 |
+| o3 | $10.00 | $40.00 |
+| o1-mini | $3.00 | $12.00 |
+| o1 | $15.00 | $60.00 |
+
+### Google (cache read = 25% do input)
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| gemini-3.8-flash / 3.7-flash / 3.6-flash (preço introdutório até Dez 2026) | $0.75 | $3.75 |
+| gemini-3.5-flash | $1.50 | $9.00 |
+| gemini-3.5-flash-lite | $0.30 | $2.50 |
+| gemini-3.1-pro | $2.00 | $12.00 |
+| gemini-3.1-flash-lite | $0.25 | $1.50 |
+| gemini-3-flash | $0.50 | $3.00 |
+| gemini-3 (outros ids 3.x, incl. o gemini-3-pro aposentado) | $2.00 | $12.00 |
+| gemini-2.5-pro | $1.25 | $10.00 |
+| gemini-2.5-flash | $0.30 | $2.50 |
+| gemini-2.5-flash-lite | $0.10 | $0.40 |
+| gemini-2.0 (desligado em 1/jun/2026 — mantido para logs de sessão antigos) | $0.075 | $0.30 |
+| gemini-1.5-pro | $1.25 | $5.00 |
+| gemini-1.5-flash | $0.075 | $0.30 |
+
+### xAI (Grok) — cached input = 25% no grok-4.7/4.6, 15% no grok-4.5, 16% nos demais; sem sobretaxa de write
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| grok-4.7 / grok-4.6 / grok-4.5 | $2.00 | $6.00 |
+| grok-4.3 / grok-4.20 | $1.25 | $2.50 |
+| grok-build / grok-code-fast | $1.00 | $2.00 |
+| grok-3 / grok-4-* (aposentados em 15/mai/2026 — a xAI os redireciona pro grok-4.3 e cobra as tarifas do grok-4.3) | $1.25 | $2.50 |
+| grok-2 | $2.00 | $10.00 |
+| grok (genérico) | $5.00 | $15.00 |
+
+### Z.AI (GLM)
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| glm-5.3 / glm-5.2 / glm-5.1 (cache read $0.26) | $1.40 | $4.40 |
+| glm-5.3-flashx (cache read $0.075) | $0.37 | $1.25 |
+| glm-5.3-flash (cache read $0.03) | $0.15 | $0.50 |
+| glm-5-turbo / glm-5v-turbo | $1.20 | $4.00 |
+| glm-5 (cache read $0.20) | $1.00 | $3.20 |
+| glm-4.7 / glm-4.6 / glm-4.5 (cache read $0.11 só no glm-4.7; 4.6/4.5 cobram tokens cacheados a preço de input) | $0.60 | $2.20 |
+| glm-4.7-flashx | $0.07 | $0.40 |
+| glm-4.7-flash / glm-4.5-flash / glm-4.6v-flash | grátis | grátis |
+| glm-4.6v-flashx | $0.04 | $0.40 |
+| glm-4.6v | $0.30 | $0.90 |
+| glm-4.5-air | $0.20 | $1.10 |
+| glm-4.5-airx | $1.10 | $4.50 |
+| glm-4.5-x | $2.20 | $8.90 |
+| glm-4.5v (cache read $0.11) | $0.60 | $1.80 |
+| outros ids Z.AI | $0.50 | $0.50 |
+
+### DeepSeek (preço de pico; cache read = 25% do input)
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| deepseek-v4-pro | $1.32 | $3.96 |
+| deepseek-v4 | $0.44 | $1.32 |
+| deepseek-r1 / deepseek-reasoner | $0.55 | $2.19 |
+| deepseek (genérico) | $0.27 | $1.10 |
+
+### Moonshot (Kimi) — preço de cache miss; cache read = 10% do input no K3, 20% no K2.7 Code, ~17% no K2.6
+
+| Modelo | Input | Output |
+|:-------|:------|:-------|
+| kimi-k3 | $3.00 | $15.00 |
+| kimi-k2.7-code-highspeed | $1.90 | $8.00 |
+| kimi / moonshot (genérico, incl. k2.7-code, k2.6 — os aposentados kimi-k2.5 / moonshot-v1-* mantêm este tier para logs de sessão antigos continuarem precificando) | $0.95 | $4.00 |
+
+### Outros
+
+| Provider | Preço |
+|:---------|:------|
+| MiniMax | MiniMax-M3 e MiniMax-M2.7 $0.30 input / $1.20 output, MiniMax-M2.7-highspeed $0.60 / $2.40 (cache read $0.06 nos três; o MiniMax-M3 cobra 2× nos dois acima de 512K de input); demais modelos $0.20 / $1.10 (flat) |
+| GitHub Copilot | $2.50 / $10.00 (flat, independente do modelo) |
+| OpenRouter | Re-despachado para a família subjacente (claude/gpt/gemini/deepseek), mais taxas flat para llama ($0.20/$0.20), mistral ($0.20/$0.60), qwen ($0.15/$0.15) — e **sobrescrito pelo `usage.cost` cobrado** sempre que a resposta o carrega |
+| Ollama, StackSpot | $0 — não tarifados do ponto de vista do ChatCLI |
+| Devin CLI | Três fontes, nesta ordem: `CHATCLI_MODEL_PRICING` quando você fixou uma tarifa; a **tarifa por conta que o CLI lista** (`devin models list --format json`, `cost_summary`) — registrada ao listar modelos e persistida em `~/.chatcli/devin_models.json` para o one-shot também precificar; senão uma **tabela estática das tarifas da Cognition** espelhada da listagem de uma conta (Set/2026), para que um build enterprise cuja listagem não traz `cost_summary` ainda estime em vez de reportar $0. Variante ou alias sem tarifa própria usa a da família; variantes `-fast`/`-priority` têm o próprio acréscimo. Uma família que a listagem nunca precificou (`adaptive`, recém-chegados não listados) fica em zero conhecido — e o `/cost` avisa em vez de mostrar um $0 mudo |
+
+<Tip>
+Os preços são atualizados nas releases do ChatCLI e pinados por testes. Um modelo não listado é reportado como **sem preço** no `/cost` (nunca zero silencioso), e o custo cobrado da OpenRouter cobre sua cauda longa independentemente das tabelas locais.
+</Tip>
+
+---
+
+## Contabilidade de Cache
+
+Tokens de cache são precificados por família — e, crucialmente, com a **semântica** correta por provider:
+
+- **Anthropic / Bedrock Anthropic** reportam tokens de cache *ao lado* de `input_tokens` (aditivos): write cobrado a 1,25× do input, read a 10% (5% no Opus 5.5 e no Sonnet 5.5, 2,5% no Fable 5.1).
+- **OpenAI, xAI, Gemini, DeepSeek, Moonshot** reportam cache reads como *subconjunto* da contagem de prompt: a fatia cacheada é recortada do input e cobrada uma única vez na taxa com desconto — nunca preço cheio mais desconto.
+- Um cache write num modelo sem tarifa de write publicada é cobrado pelo **preço de input** (antes entrava como grátis).
+
+O bloco `Economia do cache` é o balanço do cache da sessão em dólares, calculado a partir das tarifas reais de cada modelo — não um percentual fixo. **Desconto de leitura** é o que as leituras de cache pouparam contra o preço de input. **Prêmio de escrita** é o que as escritas de cache custaram acima do preço de input: 1,25x na Anthropic e no Bedrock, 2x com o TTL de uma hora, nada na OpenAI, Gemini, xAI e Kimi (a linha some quando é zero). **Economia líquida** é a diferença, e **Sem cache** é o que os mesmos tokens custariam sem cache nenhum, ao lado do total real. Só as leituras superestimam a economia: uma sessão que reescreveu o prefixo algumas vezes pode ter devolvido um terço do que as leituras pouparam, e é aqui que isso aparece. A linha `Processados` de tokens é todo token que o provedor tokenizou, cacheado ou não, já que `Input` nos esquemas aditivos é só a parte não cacheada.
+
+---
+
+## Persistência de Sessão
+
+Os dados de custo são gravados em disco conforme a sessão roda (write-through com throttle, escrita atômica):
+
+```text
+~/.chatcli/costs/<timestamp-de-início>-<pid>.json
+```
+
+**Toda superfície finaliza.** One-shot (`-p`), o daemon do gateway e os servidores MCP/ACP persistem o snapshot de custo e o gasto diário e liberam caches pagos do provedor na saída, exatamente como o cleanup do REPL; o gasto com embeddings conta no orçamento diário. Quando o hard stop do orçamento dispara dentro do loop do agent, o run é **parkado** (retoma à meia-noite local seguinte, ou com `/parked resume` depois de subir o orçamento) em vez de morrer perdendo o trabalho.
+
+**Tiers de contexto longo, assinaturas e o orçamento diário.** Uma chamada acima do limiar de contexto longo do provedor é precificada no seu tier por chamada — Claude Sonnet 4/4.5 (beta de 1M) acima de 200K (2× entrada, 1,5× saída; Claude 4.6 em diante roda o 1M inteiro no preço padrão, exceto o Haiku 5.5, que cobra todas as linhas 5× acima de 100K), Gemini 2.5 Pro e 3.1 Pro acima de 200K (2× / 1,5×; as linhas Flash têm tier único), xAI Grok 4.x e grok-build quando o prompt chega a 200K (2× / 2×), família GPT-6 da OpenAI, tiers GPT-5.6, gpt-5.5 e gpt-5.4 acima de 272K de input (2× / 1,5×), MiniMax-M3 acima de 512K (2× / 2×) — e contabilizada como valor cobrado, então o agregado nunca a dilui; a estimativa do rodapé concorda. O GitHub Copilot é assinatura (premium requests, não tokens) e entra como zero conhecido. Todo modelo em zero conhecido que carregou tokens é nomeado abaixo do total (`Sem tarifa por token conhecida para: …`), para que um $0 nunca pareça grátis quando significa desconhecido, e `CHATCLI_MODEL_PRICING` atribui uma tarifa a ele. Amazon Nova Micro/Lite/Pro/Premier têm suas linhas de lista on-demand; gerações Nova 2 aparecem como sem preço até a tarifa de lista ser verificada, em vez de chutada. Um orçamento só diário (`CHATCLI_DAILY_BUDGET_USD` sem limite de sessão) anuncia seus próprios avisos de alerta e de excedido, e quando os dois limites existem o diário fala quando estourou; `/cost export caminho.csv` grava uma linha CSV por provedor/modelo mais um total.
+
+O snapshot (`SessionCostData`) carrega os records de uso por modelo, totais, timestamps e o nome da sessão nomeada quando houver. Snapshots também são salvos no encerramento e no `/cost reset`, e podados após **90 dias**.
+
+- `/cost last` — o gasto da sessão (ou período) anterior
+- `/cost sessions` — os 10 snapshots mais recentes com data, requests, tokens e total, mais o registro de cache de cada sessão: fração de acerto, razão write/read, misses instáveis, expirados, rebuilds esperados e o TTL em vigor. A telemetria do cache de prompt é persistida com o snapshot de custo e restaurada com a sessão, então a estabilidade do prefixo pode ser comparada entre sessões em vez de morrer com o processo; as mesmas duas figuras vão para o OTLP como `chatcli.cache.hit_pct` e `chatcli.cache.write_read_ratio`.
+- `/cost export [caminho]` — snapshot atual em JSON, para pipelines e auditoria
+
+---
+
+## Orçamento de Sessão
+
+| Variável de Ambiente | Descrição | Default |
+|:--------------------|:----------|:--------|
+| `CHATCLI_SESSION_BUDGET_USD` | Limite máximo de gasto por sessão em USD | 0 (sem limite) |
+| `CHATCLI_DAILY_BUDGET_USD` | Gasto máximo por dia-calendário somando todas as sessões sob o diretório de store (por tenant no gateway); compartilha a fração de aviso e o hard stop abaixo | 0 (sem limite) |
+| `CHATCLI_MODEL_PRICING` | Fixa uma tarifa por token à mão para qualquer provedor: `PROVIDER:modelo=entrada/saída` em USD por milhão de tokens, entradas separadas por `;`, modelo `*` precifica o provedor inteiro. Vence a listagem da conta e as tabelas estáticas — o botão para um wrapper medido que nunca informa o preço ao ChatCLI (um Devin CLI enterprise cuja listagem não tem `cost_summary`), um host Ollama pago ou uma assinatura que você quer atribuir. Exemplo: `DEVIN:claude-sonnet-4.6=3/15;DEVIN:*=1/5`. O `/config` mostra quantas entradas valeram e quais não parsearam. | — |
+| `CHATCLI_BUDGET_WARNING_PCT` | Fração do limite em que o aviso dispara | 0.80 (80%) |
+| `CHATCLI_BUDGET_HARD_STOP` | Recusa novos turnos de LLM quando o limite esgota | false |
+
+As três são relidas no `/reload` — não precisa reiniciar para mudar o orçamento no meio da sessão.
+
+### Níveis de Orçamento
+
+| Nível | Condição | Comportamento |
+|:------|:---------|:--------------|
+| `BudgetOK` | Abaixo do threshold de aviso | Normal |
+| `BudgetWarning` | Entre o threshold de aviso e o limite | Aviso one-shot impresso no turno em que o threshold é cruzado |
+| `BudgetExceeded` | No limite ou acima | Aviso one-shot; com hard stop armado, novos turnos são recusados |
+
+O aviso é **proativo**: chat, agent e coder o imprimem no turno em que a sessão cruza um nível — você não precisa lembrar de rodar `/cost`. Sem `CHATCLI_BUDGET_HARD_STOP`, exceder o orçamento nunca interrompe a sessão; com ele, novos turnos (chat, loop do agent, workers do squad em pleno voo, participantes MoA, execuções agendadas, RPC/gateway) são bloqueados até o limite subir ou o `/cost reset` abrir um novo período.
+
+```bash
+# Limitar a sessão a $5.00, avisar aos 70%, bloquear ao esgotar
+export CHATCLI_SESSION_BUDGET_USD=5.00
+export CHATCLI_BUDGET_WARNING_PCT=0.70
+export CHATCLI_BUDGET_HARD_STOP=true
+```
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Controle de Conversa" icon="clock-rotate-left" href="/pt/usage/conversation-control">
+    Use /compact para reduzir tokens e custos.
+  </Card>
+  <Card title="Modo One-Shot" icon="terminal" href="/pt/usage/non-interactive-mode">
+    Monitore custos em pipelines automatizados.
+  </Card>
+  <Card title="Eficiência de Tokens" icon="gauge-high" href="/pt/context/token-efficiency">
+    As otimizações que o /cost permite verificar.
+  </Card>
+  <Card title="Roteamento de Modelos" icon="route" href="/pt/agents/model-routing">
+    Atribuição por modelo de cada turno roteado.
+  </Card>
+</CardGroup>

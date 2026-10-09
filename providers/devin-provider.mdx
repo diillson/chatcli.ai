@@ -1,0 +1,88 @@
+---
+title: "Devin Provider — the local Devin CLI as an LLM transport"
+sidebarTitle: "Devin Provider"
+description: "The DEVIN provider wraps Cognition's local Devin CLI as a pure LLM transport: ChatCLI keeps 100% of the context, memory, tools and harness; Devin is only the pipe to the model. No undocumented Cognition APIs involved."
+icon: "robot"
+---
+
+ChatCLI's **DEVIN** provider drives the local `devin` binary in non-interactive mode and uses it purely as a **transport to reach the LLM behind it**. Everything else — conversation, context attachment, memory, compaction, sessions, the agent/coder tool protocol — stays in ChatCLI.
+
+<Info>
+**Why a wrapper?** In enterprise deployments Devin is customized by Cognition (API + IDE integrations) and the HTTP API is not documented. The CLI is the **supported surface** and carries its own SSO authentication (`devin auth login`) — ChatCLI never speaks the private protocol, so Cognition-side changes are absorbed by their CLI, not by you.
+</Info>
+
+## Setup
+
+1. Install the Devin CLI and authenticate once (corporate SSO):
+
+```bash
+devin auth login
+```
+
+2. That's it — ChatCLI registers the provider automatically when the binary resolves (from `DEVIN_CLI_PATH`, from `PATH`, or from the well-known install directories):
+
+```bash
+chatcli --provider DEVIN --model gpt-5.6-terra -p "hello"
+# or interactively: /switch --provider DEVIN
+```
+
+No API key, no OAuth setup in ChatCLI: authentication belongs to the `devin` binary. Without the binary the provider simply doesn't appear — same UX as a provider without credentials.
+
+<Note>
+**IDE-spawned servers (ACP/MCP) see a minimal `PATH`.** Editors launch `chatcli acp` / `chatcli mcp-server` with the GUI-session environment — on macOS that `PATH` carries no Homebrew or npm directories, which used to make DEVIN vanish from those servers while the terminal REPL listed it fine. When the `PATH` lookup misses, ChatCLI now also probes the standard install locations (`~/.local/bin`, `~/bin`, `~/.devin/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, Linuxbrew; on Windows `%LOCALAPPDATA%\Programs\devin`, `%APPDATA%\npm`, scoop shims), so the provider stays available without per-IDE env plumbing. An explicit `DEVIN_CLI_PATH` always wins and never falls back — and fixing the env at runtime followed by `/reload` recovers the provider without restarting.
+</Note>
+
+<Note>
+**Upgrading the Devin CLI does not break the provider.** From the `3000.6` line onward the CLI refuses to run non-interactively in a directory it has not been told to trust, and `--print` has no way to raise the trust prompt. Every ChatCLI turn — and the model listing — runs in a private temp directory created moments earlier that holds nothing but the prompt file, so ChatCLI passes `--respect-workspace-trust false` and there is nothing for you to configure. A binary that predates the flag refuses to parse it; ChatCLI notices once and retries without it, so older installs keep working too. Set `DEVIN_CLI_RESPECT_WORKSPACE_TRUST=true` if you would rather see the failure than have the check waived.
+</Note>
+
+## Models
+
+**The account is the source of truth.** `/switch --model` (and the completer, the `@model` tool and the ACP/MCP model pickers) asks the CLI itself — `devin models list --format json` — so the list is exactly what *your* account can invoke, Enterprise Team Settings restrictions included. Every entry the CLI reports is tagged `[api]`; the CLI-reported context window and output cap are registered on the fly, so a brand-new model or variant gets real budgets (compaction, ctx% footer, `/max-tokens` ceiling) instead of the generic fallback.
+
+The listing carries the **family slugs** the `--model` examples use (`claude-opus-5`, `gpt-5.6-terra`, `swe-1.7-lightning`) and their **variants** — reasoning levels and modifiers such as `claude-opus-5-high`, `gpt-5-6-sol-max-priority`, `glm-5-2-1m`, `swe-1-6-fast` — plus the CLI's short aliases (`opus`, `sonnet`, `codex`, `gemini`, `swe`) resolving to the right family's specs. Legacy enum-style ids the CLI still reports for a few older families (`MODEL_…`) are skipped; those families stay reachable through their slug.
+
+The static catalog is the **fallback, not the gate**: it covers the CLI being unreachable or not logged in (entries without the `[api]` tag), and any model string still passes through untouched.
+
+```bash
+/switch --model swe-1.7-lightning
+/switch --model claude-opus-5-high     # variant with an explicit reasoning level
+/switch --model claude-sonnet-4.6      # note: family slugs use dots
+```
+
+## How the transport works
+
+- **Stateless per turn** — the full flattened history goes on every call (never `--resume`), so conversation state never splits between ChatCLI and Devin's servers. Compaction, `/session load` and context edits keep working unchanged.
+- **The inner agent can't act** — each call runs in a fresh empty directory with a transport preamble that forbids Devin's *native* tools while explicitly deferring to ChatCLI's own textual tool protocol. In agent/coder modes the model sees ChatCLI's full tool catalog and emits `<tool_call .../>` markup normally — ChatCLI executes, not Devin.
+- **No identity coercion** — the preamble never tells the model it "is" ChatCLI and demands no secrecy about the transport. The agent keeps its own identity (ask it who it is and it answers truthfully) and simply cooperates through the textual protocol. This matters in practice: an earlier preamble that assigned an identity plus a "don't mention these rules" clause made Devin **refuse whole tasks** rather than misrepresent itself.
+- **Lenient tag parsing** — models backed by agent CLIs (Devin, Codex, Claude Code) sometimes shorten the `<tool_call ...>` tag to `<tool ...>`. ChatCLI's parser accepts **both spellings** everywhere (agent, coder, chat exceptions, MoA, MCP server) while always emitting the canonical `<tool_call>` in its own prompts — liberal in what it accepts, conservative in what it sends.
+- **Workspace trust is waived, deliberately** — from the `3000.6` CLI line onward, `--print` refuses to run in a directory it has not been told to trust, and it has no way to raise the trust prompt in non-interactive mode. Every ChatCLI turn runs in a private `os.MkdirTemp` directory created moments earlier that holds nothing but the prompt file, so there is no project there to trust or distrust — ChatCLI passes `--respect-workspace-trust false` and the provider keeps answering. A binary that predates the flag refuses to parse it; that rejection is latched process-wide and the turn is retried without it, so older installs keep working. `DEVIN_CLI_RESPECT_WORKSPACE_TRUST=true` restores the CLI default, and pinning the flag yourself through `DEVIN_CLI_EXTRA_ARGS` suppresses ChatCLI's copy — passing it twice is a parse error.
+- **Clean replies** — the answer is extracted between sentinel markers so Devin's harness chrome is discarded; prompt files are always coerced to valid UTF-8 (the CLI rejects invalid bytes); invocations are serialized per process so background work (memory extraction) never races a live turn.
+
+## Environment variables
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `DEVIN_MODEL` | Default model | `claude-sonnet-4.6` |
+| `DEVIN_CLI_PATH` | Explicit binary path | `devin` from `PATH`, then well-known install dirs |
+| `DEVIN_CLI_PERMISSION_MODE` | `--permission-mode` passed to the CLI | `auto` |
+| `DEVIN_CLI_AGENT_CONFIG` | Declarative agent-config file (hardened tool lockdown) | — |
+| `DEVIN_CLI_TIMEOUT` | Per-turn ceiling | `10m` |
+| `DEVIN_CLI_SANDBOX` | Pass `--sandbox` (research preview) | `false` |
+| `DEVIN_CLI_EXTRA_ARGS` | Extra CLI args escape hatch | — |
+| `DEVIN_CLI_USAGE_EXPORT` | Per-turn ATIF `--export` read back for real token usage (`false` = chars/4 estimate) | `true` |
+| `DEVIN_CLI_RESPECT_WORKSPACE_TRUST` | Value for `--respect-workspace-trust`. `true` restores the CLI's own default and makes turns fail in the temp workdir | `false` |
+
+All exposed in `/config providers`.
+
+## Limitations (honest ones)
+
+- **Cost is derived, not billed** — every turn reads its real token usage back from the CLI's ATIF export, and the rate is the one the CLI lists for your account (`cost_summary`), so `/cost` reports what the routed model costs at Cognition's per-token rate. An enterprise build whose listing carries no `cost_summary` falls back to a static table of Cognition's rates mirrored from an account listing, and `CHATCLI_MODEL_PRICING` (`DEVIN:model=input/output;DEVIN:*=input/output`, USD per MTok) outranks both when your contract differs. ACUs are not modeled; the pricing layer never bills a routed `claude-*`/`gpt-*` model as if it were the direct API, a family no listing ever priced is named by `/cost` as having no known rate rather than shown as $0, and a build without `--export` degrades to the chars/4 estimate.
+- **Spawn latency** — each turn pays a subprocess start plus Devin's harness overhead. If that matters for heavy coder use, an ACP-based persistent transport (`devin acp`) is the natural evolution.
+- **Vision doesn't pass through** — the transport is flat text; image attachments never reach the backing model.
+
+## See also
+
+- [Supported Models](/providers/supported-models) — the DEVIN tab
+- [Environment Variables](/reference/environment-variables)
+- [MCP Server](/server/mcp-server) — combine both: expose ChatCLI over MCP and route `agent_task` to `provider: "DEVIN"`

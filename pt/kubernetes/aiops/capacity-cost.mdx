@@ -1,0 +1,435 @@
+---
+title: "Capacity Planning e Cost Attribution"
+sidebarTitle: "Capacity & Custos"
+description: "Previsão de capacidade sob demanda para os recursos dos incidentes, redução de ruído de anomalias e rastreamento de custo de LLM por incidente."
+icon: "chart-line"
+---
+
+A plataforma AIOps do ChatCLI inclui três subsistemas ao lado do pipeline de incidentes: **Capacity Planner** (previsão sob demanda para os recursos por trás dos seus incidentes), **Noise Reducer** (supressão de anomalias repetitivas, sazonais, com flapping ou de alta fadiga) e **Cost Tracker** (gasto de LLM por incidente, servido pela API REST).
+
+
+
+## Capacity Planner
+
+O Capacity Planner gera um relatório de CPU e memória para cada Deployment que aparece como recurso de uma Issue. Ele não é um job em segundo plano: roda só quando `GET /api/v1/analytics/capacity` é chamado e não guarda histórico próprio.
+
+<Warning>
+  O planner não lê uso real e não coleta histórico de uso. Ele não consulta metrics-server nem Prometheus (`PROMETHEUS_URL` não é usado aqui). O "uso atual" são os **requests** do primeiro container do Deployment (`UsageSource: "requests"`), e a porcentagem é requests dividido por limits. Sem histórico não há tendência para ajustar, então a resposta traz `Trend.Direction: "insufficient_history"` e `HistoryAvailable: false`, e nunca projeta data de esgotamento. Trate o resultado como uma checagem de requests contra limits somada a uma contagem de incidentes, não como previsão de uso.
+</Warning>
+
+### O que Ele Calcula
+
+Para cada recurso distinto (`kind/namespace/name`) entre as Issues listadas (todas, ou as do `?namespace=`), o planner:
+
+1. Lê o **Deployment** com esse nome e namespace. Se não existir (o recurso é um StatefulSet, um DaemonSet, um Pod ou foi apagado), o recurso é pulado sem erro.
+2. Pega `resources.limits` e `resources.requests` de CPU e memória do primeiro container e calcula `uso% = requests / limits × 100` (0 quando não há limit).
+3. Correlaciona o recurso com os incidentes do namespace dele dentro da janela (abaixo).
+4. Define uma **urgência** e uma recomendação a partir do que sabe: a porcentagem de requests/limits e a correlação com incidentes.
+
+A janela padrão é de **7 dias**. Quando `from` e `to` são passados juntos (RFC 3339), a janela passa a ser a diferença entre eles, e continua terminando agora.
+
+### Tendência e Urgência
+
+```text
+UsageSource      = "requests"
+HistoryAvailable = false
+Trend.Direction  = "insufficient_history"   (CPUTrendPerDay = MemoryTrendPerDay = 0)
+Forecast.*ExhaustionDate = null, Forecast.DaysUntil*Exhaustion = 0
+
+Urgency = "plan" se uso% de CPU >= 80 ou uso% de memória >= 80 ou ResourceIsBottleneck
+          "none" nos demais casos
+```
+
+`Urgency` só tem esses dois valores: sem histórico, nada é `urgent`. O banner de capacidade do dashboard lista os recursos com `Urgency: "plan"`.
+
+### Campos da Resposta
+
+O endpoint retorna `kind: CapacityForecastList` com um `CapacityForecast` por recurso. Os nomes de campo são os nomes Go (sem renomeação JSON), exceto a referência de recurso aninhada:
+
+<AccordionGroup>
+  <Accordion title="CapacityForecast">
+    | Campo | Tipo | Descrição |
+    |-------|------|-----------|
+    | `Resource` | `{kind, name, namespace}` | O recurso da Issue |
+    | `CurrentUsage.CPUMillicores` / `.MemoryBytes` | `int64` | Requests do primeiro container |
+    | `Limits.CPUMillicores` / `.MemoryBytes` | `int64` | Limits do primeiro container |
+    | `UsagePercentage.CPU` / `.Memory` | `float64` | Requests divididos por limits × 100 |
+    | `Trend` | `ResourceTrend` | Veja abaixo |
+    | `Forecast` | `ForecastResult` | Veja abaixo |
+    | `IncidentCorrelation` | `IncidentResourceCorrelation` | Veja abaixo |
+    | `UsageSource` | `string` | De onde vem o `CurrentUsage`: sempre `requests` |
+    | `HistoryAvailable` | `bool` | Sempre `false`: nenhuma amostra de uso é coletada |
+    | `Urgency` | `string` | `plan` ou `none` (veja acima) |
+  </Accordion>
+
+  <Accordion title="ResourceTrend">
+    | Campo | Tipo | Descrição |
+    |-------|------|-----------|
+    | `CPUTrendPerDay` | `float64` | Sempre `0` (sem histórico para ajustar) |
+    | `MemoryTrendPerDay` | `float64` | Sempre `0` (sem histórico para ajustar) |
+    | `Direction` | `string` | `insufficient_history` |
+  </Accordion>
+
+  <Accordion title="ForecastResult">
+    | Campo | Tipo | Descrição |
+    |-------|------|-----------|
+    | `CPUExhaustionDate` | `time` ou `null` | Sempre `null`: nenhuma data de esgotamento é projetada |
+    | `MemoryExhaustionDate` | `time` ou `null` | Sempre `null` |
+    | `DaysUntilCPUExhaustion` | `int` | Sempre `0` |
+    | `DaysUntilMemoryExhaustion` | `int` | Sempre `0` |
+    | `Recommendation` | `string` | Uma recomendação (tabela abaixo) |
+  </Accordion>
+
+  <Accordion title="IncidentResourceCorrelation">
+    | Campo | Tipo | Descrição |
+    |-------|------|-----------|
+    | `IncidentsInWindow` | `int` | Issues criadas no namespace dentro da janela |
+    | `ResourceRelatedIncidents` | `int` | Dessas, as Issues cujo nome de recurso casa |
+    | `ResourceIsBottleneck` | `bool` | `true` quando `ResourceRelatedIncidents > 2` |
+  </Accordion>
+</AccordionGroup>
+
+### Correlação com Incidentes
+
+```text
+Para cada Issue no namespace do recurso criada dentro da janela (qualquer estado):
+  IncidentsInWindow++
+  Se issue.spec.resource.name == nome do recurso: ResourceRelatedIncidents++
+
+ResourceIsBottleneck = ResourceRelatedIncidents > 2
+```
+
+Um gargalo eleva a `Urgency` para `plan` e, quando os requests estão dentro dos limits, define a recomendação.
+
+### Geração de Recomendações
+
+A primeira regra que casar vence (o texto é sempre em inglês):
+
+| Condição | Recomendação |
+|----------|--------------|
+| Requests de CPU ou memória acima de 80% dos limits | "Requests are above 80% of limits. Consider increasing limits proactively." |
+| `ResourceIsBottleneck` | "Repeated incidents on this resource. Review its capacity." |
+| Caso contrário | "No usage history is collected, so no trend or exhaustion date can be projected; requests are within limits." |
+
+### Como Usar
+
+```bash
+# todos os namespaces, últimos 7 dias (padrão)
+curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/capacity"
+
+# um namespace, janela de 30 dias (só a diferença entre from e to é usada)
+curl -H "X-API-Key: $KEY" \
+  "http://localhost:8090/api/v1/analytics/capacity?namespace=production&from=2026-08-28T00:00:00Z&to=2026-09-27T00:00:00Z"
+```
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "CapacityForecastList",
+  "metadata": {"totalCount": 1, "page": 1, "pageSize": 1},
+  "items": [
+    {
+      "Resource": {"kind": "Deployment", "name": "api-gateway", "namespace": "production"},
+      "CurrentUsage": {"CPUMillicores": 900, "MemoryBytes": 536870912},
+      "Limits": {"CPUMillicores": 1000, "MemoryBytes": 1073741824},
+      "UsagePercentage": {"CPU": 90, "Memory": 50},
+      "Trend": {"CPUTrendPerDay": 0, "MemoryTrendPerDay": 0, "Direction": "insufficient_history"},
+      "Forecast": {
+        "CPUExhaustionDate": null,
+        "MemoryExhaustionDate": null,
+        "DaysUntilCPUExhaustion": 0,
+        "DaysUntilMemoryExhaustion": 0,
+        "Recommendation": "Requests are above 80% of limits. Consider increasing limits proactively."
+      },
+      "IncidentCorrelation": {"IncidentsInWindow": 4, "ResourceRelatedIncidents": 3, "ResourceIsBottleneck": true},
+      "UsageSource": "requests",
+      "HistoryAvailable": false,
+      "Urgency": "plan"
+    }
+  ]
+}
+```
+
+O endpoint exige o papel `viewer` (só GET). Cada chamada lista todas as Issues do escopo e, por recurso, lê um Deployment mais as Issues do namespace, então mantenha as chamadas esporádicas em clusters grandes.
+
+
+
+## Noise Reducer
+
+O Noise Reducer roda dentro do controller de Anomaly. Ele só é consultado para uma anomalia que abriria uma Issue **nova**: uma anomalia cujo recurso já tem Issue ativa é antes correlacionada a ela, e uma que chega dentro do cooldown de resolução (`spec.aiops.resolutionCooldownMinutes` da Instance de onde a anomalia veio, padrão 10, `0` desliga) após uma resolução é suprimida antes de chegar ao Noise Reducer.
+
+As quatro checagens rodam em ordem e a primeira que disparar vence. Uma anomalia suprimida é marcada com `status.correlated: true`, com o motivo registrado como `suppressed:<motivo>`; nenhuma Issue é criada e `chatcli_operator_anomalies_processed_total{result="suppressed_noise"}` é incrementado. Se uma checagem falhar (por exemplo, erro num List), a anomalia não é suprimida. Os recursos são comparados pelo **nome** dentro do namespace da anomalia.
+
+### Estratégia 1: Supressão Repetitiva
+
+```text
+Condição de supressão:
+  - 5 ou mais Anomalies no namespace criadas na última 1 hora
+    com o mesmo signalType, kind e nome de recurso
+    (a anomalia que está chegando conta)
+  - e nenhuma Issue desse nome de recurso em Analyzing ou Remediating
+
+Resultado:
+  - motivo "Repetitive: N identical anomalies in last hour with no state change"
+```
+
+A severidade não entra na comparação.
+
+### Estratégia 2: Padrões Sazonais
+
+Toda anomalia não suprimida é registrada como ocorrência sazonal. Os padrões ficam por namespace no ConfigMap `chatcli-seasonal-patterns`, chave `patterns`, como um array JSON.
+
+**SeasonalPattern (JSON):**
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `signalType` | `string` | Tipo de sinal da anomalia (ex: `pod_restart`) |
+| `resource` | `{kind, name, namespace}` | Recurso da primeira anomalia registrada no padrão |
+| `hourOfDay` | `int` | Hora do dia (0 a 23) em que o padrão foi registrado pela primeira vez |
+| `dayOfWeek` | `string` | Nome do dia da semana (`Monday`, ...) |
+| `occurrences` | `int` | Anomalias registradas nesse horário |
+| `firstSeen` / `lastSeen` | `time` | Primeiro e último registro |
+
+**Algoritmo:**
+
+```text
+Registro (anomalia não suprimida):
+  Procura um padrão com o mesmo signalType e nome de recurso,
+  o mesmo dia da semana e |hora atual - hourOfDay| <= 1
+  Se achou: occurrences++, lastSeen = agora
+  Senão:    adiciona um padrão novo com occurrences = 1
+
+Checagem de supressão:
+  Mesmo critério (signalType, nome do recurso, dia da semana, hora dentro de ±1)
+  E occurrences >= 3  →  suprime
+  motivo "Seasonal: pattern detected on <dia> ~<hora>:00 (<n> occurrences)"
+```
+
+Hora e dia da semana vêm do relógio do pod do operator (UTC, a menos que você defina `TZ` no operator; a imagem inclui tzdata). A distância de horas não dá a volta na meia-noite (23:00 e 00:00 ficam a 23 horas de distância).
+
+<Warning>
+  `occurrences` conta anomalias, não semanas distintas. Três anomalias do mesmo sinal e recurso no mesmo horário de um único dia bastam para suprimir as seguintes nesse horário, no mesmo dia e no mesmo dia da semana em todas as semanas seguintes. Não há score de confiança nem limpeza: os padrões ficam no ConfigMap até você editá-lo ou apagá-lo.
+</Warning>
+
+### Estratégia 3: Detecção de Flapping
+
+```text
+Condição de flap:
+  - 3 ou mais Issues do mesmo nome de recurso no namespace,
+    criadas nas últimas 24 horas e hoje no estado Resolved
+
+Resultado:
+  - a nova anomalia é suprimida
+  - motivo "Flapping: N resolved→detected cycles in 24h for this resource"
+```
+
+Não existe flag de flapping à parte, temporizador de espera nem alerta consolidado: cada nova anomalia é checada do mesmo jeito, e a supressão para quando sobram menos de três Issues resolvidas dentro da janela de 24 horas.
+
+### Estratégia 4: Score de Fadiga de Alertas
+
+```text
+Sobre as Anomalies do namespace com o mesmo nome de recurso nas últimas 24 horas:
+  total       = número de anomalias
+  correlated  = anomalias com status.correlated = true
+                (agrupadas numa Issue, ou suprimidas antes)
+
+  volume_score  = min(50, total * 5)
+  resolve_score = int(correlated / total * 30)
+  recency_score = 20, ou 10 se a anomalia de referência tem mais de 1h,
+                  ou 5 se tem mais de 6h
+
+  fatigue_score = min(100, volume_score + resolve_score + recency_score)
+
+Suprime quando fatigue_score > 80.
+```
+
+Na prática, bastam 7 anomalias de um recurso em 24 horas, todas já correlacionadas, com uma anomalia de referência recente, para passar do limite (35 + 30 + 20 = 85), e as anomalias seguintes desse recurso são suprimidas até a contagem cair.
+
+<Note>
+  A referência de recência é o último item da lista de Anomalies do namespace sem filtro, não a anomalia mais nova do recurso, então o `recency_score` pode refletir outro recurso. O limite `> 80` é fixo e não configurável.
+</Note>
+
+
+
+## Cost Tracker
+
+O Cost Tracker registra o gasto de LLM de cada incidente a partir do usage que o servidor reporta e serve o agregado pela API REST.
+
+### Custos de LLM por Provider
+
+Toda análise (`AnalyzeIssue`, controller de AIInsight) e todo passo de remediação agêntica (`AgenticStep`, controller de Remediation) é contabilizado a partir do **usage de tokens que o servidor informa** na resposta, atribuído ao provider e modelo que de fato responderam (a fallback chain do servidor pode ter roteado para outro). Quando a resposta não traz usage (um servidor anterior aos campos de usage), as análises caem para caracteres divididos por quatro na entrada e na saída, e os passos agênticos registram zero tokens de entrada e o tamanho do raciocínio dividido por quatro como saída.
+
+O preço por token é resolvido nesta ordem:
+
+1. uma entrada para o provider no ConfigMap `chatcli-cost-config` do **namespace da Issue** (a palavra do operador do cluster);
+2. o motor de preço compartilhado (`llm/pricing`), as mesmas tabelas por modelo, overrides e regras de assinatura que o `/cost` da CLI usa (incluindo um override `CHATCLI_MODEL_PRICING` definido no processo do operator, por exemplo pelo `extraEnv` do chart), então o ledger aqui e a sessão lá concordam no preço da mesma chamada;
+3. um padrão por provider para um modelo que o motor não conhece (por exemplo `CLAUDEAI` $3/$15, `OPENAI` $10/$30, `OPENROUTER` $2/$8, `DEVIN` $0, qualquer outro $1/$3 por milhão de tokens de entrada/saída).
+
+Só as tarifas de entrada e saída são aplicadas: descontos de leitura e escrita de cache não entram no ledger. O servidor também informa `cost_usd` / `cost_known` na própria resposta (veja [modo servidor](/pt/server/server-mode#atribuição-da-resposta-e-uso-de-tokens)); o ledger não usa esses campos.
+
+### Configuração de Custos
+
+Os preços podem ser sobrescritos por provider no ConfigMap `chatcli-cost-config`, chave `pricing`, uma entrada por nome de provider exatamente como o servidor o informa (`CLAUDEAI`, `OPENAI`, ...). O tracker o procura **no namespace da Issue sendo contabilizada**, o mesmo namespace do ledger dela, então crie um em cada namespace cujos incidentes você queira precificar de outro jeito:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatcli-cost-config
+  namespace: production        # o namespace onde as Issues ficam
+data:
+  pricing: |
+    {
+      "CLAUDEAI": {"InputPerMillion": 3.00, "OutputPerMillion": 15.00},
+      "OPENAI":   {"InputPerMillion": 1.25, "OutputPerMillion": 10.00}
+    }
+```
+
+<Note>
+  Uma entrada vale para todos os modelos daquele provider; não existe chave por modelo. Sem o ConfigMap, para um provider que ele não lista, ou quando o valor de `pricing` não é um JSON válido, valem as tarifas por modelo do motor de preço. O ConfigMap é lido a cada contabilização, então uma atualização vale a partir da próxima chamada; chamadas já registradas mantêm o preço com que foram registradas.
+</Note>
+
+### IncidentCost
+
+Uma entrada no ledger por incidente, escrita pelos controllers de AIInsight e Remediation a cada chamada ao LLM:
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `issueName` | `string` | Nome do incidente |
+| `llmCosts.totalInputTokens` | `int64` | Tokens de entrada em todas as chamadas |
+| `llmCosts.totalOutputTokens` | `int64` | Tokens de saída em todas as chamadas |
+| `llmCosts.analysisCalls` | `int32` | Chamadas `AnalyzeIssue` |
+| `llmCosts.agenticSteps` | `int32` | Chamadas `AgenticStep` |
+| `llmCosts.estimatedCostUSD` | `float64` | Soma do custo de cada chamada, cada uma precificada pela tarifa do próprio provider e modelo (motor de preços ou override do ConfigMap) no momento do registro |
+| `llmCosts.provider` / `llmCosts.model` | `string` | Provider e modelo da chamada **mais recente** |
+| `engineerTimeSavedMinutes` | `float64` | Reservado para estimativa futura, `0` hoje |
+| `totalCostUSD` | `float64` | Igual a `llmCosts.estimatedCostUSD` |
+| `recordedAt` | `time` | Quando a entrada foi contabilizada pela última vez |
+
+<Note>
+  Cada chamada é precificada uma vez, pelas tarifas do provider e modelo que a responderam, e somada ao total da entrada. Uma chamada posterior em outro modelo (por exemplo depois de um fallback) nunca reprecifica as anteriores; `provider` e `model` só nomeiam a chamada mais recente.
+</Note>
+
+**Exemplo de cálculo** (com o override de `CLAUDEAI` acima):
+
+```text
+Incidente: CrashLoopBackOff em api-server
+  - Provider: CLAUDEAI
+  - Chamadas LLM: 2 (AnalyzeIssue + 1 AgenticStep)
+  - Tokens de entrada: 8.500 | Tokens de saída: 2.200
+  - Custo de entrada: 8.500 / 1.000.000 * $3,00  = $0,0255
+  - Custo de saída:   2.200 / 1.000.000 * $15,00 = $0,0330
+  - estimatedCostUSD: $0,0585
+```
+
+O usage que o servidor reporta em cada resposta (`usage` em `AnalyzeIssue` e `AgenticStep`) é o que entra no ledger, então ele reflete contagens reais de tokens, não estimativas.
+
+<Note>
+  Duas chamadas registradas ao mesmo tempo no mesmo namespace não se sobrescrevem: a atualização do ledger leva a versão que leu, e um conflito de escrita é tentado de novo. Um registro que ainda falha (o limite de tamanho do ConfigMap, falta de RBAC, um ledger que não pode ser lido ou uma entrada que não pode ser decodificada) é registrado no log do controller (`Failed to book the analysis cost on the ledger` ou `Failed to book the agentic step cost on the ledger`); a análise ou o passo em si não é afetado, e uma entrada ilegível nunca é sobrescrita por uma nova.
+</Note>
+
+### CostSummary
+
+Agregação num período, servida pela API REST (papel `viewer`, só GET), como `kind: CostSummary` com o resumo em `spec`:
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `periodStart` / `periodEnd` | `time` | Limites do período (veja abaixo) |
+| `totalLLMCost` | `float64` | Soma do `estimatedCostUSD` de cada entrada na janela |
+| `incidentCount` | `int` | Entradas do ledger na janela |
+| `costPerIncident` | `float64` | `totalLLMCost / incidentCount` (`0` quando não há nenhuma) |
+
+`from` e `to` (RFC 3339) definem um **período absoluto**: com os dois, é exatamente `[from, to]`; só com `from`, vai até agora; só com `to`, são os 30 dias que terminam em `to`; sem nenhum, são os **últimos 30 dias**. Uma entrada conta inteira quando o `recordedAt` dela (último registro) cai no período; entradas sem `recordedAt` sempre contam. Sem `namespace`, o resumo agrega todos os `chatcli-cost-ledger` do cluster. Um namespace sem ledger retorna zeros; qualquer outra falha ao ler um ledger retorna `500` (`failed to read the cost ledger: ...`) em vez de zeros.
+
+```bash
+# últimos 30 dias (padrão), todos os namespaces
+curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost"
+
+# um namespace, de 1 a 25 de setembro
+curl -H "X-API-Key: $KEY" "http://localhost:8090/api/v1/analytics/cost?namespace=production&from=2026-09-01T00:00:00Z&to=2026-09-25T00:00:00Z"
+```
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "CostSummary",
+  "spec": {
+    "periodStart": "2026-09-01T00:00:00Z",
+    "periodEnd": "2026-09-25T00:00:00Z",
+    "totalLLMCost": 1.84,
+    "incidentCount": 23,
+    "costPerIncident": 0.08
+  }
+}
+```
+
+Custo de downtime e retorno sobre investimento não são calculados: a plataforma não tem fonte confiável para receita por minuto ou custo-hora de engenheiro, e números construídos sobre constantes assumidas seriam enganosos. Combine `totalLLMCost` com a economia dos seus próprios incidentes se precisar deles.
+
+
+
+## Arquitetura de Armazenamento (ConfigMaps)
+
+Esses subsistemas persistem os dados em ConfigMaps no **namespace da Issue ou da Anomaly** a que se referem (não no namespace do operator). O Capacity Planner não armazena nada.
+
+| ConfigMap | Escrito por | Dados | Retenção |
+|-----------|-------------|-------|----------|
+| `chatcli-seasonal-patterns` | Noise Reducer | Chave `patterns`: array JSON de padrões sazonais | Indefinida (nunca podado) |
+| `chatcli-pattern-store` | Controller de Remediation (aprendizado de resolução, não o Noise Reducer) | Uma chave por fingerprint de tipo de sinal, kind do recurso e severidade: ações bem-sucedidas, contagens de sucesso/falha, tempo médio de resolução, boost de confiança | Indefinida (nunca podado) |
+| `chatcli-cost-ledger` | Cost Tracker | Uma chave por incidente com o JSON do `IncidentCost` | Indefinida (nunca podado) |
+| `chatcli-cost-config` | Você | Override de preços por provider (chave `pricing`) | Gerenciado pelo usuário |
+
+<Warning>
+  ConfigMaps têm limite de 1MB no Kubernetes, cerca de 3.000 entradas de ledger. O operator não compacta o ledger nem os padrões sazonais: num namespace com esse volume, apague chaves antigas periodicamente, ou os novos registros falham (cada falha vai para o log, veja acima).
+</Warning>
+
+### Formato de Armazenamento
+
+Um ConfigMap por namespace, `chatcli-cost-ledger`, uma chave por incidente com o JSON do `IncidentCost`. O tracker o cria com o label `app.kubernetes.io/managed-by: chatcli-operator`, que é como o resumo de todos os namespaces encontra cada ledger:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatcli-cost-ledger
+  namespace: production
+  labels:
+    app.kubernetes.io/managed-by: chatcli-operator
+data:
+  api-gateway-oom-7f3a: |
+    {
+      "issueName": "api-gateway-oom-7f3a",
+      "llmCosts": {
+        "totalInputTokens": 8500,
+        "totalOutputTokens": 2200,
+        "analysisCalls": 1,
+        "agenticSteps": 1,
+        "estimatedCostUSD": 0.0585,
+        "provider": "CLAUDEAI",
+        "model": "claude-sonnet-5"
+      },
+      "engineerTimeSavedMinutes": 0,
+      "totalCostUSD": 0.0585,
+      "recordedAt": "2026-09-25T14:13:00Z"
+    }
+```
+
+O operator nunca compacta nem expira entradas: apague chaves, ou o ConfigMap, para zerar o ledger de um namespace.
+
+
+
+## Integrações
+
+<CardGroup cols={2}>
+  <Card title="API REST" icon="code" href="/pt/reference/api/overview">
+    `/api/v1/analytics/cost` serve o resumo do ledger; `/api/v1/analytics/capacity` serve as previsões de capacidade; `/api/v1/analytics/summary` expõe dados de incidentes.
+  </Card>
+  <Card title="Web Dashboard" icon="chart-mixed" href="/pt/kubernetes/aiops/web-dashboard">
+    A view Overview tem um banner de avisos de capacidade alimentado por `/analytics/capacity`: ele lista os recursos com `Urgency: "plan"` e a recomendação de cada um. O dashboard não mostra o ledger de custos.
+  </Card>
+  <Card title="Grafana" icon="chart-area" href="/pt/kubernetes/aiops/web-dashboard#grafana-dashboards">
+    O dashboard `remediation-stats.json` cobre o sucesso da remediação por tipo de ação. Nenhum dashboard incluído cobre capacidade ou custo de LLM.
+  </Card>
+  <Card title="AIOps Platform" icon="brain" href="/pt/kubernetes/aiops-platform">
+    Arquitetura completa do pipeline AIOps e como estes subsistemas se integram.
+  </Card>
+</CardGroup>

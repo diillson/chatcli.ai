@@ -1,0 +1,849 @@
+---
+title: "SLOs e SLAs"
+sidebarTitle: "SLOs e SLAs"
+description: "Service Level Objectives com error budget e alertas de burn rate, e acompanhamento de SLA de incidentes com horário comercial, para a plataforma AIOps do ChatCLI."
+icon: "gauge-high"
+---
+
+A plataforma AIOps do ChatCLI gerencia **Service Level Objectives (SLOs)** e **Service Level Agreements (SLAs)** de incidentes por meio de dois CRDs Kubernetes. O controller de SLO calcula um SLI, um error budget e burn rates em múltiplas janelas (seguindo o modelo do Google SRE) e abre um `Issue` quando uma janela de burn rate dispara. O controller de SLA cronometra cada `Issue` contra metas de resposta e resolução por severidade, com horário comercial opcional.
+
+<Warning>
+**Leia isto antes de desenhar seus SLOs.** O controller de SLO **não** consulta o Prometheus. Todo SLI é calculado a partir dos próprios objetos `Issue` e `Anomaly` do operator (veja a seção "Como cada indicador é medido" abaixo). `metricSource: prometheus`, `prometheusQuery`, `latencyPercentile` e `latencyThresholdMs` são aceitos pelo CRD, mas hoje **não têm efeito**; um SLO com `metricSource: prometheus` avisa isso no status com a condition `MetricSourceSupported=False` (reason `PrometheusNotEvaluated`). Se você precisa de SLOs baseados em requisições via PromQL, monte-os no seu próprio Prometheus/Alertmanager; use este CRD para acompanhar disponibilidade e error budget baseados em incidentes dos workloads que o operator observa.
+</Warning>
+
+## SLO vs SLA: Entendendo a Diferença
+
+| Aspecto | SLO (Service Level Objective) | SLA (Service Level Agreement) |
+|---------|-------------------------------|-------------------------------|
+| **Definição** | Meta **interna** de confiabilidade de um serviço | **Contrato** formal com clientes/stakeholders |
+| **Quem define** | Equipe de engenharia | Negócio + engenharia + jurídico |
+| **Consequência de violação** | Alerta interno, freeze de deploys, revisão | Penalidades contratuais, créditos, multas |
+| **Exemplo** | "99.9% de disponibilidade em 30 dias" | "Incidentes críticos respondidos em 5 minutos" |
+| **CRD** | `ServiceLevelObjective` (short name `slo`) | `IncidentSLA` (short name `sla`) |
+
+<Note>
+A boa prática é definir SLOs **mais rigorosos** que os SLAs. Se seu SLA garante 99.9%, defina o SLO em 99.95%. Isso cria uma margem de segurança (error budget interno) que permite detectar degradações antes que o SLA seja violado.
+</Note>
+
+## ServiceLevelObjective CRD
+
+O `ServiceLevelObjective` define uma meta de confiabilidade para um serviço, com acompanhamento de error budget e alertas de burn rate.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: api-gateway-availability
+  namespace: production          # precisa ser o namespace do workload observado
+spec:
+  serviceName: api-gateway       # em availability: precisa ser igual ao spec.resource.name do Issue
+  description: "O API Gateway deve manter 99.9% de disponibilidade em uma janela de 30 dias"
+  enabled: true
+
+  indicator:
+    type: availability
+    metricSource: issues         # padrão; a única fonte realmente implementada
+
+  target:
+    percentage: 99.9
+    window: 30d
+
+  alertPolicy:
+    pageOnBudgetExhausted: true
+    burnRateWindows:
+      - shortWindow: 1h
+        longWindow: 6h
+        burnRateThreshold: 14.4
+        severity: critical
+      - shortWindow: 6h
+        longWindow: 3d
+        burnRateThreshold: 6.0
+        severity: high
+      - shortWindow: 24h
+        longWindow: 3d
+        burnRateThreshold: 3.0
+        severity: medium
+      - shortWindow: 72h
+        longWindow: 30d
+        burnRateThreshold: 1.0
+        severity: low
+```
+
+O controller escreve o status (nunca preencha à mão):
+
+```yaml
+status:
+  currentValue: 0.99954            # SLI como fração (99.954%)
+  targetMet: true
+  errorBudgetTotal: 0.001          # 1 - target/100
+  errorBudgetRemaining: 0.537      # fração do budget que resta (0.0-1.0)
+  errorBudgetRemainingPercentage: 53.7
+  errorBudgetConsumedPercentage: 46.3
+  burnRate1h: 0
+  burnRate6h: 0
+  burnRate24h: 13.9
+  burnRate72h: 4.6
+  lastCalculatedAt: "2026-03-19T14:00:00Z"
+  activeAlerts: []
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: SLOMet
+      message: "SLI=0.9995, target=99.90%, budget_remaining=53.7%"
+```
+
+### Campos do Spec
+
+#### Raiz
+
+| Campo | Tipo | Obrigatório | Padrão | Descrição |
+|-------|------|:-----------:|--------|-----------|
+| `serviceName` | string | **Sim** | | Nome do serviço. Vira o label `service` das métricas e, em `availability`, é usado para casar os Issues |
+| `description` | string | Não | | Descrição legível |
+| `indicator` | SLOIndicator | **Sim** | | O que medir |
+| `target` | SLOTarget | **Sim** | | Percentual alvo e janela |
+| `alertPolicy` | SLOAlertPolicy | Não | | Janelas de burn rate e page de budget esgotado |
+| `enabled` | bool | Sim (com padrão) | `true` | `false` pula o SLO: o status não é atualizado e ele é reavaliado a cada 60s |
+
+#### SLOIndicator
+
+| Campo | Tipo | Obrigatório | Padrão | Descrição |
+|-------|------|:-----------:|--------|-----------|
+| `type` | enum | **Sim** | | `availability`, `latency`, `error_rate`, `throughput` |
+| `metricSource` | enum | Sim (com padrão) | `issues` | `prometheus`, `watcher`, `issues`. Aceito, mas não usado: qualquer valor se comporta como `issues`. Com `prometheus`, o SLO informa a condition `MetricSourceSupported=False` (não avaliado) |
+| `prometheusQuery` | string | Não | | Uma string PromQL. **Não é executada** (reservado) |
+| `resource` | ResourceRef (`kind`, `name`, `namespace`, todos obrigatórios) | Não | | Filtra as Anomalies por `resource.name` em `latency`, `error_rate` e `throughput`. Também vira o `spec.resource` dos Issues que o SLO abre |
+| `latencyPercentile` | string | Não | | Ex.: `p99`. **Não é usado** no cálculo (reservado) |
+| `latencyThresholdMs` | int64 | Não | | **Não é usado** no cálculo (reservado) |
+
+#### Como cada indicador é medido
+
+Todas as buscas ficam restritas ao **namespace do próprio SLO**. Issues e Anomalies são criados no namespace do workload afetado, então o SLO precisa morar lá também.
+
+| Tipo | Fórmula do SLI (sobre `target.window`) | Objetos de origem |
+|------|---------------------------------------|-------------------|
+| `availability` | `1 - minutos_de_incidente / minutos_da_janela` | Issues cujo `spec.resource.name` é igual a `serviceName`, ou que têm o label `platform.chatcli.io/service=<serviceName>`. Cada Issue contribui com os minutos entre `status.detectedAt` (cortado no início da janela) e `status.resolvedAt`, ou até *agora* enquanto não resolvido |
+| `error_rate` | `1 - anomalias_error_rate / todas_as_anomalias` | Anomalies (filtradas por `indicator.resource.name`, se definido). Numerador: `signalType: error_rate` |
+| `latency` | `1 - anomalias_latency / todas_as_anomalias` | Idem, numerador `signalType: latency` |
+| `throughput` | `1 - anomalias_de_falha / todas_as_anomalias` | Idem, numerador `error_rate`, `pod_restart`, `oom_kill`, `pod_not_ready`, `deploy_failing` |
+
+Na prática, isso significa:
+
+- **`availability` é o único indicador baseado em tempo**, e o único cujo error budget corresponde a "downtime permitido". Minutos de Issues sobrepostos são **somados**: dois Issues simultâneos no mesmo serviço contam em dobro.
+- Os indicadores baseados em anomalias medem a **proporção de anomalias** de um tipo, e não uma proporção de requisições. Sem nenhuma anomalia na janela, o SLI é `1.0`. Se todas as anomalias da janela forem do tipo contado, o SLI é `0`.
+- Os Issues que o próprio SLO abre levam o label `platform.chatcli.io/service=<serviceName>`, mas o `availability` **deixa todo Issue `slo_violation` fora** dos minutos de incidente: o page é consequência do downtime, não mais downtime, então um Issue de violação de SLO aberto não aprofunda a violação.
+- Uma janela que não pode ser interpretada (veja abaixo) vira zero, o que deixa o SLI em `1.0` e todos os burn rates em `0`. O erro passa em silêncio.
+
+#### SLOTarget
+
+| Campo | Tipo | Obrigatório | Padrão | Descrição |
+|-------|------|:-----------:|--------|-----------|
+| `percentage` | float64 | **Sim** | | Meta, ex.: `99.9` |
+| `window` | string | Sim (com padrão) | `30d` | Janela móvel. Aceita dias inteiros (`7d`, `30d`, `90d`) ou durações Go (`24h`, `90m`). Semanas (`1w`) e dias fracionados (`1.5d`) **não** são suportados |
+
+#### SLOAlertPolicy
+
+| Campo | Tipo | Padrão | Descrição |
+|-------|------|--------|-----------|
+| `burnRateWindows` | []BurnRateWindow | nenhum | Alertas de burn rate em múltiplas janelas. Sem entradas, nenhum alerta de burn rate dispara |
+| `pageOnBudgetExhausted` | bool | `false` | Abre **um** Issue `critical` quando `errorBudgetRemaining` chega a 0, e nenhum outro enquanto o budget continuar esgotado. Ele é rearmado quando o budget volta a ficar acima de 0 (veja "O que dispara e quando") |
+| `notificationPolicyRef` | string | | **Reservado**: aceito, mas ainda não é lido. Para rotear alertas de SLO, use uma regra de `NotificationPolicy` com `signalTypes: [slo_violation]` |
+
+#### BurnRateWindow
+
+| Campo | Tipo | Obrigatório | Descrição |
+|-------|------|:-----------:|-----------|
+| `shortWindow` | string | **Sim** | Janela curta, mesmo formato de `target.window` (ex.: `1h`, `30m`) |
+| `longWindow` | string | **Sim** | Janela longa (ex.: `6h`, `3d`) |
+| `burnRateThreshold` | float64 | **Sim** | O alerta dispara quando o burn rate é **>= threshold nas duas janelas** (sempre multi-window; não existe modo de janela única) |
+| `severity` | enum | **Sim** | `critical`, `high`, `medium`, `low`: severidade do Issue aberto |
+
+<Tabs>
+  <Tab title="Availability">
+    ```yaml
+    serviceName: api-gateway      # Issues com spec.resource.name: api-gateway
+    indicator:
+      type: availability
+    ```
+  </Tab>
+  <Tab title="Error Rate">
+    ```yaml
+    indicator:
+      type: error_rate
+      resource:
+        kind: Deployment
+        name: api-gateway
+        namespace: production
+    ```
+  </Tab>
+  <Tab title="Latency">
+    ```yaml
+    indicator:
+      type: latency
+      resource:
+        kind: Deployment
+        name: payment-service
+        namespace: payments
+    ```
+  </Tab>
+  <Tab title="Throughput">
+    ```yaml
+    indicator:
+      type: throughput
+      resource:
+        kind: Deployment
+        name: worker
+        namespace: jobs
+    ```
+  </Tab>
+</Tabs>
+
+## Como Funciona o Cálculo (Google SRE Model)
+
+O controller reconcilia cada SLO **a cada 60 segundos** e também sempre que o SLO ou um dos Issues que ele possui muda.
+
+### Error Budget
+
+O error budget é a quantidade máxima de "erro" permitida dentro da janela do SLO.
+
+```text
+Error Budget = 1 - (target / 100)
+
+Exemplo para SLO de 99.9%:
+  Error Budget = 1 - (99.9 / 100) = 0.001 = 0.1%
+```
+
+Para um SLO de `availability` em uma janela de 30 dias, isso significa:
+
+```text
+Downtime permitido = 30 dias x 24h x 60min x 0.001 = 43.2 minutos
+```
+
+| SLO Target | Error Budget | Downtime/30d |
+|-----------|-------------|-------------|
+| 99% | 1.0% | 7h 12min |
+| 99.5% | 0.5% | 3h 36min |
+| 99.9% | 0.1% | 43.2 min |
+| 99.95% | 0.05% | 21.6 min |
+| 99.99% | 0.01% | 4.32 min |
+
+Os campos de status derivam dele:
+
+```text
+consumed                      = (1 - SLI) / errorBudgetTotal
+errorBudgetRemaining          = max(0, 1 - consumed)        # fração do budget, 0.0-1.0
+errorBudgetConsumedPercentage = consumed x 100              # pode passar de 100
+targetMet                     = SLI >= target / 100
+```
+
+Uma meta de `100` tem budget zero: o budget fica inteiro (SLI = 1) ou esgotado.
+
+### Burn Rate
+
+O burn rate indica **a velocidade** com que o error budget está sendo consumido.
+
+```text
+Burn Rate = error_rate_in_window / error_budget
+
+Onde error_rate_in_window é, conforme o tipo de indicador:
+  availability   minutos_de_incidente_na_janela / minutos_da_janela
+  demais         anomalias_contadas / todas_as_anomalias (na janela)
+```
+
+O controller sempre calcula e publica quatro janelas fixas: `burnRate1h`, `burnRate6h`, `burnRate24h` e `burnRate72h`. As janelas que você lista em `burnRateWindows` são calculadas à parte a cada reconcile, só para decidir se o alerta dispara.
+
+<Steps>
+  <Step title="Calcular a taxa de erro em cada janela">
+    ```text
+    Exemplo (availability): um incidente de 20 minutos no api-gateway terminou há 2 horas.
+    Janela 6h: 20 / 360 = 0.0556
+    ```
+  </Step>
+  <Step title="Calcular o burn rate">
+    Divida a taxa de erro pelo error budget.
+
+    ```text
+    burn_rate(6h) = 0.0556 / 0.001 = 55.6x
+    ```
+  </Step>
+  <Step title="Verificar as duas janelas">
+    Um alerta só dispara quando o burn rate é **>= threshold na janela curta E na longa**.
+
+    ```text
+    Janela 1h/6h (threshold 14.4x):
+      - Janela curta (1h): 0x    (o incidente terminou há 2h)
+      - Janela longa (6h): 55.6x
+      -> NÃO dispara (janela curta abaixo do threshold: o consumo não é atual)
+    ```
+  </Step>
+  <Step title="Abrir um Issue">
+    Um alerta novo registra uma entrada em `status.activeAlerts`, incrementa `chatcli_operator_slo_violations_total`, grava um AuditEvent `slo_violation` e abre um `Issue` (veja "O que dispara e quando"). Esse Issue segue o fluxo normal de incidentes: notificações, escalação e cronometragem de SLA.
+  </Step>
+</Steps>
+
+### Multi-Window Alerting: Thresholds Recomendados
+
+**Não existem janelas embutidas**: nada dispara até você listar `burnRateWindows`. Para um SLO de 30 dias, estes são os valores mais usados:
+
+| Janela Curta | Janela Longa | Burn Rate | Severidade | Significado |
+|-------------|-------------|-----------|------------|-------------|
+| 1h | 6h | 14.4x | critical | Budget esgotado em **~2 dias**. Requer ação imediata. |
+| 6h | 3d | 6.0x | high | Budget esgotado em **~5 dias**. Criar ticket urgente. |
+| 24h | 3d | 3.0x | medium | Budget esgotado em **~10 dias**. Investigar e planejar. |
+| 72h | 30d | 1.0x | low | Budget consumido **exatamente no ritmo sustentável**. Monitorar. |
+
+<Tip>
+Para derivar um threshold: `burn_rate_threshold = dias_da_janela / dias_até_esgotar`. Para um SLO de 30 dias em que você quer alertar quando o budget se esgotaria em cerca de 2 dias: `30 / 2.08 = 14.4x`.
+</Tip>
+
+<Info>
+Esses thresholds foram pensados para SLIs baseados em requisições. Eles servem para o indicador `availability`, que é baseado em tempo. Nos indicadores de proporção de anomalias, o burn rate anda em saltos grandes: uma anomalia `error_rate` entre 2 na janela dá taxa de erro de 0.5, ou seja, burn rate de 500x para uma meta de 99.9%. Escolha metas e thresholds desses indicadores levando isso em conta.
+</Info>
+
+### Exemplo Numérico Completo
+
+Considere um SLO de `availability` de **99.9%** em **30 dias** para o `api-gateway`, com um único incidente: um Issue no `api-gateway` foi detectado há 20 horas e resolvido 20 minutos depois.
+
+```text
+Configuração:
+  Target: 99.9%   Janela: 30d   Error budget: 0.001 = 43.2 minutos
+
+SLI (30d):    1 - 20 / 43200 = 0.99954
+Consumido:    (1 - 0.99954) / 0.001 = 46.3%
+Restante:     errorBudgetRemaining = 0.537 (53.7% do budget)
+
+Burn rates:
+  1h:  0 / 60            = 0x      (o incidente é mais antigo que 1h)
+  6h:  0 / 360           = 0x
+  24h: (20/1440) / 0.001 = 13.9x
+  72h: (20/4320) / 0.001 = 4.6x
+  3d:  igual a 72h       = 4.6x
+  30d: (20/43200)/0.001  = 0.46x
+
+Avaliação dos alertas:
+  1h/6h   (14.4x): 0x, 0x         -> não dispara
+  6h/3d   (6.0x):  0x, 4.6x       -> não dispara
+  24h/3d  (3.0x):  13.9x, 4.6x    -> DISPARA (severidade: medium)
+  72h/30d (1.0x):  4.6x, 0.46x    -> não dispara
+```
+
+## Error Budget Tracking
+
+### Campos de Status
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `currentValue` | float64 | SLI atual como **fração** (ex.: `0.9987` = 99.87%) |
+| `targetMet` | bool | `currentValue >= target/100` |
+| `errorBudgetTotal` | float64 | `1 - target/100` (ex.: `0.001`) |
+| `errorBudgetRemaining` | float64 | Parcela restante do budget, `0.0`-`1.0` |
+| `errorBudgetRemainingPercentage` | float64 | O mesmo, em percentual (`0`-`100`); é o que a coluna `BudgetRemaining%` mostra |
+| `errorBudgetConsumedPercentage` | float64 | Parcela consumida, em percentual (pode passar de 100) |
+| `burnRate1h`, `burnRate6h`, `burnRate24h`, `burnRate72h` | float64 | Burn rate em cada janela fixa |
+| `lastCalculatedAt` | Time | Último reconcile |
+| `activeAlerts` | []SLOAlert | Alertas ativos: `window` (ex.: `1h/6h`, ou `budget-exhausted`), `burnRate` (janela curta), `severity`, `firedAt` |
+| `conditions` | []Condition | `Ready`: `True/SLOMet` ou `False/SLONotMet` (a mensagem traz SLI, meta e budget restante). `False/SLICalculationFailed` só em erro interno de cálculo. `MetricSourceSupported=False/PrometheusNotEvaluated` quando `metricSource: prometheus` está definido |
+
+O CRD não tem campo de estado; a API REST deriva `Healthy`/`AtRisk`/`Breached` do status (veja "Consultando SLOs" abaixo). Não existem thresholds de aviso de budget (50/25/10%). Monte esses avisos como alertas do Prometheus sobre `chatcli_operator_slo_error_budget_remaining` (veja "Prometheus Metrics" abaixo).
+
+### O que dispara e quando
+
+| Gatilho | O que acontece |
+|---------|----------------|
+| Uma entrada de `burnRateWindows` está >= threshold nas duas janelas e ainda não está ativa | Abre um Issue `slo-<slo>-<curta>-<longa>-<unix-time>` (nome cortado em 63 caracteres) com a severidade da entrada. O alerta fica em `activeAlerts` enquanto as duas janelas continuam acima do threshold (sem Issue novo) e é limpo assim que uma delas cai abaixo. Se disparar de novo depois, um Issue novo é aberto |
+| `pageOnBudgetExhausted: true` e `errorBudgetRemaining` chega a 0 | Abre um único Issue `critical` `slo-<slo>-budget-exhausted-<unix-time>` e mantém uma entrada `budget-exhausted` em `activeAlerts`. Nenhum outro Issue é aberto enquanto o budget continuar em 0, e um Issue de esgotamento do mesmo SLO ainda aberto (não resolvido) também impede um segundo page. A entrada é limpa, e o page rearmado, quando o budget volta a ficar acima de 0 |
+
+Os Issues abertos por um SLO têm `spec.source: watcher`, `spec.signalType: slo_violation`, `spec.resource` = `indicator.resource` (ou o próprio SLO, se não definido), um `riskScore` baseado no budget consumido (degraus 50/75/90/100), os labels `platform.chatcli.io/signal=slo_violation` e `platform.chatcli.io/service=<serviceName>` e as annotations `platform.chatcli.io/slo-name`, `slo-window` e `burn-rate`. O SLO é o dono deles, então **apagar o SLO apaga esses Issues**.
+
+<Note>
+Um budget que se recupera e se esgota de novo aciona de novo: cada esgotamento abre exatamente um Issue.
+</Note>
+
+### Consultando SLOs
+
+```bash
+kubectl get slo -n production
+```
+
+```text
+NAME                       SERVICE       TARGET%   CURRENT             BUDGETREMAINING%    BURNRATE1H   AGE
+api-gateway-availability   api-gateway   99.9      0.999537037037037   53.70370370370371   0            12d
+```
+
+<Note>
+`CURRENT` é uma fração, não um percentual. `BUDGETREMAINING%` é o `status.errorBudgetRemainingPercentage`, a parcela do budget que **resta**, em percentual.
+</Note>
+
+A API REST do operator (header `X-API-Key`, role `viewer` ou superior) expõe os SLOs em modo somente leitura:
+
+| Endpoint | Retorno |
+|----------|---------|
+| `GET /api/v1/slos` | Lista (`?namespace=`, `?page=`, `?pageSize=` até 100) |
+| `GET /api/v1/slos/{name}` | Um SLO (`?namespace=`; sem ele, a primeira ocorrência em qualquer namespace) |
+| `GET /api/v1/slos/{name}/budget` | `SLOBudget`: `target`, `window`, `currentValue` e `errorBudgetRemaining` **em percentual**, `errorBudgetTotal` como fração |
+
+Cada SLO nas respostas REST também traz `burnRate1h`, `burnRate6h`, `burnRate24h`, `burnRate72h`, `activeAlerts` (quantos alertas estão disparados), `errorBudgetUsed` (a parte consumida, na mesma unidade de `errorBudgetTotal`) e um `state` derivado:
+
+| `state` | Quando |
+|---------|--------|
+| *(vazio)* | O controller ainda não calculou o SLO |
+| `Breached` | `targetMet` é falso ou o error budget acabou |
+| `AtRisk` | Há um alerta de burn rate ou de budget em `activeAlerts` |
+| `Healthy` | Nos demais casos |
+
+Em `/budget`, `burnRate` é o burn rate de 1 hora (`1.0` = consumindo o budget exatamente no ritmo permitido). `GET /api/v1/analytics/summary` conta os SLOs `AtRisk` e `Breached` em `slosAtRisk`.
+
+## IncidentSLA CRD
+
+Um `IncidentSLA` define as metas de resposta e resolução para **uma severidade**. Crie um objeto por severidade.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: critical-sla
+  namespace: production
+spec:
+  severity: critical
+  responseTime: "5m"
+  resolutionTime: "1h"
+```
+
+Status escrito pelo controller:
+
+```yaml
+status:
+  activeViolations: 1
+  totalViolations: 3
+  totalIssuesTracked: 120
+  compliancePercentage: 97.5
+  averageResponseTime: "2m14s"
+  averageResolutionTime: "38m2s"
+  lastViolationAt: "2026-03-15T14:30:00Z"
+  recentViolations:
+    - issueName: "api-gateway-oom-kill-1771276354"
+      type: resolution
+      elapsed: "1h12m0s"
+      threshold: "1h0m0s"
+      violatedAt: "2026-03-15T14:30:00Z"
+  conditions:
+    - type: SLAViolation
+      status: "True"
+      reason: resolutionViolation
+      message: "Issue api-gateway-oom-kill-1771276354 violated resolution SLA: 1h12m0s > 1h0m0s"
+```
+
+### Campos do Spec
+
+| Campo | Tipo | Obrigatório | Descrição |
+|-------|------|:-----------:|-----------|
+| `severity` | enum | **Sim** | `critical`, `high`, `medium`, `low` |
+| `responseTime` | string | **Sim** | Tempo máximo da detecção até a primeira análise. Duração Go (`s`, `m`, `h`), opcionalmente precedida de dias inteiros (ex.: `5m`, `1h30m`, `1d`) |
+| `resolutionTime` | string | **Sim** | Tempo máximo da detecção até a resolução (ex.: `4h`, `3d`, `2d12h`) |
+| `escalationPolicyRef` | string | Não | **Reservado**: aceito, mas ainda não é lido. Uma violação não aciona nenhuma EscalationPolicy |
+| `notificationPolicyRef` | string | Não | **Reservado**: aceito, mas ainda não é lido. Uma violação não envia notificação |
+| `businessHoursOnly` | bool | Não | Conta só o horário comercial. Só tem efeito se `businessHours` também estiver definido |
+| `businessHours` | BusinessHoursSpec | Não | Janela de horário comercial |
+
+<Note>
+`responseTime` e `resolutionTime` aceitam dias inteiros na frente de uma duração Go (`1d`, `2d12h`); semanas e dias fracionados (`1.5d`) não são aceitos. O CRD valida o padrão, então o API server recusa um valor malformado. Um valor que passa no padrão mas ainda não pode ser usado (por exemplo `0m`) coloca a condition `Ready=False` com reason `InvalidDuration`, e o SLA não é aplicado até ser corrigido; um SLA válido informa `Ready=True`.
+</Note>
+
+#### Qual SLA vale para um Issue
+
+O controller avalia todo `Issue`. Ele usa o primeiro `IncidentSLA` com a severidade do Issue no **namespace do Issue**. Se não houver, usa o primeiro com essa severidade encontrado em **qualquer namespace**. Assim dá para manter um conjunto padrão para o cluster inteiro em um namespace e sobrescrevê-lo por namespace. Mantenha um único `IncidentSLA` por severidade em cada namespace: com vários, não está definido qual vence.
+
+#### Como resposta e resolução são medidas
+
+O relógio começa no `status.detectedAt` do Issue (ou na sua criação).
+
+| Medida | Quando é verificada | Tempo decorrido |
+|--------|--------------------|-----------------|
+| **Resposta** | Uma vez, na primeira vez que o controller vê o Issue em `Analyzing` ou `Remediating` | Da detecção até esse momento |
+| **Resolução** | Uma vez, quando o Issue chega a `Resolved` | Da detecção até `status.resolvedAt` |
+| **Resolução** | Uma vez, quando o Issue chega a `Escalated` ou `Failed` | Da detecção até esse momento |
+
+A cronometragem tem limites que você precisa conhecer:
+
+- **As violações são detectadas nas transições de estado, não por um timer correndo.** Um Issue parado em `Detected` além do `responseTime` só é sinalizado quando passa para `Analyzing`/`Remediating`. Um Issue aberto além do `resolutionTime` só é sinalizado quando vira `Resolved`, `Escalated` ou `Failed`.
+- Um Issue que nunca passa por `Analyzing` nem `Remediating` nunca tem a resposta verificada.
+- `Contained` não é estado final: o relógio de resolução continua até `Resolved`/`Escalated`/`Failed`.
+- Cada Issue é cronometrado uma única vez. Se um Issue `Escalated` for resolvido depois, ele não é reavaliado.
+- O controller marca o Issue com as annotations `platform.chatcli.io/sla-response-checked`, `platform.chatcli.io/sla-resolution-checked` e, em caso de violação, `platform.chatcli.io/sla-violated` (`response`, `resolution` ou os dois).
+
+#### O que uma violação faz
+
+Cada violação:
+
+- adiciona um registro em `status.recentViolations` (só os 50 últimos são mantidos),
+- incrementa `totalViolations`, `activeViolations` e `chatcli_operator_sla_violations_total{severity,type}`, e registra o SLA na Issue (annotation `platform.chatcli.io/sla-name`),
+- preenche `lastViolationAt` e a condition `SLAViolation=True` (reason `responseViolation` ou `resolutionViolation`),
+- grava um [AuditEvent](/pt/kubernetes/aiops/audit-compliance) `sla_breach`.
+
+Ela **não** notifica ninguém nem escala por conta própria. Para ser avisado, crie um alerta sobre `chatcli_operator_sla_violations_total` no Prometheus.
+
+<Note>
+`activeViolations` conta as violações cuja Issue ainda não foi resolvida. Quando a Issue chega a `Resolved`, as violações dela são subtraídas do SLA indicado em `platform.chatcli.io/sla-name` (mesmo que a severidade da Issue tenha mudado depois), e quando o valor chega a 0 a condition passa a `SLAViolation=False` (reason `NoActiveViolation`). Uma Issue que termina em `Escalated` ou `Failed` mantém as violações ativas até ser resolvida.
+</Note>
+
+#### BusinessHoursSpec
+
+| Campo | Tipo | Padrão | Descrição |
+|-------|------|--------|-----------|
+| `timezone` | string | `UTC` | Timezone IANA (ex.: `America/Sao_Paulo`). Um timezone desconhecido cai para UTC |
+| `startHour` | int (0-23) | `9` | Hora de início (horas cheias) |
+| `endHour` | int (0-23) | `18` | Hora de fim, exclusiva. Precisa ser maior que `startHour` (janelas que viram a noite contam tempo zero) |
+| `workDays` | []string | `Monday` … `Friday` | Nomes dos dias em inglês, com inicial maiúscula: `Monday`, `Tuesday`, … `Sunday` |
+
+Não existe calendário de feriados: o relógio corre em todos os dias da semana listados.
+
+#### Como o Clock de Business Hours Funciona
+
+Com `businessHoursOnly: true` e `businessHours` definido, só conta o tempo dentro da janela. Fora dela, o relógio fica pausado.
+
+<Steps>
+  <Step title="Incidente detectado">
+    Issue detectado às 17:45 (sexta-feira).
+
+    ```text
+    Horário comercial: 09:00-18:00 (segunda a sexta), timezone America/Sao_Paulo
+    ```
+  </Step>
+  <Step title="Clock conta 15 minutos (sexta)">
+    De 17:45 até 18:00 = **15 minutos** de SLA clock.
+    Clock **pausa** às 18:00 (fim do horário comercial).
+  </Step>
+  <Step title="Fim de semana: clock pausado">
+    Sábado e domingo não estão em `workDays`.
+    Tempo SLA acumulado: **15 minutos**.
+  </Step>
+  <Step title="Segunda-feira: clock retoma">
+    Clock **retoma** às 09:00 de segunda-feira.
+    Se o incidente é resolvido às 10:30 de segunda:
+    - Sexta: 15 minutos
+    - Segunda: 1h30 = 90 minutos
+    - **Total SLA: 105 minutos (1h45)**
+  </Step>
+  <Step title="Avaliação de compliance">
+    Com um SLA `critical` de `resolutionTime: 1h`:
+    - Tempo SLA gasto: 105 minutos
+    - Limite: 60 minutos
+    - **VIOLAÇÃO**
+
+    Com um SLA `high` de `resolutionTime: 4h`:
+    - Tempo SLA gasto: 105 minutos
+    - Limite: 240 minutos
+    - **DENTRO DO SLA**
+  </Step>
+</Steps>
+
+<Warning>
+Para incidentes `critical`, considere deixar `businessHoursOnly` desligado e usar clock 24/7. Problemas críticos em produção não devem aguardar o próximo dia útil. O horário comercial é definido por `IncidentSLA`, então cada severidade pode ter a sua escolha.
+</Warning>
+
+#### Cálculo do CompliancePercentage
+
+```text
+CompliancePercentage = ((totalIssuesTracked - totalViolations) / totalIssuesTracked) * 100
+
+Exemplo:
+  Issues acompanhados: 120
+  Violações: 3
+  Compliance = ((120 - 3) / 120) * 100 = 97.5%
+```
+
+- `totalIssuesTracked` conta os Issues quando eles **fecham** (`Resolved`, `Escalated` ou `Failed`). `totalViolations` conta **violações**: um Issue que viola resposta e resolução conta duas vezes. A compliance nunca fica abaixo de 0 e vale 100 enquanto nada foi acompanhado.
+- Cada `IncidentSLA` tem a sua compliance, que também é a da sua severidade (`chatcli_operator_sla_compliance_percentage{severity}`). Os contadores são acumulados desde a criação do objeto: não existe período móvel.
+- `averageResponseTime` e `averageResolutionTime` são recalculados quando um Issue é resolvido. Eles cobrem **todos os Issues daquela severidade no cluster**, e não só os do namespace do SLA. O tempo de resposta vem da condition `Analyzing` do Issue.
+
+<Info>
+O relatório de compliance em `GET /api/v1/analytics/compliance` cobre o período absoluto `from`-`to` (padrão: os últimos 7 dias). Com objetos `IncidentSLA` no escopo, a seção de SLA conta as violações de resposta e de resolução que o controller deles registrou em cada Issue (`platform.chatcli.io/sla-violated`), e `IncidentSLAs[]` lista cada SLA com os próprios contadores (`CompliancePercentage`, `ActiveViolations`, `TotalViolations`, `TotalIssuesTracked`). Sem nenhum `IncidentSLA`, ele volta a contar todo Issue `Escalated` como violação de resolução. O relatório mantém as chaves JSON em PascalCase, e as durações vêm em nanossegundos. `GET /api/v1/policies/sla` lista os objetos `IncidentSLA` (somente leitura, role `viewer`).
+</Info>
+
+```bash
+kubectl get sla -A
+```
+
+```text
+NAMESPACE    NAME           SEVERITY   RESPONSETIME   RESOLUTIONTIME   COMPLIANCE%   VIOLATIONS   AGE
+production   critical-sla   critical   5m             1h               97.5          3            30d
+```
+
+## Exemplos YAML Completos
+
+### SLO de 99.9% Availability com Burn Rate Alerting
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: api-gateway-availability-slo
+  namespace: production
+spec:
+  serviceName: api-gateway
+  description: "99.9% de disponibilidade do API Gateway, medida como tempo sem Issue aberto"
+  enabled: true
+
+  indicator:
+    type: availability
+
+  target:
+    percentage: 99.9
+    window: 30d
+
+  alertPolicy:
+    # Um Issue critical por esgotamento; rearma quando o budget volta a ficar acima de 0
+    pageOnBudgetExhausted: true
+    burnRateWindows:
+      - shortWindow: 1h
+        longWindow: 6h
+        burnRateThreshold: 14.4
+        severity: critical
+      - shortWindow: 6h
+        longWindow: 3d
+        burnRateThreshold: 6.0
+        severity: high
+      - shortWindow: 24h
+        longWindow: 3d
+        burnRateThreshold: 3.0
+        severity: medium
+      - shortWindow: 72h
+        longWindow: 30d
+        burnRateThreshold: 1.0
+        severity: low
+```
+
+Roteie os Issues que ele abre com uma regra de `NotificationPolicy` (veja [Notificações](/pt/kubernetes/aiops/notifications)):
+
+```yaml
+  rules:
+    - name: slo-burn
+      signalTypes: [slo_violation]
+      channels: [slack-sre]
+```
+
+### SLAs de Incidente: Critical 5min/1h (24/7), Demais em Horário Comercial
+
+Um `IncidentSLA` por severidade:
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: critical-sla
+  namespace: production
+spec:
+  severity: critical
+  responseTime: "5m"
+  resolutionTime: "1h"
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: high-sla
+  namespace: production
+spec:
+  severity: high
+  responseTime: "15m"
+  resolutionTime: "4h"
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
+    startHour: 9
+    endHour: 18
+    workDays: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: medium-sla
+  namespace: production
+spec:
+  severity: medium
+  responseTime: "2h"
+  resolutionTime: "24h"
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
+---
+apiVersion: platform.chatcli.io/v1alpha1
+kind: IncidentSLA
+metadata:
+  name: low-sla
+  namespace: production
+spec:
+  severity: low
+  responseTime: "8h"
+  resolutionTime: "3d"           # dias inteiros são aceitos (o mesmo que "72h")
+  businessHoursOnly: true
+  businessHours:
+    timezone: "America/Sao_Paulo"
+```
+
+<Note>
+`medium-sla` e `low-sla` usam os padrões de `businessHours` (09:00-18:00, segunda a sexta). O objeto precisa estar presente mesmo assim: `businessHoursOnly: true` sem `businessHours` volta para o clock 24/7.
+</Note>
+
+### SLO de Latência para um Deployment (Baseado em Anomalias)
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: payment-service-latency-slo
+  namespace: payments
+spec:
+  serviceName: payment-service
+  description: "Proporção de anomalias de latência entre todas as anomalias do payment-service"
+  enabled: true
+
+  indicator:
+    type: latency
+    resource:
+      kind: Deployment
+      name: payment-service
+      namespace: payments
+
+  target:
+    percentage: 95
+    window: 7d
+
+  alertPolicy:
+    burnRateWindows:
+      - shortWindow: 30m
+        longWindow: 3h
+        burnRateThreshold: 10
+        severity: high
+```
+
+O SLI conta as Anomalies com `signalType: latency` (geradas pelo watcher a partir de alertas `HighLatency`/`Latency`) contra todas as Anomalies do `payment-service` na janela.
+
+## Grafana Dashboards
+
+O repositório traz 4 dashboards Grafana em `deploy/grafana/`, construídos sobre as métricas do operator:
+
+<CardGroup cols={2}>
+  <Card title="SLO Burn Rate & SLA Compliance" icon="chart-line">
+    `slo-burn-rate.json`: error budget restante, SLI atual, burn rate por janela fixa (1h/6h/24h/72h) contra as linhas de referência de 14.4/6/3/1x, tempo até esgotar o budget, compliance de SLA, distribuição dos tempos de resposta/resolução e violações por tipo.
+  </Card>
+  <Card title="Remediation Stats & Operator Health" icon="chart-area">
+    `remediation-stats.json`: estatísticas de remediação, mais uma seção de SLA com compliance e p95 dos tempos de resposta/resolução por severidade.
+  </Card>
+  <Card title="AIOps Overview" icon="file-chart-line">
+    `aiops-overview.json`: visão geral da plataforma com issues, anomalias e remediações.
+  </Card>
+  <Card title="Incident Timeline & Workflows" icon="timeline-arrow">
+    `incident-timeline.json`: fluxo dos incidentes da detecção à análise, remediação e resolução.
+  </Card>
+</CardGroup>
+
+**Importando os dashboards** (a partir de um checkout do repositório do chatcli):
+
+```bash
+# Como ConfigMap para o sidecar do Grafana (label grafana_dashboard=1)
+kubectl create configmap chatcli-grafana-dashboards -n monitoring \
+  --from-file=deploy/grafana/aiops-overview.json \
+  --from-file=deploy/grafana/slo-burn-rate.json \
+  --from-file=deploy/grafana/incident-timeline.json \
+  --from-file=deploy/grafana/remediation-stats.json
+kubectl label configmap chatcli-grafana-dashboards -n monitoring grafana_dashboard=1
+
+# Ou pela API HTTP do Grafana (os arquivos são dashboards "puros", então embrulhe-os)
+for f in deploy/grafana/*.json; do
+  jq '{dashboard: ., overwrite: true}' "$f" | curl -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $GRAFANA_API_KEY" \
+    -d @- "https://grafana.example.com/api/dashboards/db"
+done
+```
+
+## Prometheus Metrics
+
+O operator expõe estas métricas na sua porta de métricas (`8080`, path `/metrics`).
+
+### Métricas de SLO
+
+| Métrica | Tipo | Labels | Descrição |
+|---------|------|--------|-----------|
+| `chatcli_operator_slo_current_value` | Gauge | `service`, `slo_name` | SLI atual como fração (ex.: `0.9992`) |
+| `chatcli_operator_slo_error_budget_remaining` | Gauge | `service`, `slo_name` | Parcela restante do error budget, `0.0`-`1.0` |
+| `chatcli_operator_slo_burn_rate` | Gauge | `service`, `slo_name`, `window` | Burn rate; `window` é `1h`, `6h`, `24h` ou `72h` (as `burnRateWindows` customizadas não são exportadas) |
+| `chatcli_operator_slo_violations_total` | Counter | `service`, `slo_name`, `severity` | Alertas de burn rate disparados mais pages de budget esgotado |
+
+### Métricas de SLA
+
+| Métrica | Tipo | Labels | Descrição |
+|---------|------|--------|-----------|
+| `chatcli_operator_sla_violations_total` | Counter | `severity`, `type` (`response`, `resolution`) | Violações de SLA |
+| `chatcli_operator_sla_compliance_percentage` | Gauge | `severity` | Compliance do `IncidentSLA` daquela severidade |
+| `chatcli_operator_sla_response_time_seconds` | Histogram | `severity` | Da detecção à primeira análise (observado na verificação de resposta) |
+| `chatcli_operator_sla_resolution_time_seconds` | Histogram | `severity` | Da detecção à resolução (observado só para Issues `Resolved`) |
+
+<Note>
+Os gauges só são atualizados enquanto o SLO ou o SLA é reconciliado. Apagar um SLO não remove os últimos valores dele do `/metrics` até o operator reiniciar.
+</Note>
+
+**Alertas Prometheus recomendados:**
+
+```yaml
+groups:
+  - name: chatcli-slo-sla
+    rules:
+      - alert: SLOBudgetExhausted
+        expr: chatcli_operator_slo_error_budget_remaining <= 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error budget esgotado para o SLO {{ $labels.slo_name }}"
+          description: "O serviço {{ $labels.service }} esgotou seu error budget. Nenhum downtime adicional é permitido."
+
+      - alert: SLOBudgetLow
+        expr: chatcli_operator_slo_error_budget_remaining <= 0.10 and chatcli_operator_slo_error_budget_remaining > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error budget baixo ({{ $value | humanizePercentage }}) para o SLO {{ $labels.slo_name }}"
+
+      - alert: SLAComplianceBelow95
+        expr: chatcli_operator_sla_compliance_percentage < 95
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Compliance de SLA abaixo de 95% para incidentes {{ $labels.severity }}"
+          description: "Compliance atual: {{ $value }}%. Revise os incidentes recentes e tome ações corretivas."
+
+      - alert: SLABreached
+        expr: increase(chatcli_operator_sla_violations_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLA de {{ $labels.type }} violado em um incidente {{ $labels.severity }}"
+
+      - alert: SLAResponseTimeExceeded
+        expr: histogram_quantile(0.95, sum by (le, severity) (rate(chatcli_operator_sla_response_time_seconds_bucket[1h]))) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 do tempo de resposta de SLA acima de 5 minutos para incidentes {{ $labels.severity }}"
+```
+
+## Próximo Passo
+
+<CardGroup cols={2}>
+  <Card title="Notificações e Escalação" icon="bell" href="/pt/kubernetes/aiops/notifications">
+    Sistema de notificação multicanal e escalação automática
+  </Card>
+  <Card title="Workflow de Aprovação" icon="shield-check" href="/pt/kubernetes/aiops/approval-workflow">
+    Controle de mudanças com políticas de aprovação e blast radius
+  </Card>
+  <Card title="AIOps Platform" icon="brain" href="/pt/kubernetes/aiops-platform">
+    Aprofundamento na arquitetura AIOps
+  </Card>
+  <Card title="K8s Operator" icon="dharmachakra" href="/pt/kubernetes/k8s-operator">
+    Configuração do operator e CRDs
+  </Card>
+</CardGroup>

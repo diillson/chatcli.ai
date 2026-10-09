@@ -1,0 +1,199 @@
+---
+title: "Agent Squad"
+sidebarTitle: "Agent Squad"
+description: "Um time coordenado de agents: observabilidade ao vivo de cada execução, um board kanban compartilhado, mensagens agent-a-agent e um playbook do orquestrador que leva um único prompt até a entrega validada — de forma autônoma."
+icon: "people-group"
+---
+
+A camada **Agent Squad** transforma a [Orquestração Multi-Agent](/pt/agents/multi-agent-orchestration) em um time de verdade. Você dá um prompt; o orquestrador planeja o trabalho em cards, despacha workers especialistas, acompanha onde cada um está, devolve o feedback de review para o coder, agenda continuações e só entrega depois de validar — sem você precisar ser babá de nada.
+
+São quatro peças, cada uma utilizável sozinha:
+
+| Peça | Superfície humana | Superfície da IA |
+|---|---|---|
+| Registry de runs ao vivo | `/agents` | `@agents` |
+| Board de trabalho (kanban) | `/board` | `@board` |
+| Squad mail | `/mail` | `@mail` + `send_mail` dos workers |
+| Playbook de entrega | — | system prompt do orquestrador |
+
+---
+
+## Quando o squad ativa?
+
+Não existe um "botão de squad" no código — o orquestrador decide **por turno**, guiado por uma escada de decisão ensinada no system prompt dele (sempre presente no `/coder` e no `/agent`, já que o modo multi-agent é ligado por padrão). Conhecer a escada evita a confusão clássica de "pedi algo e nenhum card apareceu":
+
+| Seu pedido parece… | O que o orquestrador faz |
+|---|---|
+| 1–2 leituras ou um edit pequeno ("corrige esse typo") | Tool calls diretas. Sem workers, sem cards — o squad seria puro overhead. |
+| 3+ operações independentes, mudança multi-arquivo, busca no codebase inteiro | Despacha workers em paralelo via `agent_call` — ainda sem board, é mais rápido que burocracia de card. |
+| Objetivo multi-etapa com entregável ("implementa OAuth com testes, revisado") | **Squad completo**: cards no board, workers atribuídos, ciclo de review, entrega validada. O playbook proíbe terminar com cards fora de `done`/`blocked`. |
+| Trabalho contínuo ou futuro ("monitore X", "todo dia às 9h") | Squad + [scheduler](/pt/tools/scheduler): o job fica vinculado ao card, que espera em `blocked` com nota. |
+
+Existem também dois gatilhos determinísticos: tarefas de alta complexidade disparam o [Plan-and-Solve](/pt/agents/harness/plan-and-solve) antes do loop (um plano estruturado naturalmente vira cards), e qualquer `[SQUAD MAIL]` na inbox é injetado no boundary do turno com instrução de reagir antes de continuar.
+
+<Tip>Você sempre pode forçar: `/plan <objetivo>` planeja primeiro, e uma instrução explícita no prompt — "crie cards no board e me entregue revisado" — vence a heurística. O meio-termo é julgamento do modelo por design: o playbook dá uma régua, não um if/else rígido.</Tip>
+
+<Note>Para um **plano aprovado com 5+ tasks genuinamente independentes**, existe uma camada mais estrita acima do playbook: o [Task Graph](/pt/agents/task-graph) — um DAG persistido onde o engine executa ele mesmo os comandos de validação de cada task e um reviewer independente dá o veredito antes de qualquer coisa contar como done.</Note>
+
+<Note>Um worker despachado pode receber plugins da sessão para sua task — `<agent_call agent="coder" task="..." tools="@browser,@websearch" />` — gateado pela mesma política de segurança. Ver [Capacidades do worker](/pt/agents/task-graph#capacidades-do-worker).</Note>
+
+---
+
+## Registry de runs — onde está cada agent?
+
+Toda execução de agent se registra num registry process-wide: o loop do orquestrador, cada worker despachado, subagents delegados, membros do painel Mixture-of-Agents e runs headless do scheduler. Os runs formam uma árvore pai → filho, e cada um reporta seu turno ReAct atual e a ação em andamento.
+
+O painel de dispatch ao vivo usa o registry para mostrar progresso real por agent:
+
+```text
+⠋ [gpt-5.6-sol] [1m02s] [████████░░░░░░░░░░░░] 2/4 agents (50%)
+  ✓ [file] Ler arquivos do engine ─ concluido (12.4s)
+  ⠋ [coder] Implementar comando /foo ─ turno 7/30 · patch cli/foo.go
+      ↳ [subagent] analisar endpoint de métricas — turno 3/15 · read
+  ⠋ [reviewer] Revisar o diff ─ turno 2/30 · git-diff
+  ○ [tester] Rodar a suíte de testes ─ pendente
+```
+
+### `/agents`
+
+```bash
+/agents              # árvore de runs ativos + histórico recente
+/agents show run-3   # um run completo: turno, ação, tool calls, filhos
+/agents cancel run-3 # cancela um run travado (propaga aos subagents dele)
+```
+
+### `@agents` (para a IA)
+
+O orquestrador usa o mesmo registry através da tool `@agents` (`list`, `show`, `cancel`) — assim verifica o que já está rodando antes de despachar trabalho duplicado e mata um worker que esteja em loop sem progresso.
+
+O cancelamento é por run: cancela o contexto daquele run e tudo que ele criou, nunca o lote inteiro.
+
+### Runs cross-process — enxergue o gateway daemon do seu REPL
+
+Com o [Conversation Hub](/pt/gateway/conversation-hub) habilitado, cada processo do ChatCLI espelha seus runs vivos no banco compartilhado do hub. O `/agents` (e o `@agents`) passam a listar runs de **outros processos** — um squad executando dentro do gateway daemon, um run headless do scheduler — numa seção dedicada, com a origem marcada:
+
+```text
+Execuções em outros processos (via hub) (2)
+  ▶ run-3f9a2b01-2 [worker/coder] · turno 5/30 · patch api.go · 42s — build the customer API [gateway]
+  ▶ run-77ab01c4-1 [headless/scheduler] · 12s — nightly dependency scan [scheduler]
+```
+
+Cada run espelhado carrega um heartbeat de vida; se o processo dono morrer sem finalizar, a entrada é sinalizada (`⚠ sem heartbeat`) em vez de mentir "rodando" para sempre. O `/agents cancel` também funciona cross-process: o pedido é gravado no hub e o processo dono o honra no próximo ciclo de sincronização (cerca de um segundo).
+
+Os IDs de run embutem um token de instância por processo (`run-<inst>-<n>`), então dois processos nunca cunham IDs colidentes.
+
+---
+
+## Comandando o squad enquanto ele roda
+
+O terminal não fica mais preso enquanto um squad (ou qualquer run do `/coder`) trabalha: digite `/agents`, `/board`, `/mail`, `/jobs`, `/taskgraph` ou [`/dash`](/pt/usage/live-dashboard) a qualquer momento e o comando executa na hora — o painel de progresso pausa, a saída imprime, o painel retoma.
+
+No macOS/Linux você também **vê o que digita**: a linha em composição aparece viva numa linha própria **abaixo** do painel ou do spinner de turno, como `❯ seu texto▌`, com backspace funcionando — o ChatCLI assume a edição da linha enquanto o loop roda, então o spinner não come mais as teclas. (No Windows vale o comportamento clássico: a linha é entregue no Enter.)
+
+```text
+⠋ [claude-sonnet-5] [1m02s] [████████░░░░] 2/4 agents (50%)
+/board                     ← digitado no meio do run
+  ⚡ /board
+  📋 doing: card-2 Implement API (coder, run-…-3)
+  ...painel retoma...
+```
+
+Duas regras mantêm isso seguro:
+
+- Esses quatro comandos nunca chegam ao modelo nem a um prompt de segurança pendente — são interceptados antes da fila de type-ahead, então digitar `/board` na hora errada jamais vira resposta de prompt nem instrução para a LLM.
+- Se o terminal estiver momentaneamente ocupado por uma confirmação de segurança, o comando entra na fila e roda no próximo boundary de turno (você verá `⚡ Aplicando N comando(s) enfileirado(s) durante a execução`).
+
+`/mail send <agent> <texto>` no meio do run é o volante: a diretiva cai na inbox do destinatário e é entregue no próximo turno ReAct dele — inclusive para agents rodando em outro processo, via hub.
+
+Qualquer outra coisa digitada no meio do run mantém o comportamento existente: entra como type-ahead e é injetada na conversa como sua próxima instrução no boundary de turno.
+
+---
+
+## Board de trabalho — o kanban do time
+
+O board é a unidade de trabalho compartilhada: cards fluindo por **backlog → doing → review → blocked → done**. Um card carrega assignee (tipo de worker agent), notas com timestamp (veredictos de review, resumos de entrega), IDs de runs e de jobs do scheduler vinculados, e todo o histórico de transições.
+
+```bash
+/board                          # kanban agrupado por coluna
+/board show card-3              # descrição, notas, histórico, runs/jobs vinculados
+/board create Corrigir login    # você também pode adicionar trabalho
+/board move card-3 review
+/board assign card-3 reviewer
+/board note card-3 faltam testes do caminho OAuth
+/board archive 24h              # limpa cards concluídos antigos
+```
+
+A IA gerencia o mesmo board via `@board` (`create`, `list`, `show`, `move`, `assign`, `note`, `link`, `archive`). Os resultados dos agents incluem o `run_id`, então o orquestrador vincula cada execução ao seu card para rastreabilidade.
+
+A persistência é um documento JSON único escrito atomicamente em `~/.chatcli/board.json` (sobrescreva com `CHATCLI_BOARD_PATH`). Arquivo corrompido gera erro — nunca é apagado silenciosamente.
+
+---
+
+## Squad mail — agents conversando entre si
+
+O squad mail é um bus de mensagens direcionadas entre agents. As mensagens são injetadas no contexto do destinatário no **próximo boundary de turno** — o único ponto que não quebra um tool call nativo e seu resultado.
+
+- **Workers** ganham a tool nativa universal `send_mail` (independente do allowlist de comandos): um reviewer entrega o veredicto direto ao coder em pleno voo.
+- **O orquestrador** drena a própria inbox a cada turno (entregue como blocos `[SQUAD MAIL]`) e usa `@mail` (`send`, `inbox`, `history`).
+- **Você** pode redirecionar qualquer agent sem interrompê-lo:
+
+```bash
+/mail send coder priorize a correção do login antes do refactor
+/mail list      # tráfego recente (quem disse o quê para quem)
+/mail pending   # mensagens na fila por destinatário
+```
+
+### Durável e cross-process
+
+O squad mail é persistido no store SQLite do [Conversation Hub](/pt/gateway/conversation-hub) (modo WAL): mensagens sobrevivem a restarts e fluem entre processos. Uma diretiva digitada no seu REPL alcança agents rodando dentro do daemon do [Chat Gateway](/pt/gateway/chat-gateway), e vice-versa. Acks de entrega impedem que outros processos (e a hidratação pós-restart) reentreguem mensagens já consumidas.
+
+---
+
+## O playbook de entrega
+
+Com observabilidade, board e mensageria no lugar, o system prompt do orquestrador ensina o ciclo autônomo completo:
+
+1. **Plan** — quebra o objetivo em cards (`@board create`, um por entregável, assignee = tipo de agent).
+2. **Develop** — move o card para `doing`, despacha os workers designados, vincula o `run_id`.
+3. **Review** — move para `review`, despacha reviewer/tester, registra o veredicto como nota do card. Review reprovado → os achados voltam para o coder (novo dispatch ou `@mail send coder`), o card volta para `doing`.
+4. **Deliver** — valida de verdade (build + testes, red → green) e move para `done` com nota de entrega.
+5. **Loop** — repete até nenhum card ficar fora de `done`. Trabalho contínuo ou adiado é agendado via [`@scheduler`](/pt/tools/scheduler) com o job vinculado ao card.
+
+O orquestrador é instruído a nunca terminar um run com cards inacabados, exceto em `blocked` com nota explicando o bloqueio.
+
+---
+
+## Telemetria estruturada no gateway
+
+Quando o squad roda dentro do [Chat Gateway](/pt/gateway/chat-gateway) (Telegram, Slack, …), o progresso é emitido a partir de **eventos tipados do agent** em vez de raspar a saída do terminal: linhas de raciocínio, início/fim de tool com duração, contadores de plano e uma linha por mudança de estado de worker (turno e ação atuais, depois status terminal).
+
+```text
+🧠 Lendo a config para entender os defaults
+▸ Reading: cli/foo.go
+✓ Reading: cli/foo.go (120ms)
+🤖 [reviewer] turno 4/30 · git-diff
+✓ [reviewer] concluído (41s)
+📋 2/5 · aplicar patch
+```
+
+O caminho legado de scraping continua disponível com `CHATCLI_GATEWAY_STRUCTURED_PROGRESS=false`.
+
+---
+
+## Gestão de janela dos workers
+
+Todo worker compartilha a gestão de janela do orquestrador em vez de rodar só com o microcompact L0: a cada fronteira de turno o compactador da sessão (trim de Nível 1, resumo de Nível 2 com o sumarizador configurado, arquivo CCR pela camada do tenant ativo) roda quando o histórico do worker cruza o orçamento da sessão; um turno que falha com erro de overflow de contexto é compactado com os mesmos níveis limitados de recuperação do loop principal e reenviado em vez de falhar a tarefa; e cada turno de worker é registrado no journal da sessão pai, marcado com o nome do worker, então o registro fica completo sem o histórico do pai ser poluído por eventos de workers. Participantes do MoA recuperam por thread do mesmo jeito.
+
+## Configuração
+
+| Variável | Default | Função |
+|---|---|---|
+| `CHATCLI_AGENT_RUNS_HISTORY` | `200` | Runs concluídos retidos para `/agents` e `@agents` |
+| `CHATCLI_HUB_RUNS` | `true` | Espelha runs via hub para `/agents` cross-process (use `false` para desligar) |
+| `CHATCLI_BOARD_PATH` | `~/.chatcli/board.json` | Localização do arquivo do board |
+| `CHATCLI_GATEWAY_STRUCTURED_PROGRESS` | `true` | Telemetria estruturada no gateway (`false` volta ao scraping legado) |
+| `CHATCLI_HUB_POLL_MS` | `1000` | Cadência de polling do mail cross-process (compartilhada com o hub sync) |
+
+Todas aparecem em `/config agent` e `/config gateway`.
+
+<Info>As tools do squad são expostas à LLM tanto no catálogo de tools do prompt quanto como definições nativas de function calling (`agents_runs`, `board_cards`, `squad_mail`), então a orquestração funciona em qualquer provider.</Info>

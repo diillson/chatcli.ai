@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="images/chatcli-logo.png" alt="ChatCLI" width="200" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/chatcli-logo-dark.png" />
+    <img src="images/chatcli-logo.png" alt="ChatCLI" width="240" />
+  </picture>
 </p>
 
 <h1 align="center">ChatCLI Documentation</h1>
@@ -31,38 +34,52 @@
 
 Este repositório contém a **documentação oficial** do [ChatCLI](https://github.com/diillson/chatcli), construída com [Mintlify](https://mintlify.com) e publicada em **[chatcli.edilsonfreitas.com](https://chatcli.edilsonfreitas.com)**.
 
-O ChatCLI é uma CLI open-source escrita em Go que conecta seu terminal a 14 provedores de IA (OpenAI, OpenAI Assistants, Anthropic Claude, AWS Bedrock, Google Gemini, xAI Grok, ZAI, MiniMax, Moonshot (Kimi), StackSpot, Ollama, GitHub Copilot, GitHub Models e OpenRouter) com modos agente, coder, MCP, K8s operator e muito mais.
+O ChatCLI é uma CLI open-source escrita em Go que leva os principais provedores de LLM para o terminal, com coder mode, agentes, servidor gRPC, operator Kubernetes e muito mais. A lista de provedores e modelos fica em [Modelos suportados](https://chatcli.edilsonfreitas.com/providers/supported-models).
 
 ---
 
 ## Estrutura da Documentação
 
+O inglês é servido na raiz e o português em `pt/`, com a mesma árvore. A navegação (`docs.json`) segue as seções abaixo.
+
 ```
 chatcli.ai/
-├── introduction.mdx            # Página inicial
-├── getting-started/            # Instalação e Docker
-├── core-concepts/              # Uso básico, comandos @, agente, coder
-├── features/                   # 20+ funcionalidades detalhadas
-│   ├── IA e Agentes            # Tool Use, plugins, multi-agent, personas
-│   ├── Coder                   # Plugin coder, segurança do coder
-│   ├── Infraestrutura          # K8s watcher/operator, AIOps, server, remote
-│   ├── Sessões e Contexto      # Sessões, contextos, bootstrap, memory
-│   ├── Integrações             # Plugins, MCP, skills, OAuth, fallback
-│   └── Avançado                # Non-interactive, migration, segurança, i18n
-├── reference/                  # Comandos, env vars, configuração, modelos, arquitetura
-├── cookbook/                    # 9 receitas práticas (agent, coder, pipelines, K8s...)
-├── support/                    # Troubleshooting e contribuição
-├── images/                     # Logo, favicon, demo GIF
-└── mint.json                   # Configuração do Mintlify
+├── index.mdx                   # Home: banner, release mais recente, início rápido
+├── start/                      # Comece aqui: quickstart, instalação, Docker/K8s, atualização
+├── usage/                      # Usando o ChatCLI: prompt, @contexto, modos agent/coder, one-shot
+├── coder/                      # Coder: @coder, tools atômicos, permissões, worktrees, LSP
+├── agents/                     # Agentes: multiagente, squad, task graph, personas
+│   └── harness/                #   Harness de qualidade (7 padrões + evals)
+├── context/                    # Contexto e memória: contexto persistente, knowledge, sessões
+├── providers/                  # Modelos e provedores: catálogo, OAuth, Bedrock, fallback, custo
+├── tools/                      # Ferramentas: web, browser, API explorer, forges, imagens, scheduler
+├── extensions/                 # Extensões: plugins, MCP, skills, slash commands, hooks
+├── gateway/                    # Canais e gateway: Telegram, Slack, Discord, WhatsApp, voz
+├── server/                     # Servidor e IDE: gRPC, conexão remota, servidor MCP, ACP
+├── kubernetes/                 # Kubernetes e AIOps: watcher, operator
+│   └── aiops/                  #   Plataforma AIOps
+├── security/                   # Segurança
+├── cookbook/                   # Receitas passo a passo
+├── reference/                  # Comandos, variáveis, configuração, arquitetura, API REST
+├── releases.mdx                # Índice das notas de release (gerado)
+├── releases/                   # Uma página por versão (gerado)
+├── help/                       # Troubleshooting e contribuição
+├── pt/                         # A mesma árvore em português
+├── images/                     # Logos, favicon, ícone do ArtifactHub, mídia
+├── scripts/gen-intro-banner.py # Gera o banner da home a partir do cli/welcome.go
+├── style.css                   # Tema: tokens de cor claro/escuro, componentes, home, releases
+├── flags.js                    # Bandeiras no seletor de idioma
+└── docs.json                   # Configuração e navegação do Mintlify
 ```
 
-| Métrica | Valor |
-|:---|:---|
-| Total de páginas | **47** |
-| Categorias | **7** (Início, Primeiros Passos, Conceitos, Features, Referência, Cookbook, Suporte) |
-| Receitas no Cookbook | **9** |
-| Provedores documentados | **7** |
-| Idioma | Português (pt-BR) |
+### Notas de release (geradas)
+
+`releases.mdx`, `releases/`, a faixa "New release" da home (entre os marcadores `release-strip`) e o grupo Releases da navegação são gerados a partir do `CHANGELOG.md` do release-please pelo `scripts/docs/gen-release-notes.py` do repositório do ChatCLI. O job `update_docs_version` da pipeline de release roda o script a cada versão; edições à mão nesses arquivos são sobrescritas. Para regenerar localmente:
+
+```bash
+python3 ../chatcli/scripts/docs/gen-release-notes.py \
+  --changelog ../chatcli/CHANGELOG.md --docs .
+```
 
 ---
 
@@ -71,29 +88,30 @@ chatcli.ai/
 ### Pré-requisitos
 
 - [Node.js](https://nodejs.org/) v18+
-- [Mintlify CLI](https://www.npmjs.com/package/mintlify)
+- [Mintlify CLI](https://www.npmjs.com/package/mint) (`mint`)
 
 ### Executar localmente
 
 ```bash
 # Instalar a CLI do Mintlify
-npm i -g mintlify
+npm i -g mint
 
 # Clonar o repositório
 git clone https://github.com/diillson/chatcli.ai.git
 cd chatcli.ai
 
-# Iniciar servidor de desenvolvimento
-mintlify dev
+# Iniciar servidor de desenvolvimento (as ~840 páginas de release pedem
+# mais memória para o Node)
+NODE_OPTIONS=--max-old-space-size=8192 mint dev
 ```
 
 O site estará disponível em `http://localhost:3000`.
 
 ### Adicionar nova página
 
-1. Crie o arquivo `.mdx` no diretório apropriado
-2. Adicione o path em `mint.json` na seção `navigation`
-3. Verifique localmente com `mintlify dev`
+1. Crie o arquivo `.mdx` na seção apropriada, em inglês na raiz e em português em `pt/`
+2. Adicione o path nos dois idiomas em `docs.json`, na seção `navigation`
+3. Verifique localmente com `mint dev` e `mint broken-links`
 
 ---
 
@@ -125,7 +143,7 @@ Contribuições são bem-vindas! Para melhorias na documentação:
 1. Fork o repositório
 2. Crie uma branch (`git checkout -b docs/minha-melhoria`)
 3. Faça suas alterações
-4. Teste com `mintlify dev`
+4. Teste com `mint dev` e `mint broken-links`
 5. Abra um Pull Request
 
 Para contribuir com o **código do ChatCLI**, veja o [repositório principal](https://github.com/diillson/chatcli).

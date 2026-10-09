@@ -1,0 +1,557 @@
+---
+title: "Deploy with Docker and Kubernetes"
+sidebarTitle: "Docker & Kubernetes"
+description: "Run the ChatCLI server with Docker, Docker Compose or the Helm chart: images, working commands, credentials, TLS, probes, logs, upgrades and troubleshooting."
+icon: "docker"
+---
+
+This page runs the [ChatCLI server](/server/server-mode) in a container and on Kubernetes with the server Helm chart. For operator-managed servers (`Instance` resources and the AIOps pipeline) see [K8s Operator](/kubernetes/k8s-operator).
+
+<Warning>
+Every recipe below sets a credential. A server that listens beyond loopback (any container with a published port, every Kubernetes pod) **refuses to start** without a shared token, JWT material or a client CA, and by default says so only in its log file. See [the credential rule](/server/server-mode#bind-address-and-the-credential-rule).
+</Warning>
+
+## Images
+
+| Image | Tags | Runtime |
+|---|---|---|
+| `ghcr.io/diillson/chatcli` | `<version>` (no `v`, e.g. `1.214.0`) and `latest` | `gcr.io/distroless/static-debian12:nonroot`, UID 65532, no shell |
+| `ghcr.io/diillson/chatcli-operator` | `<version>` and `latest` | Alpine (`SourceRepository` needs git and, for `authType: ssh`, `openssh-client`), UID 65532 |
+
+```bash
+docker pull ghcr.io/diillson/chatcli:1.214.0
+docker pull ghcr.io/diillson/chatcli-operator:1.214.0
+```
+
+Both are multi-arch (`linux/amd64`, `linux/arm64`), carry SBOM and provenance attestations and are signed with cosign (keyless):
+
+```bash
+cosign verify ghcr.io/diillson/chatcli:1.214.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github.com/diillson/chatcli/'
+```
+
+The server image contains `/usr/local/bin/chatcli` (stamped with the release version, which `GetServerInfo` and the operator report), `/usr/local/bin/grpc-health-probe`, `ENTRYPOINT ["chatcli", "server"]`, `EXPOSE 50051`, and a `HEALTHCHECK` that runs `grpc-health-probe -addr=:50051` in plaintext every 30 seconds. Arguments after the image name are `chatcli server` flags. The Devin CLI is not in the image, so `DEVIN` is not a server provider.
+
+### Build locally
+
+```bash
+# Server image (from the repository root)
+docker build -t chatcli:dev --build-arg VERSION=dev .
+
+# Operator image: also from the repository root (operator/go.mod replaces the root module with ../)
+docker build -f operator/Dockerfile -t chatcli-operator:dev .
+```
+
+Without `--build-arg VERSION=…` the binary reports version `dev`.
+
+## Docker
+
+The server binds `127.0.0.1` outside Kubernetes, which inside a container means nothing outside the container reaches it. Publishing a port therefore needs `CHATCLI_BIND_ADDRESS=0.0.0.0`, and that bind needs a credential.
+
+```bash
+export CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)"
+export ANTHROPIC_API_KEY=sk-ant-xxx
+
+docker run -d --name chatcli \
+  -p 50051:50051 -p 9090:9090 \
+  -e CHATCLI_BIND_ADDRESS=0.0.0.0 \
+  -e CHATCLI_SERVER_TOKEN \
+  -e LLM_PROVIDER=CLAUDEAI \
+  -e ANTHROPIC_API_KEY \
+  -v chatcli-home:/home/nonroot \
+  ghcr.io/diillson/chatcli:1.214.0
+```
+
+| Setting | Why |
+|---|---|
+| `CHATCLI_BIND_ADDRESS=0.0.0.0` | listen on the container interface so the published port works |
+| `CHATCLI_SERVER_TOKEN` | the credential that bind requires (or `CHATCLI_JWT_SECRET` / `CHATCLI_JWT_PUBLIC_KEY`) |
+| `-v chatcli-home:/home/nonroot` | keep `~/.chatcli` (sessions, conversation hub, memory, plugins, log file) across restarts; the image's home is `/home/nonroot`, and a named volume there inherits its ownership |
+| `-p 9090:9090` | optional: `/metrics` and `/healthz` |
+
+In a container the server writes its log to stderr as JSON lines, so `docker logs` carries startup errors and everything after them with no extra setting (`CHATCLI_ENV=dev` switches to the colored development console instead). Check it and connect (the listener is plaintext, so the client needs `CHATCLI_ALLOW_INSECURE=true`):
+
+```bash
+docker logs chatcli | grep listening          # 🚀 ChatCLI server listening on 0.0.0.0:50051
+docker inspect --format '{{.State.Health.Status}}' chatcli   # healthy
+curl -s localhost:9090/healthz                 # ok
+
+CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$CHATCLI_SERVER_TOKEN"
+```
+
+For a quick test without a credential, keep the server on loopback inside the container and use it from there only: omit `CHATCLI_BIND_ADDRESS` and the `-p` flags.
+
+### TLS in Docker
+
+```bash
+# tls/ holds server.crt, server.key and ca.crt, readable by UID 65532
+docker run -d --name chatcli -p 50051:50051 \
+  -e CHATCLI_BIND_ADDRESS=0.0.0.0 -e CHATCLI_SERVER_TOKEN \
+  -e LLM_PROVIDER=CLAUDEAI -e ANTHROPIC_API_KEY \
+  -e CHATCLI_SERVER_TLS_CERT=/etc/chatcli/tls/server.crt \
+  -e CHATCLI_SERVER_TLS_KEY=/etc/chatcli/tls/server.key \
+  -v "$PWD/tls:/etc/chatcli/tls:ro" \
+  -v chatcli-home:/home/nonroot \
+  --no-healthcheck \
+  ghcr.io/diillson/chatcli:1.214.0
+
+chatcli connect localhost:50051 --tls --ca-cert tls/ca.crt --token "$CHATCLI_SERVER_TOKEN"
+```
+
+The built-in `HEALTHCHECK` probes plaintext, so with TLS it reports `unhealthy`. The image has no shell, and `docker run --health-cmd` always runs through one, so either disable it (`--no-healthcheck`) or use an exec-form check in Compose (below). The server certificate needs `localhost` in its SANs for the client above; see [TLS](/server/server-mode#tls) for a certificate recipe.
+
+### Docker Compose
+
+The repository's `docker-compose.yml` builds the image from source and runs it hardened (read-only root filesystem, `no-new-privileges`, a 100 MB `/tmp` tmpfs, 2 CPUs / 1 GB). It binds `0.0.0.0` and reads every provider variable from your shell, so export a credential first:
+
+```bash
+git clone https://github.com/diillson/chatcli.git && cd chatcli
+export CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)"
+export LLM_PROVIDER=CLAUDEAI ANTHROPIC_API_KEY=sk-ant-xxx
+docker compose up -d --build
+
+CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$CHATCLI_SERVER_TOKEN"
+```
+
+The compose file sets `HOME=/home/nonroot` and keeps the whole home in one named volume, `chatcli-home`, mounted at `/home/nonroot`: `~/.chatcli` (sessions, the conversation hub, memory, plugins, the log file) survives restarts, and the volume is writable under the read-only root filesystem because Docker seeds it with the ownership of the image's home. Drop plugin binaries into `~/.chatcli/plugins` inside that volume.
+
+The image's `HEALTHCHECK` probes plaintext. With TLS on the server, replace it in an override; Compose merges `docker-compose.override.yml` automatically:
+
+```yaml
+# docker-compose.override.yml
+services:
+  chatcli-server:
+    # Exec form, no shell needed:
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc-health-probe", "-addr=:50051", "-tls",
+             "-tls-ca-cert", "/etc/chatcli/tls/ca.crt", "-tls-server-name", "localhost"]
+```
+
+`CHATCLI_FALLBACK_PROVIDERS` alone turns on the [fallback chain](/server/server-mode#fallback-chain) (there is no separate enable switch), and it must list the primary provider first. The compose file also passes `CHATCLI_FALLBACK_MAX_RETRIES` (default `2`), `CHATCLI_FALLBACK_COOLDOWN_BASE` (`30s`) and `CHATCLI_FALLBACK_COOLDOWN_MAX` (`5m`) from your shell.
+
+## Kubernetes (Helm)
+
+The server chart is published as an OCI artifact at `oci://ghcr.io/diillson/charts/chatcli`. Chart version and server image version are the same number, and the chart's `appVersion` pins the image.
+
+### Prerequisites
+
+- Kubernetes 1.30+, `kubectl` pointed at the cluster
+- Helm 3.8+ (OCI support), Helm 4 included
+- An LLM provider key (or IRSA / Workload Identity for Bedrock)
+
+### Install
+
+
+<Steps>
+  <Step title="Install with a credential">
+    ```bash
+    helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
+      --version 1.214.0 \
+      --namespace chatcli --create-namespace \
+      --set llm.provider=CLAUDEAI \
+      --set secrets.anthropicApiKey="$ANTHROPIC_API_KEY" \
+      --set server.token="$(openssl rand -hex 32)"
+    ```
+
+    Inside a pod the server binds `0.0.0.0`, so `server.token` (or JWT / mTLS, below) is required. The chart stores the token in its Secret and delivers it as `CHATCLI_SERVER_TOKEN` through `secretKeyRef`, never as a command-line argument. In a pod the server also writes its log to stderr, so `kubectl logs` shows it.
+  </Step>
+  <Step title="Wait for it">
+    ```bash
+    kubectl -n chatcli rollout status deploy/chatcli
+    kubectl -n chatcli logs deploy/chatcli | grep listening
+    # 🚀 ChatCLI server listening on 0.0.0.0:50051
+    ```
+  </Step>
+  <Step title="Connect">
+    ```bash
+    export CHATCLI_REMOTE_TOKEN="$(kubectl -n chatcli get secret chatcli \
+      -o jsonpath='{.data.CHATCLI_SERVER_TOKEN}' | base64 -d)"
+
+    kubectl -n chatcli port-forward svc/chatcli 50051:50051 &
+    CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token "$CHATCLI_REMOTE_TOKEN"
+    ```
+
+    Object names follow the release: a release named other than `chatcli` produces `<release>-chatcli` (Deployment, Service and Secret). `helm install` prints the exact commands in its notes, and warns when no credential is set.
+  </Step>
+</Steps>
+
+What the chart creates: a Deployment (non-root UID 1000, read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp), a Service, a ConfigMap and a Secret loaded with `envFrom`, a ServiceAccount and RBAC for the watcher, a 1 Gi PVC for sessions (`persistence.enabled`, default on), the 17 AIOps CRDs plus a pre-install/pre-upgrade hook that re-applies them (`crdUpgrade.enabled`), and optionally an Ingress, HPA, PDB, NetworkPolicy and ServiceMonitor.
+
+### Probes
+
+A kubelet `grpc` probe cannot do TLS, so the chart probes:
+
+| Probe | Check | Timing |
+|---|---|---|
+| startup | `GET /healthz` on the `metrics` port | every 5 s, up to 30 failures |
+| liveness | `GET /healthz` on the `metrics` port | every 20 s, 3 failures |
+| readiness | TCP connect to the `grpc` port | every 10 s, 3 failures |
+
+With `server.metricsPort: 0` startup and liveness fall back to a TCP check on the gRPC port. These probes work with and without TLS.
+
+### Credentials
+
+| Option | Values | Notes |
+|---|---|---|
+| Shared token | `server.token`, or `CHATCLI_SERVER_TOKEN` in `secrets.existingSecret` | role `admin` for every caller |
+| HS256 JWTs | `security.jwtSecretRef: {name, key}` (or inline `security.jwtSecret`) | tokens need `exp`; see [JWT](/server/server-mode#server-authentication) |
+| RS256 JWTs | `security.jwtPublicKeyRef: {name, key}` (or inline `security.jwtPublicKey`) | several PEM keys may be listed, for rotation |
+| Mutual TLS | `tls.*` plus `security.tlsClientCA` (a path in the pod) | every connection needs a client certificate |
+| None | `security.bindAddress: "127.0.0.1"` | reachable only from inside the pod |
+
+`security.jwtIssuer` / `security.jwtAudience` add `iss` / `aud` checks; `security.mtlsRole` sets the role of certificate-only callers (`viewer`/`readonly`, `user`/`operator`, `admin`; default `user`). Prefer the `*Ref` values: inline ones land in the Deployment's environment.
+
+```bash
+kubectl -n chatcli create secret generic chatcli-jwt --from-literal=secret="$(openssl rand -hex 32)"
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.214.0 -n chatcli \
+  --reset-then-reuse-values --set security.jwtSecretRef.name=chatcli-jwt --set security.jwtSecretRef.key=secret
+```
+
+### TLS
+
+```yaml
+# values-tls.yaml
+tls:
+  enabled: true
+  existingSecret: chatcli-tls              # kubernetes.io/tls Secret, mounted at /etc/chatcli/tls
+```
+
+With `tls.existingSecret`, `certFile` and `keyFile` default to `/etc/chatcli/tls/tls.crt` and `/etc/chatcli/tls/tls.key`; set them only when the files in your Secret have other names. Without a Secret, set both paths (to files you mount with `extraVolumes` / `extraVolumeMounts`).
+
+<Warning>
+`tls.enabled: true` with neither `tls.existingSecret` nor both `certFile` and `keyFile` fails `helm install` / `helm upgrade` (`tls.enabled=true needs tls.existingSecret ... or both tls.certFile and tls.keyFile`), instead of starting a server that would listen in plaintext.
+</Warning>
+
+For mTLS with a client CA that lives in the same Secret use `security.tlsClientCA: /etc/chatcli/tls/ca.crt`; for a separate CA Secret mount it with `extraVolumes` / `extraVolumeMounts` (example in [Security values](#security)). Through `kubectl port-forward` the certificate needs `localhost` in its SANs.
+
+### Values reference
+
+#### Server
+
+| Value | Default | Description |
+|---|---|---|
+| `replicaCount` | `1` | Replicas (ignored when `autoscaling.enabled`) |
+| `strategy` | `{}` | Deployment update strategy, rendered as written; empty = chosen from persistence (see [Rollouts on the sessions volume](#rollouts-on-the-sessions-volume)) |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/diillson/chatcli` / chart `appVersion` / `IfNotPresent` | Server image |
+| `imagePullSecrets` | `[]` | Pull secrets |
+| `server.port` | `50051` | gRPC port |
+| `server.metricsPort` | `9090` | `/metrics` and `/healthz`; `0` disables both |
+| `server.token` | `""` | Shared token (required unless JWT or mTLS) |
+| `server.grpcReflection` | `false` | Sets `CHATCLI_GRPC_REFLECTION=true`, which registers gRPC server reflection; reflection calls still need the server credential. Keep it off in production |
+| `extraEnv` | `[]` | Extra environment variables (for example `LOG_LEVEL=debug`); an entry for a `CHATCLI_LOG_*` variable replaces the chart's `logging` value |
+| `logging.maxSizeMB` / `maxBackups` / `maxAgeDays` / `compress` | `20` / `3` / `28` / `true` | Log file rotation → `CHATCLI_LOG_MAX_SIZE_MB`, `CHATCLI_LOG_MAX_BACKUPS`, `CHATCLI_LOG_MAX_AGE_DAYS`, `CHATCLI_LOG_COMPRESS` (see [Logs, health and metrics](#logs-health-and-metrics)) |
+| `extraVolumes` / `extraVolumeMounts` | `[]` | Extra volumes for the server container |
+
+#### LLM
+
+| Value | Default | Description |
+|---|---|---|
+| `llm.provider` | `""` (first provider with credentials) | `OPENAI`, `OPENAI_ASSISTANT`, `CLAUDEAI`, `BEDROCK`, `GOOGLEAI`, `XAI`, `ZAI`, `MINIMAX`, `MOONSHOT`, `STACKSPOT`, `OLLAMA`, `COPILOT`, `OPENROUTER` |
+| `llm.model` | `""` | Default model |
+| `secrets.existingSecret` | `""` | Your Secret, loaded with `envFrom` (keys are variable names) instead of the chart's |
+| `secrets.openaiApiKey`, `anthropicApiKey`, `googleaiApiKey`, `xaiApiKey`, `zaiApiKey`, `minimaxApiKey`, `moonshotApiKey`, `openrouterApiKey`, `githubCopilotToken` | `""` | Provider keys → `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLEAI_API_KEY`, `XAI_API_KEY`, `ZAI_API_KEY`, `MINIMAX_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY`, `GITHUB_COPILOT_TOKEN` |
+| `secrets.minimaxApiCompat` | `""` | `anthropic` = Anthropic Messages API compatibility |
+| `secrets.stackspotClientId`, `stackspotClientKey`, `stackspotRealm`, `stackspotAgentId` | `""` | StackSpot (`CLIENT_ID`, `CLIENT_KEY`, `STACKSPOT_REALM`, `STACKSPOT_AGENT_ID`) |
+| `secrets.awsAccessKeyId`, `awsSecretAccessKey`, `awsSessionToken`, `bedrockRegion`, `awsRegion` | `""` | Bedrock; leave the keys empty for IRSA (`serviceAccount.annotations`) |
+| `secrets.chatcliBedrockCaBundle`, `chatcliBedrockInsecureSkipVerify` | `""` | Bedrock CA bundle path / skip verification (troubleshooting only) |
+| `copilot.model`, `copilot.maxTokens`, `copilot.apiBaseUrl` | `""` | `COPILOT_MODEL`, `COPILOT_MAX_TOKENS`, `COPILOT_API_BASE_URL` |
+| `ollama.enabled`, `ollama.baseUrl`, `ollama.model` | `false`, `http://ollama:11434`, `""` | Server-side Ollama (not subject to the SSRF check) |
+
+With `secrets.existingSecret`, create the Secret with variable names as keys, the credential included:
+
+```bash
+kubectl -n chatcli create secret generic chatcli-llm-keys \
+  --from-literal=CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+helm install chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.214.0 -n chatcli \
+  --set llm.provider=CLAUDEAI --set secrets.existingSecret=chatcli-llm-keys
+```
+
+#### Provider fallback
+
+| Value | Default | Description |
+|---|---|---|
+| `fallback.enabled` | `false` | Turn the chain on |
+| `fallback.providers` | `[]` | Providers after `llm.provider`, each `{name, model}`; without `model` a provider runs its own default model |
+| `fallback.maxRetries` | `2` | Attempts per provider; `0` fails over at once |
+| `fallback.cooldownBase` / `fallback.cooldownMax` | `30s` / `5m` | Cooldown after a failure / ceiling |
+
+The chart puts `llm.provider` (with `llm.model`) first unless you list it yourself, because the server builds the chain from the list alone and installs it only with two or more working providers. Put every provider's key in the Secret. `fallback.enabled` only decides whether the chart writes `CHATCLI_FALLBACK_PROVIDERS`; the chart writes no separate enable variable, since the server reads none.
+
+```yaml
+llm:
+  provider: CLAUDEAI
+  model: claude-sonnet-5
+fallback:
+  enabled: true
+  providers:                    # effective chain: CLAUDEAI -> OPENAI -> GOOGLEAI
+    - name: OPENAI
+      model: gpt-6-sol
+    - name: GOOGLEAI
+      model: gemini-3.8-flash
+```
+
+#### MCP
+
+| Value | Default | Description |
+|---|---|---|
+| `mcp.enabled` | `false` | Turn MCP on |
+| `mcp.servers` | `[]` | Inline servers: `name`, `transport` (`stdio`/`sse`), `command`, `args`, `url`, `env`, `enabled`, `overrides` |
+| `mcp.existingConfigMap` | `""` | Your ConfigMap with a `mcp_servers.json` key, mounted at `/etc/chatcli/mcp` (wins over `servers`) |
+
+#### K8s watcher
+
+| Value | Default | Description |
+|---|---|---|
+| `watcher.enabled` | `false` | Turn the watcher on |
+| `watcher.targets` | `[]` | Multi-target list of `{deployment, kind, namespace, metricsPort, metricsPath, metricsFilter}`; `deployment` is the resource name and `kind` is `Deployment` (default), `StatefulSet`, `DaemonSet`, `Job` or `CronJob` |
+| `watcher.deployment` / `watcher.namespace` | `""` | Single-target mode (used when `targets` is empty), watches a Deployment; an empty namespace means the namespace named `default` |
+| `watcher.interval` / `watcher.window` | `30s` / `2h` | Collection interval / retention |
+| `watcher.maxLogLines` / `watcher.maxContextChars` | `100` / `32000` | Log lines per pod / LLM context budget |
+
+A target without `kind` is a Deployment; a target with a namespace omitted watches `default`. Targets outside the release namespace, or in several namespaces, switch the chart's RBAC to a ClusterRole automatically, and so does a single-target `watcher.namespace` other than the release namespace (an empty one counts as `default`).
+
+```yaml
+watcher:
+  enabled: true
+  interval: "15s"
+  targets:
+    - deployment: api-gateway
+      namespace: production
+      metricsPort: 9090
+      metricsFilter: ["http_requests_*", "http_request_duration_*"]
+    - deployment: postgres
+      kind: StatefulSet
+      namespace: production
+    - deployment: nightly-report
+      kind: CronJob
+      namespace: batch
+```
+
+#### Storage, memory, pipeline and resources
+
+| Value | Default | Description |
+|---|---|---|
+| `persistence.enabled` | `true` | PVC `<fullname>-sessions` for sessions, mounted at `~/.chatcli/sessions` |
+| `persistence.storageClass` / `accessModes` / `size` | `""` / `[ReadWriteOnce]` / `1Gi` | `-` = `storageClassName: ""`. Without `ReadWriteMany` a rollout stops the old pod first; `ReadWriteOncePod` fails the render with more than one replica |
+| `memory.enabled` | `false` | Long-term memory at `~/.chatcli/memory` (on the sessions PVC when persistence is on, a 200Mi emptyDir otherwise) |
+| `memory.subPath` | `memory` | Directory of the sessions PVC that holds memory when persistence is on; memory written at the PVC root by earlier charts is copied into it once. `""` = the PVC root, shared with the session files (the old layout) |
+| `pipeline.enabled` | `false` | [Pipeline RPCs](/server/server-mode#pipeline-rpcs) (`CHATCLI_SERVER_PIPELINE`) |
+| `agents.*`, `skills.*`, `bootstrap.*` | disabled | `enabled`, `definitions` (inline files), `existingConfigMap`; enabled with neither, nothing is mounted |
+| `skillRegistry.enabled`, `registryUrls`, `registryDisable`, `installDir` | `false`, `""` | Skill registry settings |
+| `plugins.enabled`, `initImage`, `existingPVC` | `false`, `""` | Plugins directory, filled from an init image or a PVC |
+| `resources` | requests `100m`/`128Mi`, limits `500m`/`512Mi` | Container resources |
+| `podSecurityContext` / `securityContext` | UID/GID/fsGroup 1000, non-root, `RuntimeDefault`; no privilege escalation, read-only root, drop `ALL` | Pod and container security |
+| `nodeSelector`, `tolerations`, `affinity` | empty | Scheduling |
+
+The chart mounts an emptyDir at `/home/chatcli/.chatcli` and `/tmp` and sets `HOME=/home/chatcli`, so the read-only root filesystem works.
+
+The server reads the MCP, agents, skills and bootstrap ConfigMaps only at startup. Each one the chart renders (from `mcp.servers` or `*.definitions`) is hashed into a `checksum/<name>` pod annotation, so a `helm upgrade` that edits it rolls the pods. A ConfigMap you manage yourself (`*.existingConfigMap`) cannot be hashed by Helm: after editing one, run `kubectl -n chatcli rollout restart deploy/chatcli`. `agents`, `skills` or `bootstrap` enabled with neither `definitions` nor `existingConfigMap` mount nothing, and the server finds an empty directory (earlier charts mounted a ConfigMap that did not exist, leaving the pod in `ContainerCreating`).
+
+#### Rollouts on the sessions volume
+
+With `persistence.enabled` and no `ReadWriteMany` access mode, a rollout stops the old pod before starting the new one: the chart renders `RollingUpdate` with `maxSurge: 0` and `maxUnavailable: 1`. Under the API server default (one surge pod, no unavailable pod), a new pod scheduled on another node could not attach the `ReadWriteOnce` volume while the old pod held it, and the old pod was only stopped once the new one was ready, so the rollout hung. Stopping the old pod first means a short gap in service on each rollout instead. Without persistence, or with `ReadWriteMany`, nothing is rendered and the API server default applies.
+
+An explicit `strategy` wins in every case; `type: Recreate` without `rollingUpdate` is rendered with `rollingUpdate: null`. A fresh install, a Helm 3 release, and a release already upgraded once on the chart's default can switch to `Recreate` directly. A release installed by Helm 4 on an earlier chart (up to 1.211.x, which rendered no strategy) needs one upgrade on the default first, because Helm 4's server-side apply cannot remove the defaulted `rollingUpdate` block (the upgrade fails with `spec.strategy.rollingUpdate: Forbidden`), or this patch:
+
+```bash
+kubectl -n chatcli patch deploy/chatcli --type=json \
+  -p '[{"op":"remove","path":"/spec/strategy/rollingUpdate"},{"op":"replace","path":"/spec/strategy/type","value":"Recreate"}]'
+```
+
+```yaml
+strategy:
+  type: Recreate
+```
+
+A `ReadWriteOnce` volume attaches to one node at a time, so several replicas on it work only while they all run on that node; pods scheduled elsewhere stay in `ContainerCreating`. Run one replica, or use a `ReadWriteMany` storage class for several. `ReadWriteOncePod` admits a single pod: the render fails when `replicaCount` (or `autoscaling.maxReplicas` with the HPA on) is above 1.
+
+#### Memory on the sessions PVC
+
+With `memory.enabled` and persistence, the sessions stay at the PVC root (mounted at `~/.chatcli/sessions`) and memory lives in the `memory.subPath` directory of the same PVC (mounted at `~/.chatcli/memory`). kubelet creates that directory on the first mount, and the default `podSecurityContext.fsGroup` makes it writable. Earlier charts (up to 1.211.x) mounted memory at the PVC root too, so its JSON stores sat among the session files, where the session list showed them and session expiry could delete them.
+
+Upgrading an install that ran with memory and persistence migrates on its own. No session moves. The chart sets `CHATCLI_MEMORY_LEGACY_DIR=/home/chatcli/.chatcli/sessions` (the PVC root as the server sees it) whenever persistence, memory and a `memory.subPath` are all on, and the first time the server opens memory on the new layout it copies memory's own files from there into the memory directory:
+
+- only memory's files (`MEMORY.md` and its backups, `memory_index.json`, `memory_tombstones.json`, `episodes.json`, `user_profile.json`, `topics.json`, `projects.json`, `usage_stats.json`, `graph.json`, `vector_index.json`, `memory_archive.json`, `compactor_state.json`, their `.corrupt` quarantines, the `YYYYMM/` daily notes, `weekly/`, `monthly/` and `pending/`); the session files stay where they are;
+- a copy only: nothing at the root is moved, deleted or rewritten, and a file already in the memory directory is never overwritten; each file lands atomically with mode 0600;
+- once: it runs only while the memory directory holds none of memory's files, and writes the marker `.migrated-from-legacy` there when done;
+- an unreadable file is skipped with a warning; a file sealed with `CHATCLI_ENCRYPTION_KEY` is resealed for its new path, and while the key is missing or wrong the copy stays pending (`.migrating-from-legacy`) and resumes on the next start;
+- the log records it as `memory: adopted the legacy memory directory`.
+
+`memory.subPath: ""` keeps the old shared layout instead (no copy, no `CHATCLI_MEMORY_LEGACY_DIR`). An upgrade with plain `--reuse-values` carries no `memory.subPath` key and keeps the old layout too; `--reset-then-reuse-values` picks up the new default.
+
+#### Security
+
+| Value | Default | Description |
+|---|---|---|
+| `security.jwtSecret` / `jwtSecretRef` | `""` / `{}` | HS256 secret, inline / from a Secret; set one, not both (both fail the render) |
+| `security.jwtPublicKey` / `jwtPublicKeyRef` | `""` / `{}` | RS256 public key(s), inline PEM or path / from a Secret; set one, not both (both fail the render) |
+| `security.jwtIssuer` / `jwtAudience` | `""` | Required `iss` / `aud` |
+| `security.tlsClientCA` | `""` | CA bundle path for mTLS (needs `tls.*`) |
+| `security.mtlsRole` | `""` (`user`) | Role of certificate-only callers |
+| `security.rateLimitRps` / `rateLimitBurst` | `""` (10 / 20) | Per-caller rate limit |
+| `security.maxRecvMsgSize` / `maxSendMsgSize` / `maxConcurrentStreams` | `""` (50 MB / 50 MB / 100) | gRPC limits |
+| `security.bindAddress` | `""` (`0.0.0.0` in Kubernetes) | Listen address |
+| `security.auditLogPath` | `""` | Absolute, writable path of the audit trail (mount a volume) |
+| `security.debug` | `false` | Stack traces in error logs |
+| `security.agentSecurityMode` | `""` (strict) | `strict` or `permissive` |
+| `security.sessionTTL` | `""` (90 days) | Session expiry in days |
+| `security.envRedactMode` | `""` (permissive) | `strict` or `permissive` |
+| `security.allowUnsignedPlugins` | `false` | Allow unsigned plugins (development only) |
+| `security.allowInsecure` | `false` | Sets `CHATCLI_ALLOW_INSECURE`, which only the client reads; no effect on the server |
+| `security.encryptionKey` | `""` | Session encryption key, inline (prefer `extraEnv` with `secretKeyRef`) |
+
+```yaml
+# JWT from a Secret, mTLS with a separate client CA, audit log on a volume
+tls:
+  enabled: true
+  existingSecret: chatcli-tls                 # paths default to /etc/chatcli/tls/tls.crt and tls.key
+security:
+  jwtSecretRef: {name: chatcli-jwt, key: secret}
+  tlsClientCA: /etc/chatcli/client-ca/ca.crt
+  mtlsRole: viewer
+  auditLogPath: /var/log/chatcli/audit.jsonl
+extraVolumes:
+  - name: client-ca
+    secret: {secretName: chatcli-client-ca}
+  - name: audit
+    emptyDir: {}
+extraVolumeMounts:
+  - {name: client-ca, mountPath: /etc/chatcli/client-ca, readOnly: true}
+  - {name: audit, mountPath: /var/log/chatcli}
+```
+
+#### Service, ingress, network policy
+
+| Value | Default | Description |
+|---|---|---|
+| `service.type` / `service.port` | `ClusterIP` / `50051` | Service |
+| `service.headless` | `false` | Headless Service for client-side balancing; use it with more than one replica |
+| `ingress.enabled`, `className`, `annotations`, `hosts`, `tls` | disabled | Ingress; `className: nginx` adds `backend-protocol: GRPC` and `ssl-redirect: "true"`, and the same keys in `annotations` replace those defaults |
+| `networkPolicy.enabled` | `false` | Ingress to the gRPC and metrics ports |
+| `networkPolicy.ingressFrom` | unset (any source) | Allowed peers |
+| `networkPolicy.egress` | `allowAll` | `restricted` = DNS, 443, `kubernetesApiPort` (6443), `egressExtraPorts` |
+
+#### Scaling and monitoring
+
+| Value | Default | Description |
+|---|---|---|
+| `autoscaling.enabled`, `minReplicas`, `maxReplicas`, `targetCPUUtilizationPercentage`, `targetMemoryUtilizationPercentage` | `false`, `1`, `5`, `80`, unset | HPA |
+| `podDisruptionBudget.enabled`, `minAvailable`, `maxUnavailable` | `false`, `1`, unset | PDB, rendered only when `replicaCount > 1` |
+| `serviceMonitor.enabled`, `interval`, `scrapeTimeout`, `labels` | `false`, `30s` | Prometheus Operator ServiceMonitor on the metrics port |
+| `serviceAccount.create`, `name`, `annotations` | `true` | IRSA / Workload Identity annotations go here |
+| `rbac.create`, `clusterWide`, `additionalRules` | `true`, `false`, `[]` | Watcher and remediation RBAC. It grants no access to Secrets (the server never reads one through the API); add a rule scoped with `resourceNames` in `additionalRules` only for a plugin that needs one |
+| `crdUpgrade.enabled` | `true` | CRD re-apply hook (kubectl image `registry.k8s.io/kubectl:v1.31.10`) |
+| `prometheusUrl` | `""` | Deprecated, ignored by the server (set it on the operator chart) |
+
+The values schema rejects unknown keys, so a misspelled value fails the install instead of being ignored.
+
+### Exposing the server
+
+| Way | How | Client |
+|---|---|---|
+| Port-forward (development) | `kubectl -n chatcli port-forward svc/chatcli 50051:50051` | `CHATCLI_ALLOW_INSECURE=true chatcli connect localhost:50051 --token …` (or `--tls --ca-cert` with TLS) |
+| Ingress, TLS at the ingress | `ingress.className: nginx`, `ingress.tls`, server plaintext | `chatcli connect chatcli.example.com:443 --tls --token …` |
+| LoadBalancer / NodePort | `service.type`, with `tls.*` on | `chatcli connect <address>:50051 --tls --ca-cert ca.crt --token …` |
+
+```yaml
+# values-ingress.yaml: TLS terminates at ingress-nginx, gRPC to the pod
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: chatcli.example.com
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls:
+    - secretName: chatcli-ingress-tls
+      hosts: [chatcli.example.com]
+```
+
+With `className: nginx` the chart sets `backend-protocol: GRPC` (plaintext to the pod) and `ssl-redirect: "true"` as defaults. A key you set in `ingress.annotations` replaces the default instead of being rendered twice, so for end-to-end TLS through nginx (with `tls.*` on the server) add `nginx.ingress.kubernetes.io/backend-protocol: GRPCS`.
+
+### Logs, health and metrics
+
+```bash
+kubectl -n chatcli logs deploy/chatcli -f            # the banner, then the log as JSON lines
+kubectl -n chatcli port-forward deploy/chatcli 9090:9090 &
+curl -s localhost:9090/healthz                       # ok
+curl -s localhost:9090/metrics | grep '^chatcli_server_info'
+```
+
+In a pod the server writes every log entry to stderr as JSON lines, which is what `kubectl logs` and your log collector read; the rotating file at `/home/chatcli/.chatcli/app.log` (an emptyDir, no shell to read it with) is a copy that dies with the pod. `CHATCLI_LOG_STDERR=false` in `extraEnv` turns the stderr copy off.
+
+With the default read-only root filesystem, `/home/chatcli/.chatcli` is an emptyDir limited to 200Mi, and a volume past its limit gets the pod evicted. The server's own rotation defaults (100 MB, 3 backups: up to 400 MB) do not fit, so the chart sets a rotation that does, at most 80 MB of log:
+
+| Value | Default | Variable |
+|---|---|---|
+| `logging.maxSizeMB` | `20` | `CHATCLI_LOG_MAX_SIZE_MB`: size at which the file rotates |
+| `logging.maxBackups` | `3` | `CHATCLI_LOG_MAX_BACKUPS`: rotated files kept |
+| `logging.maxAgeDays` | `28` | `CHATCLI_LOG_MAX_AGE_DAYS`: days a rotated file is kept |
+| `logging.compress` | `true` | `CHATCLI_LOG_COMPRESS`: gzip rotated files |
+
+While that emptyDir is in use, the render fails when `maxSizeMB × (maxBackups + 1)` exceeds 100 MB. A field set to `null` renders no variable (the server default applies and counts as such in the check). An `extraEnv` entry of the same name wins over the chart's value, and one for the size or the backups skips the check.
+
+```yaml
+logging:
+  maxSizeMB: 10
+  maxBackups: 5
+extraEnv:
+  - name: LOG_LEVEL              # debug | info | warn | error
+    value: info
+``` The metrics port has no authentication; restrict it with `networkPolicy.ingressFrom` where that matters.
+
+### Upgrade, rollback, uninstall
+
+```bash
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.214.0 \
+  -n chatcli --reset-then-reuse-values
+helm history chatcli -n chatcli
+helm rollback chatcli <revision> -n chatcli
+helm uninstall chatcli -n chatcli
+```
+
+- A changed chart-managed Secret or ConfigMap rolls the pods (checksum annotations), the MCP, agents, skills and bootstrap ConfigMaps included. A changed `secrets.existingSecret` or `*.existingConfigMap` does not: run `kubectl -n chatcli rollout restart deploy/chatcli`.
+- With persistence on a volume without `ReadWriteMany`, each rollout stops the old pod before the new one starts: expect a short gap (see [Rollouts on the sessions volume](#rollouts-on-the-sessions-volume)).
+- If both the server chart and the `chatcli-operator` chart are installed, keep them on the same version: each re-applies its own copy of the CRDs.
+- `helm uninstall` deletes the sessions PVC; back it up first. CRDs stay; deleting them deletes every resource of those kinds.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pod `CrashLoopBackOff`; `kubectl logs --previous` ends with `refusing to serve an unauthenticated API on 0.0.0.0` | No credential on a reachable bind | Set `server.token` or JWT |
+| `helm install` notes print `WARNING: no credential is configured` | No token, JWT or client CA in the values | Set `server.token` or `security.jwtSecretRef` |
+| Client: `tls: first record does not look like a TLS handshake` | Plaintext server (`tls.enabled=false`) | `CHATCLI_ALLOW_INSECURE=true`, or enable TLS |
+| `helm install` fails with `tls.enabled=true needs tls.existingSecret` | TLS on without certificate material | Set `tls.existingSecret`, or both `tls.certFile` and `tls.keyFile` |
+| Client: `x509: certificate is valid for …, not localhost` | Port-forward dials `localhost` | Add `localhost`/`127.0.0.1` SANs, or connect by the certificate's name |
+| `Error: values don't meet the specifications of the schema(s)` | Unknown or misspelled value | Check the key against the tables above |
+| Watcher reports nothing for a namespace | RBAC: the chart made a Role, the target is elsewhere | Set the target's namespace in `watcher.targets` or `watcher.namespace` (auto ClusterRole), or `rbac.clusterWide: true` |
+| Sessions lost on restart | `persistence.enabled: false` | Enable it |
+| Rollout hangs; the new pod sits in `ContainerCreating` with `Multi-Attach error` | A chart that rendered no strategy (up to 1.211.x), or an explicit `strategy` that surges, on a `ReadWriteOnce` volume | Upgrade on the default `strategy` (stop-first), or scale to one replica on one node |
+| Extra replicas stuck in `ContainerCreating` | Several replicas on a `ReadWriteOnce` sessions volume, scheduled on other nodes | One replica, or `persistence.accessModes: [ReadWriteMany]` |
+| `helm install` fails with `ReadWriteOncePod admits a single pod` | `ReadWriteOncePod` with `replicaCount` or `autoscaling.maxReplicas` above 1 | One replica, or `ReadWriteMany` |
+| `helm install` fails with `logging.maxSizeMB x (logging.maxBackups + 1) = … MB` | Log rotation larger than 100 MB on the data emptyDir | Lower `logging.maxSizeMB` or `logging.maxBackups` |
+| `helm install` fails with `security.jwtSecret and security.jwtSecretRef both set` (or `jwtPublicKey` and `jwtPublicKeyRef`) | Inline value and Secret reference both set | Keep only the reference |
+| Edited `*.existingConfigMap` not picked up | The server reads it only at startup, and Helm cannot hash it | `kubectl -n chatcli rollout restart deploy/chatcli` |
+| Two replicas, one gets all traffic | ClusterIP pins HTTP/2 connections | `service.headless: true` |
+
+See also the [server troubleshooting table](/server/server-mode#troubleshooting).
+
+## Next steps
+
+<CardGroup cols={3}>
+  <Card title="Server Mode" icon="server" href="/server/server-mode">
+    Flags, auth, limits, operations
+  </Card>
+  <Card title="Remote Connection" icon="plug" href="/server/remote-connect">
+    Connect to the server
+  </Card>
+  <Card title="K8s Watcher" icon="binoculars" href="/kubernetes/k8s-watcher">
+    Monitor workloads
+  </Card>
+</CardGroup>

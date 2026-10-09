@@ -1,0 +1,330 @@
+---
+title: "Sistema de Hooks"
+sidebarTitle: "Hooks"
+description: "Automatize ações com hooks de lifecycle para eventos como execução de tools, inicio/fim de sessão e submissao de prompts"
+icon: "webhook"
+---
+
+O **Sistema de Hooks** do ChatCLI permite que você execute ações automáticas em resposta a eventos do ciclo de vida da aplicação. Com hooks, você pode auto-formatar código após edicoes, enviar notificações, bloquear comandos perigosos, registrar logs de auditoria e muito mais.
+
+<Info>
+Hooks são **aditivos**: configurações globais e de workspace são mescladas. Hooks de workspace complementam os globais, nunca os substituem.
+</Info>
+
+---
+
+## Configuração
+
+Os hooks são definidos em arquivos JSON em dois níveis:
+
+| Nível | Arquivo | Escopo |
+|:------|:--------|:-------|
+| **Global** | `~/.chatcli/hooks.json` | Todos os projetos e sessões |
+| **Workspace** | `.chatcli/hooks.json` | Apenas o projeto atual |
+
+<Tip>
+Hooks de workspace são **aditivos** -- eles se somam aos hooks globais. Se o mesmo evento tem hooks em ambos os níveis, todos são executados (globais primeiro, depois workspace).
+</Tip>
+
+### Estrutura do Arquivo
+
+```json
+{
+  "hooks": [
+    {
+      "event": "PostToolUse",
+      "type": "command",
+      "command": "gofmt -w {{.FilePath}}",
+      "toolPattern": "write|patch",
+      "description": "Auto-format Go files after edits"
+    },
+    {
+      "event": "SessionEnd",
+      "type": "http",
+      "url": "https://hooks.example.com/chatcli",
+      "description": "Notify team of session end"
+    }
+  ]
+}
+```
+
+---
+
+## Eventos Disponíveis
+
+O ChatCLI emite 8 eventos de lifecycle aos quais hooks podem se vincular:
+
+| Evento | Quando dispara | Blocking |
+|:-------|:---------------|:---------|
+| `SessionStart` | Ao iniciar uma nova sessão do ChatCLI | Não |
+| `SessionEnd` | Ao encerrar a sessão (exit/quit) | Não |
+| `UserPromptSubmit` | Quando o usuário submete um prompt | Não |
+| `PreToolUse` | **Antes** de executar uma ferramenta | **Sim** |
+| `PostToolUse` | **Após** executar uma ferramenta com sucesso | Não |
+| `PostToolUseFailure` | Quando uma ferramenta falha | Não |
+| `PreCompact` | **Antes** de qualquer compactação de histórico — automática (chat, agent/coder, one-shot), `/compact` ou recovery de overflow de contexto | Não |
+| `PostCompact` | Depois que o histórico compactado está no lugar | Não |
+
+Os eventos de compactação carregam um campo `trigger` (`auto`, `manual`, `recovery`) e, no `PostCompact`, um `outcome` (`applied` quando o histórico mudou, `skipped` quando nada mudou: no-op, resumo rejeitado, falha) no payload JSON e em `CHATCLI_HOOK_TRIGGER` / `CHATCLI_HOOK_OUTCOME`; todo `PreCompact` tem exatamente um `PostCompact` par, então um hook pode tirar snapshot do transcript antes de uma reescrita automática, logar `/compact` manuais separadamente ou alertar em recoveries de overflow. `PreCompact` roda de forma síncrona antes de o histórico mudar; `PostCompact` roda desacoplado do turno.
+
+<Warning>
+O evento `PreToolUse` e **blocking**: se o hook retornar exit code 2, a execução da ferramenta e **bloqueada**. Isso permite criar guardrails que impedem operações perigosas.
+</Warning>
+
+---
+
+## Tipos de Hook
+
+<Tabs>
+  <Tab title="Command (Shell)">
+    Executa um comando shell no sistema operacional. O comando tem acesso a variáveis de ambiente com contexto do evento.
+
+    ```json
+    {
+      "event": "PostToolUse",
+      "type": "command",
+      "command": "gofmt -w {{.FilePath}}",
+      "toolPattern": "write|patch",
+      "description": "Auto-format Go files after write/patch"
+    }
+    ```
+
+    **Exit codes**:
+    - `0` -- Sucesso (execução continua normalmente)
+    - `1` -- Erro (logado, mas não bloqueia)
+    - `2` -- **Bloqueia a operação** (apenas para `PreToolUse`)
+
+    <Info>O comando e executado via `sh -c` no Linux/macOS e `cmd /c` no Windows.</Info>
+  </Tab>
+  <Tab title="HTTP (Webhook)">
+    Envia uma requisicao HTTP POST para a URL especificada. O corpo da requisicao contem um JSON com os dados do evento.
+
+    ```json
+    {
+      "event": "SessionEnd",
+      "type": "http",
+      "url": "https://hooks.example.com/chatcli/events",
+      "description": "Send session end notification"
+    }
+    ```
+
+    **Payload JSON enviado**:
+
+    ```json
+    {
+      "event": "SessionEnd",
+      "timestamp": "2026-03-29T14:30:00Z",
+      "session_id": "abc123",
+      "tool": "",
+      "data": {
+        "duration": "45m12s",
+        "messages": 32
+      }
+    }
+    ```
+
+    <Tip>Webhooks são disparados de forma assincrona e não bloqueiam a execução do ChatCLI.</Tip>
+  </Tab>
+</Tabs>
+
+---
+
+## ToolPattern -- Filtro por Ferramenta
+
+O campo `toolPattern` permite filtrar quais ferramentas acionam o hook. Ele aceita padroes **glob**:
+
+| Pattern | Ferramentas matched |
+|:--------|:-------------------|
+| `write` | Apenas `write` |
+| `write\|patch` | `write` ou `patch` |
+| `exec*` | `exec`, `exec_background`, etc. |
+| `mcp_*` | Todas as ferramentas MCP |
+| `*` | Todas as ferramentas (default se omitido) |
+
+```json
+{
+  "event": "PreToolUse",
+  "type": "command",
+  "command": "echo 'BLOCKED: exec not allowed' && exit 2",
+  "toolPattern": "exec*",
+  "description": "Block all exec commands"
+}
+```
+
+---
+
+## Variáveis de Ambiente
+
+Hooks do tipo `command` recebem variáveis de ambiente com contexto do evento:
+
+| Variável | Descrição | Exemplo |
+|:---------|:----------|:--------|
+| `CHATCLI_HOOK_EVENT` | Nome do evento que disparou o hook | `PostToolUse` |
+| `CHATCLI_HOOK_TOOL` | Nome da ferramenta (se aplicável) | `write` |
+| `CHATCLI_HOOK_SESSION` | ID da sessão atual | `session_abc123` |
+| `CHATCLI_HOOK_TRIGGER` | Gatilho da compactação (só `PreCompact`/`PostCompact`) | `auto` |
+| `CHATCLI_HOOK_OUTCOME` | Resultado da compactação (só `PostCompact`): `applied` ou `skipped` | `applied` |
+
+Todo o resto do evento — argumentos e output da ferramenta, o prompt do usuário, o diretório de trabalho, a mensagem de erro — chega como payload JSON no **stdin** (`toolArgs`, `toolOutput`, `userPrompt`, `workingDir`, `error`, `trigger`); leia com `jq` quando um hook precisar de mais do que as quatro variáveis acima.
+
+---
+
+## Desligando os Hooks
+
+| Variável | Efeito |
+|:---------|:-------|
+| `CHATCLI_HOOKS_ENABLED=false` | Para todos os hooks do processo (`0`, `off` e `no` também valem). Sem definir, ficam ligados. O `/config integrations` mostra a configuração |
+
+Os hooks também **nunca disparam dentro de uma execução do [`chatcli eval`](/pt/agents/harness/evals)**, seja qual for o valor dessa variável. Cada candidato do eval é um processo real do chatcli, então sem essa regra um hook que roda um eval dispararia de novo dentro de cada candidato que o eval cria, sem fim, e um hook `UserPromptSubmit` que injeta contexto mudaria o resultado que está sendo medido. O harness de eval também define `CHATCLI_HOOKS_ENABLED=false` em cada candidato.
+
+---
+
+## Exemplos Completos
+
+<Tabs>
+  <Tab title="Auto-Format">
+    Auto-formatar arquivos Go após qualquer edicao:
+
+    ```json
+    {
+      "hooks": [
+        {
+          "event": "PostToolUse",
+          "type": "command",
+          "command": "f=$(jq -r '.toolArgs' | grep -oE '[^ \"]+\\.go' | head -1); if [ -n \"$f\" ]; then gofmt -w \"$f\"; fi",
+          "toolPattern": "write|patch",
+          "description": "Auto-format Go files"
+        }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Notificações">
+    Enviar notificação no Slack ao final de cada sessão:
+
+    ```json
+    {
+      "hooks": [
+        {
+          "event": "SessionEnd",
+          "type": "http",
+          "url": "https://hooks.slack.com/services/T00/B00/xxx",
+          "description": "Notify Slack on session end"
+        }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Bloqueio de Comandos">
+    Bloquear `rm -rf` e `DROP TABLE` em produção:
+
+    ```json
+    {
+      "hooks": [
+        {
+          "event": "PreToolUse",
+          "type": "command",
+          "command": "if jq -r '.toolArgs' | grep -qE 'rm -rf|DROP TABLE'; then echo 'BLOCKED: dangerous command' >&2; exit 2; fi",
+          "toolPattern": "exec*",
+          "description": "Block dangerous shell commands"
+        }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Auditoria">
+    Registrar log de todas as ferramentas executadas:
+
+    ```json
+    {
+      "hooks": [
+        {
+          "event": "PostToolUse",
+          "type": "command",
+          "command": "echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) $CHATCLI_HOOK_EVENT $CHATCLI_HOOK_TOOL $CHATCLI_HOOK_TRIGGER\" >> ~/.chatcli/audit.log",
+          "description": "Audit log for all tool executions"
+        }
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Casos de Uso
+
+<CardGroup cols={2}>
+  <Card title="Auto-Format" icon="wand-magic-sparkles">
+    Execute formatadores (gofmt, prettier, black) automaticamente após edicoes de arquivo.
+  </Card>
+  <Card title="Notificações" icon="bell">
+    Envie alertas para Slack, Discord ou email ao final de sessões ou em erros.
+  </Card>
+  <Card title="Guardrails" icon="shield-halved">
+    Bloqueie comandos perigosos (rm -rf, DROP TABLE, force push) com PreToolUse.
+  </Card>
+  <Card title="Auditoria" icon="clipboard-list">
+    Registre todas as ações do agent em arquivos de log para compliance.
+  </Card>
+  <Card title="Testes Automaticos" icon="flask-vial">
+    Execute testes automaticamente após cada edicao de código.
+  </Card>
+  <Card title="Linting" icon="broom">
+    Execute linters (golangci-lint, eslint) após cada write/patch.
+  </Card>
+</CardGroup>
+
+---
+
+## Rodando um Eval a partir de um Hook
+
+Um hook pode rodar uma [suíte de evals](/pt/agents/harness/evals), por exemplo uma checagem barata quando você sai do REPL, que só avisa se houver regressão. Um eval leva de segundos a minutos, e o `SessionEnd` roda enquanto o ChatCLI encerra, dentro do timeout do hook (10 s por padrão). Por isso o hook inicia o eval **em segundo plano** e retorna na hora, com a saída indo para um arquivo, para que nada fique esperando por ele.
+
+```json ~/.chatcli/hooks.json
+{
+  "hooks": [
+    {
+      "name": "eval-on-exit",
+      "event": "SessionEnd",
+      "type": "command",
+      "timeout": 5000,
+      "command": "sh ~/.chatcli/hooks/eval-smoke.sh"
+    }
+  ]
+}
+```
+
+```sh ~/.chatcli/hooks/eval-smoke.sh
+#!/bin/sh
+# Uma execução por vez.
+mkdir /tmp/chatcli-eval.lock 2>/dev/null || exit 0
+cd ~/meu-projeto || exit 0
+nohup sh -c '
+  chatcli eval run evals/ --filter tag:smoke --baseline runs/main.json \
+    --out runs/last.json --max-cost 0.50 --quiet > runs/last.log 2>&1
+  [ $? -eq 3 ] && osascript -e "display notification \"Regressão no eval\" with title \"chatcli\""
+  rmdir /tmp/chatcli-eval.lock
+' >/dev/null 2>&1 &
+```
+
+O exit code `3` significa regressão contra o baseline. Troque o `osascript` (macOS) por `notify-send` no Linux, ou por um curl para um webhook de chat. Para rodar o eval só quando você muda algo que define o comportamento, como uma skill ou um slash command, use `PostToolUse` com `"toolPattern": "@coder"` e faça o script verificar, no `toolArgs` do stdin, se aparece `.chatcli/skills` ou `.chatcli/commands`. Você não precisa de trava contra recursão: os hooks não disparam dentro das execuções do próprio eval.
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Coder Security" icon="shield-halved" href="/pt/coder/coder-security">
+    Politicas de segurança e aprovação para operações do coder.
+  </Card>
+  <Card title="Segurança" icon="shield-halved" href="/pt/security/overview">
+    Entenda o modelo de segurança do ChatCLI.
+  </Card>
+  <Card title="UI Compacta" icon="minimize" href="/pt/usage/compact-ui">
+    Modo de exibicao minimalista para o coder mode.
+  </Card>
+  <Card title="Modo Coder" icon="code" href="/pt/usage/coder-mode">
+    O ciclo completo de engenharia com hooks integrados.
+  </Card>
+</CardGroup>

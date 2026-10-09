@@ -1,0 +1,898 @@
+---
+title: "Audit and Compliance"
+sidebarTitle: "Audit and Compliance"
+description: "AuditEvent records written by the operator's controllers, Kubernetes RBAC roles for the platform CRDs, an on-demand compliance report, and JSON export for SIEM ingestion."
+icon: "clipboard-check"
+---
+
+The ChatCLI AIOps platform records the key steps of its pipeline -- Issue lifecycle, remediation execution, approval gates, notification deliveries, SLO burn-rate alerts and SLA breaches -- as `AuditEvent` resources. Combined with the platform ClusterRoles and an on-demand compliance report, this gives you a queryable trail of what the automation did and when.
+
+<Info>
+  An AuditEvent is a CRD with only a `spec` (no `status` subresource). The
+  operator creates AuditEvents and never updates or deletes them, but nothing
+  in the cluster **enforces** immutability: there is no admission webhook, and
+  the shipped `chatcli-role-admin` ClusterRole can `update`/`patch` AuditEvents
+  (`chatcli-role-superadmin` can also `delete` them). If you need a
+  tamper-proof trail, see [Immutability](#immutability-annotation) and ship the
+  events to an external system.
+</Info>
+
+
+
+## Why Audit Trail for AIOps
+
+When a platform makes autonomous decisions on production infrastructure, traceability is no longer optional:
+
+<CardGroup cols={2}>
+  <Card title="Accountability" icon="user-shield">
+    When was a remediation started, parked for approval, approved, rejected or
+    expired? Which controller did it? Every one of those steps leaves a record.
+  </Card>
+  <Card title="Post-Incident Investigation" icon="magnifying-glass">
+    Every event carries a `correlationId` (the Issue name), so the trail of an
+    incident -- creation, remediation, notifications, resolution -- can be
+    pulled with one filter.
+  </Card>
+  <Card title="Regulatory Compliance" icon="scale-balanced">
+    Evidence for change-control audits (SOC 2, ISO 27001, PCI-DSS and similar):
+    a record of automated actions plus documented RBAC. The platform provides
+    the records; it is not certified against any framework.
+  </Card>
+  <Card title="Continuous Improvement" icon="chart-line">
+    MTTD, MTTR, remediation success rate and approval outcomes, computed on
+    demand from the platform CRDs.
+  </Card>
+</CardGroup>
+
+
+
+## AuditEvent CRD
+
+The `AuditEvent` has only `spec`, no `status`. Short name: `ae`.
+
+### Complete Specification
+
+A real event, as written by the remediation controller when a plan starts executing:
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: AuditEvent
+metadata:
+  name: audit-1773930600123456789-a7f3b2
+  namespace: production                  # namespace of the affected resource
+  labels:
+    platform.chatcli.io/event-type: remediation_started
+    platform.chatcli.io/severity: info
+  annotations:
+    platform.chatcli.io/immutable: "true"
+spec:
+  # Event type (free-form string; see the list below)
+  eventType: remediation_started
+
+  # When the event was recorded (RFC 3339, second precision)
+  timestamp: "2026-03-19T14:30:00Z"
+
+  # Who performed the action
+  actor:
+    type: controller                     # always "controller" for operator-written events
+    name: RemediationReconciler
+    controller: remediation-controller
+
+  # Affected resource
+  resource:
+    kind: RemediationPlan
+    name: api-server-pod-restart-1773930000-plan-1
+    namespace: production
+    uid: 6f1c2d0a-4b7e-4f35-9a51-0c8e2b7d9e14
+
+  # Event-specific details (map of strings)
+  details:
+    issue: api-server-pod-restart-1773930000
+    attempt: "1"
+    strategy: "Roll back to the previous revision"
+    agentic: "false"
+
+  # Groups related events: the Issue name (the SLO name for slo_violation)
+  correlationId: api-server-pod-restart-1773930000
+
+  # info | warning | critical (default "info")
+  severity: info
+```
+
+Field reference (`operator/api/v1alpha1/auditevent_types.go`):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `eventType` | string | Required. No enum validation. |
+| `actor.type` / `actor.name` / `actor.controller` | string | `type` and `name` required. |
+| `resource.kind` / `.name` / `.namespace` / `.uid` | string | `uid` optional. |
+| `details` | map[string]string | Optional. Long values are truncated (200-300 characters). |
+| `severity` | string | Default `info`. The operator writes `info`, `warning` or `critical`. |
+| `correlationId` | string | Optional. |
+| `timestamp` | time | Required. |
+
+### Event Types (EventType)
+
+The operator emits **14** event types, the same list the CRD's `eventType` field comment documents. All are written with `actor.type: controller`, except an approval or rejection decided by people (see the Governance tab):
+
+<Tabs>
+  <Tab title="Incidents">
+    | EventType | Written when | Actor / resource | Severity | `details` keys |
+    |-----------|--------------|------------------|----------|----------------|
+    | `issue_created` | A new Issue gets its AIInsight and moves to `Analyzing` | `IssueReconciler` / Issue | info | `severity`, `resource`, `description` |
+    | `issue_resolved` | An Issue is resolved: remediation verified, auto-resolve, or human restore after containment | `IssueReconciler` / Issue | info | `resolution`, `attempts` |
+    | `issue_escalated` | All remediation attempts failed (`MaxAttemptsReached`) | `IssueReconciler` / Issue | warning | `severity`, `attempts` |
+    | `issue_contained` | A containment action silenced the workload and a human must restore service | `IssueReconciler` / Issue | warning | `severity`, `attempts`, `required_action` |
+  </Tab>
+  <Tab title="Remediation">
+    | EventType | Written when | Actor / resource | Severity | `details` keys |
+    |-----------|--------------|------------------|----------|----------------|
+    | `remediation_started` | A RemediationPlan enters `Executing` | `RemediationReconciler` / RemediationPlan | info | `issue`, `attempt`, `strategy`, `agentic` |
+    | `remediation_completed` | Post-execution health verification passed | `RemediationReconciler` / RemediationPlan | info | `issue`, `result` |
+    | `remediation_failed` | A plan ends `Failed` or `RolledBack` (once, on the transition) | `RemediationReconciler` / RemediationPlan | warning | `issue`, `result`, `attempt` |
+  </Tab>
+  <Tab title="Governance">
+    | EventType | Written when | Actor / resource | Severity | `details` keys |
+    |-----------|--------------|------------------|----------|----------------|
+    | `approval_requested` | A plan is parked in `WaitingApproval` by an ApprovalPolicy, the cluster tier or the decision engine | `RemediationReconciler` / ApprovalRequest | info | `issue`, `plan`, `rule` |
+    | `approval_approved` | The parked plan leaves `WaitingApproval` because the request was approved | the approvers (`user`), or `ApprovalReconciler` for an auto-approval / ApprovalRequest | info | `issue`, `decision`, `auto`, `approvers` |
+    | `approval_rejected` | ...because the request was rejected | the approvers who rejected (`user`) / ApprovalRequest | warning | `issue`, `decision`, `auto`, `approvers` |
+    | `approval_expired` | ...because the request timed out | `ApprovalReconciler` / ApprovalRequest | warning | `issue`, `decision`, `auto`, `approvers` (empty) |
+
+    All four approval events are written by the remediation controller (`actor.controller: remediation-controller`): `approval_requested` when it parks the plan, the other three once per decision when the plan leaves `WaitingApproval`. For a human decision, the event names **who** decided: `actor.type: user` and `actor.name` (and the `approvers` detail) are the approvers recorded in the ApprovalRequest's `status.decisions` with that decision, joined by commas (see [Approval Workflow](/kubernetes/aiops/approval-workflow)). An auto-approval or an expiry has no approver, so its actor is `controller` / `ApprovalReconciler`. A matching ApprovalPolicy rule in `auto` mode without `autoApproveConditions` does not park the plan, so it produces no approval events; one with conditions parks it and produces them like any other rule.
+  </Tab>
+  <Tab title="Alerts and delivery">
+    | EventType | Written when | Actor / resource | Severity | `details` keys |
+    |-----------|--------------|------------------|----------|----------------|
+    | `notification_sent` | Every delivery attempt of a NotificationPolicy or escalation channel, success or failure | `NotificationReconciler` / Issue | info (warning on failure) | `channel`, `success`, `error` |
+    | `slo_violation` | A burn-rate window newly fires on a ServiceLevelObjective | `SLOReconciler` / ServiceLevelObjective | warning | `window`, `burn_rate` |
+    | `sla_breach` | An IncidentSLA records a response or resolution violation | `SLAReconciler` / Issue | critical | `type`, `elapsed`, `threshold` |
+  </Tab>
+</Tabs>
+
+<Warning>
+  No other event type is written. Names that older material listed, such as
+  `approval_granted` (the real name is `approval_approved`), `pattern_learned`,
+  `config_changed`, `cluster_connected`, `cluster_disconnected`,
+  `escalation_triggered`, `postmortem_created` and `runbook_generated`, never appear.
+  Chaos experiments, the decision engine's confidence verdicts, AI analysis,
+  anomaly detection, federation and REST API calls produce **no** AuditEvents
+  of their own. Do not build alerts or reports on those names.
+</Warning>
+
+### AuditActor
+
+The `actor` field identifies who or what performed the action:
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `controller` | Operator controller | `IssueReconciler`, `RemediationReconciler`, `ApprovalReconciler`, `NotificationReconciler`, `SLOReconciler`, `SLAReconciler` |
+| `user` | The approvers of a human `approval_approved` / `approval_rejected` decision, as recorded in `status.decisions` | `alice (api-key: ops-team)` |
+| `system` | Accepted by the schema (free-form string) but never written by the operator | -- |
+
+Other human actions (acknowledging or snoozing an incident, `kubectl` edits) are not turned into AuditEvents. Use the Kubernetes API server audit log for who changed which object.
+
+### AuditResource
+
+The `resource` field identifies the affected Kubernetes resource:
+
+```go
+type AuditResource struct {
+    Kind      string `json:"kind"`
+    Name      string `json:"name"`
+    Namespace string `json:"namespace"`
+    UID       string `json:"uid,omitempty"`
+}
+```
+
+### Name Format and Namespace
+
+Each AuditEvent is named:
+
+```
+audit-{unix-nanoseconds}-{random-6-chars}
+```
+
+Example: `audit-1773930600123456789-a7f3b2`.
+
+The event is created **in the namespace of the affected resource** (the Issue's, RemediationPlan's, ApprovalRequest's or SLO's namespace), not in the operator namespace. Query with `-A` or with the workload's namespace.
+
+Only two labels are set: `platform.chatcli.io/event-type` and `platform.chatcli.io/severity`. There is no correlation label; filter on `spec.correlationId` instead (examples below).
+
+### Immutability Annotation
+
+Every AuditEvent is created with the annotation `platform.chatcli.io/immutable: "true"`. The operator ships no admission webhook, so the annotation is only a marker. To make the trail tamper-resistant:
+
+- enforce it with a policy engine rule (Kyverno, Gatekeeper) that rejects `UPDATE` and `DELETE` on resources carrying the annotation, except for your retention job;
+- review who holds `update`/`patch`/`delete` on `auditevents` (the operator's own ServiceAccount, `chatcli-role-admin` and `chatcli-role-superadmin` all do);
+- export the events to a SIEM or write-once storage.
+
+The operator writes AuditEvents best-effort: if a create fails, the controller logs the error and carries on, so a gap in the trail does not block remediation.
+
+
+
+## Audit Recorder
+
+The `AuditRecorder` (`operator/controllers/audit_recorder.go`) is the internal component the controllers call to write AuditEvents. It is not a public API or extension point: one recorder is created at startup and shared by the Issue, Remediation, Notification, SLO and SLA reconcilers. The Approval, Chaos, Federation, AIInsight, Anomaly and PostMortem reconcilers do not hold one.
+
+### Which Controller Writes What
+
+| Controller | Events |
+|------------|--------|
+| Issue | `issue_created`, `issue_resolved`, `issue_escalated`, `issue_contained` |
+| Remediation | `remediation_started`, `remediation_completed`, `remediation_failed`, `approval_requested`, `approval_approved`, `approval_rejected`, `approval_expired` |
+| Notification | `notification_sent` |
+| SLO | `slo_violation` |
+| SLA | `sla_breach` |
+
+### Generated Event Example
+
+An SLA breach, as written by the SLA controller:
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: AuditEvent
+metadata:
+  name: audit-1773934200987654321-k2m9qz
+  namespace: production
+  labels:
+    platform.chatcli.io/event-type: sla_breach
+    platform.chatcli.io/severity: critical
+  annotations:
+    platform.chatcli.io/immutable: "true"
+spec:
+  eventType: sla_breach
+  timestamp: "2026-03-19T15:30:00Z"
+  actor:
+    type: controller
+    name: SLAReconciler
+    controller: sla-controller
+  resource:
+    kind: Issue
+    name: api-server-pod-restart-1773930000
+    namespace: production
+    uid: 0b7e3c1d-92a4-4c1e-8f60-5d2a9e3b7c48
+  details:
+    type: resolution
+    elapsed: 1h0m12s
+    threshold: 1h0m0s
+  correlationId: api-server-pod-restart-1773930000
+  severity: critical
+```
+
+
+
+## Compliance Reporter
+
+The `ComplianceReporter` computes an on-demand report and is served by the REST API at `GET /api/v1/analytics/compliance` (viewer role). Nothing is scheduled or stored: each call lists the platform CRDs and computes the figures.
+
+### Requesting a Report
+
+```bash
+curl -s -H "X-API-Key: $CHATCLI_API_KEY" \
+  "http://chatcli-operator.chatcli-system.svc:8090/api/v1/analytics/compliance?namespace=production" | jq .
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `namespace` | Limit to one namespace (default: all namespaces) |
+| `from`, `to` | RFC 3339. An **absolute period**: with both, exactly `[from, to]`; with only `from`, up to now; with only `to`, the 7 days ending at `to`. Default: the last 7 days. |
+
+The report covers objects **created** inside the period (by `metadata.creationTimestamp`). It reads Issues, RemediationPlans, ApprovalRequests, IncidentSLAs and AuditEvents -- AuditEvents only feed the audit summary; the other figures come from the resources themselves.
+
+The response wraps the report in `spec`. Keys are PascalCase (pinned by explicit JSON tags), and **durations are integers in nanoseconds**:
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "ComplianceReport",
+  "spec": {
+    "Period": { "Start": "2026-03-12T14:00:00Z", "End": "2026-03-19T14:00:00Z" },
+    "IncidentMetrics": { "...": "..." },
+    "RemediationMetrics": { "...": "..." },
+    "SLAMetrics": { "...": "..." },
+    "ApprovalMetrics": { "...": "..." },
+    "AuditSummary": { "...": "..." },
+    "IncidentSLAs": [ { "...": "..." } ]
+  }
+}
+```
+
+### Report Metrics
+
+<Tabs>
+  <Tab title="Incident Metrics">
+    Computed from Issues created in the window.
+
+    | Field | Calculation |
+    |-------|-------------|
+    | `TotalIncidents` | Issues created in the window |
+    | `BySeverity`, `ByState` | Counts by `spec.severity` and `status.state` |
+    | `MTTD` | `avg(status.detectedAt - metadata.creationTimestamp)`: the time from the Issue object's creation to the controller stamping `detectedAt`. It is **not** the time from the problem starting to its detection, and is usually close to zero. |
+    | `MTTR` | `avg(status.resolvedAt - status.detectedAt)` over resolved Issues |
+    | `MeanRemediationAttempts` | `sum(status.remediationAttempts) / TotalIncidents` |
+
+    ```json
+    "IncidentMetrics": {
+      "TotalIncidents": 47,
+      "BySeverity": { "critical": 2, "high": 8, "medium": 22, "low": 15 },
+      "ByState": { "Resolved": 41, "Escalated": 3, "Contained": 1, "Analyzing": 2 },
+      "MTTD": 850000000,
+      "MTTR": 510000000000,
+      "MeanRemediationAttempts": 1.3
+    }
+    ```
+  </Tab>
+  <Tab title="Remediation Metrics">
+    Computed from RemediationPlans created in the window.
+
+    | Field | Calculation |
+    |-------|-------------|
+    | `TotalRemediations` | Plans created in the window |
+    | `SuccessRate` | `Completed / (Completed + Failed + RolledBack) * 100` -- a **percentage** (0-100) |
+    | `ByActionType` | Per action type in `spec.actions`: `Count`, `Success` (plan `Completed`), `Failed` (plan `Failed`; `RolledBack` plans are not counted here) |
+    | `AutoRemediatedCount` | Number of `Completed` plans, whether or not they went through an approval |
+    | `AgenticCount` | Plans with `spec.agenticMode: true` |
+
+    ```json
+    "RemediationMetrics": {
+      "TotalRemediations": 52,
+      "SuccessRate": 88.5,
+      "ByActionType": {
+        "RollbackDeployment": { "Count": 15, "Success": 14, "Failed": 1 },
+        "RestartDeployment":  { "Count": 18, "Success": 17, "Failed": 1 },
+        "ScaleDeployment":    { "Count": 10, "Success": 9,  "Failed": 1 }
+      },
+      "AutoRemediatedCount": 46,
+      "AgenticCount": 7
+    }
+    ```
+  </Tab>
+  <Tab title="SLA Metrics">
+    With **IncidentSLA** resources in scope, this section counts what their
+    controller recorded on each Issue created in the period (annotation
+    `platform.chatcli.io/sla-violated`), and `IncidentSLAs[]` lists every SLA
+    with its own counters (see [SLOs and SLAs](/kubernetes/aiops/slo-sla)).
+    Without any IncidentSLA, it falls back to a proxy: an `Escalated` Issue
+    counts as a resolution violation.
+
+    | Field | Calculation |
+    |-------|-------------|
+    | `CompliancePercentage` | `(TotalIncidents - Issues with a violation) / TotalIncidents * 100`; 100 when there are no Issues |
+    | `ResolutionSLAViolations` | Issues with a `resolution` violation (fallback: Issues in `Escalated` state) |
+    | `ResponseSLAViolations` | Issues with a `response` violation (fallback: 0) |
+    | `AverageResponseTime` | `avg(status.detectedAt - metadata.creationTimestamp)` |
+    | `AverageResolutionTime` | `avg(status.resolvedAt - metadata.creationTimestamp)` |
+
+    ```json
+    "SLAMetrics": {
+      "CompliancePercentage": 93.6,
+      "ResponseSLAViolations": 1,
+      "ResolutionSLAViolations": 3,
+      "AverageResponseTime": 850000000,
+      "AverageResolutionTime": 511000000000
+    },
+    "IncidentSLAs": [
+      {
+        "Name": "critical-sla", "Namespace": "production", "Severity": "critical",
+        "ResponseTime": "5m", "ResolutionTime": "1h",
+        "CompliancePercentage": 97.5, "ActiveViolations": 1,
+        "TotalViolations": 3, "TotalIssuesTracked": 120
+      }
+    ]
+    ```
+  </Tab>
+  <Tab title="Approval Metrics">
+    Computed from ApprovalRequests created in the window.
+
+    | Field | Calculation |
+    |-------|-------------|
+    | `TotalRequests` | ApprovalRequests created in the window |
+    | `AutoApproved` / `ManualApproved` | `Approved` requests split by `status.autoApproved` |
+    | `Rejected`, `Expired` | Requests in those states |
+    | `AverageDecisionTime` | `avg(status.approvedAt - metadata.creationTimestamp)` over approved requests that carry `approvedAt` |
+
+    ```json
+    "ApprovalMetrics": {
+      "TotalRequests": 12,
+      "AutoApproved": 0,
+      "ManualApproved": 8,
+      "Rejected": 2,
+      "Expired": 2,
+      "AverageDecisionTime": 270000000000
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Audit Summary
+
+Counts of AuditEvents created in the window, by severity and by event type:
+
+```json
+"AuditSummary": {
+  "TotalEvents": 312,
+  "BySeverity": { "info": 251, "warning": 55, "critical": 6 },
+  "ByEventType": {
+    "issue_created": 47,
+    "issue_resolved": 41,
+    "issue_escalated": 3,
+    "remediation_started": 52,
+    "remediation_completed": 46,
+    "remediation_failed": 6,
+    "approval_requested": 12,
+    "approval_approved": 8,
+    "approval_rejected": 2,
+    "approval_expired": 2,
+    "notification_sent": 87,
+    "sla_breach": 6
+  }
+}
+```
+
+
+
+## Kubernetes RBAC Roles
+
+The platform ships **4 ClusterRoles** for people and tooling that work with the platform CRDs through `kubectl`. They are created by the operator Helm chart (`rbac.create: true`, the default) or by `make deploy` (`operator/config/rbac/role.yaml`), never by the operator at runtime (H5 hardening: the operator holds no permission to create ClusterRoles, and nothing in the operator binds these roles -- you bind them yourself).
+
+### Role Definitions
+
+<Tabs>
+  <Tab title="Viewer">
+    **`chatcli-role-viewer`** -- read-only access to the incident-facing CRDs.
+
+    ```yaml
+    rules:
+      - apiGroups: ["platform.chatcli.io"]
+        resources:
+          - issues
+          - anomalies
+          - aiinsights
+          - postmortems
+          - auditevents
+          - servicelevelobjectives
+          - incidentslas
+          - remediationplans
+          - runbooks
+          - approvalrequests
+        verbs: ["get", "list", "watch"]
+    ```
+
+    Not included: policies (Approval, Notification, Escalation), ChaosExperiments, ClusterRegistrations, SourceRepositories, Instances.
+  </Tab>
+  <Tab title="Operator">
+    **`chatcli-role-operator`** -- viewer, plus `update`/`patch` on Issues, ApprovalRequests and PostMortems.
+
+    ```yaml
+    rules:
+      - apiGroups: ["platform.chatcli.io"]
+        resources: [issues, anomalies, aiinsights, postmortems, auditevents,
+                    servicelevelobjectives, incidentslas, remediationplans,
+                    runbooks, approvalrequests]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["platform.chatcli.io"]
+        resources: ["issues", "approvalrequests", "postmortems"]
+        verbs: ["update", "patch"]
+    ```
+
+    This is enough to approve or reject with the `platform.chatcli.io/approve` / `platform.chatcli.io/reject` annotations (see [Approval Workflow](/kubernetes/aiops/approval-workflow)). No `create` verbs and no `/status` subresource access.
+  </Tab>
+  <Tab title="Admin">
+    **`chatcli-role-admin`** -- `update`/`patch` on the incident CRDs (**including `auditevents`**), plus full management of Runbooks, NotificationPolicies, ServiceLevelObjectives and IncidentSLAs.
+
+    ```yaml
+    rules:
+      - apiGroups: ["platform.chatcli.io"]
+        resources: [issues, anomalies, aiinsights, postmortems, auditevents,
+                    servicelevelobjectives, incidentslas, remediationplans,
+                    approvalrequests]
+        verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["platform.chatcli.io"]
+        resources: [runbooks, notificationpolicies, servicelevelobjectives, incidentslas]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    ```
+
+    Not included: ApprovalPolicies, EscalationPolicies, ChaosExperiments, ClusterRegistrations, SourceRepositories, Instances.
+  </Tab>
+  <Tab title="SuperAdmin">
+    **`chatcli-role-superadmin`** -- full CRUD on all 17 platform CRDs (including `delete` on `auditevents`) and `get`/`update`/`patch` on their `/status` subresources.
+
+    It grants nothing outside the `platform.chatcli.io` group: no RBAC objects, no ConfigMaps, no Secrets.
+  </Tab>
+</Tabs>
+
+### Granting a Role
+
+Bind a role to a user or group the way you bind any ClusterRole:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chatcli-role-operator-sre
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chatcli-role-operator
+subjects:
+  - kind: Group
+    name: sre-oncall
+    apiGroup: rbac.authorization.k8s.io
+```
+
+Use a namespaced `RoleBinding` to the same ClusterRole to limit access to one namespace. Revoking is deleting the binding. Role changes are visible in the Kubernetes audit log; the operator's AuditEvents cover what the controllers do, not who was granted what.
+
+<Note>
+  The REST API and the dashboard use their own role model, API keys with `viewer`, `operator` or `admin`, described in [Web Dashboard](/kubernetes/aiops/web-dashboard). The ClusterRoles above are for people and tooling that reach the CRDs through `kubectl`.
+</Note>
+
+
+
+## Audit REST API
+
+The operator's REST API (port 8090, header `X-API-Key`, any role from `viewer` up) exposes two read-only endpoints. Both accept only `GET`.
+
+### GET /api/v1/audit
+
+Lists events, filtered and paginated in memory, **newest first** by `timestamp` (the creation time when it is missing; ties by name), so each page is a stable slice of the trail.
+
+**Query parameters:**
+
+| Parameter | Type | Description | Example |
+|-----------|------|-------------|---------|
+| `namespace` | string | Limit to one namespace (default: all) | `production` |
+| `type` | string | Exact `eventType` match | `remediation_failed` |
+| `severity` | string | Exact severity match | `warning` |
+| `resource` | string | Exact `resource.name` match | `api-server-pod-restart-1773930000` |
+| `from` | RFC 3339 | Events at or after, by `spec.timestamp` | `2026-03-18T00:00:00Z` |
+| `to` | RFC 3339 | Events at or before | `2026-03-19T23:59:59Z` |
+| `page` | int | Page number (default 1) | `2` |
+| `pageSize` | int | Page size (default 20, max 100) | `50` |
+
+There is no actor or correlation-ID filter; to get all events of one incident, filter `correlationId` client-side (see the kubectl and `jq` examples below).
+
+**Request example:**
+
+```bash
+curl -s -H "X-API-Key: $CHATCLI_API_KEY" \
+  "http://chatcli-operator.chatcli-system.svc:8090/api/v1/audit?type=remediation_failed&from=2026-03-18T00:00:00Z&to=2026-03-19T23:59:59Z&pageSize=10" | jq .
+```
+
+**Response example:**
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "AuditEventList",
+  "metadata": { "totalCount": 3, "page": 1, "pageSize": 10 },
+  "items": [
+    {
+      "name": "audit-1773931800456789123-p4x8nb",
+      "namespace": "production",
+      "eventType": "remediation_failed",
+      "severity": "warning",
+      "actorType": "controller",
+      "actorName": "RemediationReconciler",
+      "resourceKind": "RemediationPlan",
+      "resourceName": "api-server-pod-restart-1773930000-plan-1",
+      "resourceNamespace": "production",
+      "correlationId": "api-server-pod-restart-1773930000",
+      "detail": "issue=api-server-pod-restart-1773930000; result=Approval request expired without decision; attempt=1",
+      "timestamp": "2026-03-19T14:50:00Z",
+      "creationTimestamp": "2026-03-19T14:50:00Z"
+    }
+  ]
+}
+```
+
+The REST view flattens the record: `details` becomes one `detail` string of `key=value` pairs joined by `; ` (in no fixed order), and `actor.controller` and `resource.uid` are dropped. Use `kubectl get auditevent <name> -o yaml` for the full object.
+
+### GET /api/v1/audit/export
+
+Takes the same filters (`namespace`, `type`, `severity`, `resource`, `from`, `to`) but **no pagination**, and returns every matching event as a downloadable JSON document (`Content-Disposition: attachment; filename=audit-events-<timestamp>.json`):
+
+```bash
+curl -s -H "X-API-Key: $CHATCLI_API_KEY" -o audit-export.json \
+  "http://chatcli-operator.chatcli-system.svc:8090/api/v1/audit/export?from=2026-03-18T14:00:00Z&to=2026-03-19T14:00:00Z"
+
+jq '.totalCount' audit-export.json
+```
+
+**Export format** -- a single indented JSON object (not NDJSON), whose `items` have the same shape as the list endpoint:
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "AuditEventExport",
+  "exportedAt": "2026-03-19T14:00:05Z",
+  "totalCount": 312,
+  "items": [
+    { "name": "audit-1773930600123456789-a7f3b2", "eventType": "remediation_started", "...": "..." }
+  ]
+}
+```
+
+Use `jq -c '.items[]'` to turn it into one event per line.
+
+<Note>
+  The REST API is rate-limited to 600 requests per minute per valid API key (30 per minute per client host without one).
+  Access to it is only logged to the operator's stdout (`[REST] method path
+  status duration role=...`); REST calls do not create AuditEvents.
+</Note>
+
+
+
+## SIEM Integration
+
+There is no built-in SIEM push. Pull the export endpoint on a schedule and forward it to Splunk, Elastic, Datadog or any other collector. The examples below use `alpine` with `curl` and `jq`, and an API key stored in a Secret (`chatcli-audit-exporter`, key `api-key`, holding a `viewer` key).
+
+### Splunk
+
+<Steps>
+  <Step title="Configure HEC (HTTP Event Collector)">
+    Create an HEC token in Splunk to receive events from the AIOps platform.
+  </Step>
+  <Step title="Create export CronJob">
+    ```yaml
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: audit-export-splunk
+      namespace: chatcli-system
+    spec:
+      schedule: "*/15 * * * *"   # Every 15 minutes
+      jobTemplate:
+        spec:
+          template:
+            spec:
+              containers:
+                - name: exporter
+                  image: alpine:3.22
+                  command:
+                    - /bin/sh
+                    - -c
+                    - |
+                      set -eu
+                      apk add --no-cache curl jq >/dev/null
+                      # Last 20 minutes (5 min overlap; deduplicate on "name" in Splunk)
+                      FROM=$(date -u -d "@$(( $(date +%s) - 1200 ))" +%Y-%m-%dT%H:%M:%SZ)
+                      TO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+                      curl -sf -H "X-API-Key: $CHATCLI_API_KEY" \
+                        "http://chatcli-operator.chatcli-system.svc:8090/api/v1/audit/export?from=$FROM&to=$TO" \
+                        | jq -c '.items[] | {event: ., sourcetype: "chatcli:audit"}' > /tmp/events.json
+
+                      # HEC accepts several events in one request
+                      [ -s /tmp/events.json ] && curl -sf -X POST \
+                        "https://splunk.example.com:8088/services/collector/event" \
+                        -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" \
+                        --data-binary @/tmp/events.json
+                  env:
+                    - name: CHATCLI_API_KEY
+                      valueFrom:
+                        secretKeyRef:
+                          name: chatcli-audit-exporter
+                          key: api-key
+                    - name: SPLUNK_HEC_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: splunk-credentials
+                          key: hec-token
+              restartPolicy: OnFailure
+    ```
+  </Step>
+  <Step title="Create index and dashboards">
+    Configure a dedicated `chatcli_audit` index in Splunk and create dashboards
+    to visualize events by type, severity and namespace.
+  </Step>
+</Steps>
+
+### Elasticsearch
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-export-elastic
+  namespace: chatcli-system
+spec:
+  schedule: "*/15 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: exporter
+              image: alpine:3.22
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  apk add --no-cache curl jq >/dev/null
+                  FROM=$(date -u -d "@$(( $(date +%s) - 1200 ))" +%Y-%m-%dT%H:%M:%SZ)
+                  TO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+                  # Bulk API; the event name as _id makes the overlap idempotent
+                  curl -sf -H "X-API-Key: $CHATCLI_API_KEY" \
+                    "http://chatcli-operator.chatcli-system.svc:8090/api/v1/audit/export?from=$FROM&to=$TO" \
+                    | jq -c '.items[] | {index: {_id: .name}}, .' > /tmp/bulk.ndjson
+
+                  [ -s /tmp/bulk.ndjson ] && curl -sf -X POST \
+                    "https://elastic.example.com:9200/chatcli-audit/_bulk" \
+                    -H "Content-Type: application/x-ndjson" \
+                    -u "$ELASTIC_USER:$ELASTIC_PASS" \
+                    --data-binary @/tmp/bulk.ndjson
+              env:
+                - name: CHATCLI_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chatcli-audit-exporter
+                      key: api-key
+                - name: ELASTIC_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: elastic-credentials
+                      key: username
+                - name: ELASTIC_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: elastic-credentials
+                      key: password
+          restartPolicy: OnFailure
+```
+
+<Tip>
+  If the operator's REST API runs with TLS (`CHATCLI_AIOPS_TLS_CERT` /
+  `CHATCLI_AIOPS_TLS_KEY`), switch the URLs to `https://` and pass the CA with
+  `--cacert`.
+</Tip>
+
+
+
+## kubectl Commands
+
+<Accordion title="Common audit queries via kubectl">
+```bash
+# List all audit events (they live in the workloads' namespaces)
+kubectl get auditevents -A
+# Columns: EVENTTYPE, ACTOR, RESOURCE, SEVERITY, AGE (short name: ae)
+
+# Filter by event type
+kubectl get ae -A -l platform.chatcli.io/event-type=remediation_failed
+
+# Filter by severity
+kubectl get ae -A -l platform.chatcli.io/severity=critical
+
+# All events for one incident (correlationId = Issue name), in order
+kubectl get ae -n production -o json | \
+  jq -r '.items | map(select(.spec.correlationId == "api-server-pod-restart-1773930000"))
+         | sort_by(.spec.timestamp)[] | "\(.spec.timestamp) \(.spec.eventType)"'
+
+# View details of a specific event
+kubectl get ae audit-1773930600123456789-a7f3b2 -n production -o yaml
+
+# Count events by type
+kubectl get ae -A -o json | \
+  jq '[.items[].spec.eventType] | group_by(.) | map({type: .[0], count: length})'
+
+# Check the platform ClusterRoles and who is bound to them
+kubectl get clusterroles | grep chatcli-role-
+kubectl get clusterrolebindings -o json | \
+  jq -r '.items[] | select(.roleRef.name | startswith("chatcli-role-"))
+         | "\(.metadata.name): \(.roleRef.name) -> \([.subjects[]?.name] | join(","))"'
+
+# Compliance report for the last 7 days (via REST)
+curl -s -H "X-API-Key: $CHATCLI_API_KEY" \
+  "http://chatcli-operator.chatcli-system.svc:8090/api/v1/analytics/compliance?namespace=production" | jq .spec
+```
+</Accordion>
+
+
+
+## Event Retention
+
+<Note>
+  The operator never deletes AuditEvents -- there is no TTL, retention setting
+  or owner reference, so they are not garbage-collected with their Issue.
+  Every event is an object in etcd; configure a retention job to keep the
+  count bounded.
+</Note>
+
+```yaml
+# Deletes AuditEvents older than 90 days, in every namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit-retention
+  namespace: chatcli-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: audit-retention
+rules:
+  - apiGroups: ["platform.chatcli.io"]
+    resources: ["auditevents"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: audit-retention
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: audit-retention
+subjects:
+  - kind: ServiceAccount
+    name: audit-retention
+    namespace: chatcli-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-retention
+  namespace: chatcli-system
+spec:
+  schedule: "0 2 * * 0"    # Every Sunday at 02:00
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: audit-retention
+          containers:
+            - name: cleanup
+              # Any image that ships kubectl and a POSIX shell
+              image: registry.example.com/tools/kubectl-shell:1.31
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  CUTOFF=$(date -u -d "@$(( $(date +%s) - 90*86400 ))" +%Y-%m-%dT%H:%M:%SZ)
+                  kubectl get auditevents -A --no-headers \
+                    -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TS:.spec.timestamp | \
+                  awk -v c="$CUTOFF" '$3 < c {print $1, $2}' | \
+                  while read -r ns name; do
+                    kubectl delete auditevent -n "$ns" "$name"
+                  done
+          restartPolicy: OnFailure
+```
+
+Export to your SIEM before the retention window closes if you need to keep events longer.
+
+
+
+## Server-Side Audit Trail
+
+The AuditEvents above cover the **operator**. The ChatCLI **server** (`chatcli server`, the pod an Instance runs) has a separate, file-based trail: set `spec.server.security.auditLogPath` on the Instance (it becomes `CHATCLI_AUDIT_LOG_PATH`) to an **absolute** path, and every gRPC call is appended as a hash-chained JSON line (`kind: "grpc"`: action, actor, role, caller IP, result, duration), interleaved with the LLM request entries in the same verifiable chain. Details and verification (`/config security verify-audit`) are in [Security](/security/overview).
+
+The Instance pod has a read-only root filesystem; only `/tmp` and `/home/chatcli/.chatcli` are writable, both `emptyDir` volumes lost on restart. To keep the file across restarts, enable `spec.persistence` and point the path into the sessions volume, e.g. `/home/chatcli/.chatcli/sessions/audit.jsonl`.
+
+<Warning>
+  The **operator** itself writes no file audit log. It does not read
+  `CHATCLI_AUDIT_LOG_PATH`; the operator chart value `security.auditLogPath`
+  still renders that variable but has no effect.
+</Warning>
+
+
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Approval Workflow" icon="user-check" href="/kubernetes/aiops/approval-workflow">
+    How plans are parked and decided -- the source of the `approval_*`
+    events, including gates raised by the decision engine and the cluster tier.
+  </Card>
+  <Card title="SLOs and SLAs" icon="gauge-high" href="/kubernetes/aiops/slo-sla">
+    Burn-rate alerts and SLA timers behind `slo_violation` and `sla_breach`,
+    and the real per-severity SLA compliance.
+  </Card>
+  <Card title="Web Dashboard" icon="browser" href="/kubernetes/aiops/web-dashboard">
+    The audit view, API keys and REST roles.
+  </Card>
+  <Card title="AIOps Platform" icon="brain" href="/kubernetes/aiops-platform">
+    Return to the AIOps platform overview.
+  </Card>
+</CardGroup>
