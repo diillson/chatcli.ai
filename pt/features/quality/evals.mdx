@@ -1,0 +1,263 @@
+---
+title: "Evals: medindo o ChatCLI"
+sidebarTitle: "Evals"
+description: "O chatcli eval roda uma suíte fixa de casos pelo binário real do chatcli em sandboxes descartáveis, avalia com checagens determinísticas e um LLM-juiz, agrega tentativas repetidas e faz o CI falhar quando uma mudança deixa o ChatCLI pior que um baseline salvo."
+icon: "flask"
+---
+
+Os padrões de qualidade (Self-Refine, CoVe, Reflexion) fazem o ChatCLI verificar a própria resposta enquanto trabalha. Isso ajuda a resposta do momento, mas não deixa nada para comparar entre uma versão e outra, e um modelo verificando a si mesmo carrega os próprios pontos cegos. Os **evals** cobrem essa lacuna. Uma suíte de evals é um conjunto fixo de casos com critério de aprovação conhecido, rodado sempre do mesmo jeito. O resultado é um placar (taxa de aprovação, nota média, custo e latência) que você pode salvar como baseline e usar como gate no CI.
+
+O `chatcli eval` é esse harness. Use-o para provar que uma mudança de prompt, modelo ou engine deixou o ChatCLI melhor, e não pior, e para comparar modelos e providers nas mesmas tarefas.
+
+<Info>Evals gastam tokens de verdade: cada caso é uma chamada real ao modelo, e as checagens de juiz somam outras. Use `--max-cost` para limitar uma execução e `validate`/`list` para conferir uma suíte sem gastar nada.</Info>
+
+---
+
+## Começo rápido
+
+```bash
+chatcli eval validate evals/                    # só valida, sem LLM e sem custo
+chatcli eval list evals/ --filter tag:coder     # o que uma execução rodaria
+
+# Use um juiz que seja um modelo diferente do avaliado: autoavaliação tem viés.
+chatcli eval run evals/ --provider CLAUDEAI --model claude-sonnet-5-5 \
+  --judge-provider OPENAI --judge-model gpt-6.1-sol \
+  --trials 3 --max-cost 2 --out runs/sonnet.json --markdown runs/sonnet.md
+```
+
+Uma execução real da suíte inicial, com Claude Haiku 5.5 como candidato e Claude Sonnet 5.5 como juiz, comparada com uma execução anterior em que o caso de bugfix em Go tinha estourado o tempo. Durante a execução, cada tentativa concluída imprime uma linha no stderr; no fim, o resumo vai para o stdout:
+
+```text
+[1/7] ✓ core/chat-arithmetic-exact #1  1.00 · 2.9s · $0.0000
+[2/7] ✓ core/chat-json-only #1  1.00 · 3.3s · $0.0001
+[3/7] ✓ core/chat-ptbr-language #1  1.00 · 3.7s · $0.0023
+[4/7] ✓ core/chat-admits-unknown #1  0.97 · 3.9s · $0.0029
+[5/7] ✓ core/coder-create-file #1  1.00 · 11.1s · $0.0040
+[6/7] ✓ core/coder-fix-off-by-one #1  1.00 · 29.4s · $0.0062
+[7/7] ✓ core/coder-read-only-question #1  1.00 · 17.2s · $0.0039
+
+✓ core/chat-ptbr-language                  chat    1/1 tentativas  1.00  $0.0023
+✓ core/chat-arithmetic-exact               chat    1/1 tentativas  1.00  $0.0000
+✓ core/chat-json-only                      chat    1/1 tentativas  1.00  $0.0001
+✓ core/chat-admits-unknown                 chat    1/1 tentativas  0.97  $0.0029
+✓ core/coder-fix-off-by-one                coder   1/1 tentativas  1.00  $0.0062
+✓ core/coder-create-file                   coder   1/1 tentativas  1.00  $0.0040
+✓ core/coder-read-only-question            coder   1/1 tentativas  1.00  $0.0039
+
+Aprovados 7 de 7 (100.0%) · reprovados 0 · erros 0 · pulados 0 · instáveis 0
+Nota média 1,00 · custo $0.0146 + juiz $0.0049 · tokens 293.835 entrada / 2.540 saída
+Latência p50 3.9s · p95 29.4s · tempo total 42.9s
+Avaliado: CLAUDEAI claude-haiku-5-5
+Juiz: CLAUDEAI claude-sonnet-5-5
+
+Contra o baseline:
+  aprovação 85.7% → 100.0%
+  nota 0,85 → 1,00
+  custo $0.0210 → $0.0195
+  ✓ core/coder-fix-off-by-one passou a aprovar (error → pass)
+```
+
+Um caso que reprova lista as checagens que falharam logo abaixo da linha dele, por exemplo `✗ testes passam: saiu com 1 (esperado 0): --- FAIL: TestSum …`.
+
+O repositório traz uma suíte inicial em `evals/`: idioma no chat, formato JSON, aritmética, não inventar uma flag, corrigir um bug em Go, criar um arquivo e responder sem mexer em arquivos.
+
+---
+
+## Como uma tentativa roda
+
+<Steps>
+  <Step title="Sandbox">
+    Um diretório temporário é criado. A `fixture` do caso é copiada para ele, os `files` inline são escritos e os comandos de `setup` são executados (por exemplo `git init`). Se o setup falhar, a tentativa é marcada como **erro** e o candidato nem roda.
+  </Step>
+  <Step title="Policy do coder">
+    Em casos `coder`, é gravado um `coder_policy.json` local (`merge: true`, ou seja, por cima da sua policy global). Por padrão ele libera o `@coder`, inclusive o `exec`, dentro do workspace descartável. Use `policy:` no caso para restringir. Operações safety-immune continuam pedindo aprovação, e como num eval não há ninguém para aprovar, elas são negadas. Não existe uma chave de "aprovar tudo" para isso.
+  </Step>
+  <Step title="Candidato">
+    O binário real roda `chatcli -p "<prompt>" --raw --no-anim` (com `/coder ` na frente nos casos coder), sem stdin e dentro do timeout do caso. Por padrão a execução é **hermética**: memória de longo prazo, bootstrap, recall de memória e de sessão, autosave de sessão, checkpoints do coder e histórico do REPL ficam desligados, então o resultado depende só da suíte. Com `--with-memory`, a avaliação usa a sua memória e o seu recall reais.
+  </Step>
+  <Step title="Registro">
+    Pelo `CHATCLI_EVAL_RECORD`, o one-shot informa a resposta final, as tool calls, os turnos, tokens, custo e transcript num arquivo fora do sandbox, que o candidato não consegue ler nem alterar.
+  </Step>
+  <Step title="Avaliação">
+    Cada checagem roda sobre a resposta e sobre o sandbox. Comandos como `go test ./...` rodam dentro dele. A tentativa só passa se **todas** as checagens passarem, e a nota dela é a média ponderada das notas das checagens.
+  </Step>
+  <Step title="Limpeza">
+    O sandbox é apagado. Com `--keep` ele fica no disco, e o relatório guarda o caminho.
+  </Step>
+</Steps>
+
+<Warning>Com `--with-memory` a execução também pode **escrever** na sua memória: um one-shot enfileira o turno para extração de memória como qualquer outra execução. Use execuções herméticas para baselines.</Warning>
+
+---
+
+## Formato da suíte
+
+A suíte é um arquivo YAML. Passando um diretório, são carregados todos os `*.yaml` / `*.yml` que estão diretamente nele. Subdiretórios não são varridos, então as fixtures podem ter YAML próprio. As chaves são estritas: uma chave escrita errada é erro, e nunca vira uma checagem ignorada em silêncio.
+
+```yaml
+name: core
+judge: {provider: OPENAI, model: gpt-6.1-sol}   # juiz padrão; as flags sobrescrevem
+defaults:                                        # herdados por todos os casos
+  mode: chat            # chat | coder
+  timeout: 4m
+  trials: 1
+  pass_policy: all      # all (pass^k, padrão) | any (pass@k) | majority
+  env: {CHAVE: valor}   # mesclado no env de cada caso
+  setup: ["git init -q"]
+  checks:               # anexadas a todos os casos
+    - not_regex: '(?i)\bas an ai (language )?model\b'
+
+cases:
+  - id: chat-ptbr-language            # letras, dígitos, . _ -
+    tags: [chat, i18n]
+    prompt: "Explique em no máximo duas frases o que é um mutex."
+    checks:
+      - regex: '(?i)(thread|goroutine|concorr|exclus)'
+      - judge:
+          rubric: "Escrito em português do Brasil, correto sobre exclusão mútua, no máximo duas frases."
+          threshold: 0.7
+
+  - id: coder-fix-off-by-one
+    mode: coder
+    fixture: fixtures/go-off-by-one   # diretório relativo ao arquivo da suíte (a suíte inicial traz este módulo inline em files:)
+    setup: ["git init -q && git add -A && git -c user.email=e@x -c user.name=e commit -qm fixture"]
+    prompt: "Os testes falham. Corrija o bug no código. Não altere os testes."
+    checks:
+      - name: testes passam
+        command: {run: "go test ./...", timeout: 3m}
+      - name: testes intactos
+        command: {run: "git diff --exit-code -- sum_test.go"}
+      - tool_called: "@coder"
+      - max_turns: 25
+      - max_cost_usd: 0.25
+```
+
+| Campo do caso | Significado |
+| --- | --- |
+| `id` | Único dentro da suíte. Os relatórios identificam o caso como `<suíte>/<id>` |
+| `prompt` | O que o candidato recebe |
+| `mode` | `chat` (one-shot simples) ou `coder` (o loop ReAct completo, com ferramentas) |
+| `fixture` / `files` / `setup` | Conteúdo do sandbox: diretório a copiar, arquivos inline e comandos de shell a rodar antes |
+| `trials` / `pass_policy` / `timeout` / `env` | Sobrescritas por caso dos defaults (`trials` de 1 a 20) |
+| `policy` | Regras da policy do coder para o sandbox, `{pattern, action: allow\|deny\|ask}` |
+| `skip` | Mantém o caso na suíte sem rodá-lo; o valor é o motivo |
+| `checks` | Pelo menos uma, depois de anexadas as checagens dos defaults |
+
+<Tip>A fixture costuma estar quebrada de propósito, então mantenha-a longe das ferramentas que varrem o repositório que a hospeda. Um diretório de fixture que é um módulo Go precisa de um `go.mod` próprio, o que o deixa fora do `go test ./...`. Fixtures pequenas podem ir inline em `files:`, e uma âncora YAML (`files: &nome` … `files: *nome`) as compartilha entre casos. É o que a suíte inicial faz.</Tip>
+
+---
+
+## Checagens
+
+As checagens determinísticas vêm primeiro: são baratas, reprodutíveis e não abrem margem para discussão. Use o juiz só para o que não tem teste determinístico.
+
+| Checagem | Passa quando |
+| --- | --- |
+| `contains` / `not_contains` / `equals` | A resposta final contém, não contém ou é igual ao texto (existe `ignore_case: true`) |
+| `regex` / `not_regex` | A resposta bate, ou não bate, com o padrão |
+| `json: {require_keys: [...]}` | A resposta, ou o primeiro JSON em bloco ou embutido nela, é válida e tem as chaves |
+| `file_exists` / `file_absent` | Um arquivo do sandbox existe, ou não existe |
+| `file_contains` / `file_regex: {path, text}` | Um arquivo do sandbox contém o texto, ou bate com o padrão |
+| `command: {run, expect_exit, contains, timeout}` | Um comando de shell, rodado no sandbox depois do candidato, sai com `expect_exit` (padrão `0`) e, quando `contains` é definido, a saída o contém. Timeout padrão `2m` |
+| `tool_called` / `tool_not_called` | Uma ferramenta foi, ou não foi, chamada. Casa pelo nome (`@coder`) ou pelo nome mais o início dos argumentos (`@coder write`), tanto em tool calls nativas quanto em XML |
+| `max_cost_usd` / `max_turns` / `max_duration` | O candidato ficou dentro do orçamento |
+| `judge: {rubric, reference, threshold, samples}` | A mediana da nota do LLM-juiz em `samples` chamadas (padrão 1, máximo 5) é pelo menos `threshold` (padrão `0.7`) |
+
+Toda checagem aceita `name:` (aparece nos relatórios) e `weight:` (o peso dela na nota da tentativa, padrão 1). Os caminhos nas checagens e em `files` precisam ser relativos e ficar dentro do sandbox: caminhos absolutos e escapes com `..` são recusados já ao carregar a suíte.
+
+### O juiz
+
+O juiz recebe a tarefa, a rubrica, a resposta de referência (`reference`, opcional), as ferramentas que o candidato chamou e a resposta do candidato. Ele não fica sabendo qual modelo gerou a resposta. Responde com `{"score": 0..1, "reasoning": "..."}`, e a leitura é tolerante: aceita bloco de código e normaliza uma nota dada em escala de 0 a 10 ou de 0 a 100. Uma chamada ao juiz que falha ou não pode ser lida conta como amostra zero. Nunca vira aprovação silenciosa.
+
+- **Qual modelo julga:** `--judge-provider`/`--judge-model`; senão, o primeiro `judge:` declarado numa suíte; senão, o seu padrão configurado.
+- **Autoavaliação é sinalizada:** quando o juiz é o mesmo modelo do candidato, o relatório marca a execução como `self_judged` e avisa.
+- **O gasto do juiz** entra no seu cost tracker real e aparece separado do gasto do candidato.
+
+---
+
+## Tentativas, pass@k e pass^k
+
+A saída de LLM varia, então um caso pode rodar `trials` vezes. Para cada caso o relatório traz:
+
+| Métrica | Significado |
+| --- | --- |
+| `pass_rate` | Tentativas aprovadas ÷ tentativas avaliadas |
+| `pass_at_k` | Pelo menos uma tentativa passou |
+| `pass_hat_k` | Todas as tentativas passaram |
+| `flaky` | Algumas tentativas passaram e outras não |
+| `mean_score` | Nota média das tentativas |
+
+O veredito do caso segue a `pass_policy`. `all` (o padrão, pass^k) é rígido: um caso que passa duas vezes em três é instável e reprova, e o relatório mostra isso em vez de esconder. `any` e `majority` estão disponíveis por caso. Uma tentativa em que a execução quebrou ou estourou o tempo conta como **erro**, separado de **reprovação**, para que "o ChatCLI quebrou" nunca seja lido como "o ChatCLI errou".
+
+---
+
+## Baselines e o gate de CI
+
+`--out` salva o relatório JSON. Uma execução posterior com `--baseline` compara caso a caso:
+
+- **Regressões:** casos que passavam e agora não passam.
+- **Correções:** casos que não passavam e agora passam.
+- Casos **novos** e **removidos**.
+- Taxa de aprovação, nota média e custo antes e depois, medidos só sobre os casos avaliados nas duas execuções. Assim, uma execução filtrada comparada com um baseline completo compara a mesma coisa.
+
+```bash
+chatcli eval run evals/ --out runs/main.json                           # na main
+chatcli eval run evals/ --baseline runs/main.json --max-regressions 0  # na branch
+chatcli eval compare runs/main.json runs/branch.json                   # offline, sem LLM
+```
+
+| Exit code | Significado |
+| --- | --- |
+| `0` | Tudo dentro dos gates |
+| `1` | Taxa de aprovação abaixo de `--min-pass-rate` (padrão `1.0`) |
+| `2` | Erro de uso ou suíte inválida |
+| `3` | Regressão contra o `--baseline`: mais regressões de caso que `--max-regressions`, ou queda de taxa de aprovação maior que `--tolerance` |
+
+`--markdown` grava o mesmo resultado em Markdown (tabela de resumo, delta contra o baseline e checagens que falharam), pronto para comentário de PR ou resumo de job de CI.
+
+---
+
+## Referência de comandos
+
+| Forma | Descrição |
+| --- | --- |
+| `chatcli eval run [caminho]` | Roda, avalia, reporta e aplica os gates. `caminho` é um arquivo ou diretório de suíte, padrão `./evals` |
+| `chatcli eval list [caminho] [--filter …]` | Os casos que uma execução rodaria, com modo, tentativas, número de checagens e tags |
+| `chatcli eval validate [caminho]` | Só faz o parse e valida. Não sobe provider e não gasta nada |
+| `chatcli eval compare <baseline.json> <atual.json>` | Compara dois relatórios salvos; mesmas flags de gate e exit codes do `run` |
+
+| Flag do `run` | Descrição | Padrão |
+| --- | --- | --- |
+| `--provider`, `--model` | Provider e modelo avaliados | O seu padrão configurado |
+| `--judge-provider`, `--judge-model` | Modelo juiz | `judge:` da suíte; senão, o seu padrão |
+| `--trials <n>` | Sobrescreve o número de tentativas de todos os casos (1 a 20) | Por caso |
+| `--concurrency <n>` | Tentativas rodando ao mesmo tempo | `2` |
+| `--filter <lista>` | Ids de caso separados por vírgula (aceita glob como `coder-*`) ou `tag:<nome>` | Todos os casos |
+| `--timeout <dur>` | Sobrescreve o timeout de todos os casos | Por caso (`5m`) |
+| `--max-cost <usd>` | Para de iniciar tentativas quando o gasto de candidato + juiz chega ao valor; as tentativas restantes aparecem como puladas | Sem teto |
+| `--out <arquivo>` / `--markdown <arquivo>` | Grava o relatório JSON / Markdown | — |
+| `--baseline <arquivo>` | Relatório para comparar | — |
+| `--max-regressions <n>` / `--tolerance <0..1>` | Gate de regressão | `0` / `0` |
+| `--min-pass-rate <0..1>` | Gate de taxa de aprovação | `1.0` |
+| `--with-memory` | Avalia com a sua memória e recall reais | Desligado (hermético) |
+| `--keep` | Mantém o sandbox de cada tentativa | Desligado |
+| `--json` | Imprime o relatório em JSON no stdout (o progresso continua no stderr) | Desligado |
+| `--quiet` | Sem progresso por tentativa | Desligado |
+| `--bin <caminho>` | Binário do chatcli que roda os casos | Este binário |
+
+Ctrl+C para de agendar tentativas novas e encerra as que estão rodando. O relatório as marca como puladas.
+
+<Note>`CHATCLI_EVAL_RECORD` é o contrato privado do harness com o binário que ele dirige: quando definida, uma execução one-shot grava o registro nesse caminho ao sair. Sem ela, que é o caso de toda execução que não vem do `chatcli eval`, o one-shot não grava nada.</Note>
+
+---
+
+## Evals e o pipeline de qualidade
+
+Os padrões de qualidade mudam como o ChatCLI responde. Os evals mostram se a mudança valeu a pena. Para medir, por exemplo, se ligar o CoVe melhora um modelo nas suas tarefas, rode a mesma suíte duas vezes e compare:
+
+```bash
+chatcli eval run evals/ --out runs/cove-off.json
+CHATCLI_QUALITY_VERIFY_ENABLED=true chatcli eval run evals/ --baseline runs/cove-off.json --min-pass-rate 0
+```
+
+O candidato herda o ambiente, então qualquer configuração `CHATCLI_*` pode ser comparada assim, e o mesmo vale para o `env:` de um caso.
