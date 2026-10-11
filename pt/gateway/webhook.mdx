@@ -1,15 +1,15 @@
 ---
 title: "Webhook"
-description: "Conecte ao ChatCLI qualquer sistema que fale HTTP: poste uma mensagem JSON com um segredo compartilhado e receba o aviso, o progresso e a resposta na sua URL de callback, cada um marcado com o seu tipo."
+description: "Conecte ao ChatCLI qualquer sistema que fale HTTP: poste uma mensagem JSON assinada e receba o aviso, o progresso e a resposta na sua URL de callback, cada um marcado com o seu tipo e assinado do mesmo jeito."
 icon: "webhook"
 ---
 
-O webhook genérico é o canal para todo o resto: um chat interno, um sistema de tickets, um job de CI ou um script. O seu sistema **posta uma mensagem JSON** no gateway, e o gateway **posta as respostas de volta** numa URL de callback que você escolhe. Os dois sentidos levam o mesmo segredo compartilhado.
+O webhook genérico é o canal para todo o resto: um chat interno, um sistema de tickets, um job de CI ou um script. O seu sistema **posta uma mensagem JSON** no gateway, e o gateway **posta as respostas de volta** numa URL de callback que você escolhe. Os dois sentidos são **assinados** com o mesmo segredo compartilhado: um HMAC-SHA256 sobre um timestamp e o corpo cru, não o segredo num header.
 
 | | Webhook |
 | --- | --- |
 | Transporte | Um endpoint HTTP que o gateway serve, mais uma URL de callback para onde ele posta |
-| Quem pode falar com o agente | Quem envia o segredo compartilhado |
+| Quem pode falar com o agente | Quem assina a requisição com o segredo compartilhado |
 | Voz recebida | Sim, como base64 ou URL na requisição |
 | Respostas em voz | Não (só texto) |
 | Imagens recebidas | Sim, como base64 ou URL na requisição |
@@ -24,7 +24,7 @@ sequenceDiagram
     participant App as Seu sistema
     participant GW as ChatCLI gateway
     participant CB as Sua URL de callback
-    App->>GW: POST /inbound (X-ChatCLI-Secret)
+    App->>GW: POST /inbound (assinado: timestamp + assinatura)
     GW-->>App: 202 Accepted (na hora)
     Note over GW: baixa anexos por URL, roda o agente
     GW->>CB: kind "thinking" (após ~2 s)
@@ -34,6 +34,15 @@ sequenceDiagram
 ```
 
 A requisição é respondida com `202` **antes** de qualquer trabalho: download de anexo e execução do agente acontecem depois. Tudo o que o agente produz chega na sua URL de callback, e o campo `kind` diz o que é cada post.
+
+<Note>
+**Toda requisição e todo callback são assinados.** O antigo header `X-ChatCLI-Secret` **não é mais aceito**; mande dois headers no lugar:
+
+- `X-ChatCLI-Timestamp: <unix segundos>` — precisa estar dentro de **±5 minutos** do relógio do gateway.
+- `X-ChatCLI-Signature: sha256=<hex>` — o HMAC-SHA256 em hex da string exata `<timestamp>.<corpo cru>`, com chave `CHATCLI_WEBHOOK_SECRET`.
+
+O gateway assina os callbacks para você do mesmo jeito, sobre o corpo que envia, e **reassina a cada retentativa**. O segredo de entrada **nunca** é devolvido num callback. Veja o [guia de atualização de segurança](/pt/security/hardening-upgrade).
+</Note>
 
 ## Configuração
 
@@ -61,10 +70,16 @@ A requisição é respondida com `202` **antes** de qualquer trabalho: download 
   </Step>
   <Step title="Mande uma mensagem">
     ```bash
+    secret="um-texto-longo-e-aleatorio"
+    body='{"chat_id": "ticket-42", "user_id": "alice", "text": "resuma o log do último deploy"}'
+    ts=$(date +%s)
+    sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1)
+
     curl -X POST http://localhost:8083/inbound \
       -H "Content-Type: application/json" \
-      -H "X-ChatCLI-Secret: um-texto-longo-e-aleatorio" \
-      -d '{"chat_id": "ticket-42", "user_id": "alice", "text": "resuma o log do último deploy"}'
+      -H "X-ChatCLI-Timestamp: $ts" \
+      -H "X-ChatCLI-Signature: sha256=$sig" \
+      -d "$body"
     ```
 
     O gateway responde `202 Accepted` na hora; o aviso, o progresso e a resposta chegam na sua URL de callback.
@@ -75,9 +90,9 @@ A requisição é respondida com `202` **antes** de qualquer trabalho: download 
 
 | Variável | Obrigatória | Padrão | O que faz |
 | --- | --- | --- | --- |
-| `CHATCLI_WEBHOOK_ADDR` | sim | — | Endereço do endpoint, por exemplo `:8083`. O adaptador liga quando ela está definida. |
-| `CHATCLI_WEBHOOK_SECRET` | sim, na prática | — | Segredo compartilhado conferido em toda requisição no `X-ChatCLI-Secret` e reenviado em todo callback. Sem ele **toda requisição é recusada** com `401`, e um aviso é registrado no start. |
-| `CHATCLI_WEBHOOK_CALLBACK_URL` | sim, para receber respostas | — | Para onde o gateway posta o aviso, o progresso e a resposta. Sem ela as requisições continuam aceitas e rodam, mas **as respostas não são entregues a lugar nenhum**, um aviso é registrado no start e o `@send webhook` falha dizendo o que falta. |
+| `CHATCLI_WEBHOOK_ADDR` | sim | — | Endereço do endpoint, por exemplo `:8083`. |
+| `CHATCLI_WEBHOOK_SECRET` | sim | — | Chave do HMAC verificado em toda requisição e adicionado a todo callback. **O adaptador não sobe sem ela**, e uma requisição que não esteja corretamente assinada é recusada com `401`. |
+| `CHATCLI_WEBHOOK_CALLBACK_URL` | sim, para receber respostas | — | Para onde o gateway posta o aviso, o progresso e a resposta. Precisa usar **`https`** (um host loopback pode usar `http` puro). Sem ela as requisições continuam aceitas e rodam, mas **as respostas não são entregues a lugar nenhum**, um aviso é registrado no start e o `@send webhook` falha dizendo o que falta. |
 | `CHATCLI_WEBHOOK_PATH` | não | `/inbound` | Caminho do endpoint. |
 | `CHATCLI_WEBHOOK_HOME_CHANNEL` | não | — | `chat_id` usado nas [mensagens proativas](/pt/gateway/proactive-messaging) enviadas com `@send webhook`. |
 
@@ -85,7 +100,7 @@ As configurações compartilhadas (transcrição de voz, limites de mídia, Conv
 
 ## A requisição
 
-`POST` em `CHATCLI_WEBHOOK_PATH` com o header `X-ChatCLI-Secret` e um corpo JSON:
+`POST` em `CHATCLI_WEBHOOK_PATH` com os headers de assinatura (o `X-ChatCLI-Timestamp` e o `X-ChatCLI-Signature` descritos [acima](#como-funciona)) e um corpo JSON:
 
 | Campo | Obrigatório | Significado |
 | --- | --- | --- |
@@ -108,10 +123,12 @@ Toda recusa traz o motivo num corpo JSON, por exemplo `{"error": "missing_chat_i
 | `400 Bad Request` | `missing_chat_id` | Falta `chat_id`, ou ele está vazio. |
 | `400 Bad Request` | `invalid_audio_b64` / `invalid_image_b64` | O base64 não decodifica. |
 | `400 Bad Request` | `empty_message` | Não há texto, áudio nem imagem. |
-| `401 Unauthorized` | `unauthorized` | O segredo está ausente ou errado, ou `CHATCLI_WEBHOOK_SECRET` não está definido. |
+| `401 Unauthorized` | `unauthorized` | A assinatura está ausente ou errada, ou `CHATCLI_WEBHOOK_SECRET` não está definido. |
+| `401 Unauthorized` | `stale_timestamp` | O `X-ChatCLI-Timestamp` está fora da janela de ±5 minutos. |
 | `405 Method Not Allowed` | `method_not_allowed` | Qualquer coisa que não seja `POST` (a resposta traz `Allow: POST`). |
+| `409 Conflict` | `replayed` | Uma requisição com esta assinatura já foi vista dentro da janela (replay). |
 | `413 Request Entity Too Large` | `payload_too_large` | O corpo passou do teto (veja [limites](#limites)). |
-| `429 Too Many Requests` | `queue_full` | Já há 32 mensagens esperando nesta conversa. Tente de novo depois. |
+| `429 Too Many Requests` | `queue_full` | Já há 32 mensagens esperando nesta conversa, ou a memória de proteção contra replay está cheia. Tente de novo depois. |
 | `503 Service Unavailable` | `shutting_down` | O gateway está desligando. |
 
 As mensagens de um mesmo `chat_id` chegam ao agente **na ordem em que foram aceitas**, mesmo quando uma delas espera o download de um anexo; conversas diferentes não esperam umas pelas outras.
@@ -142,9 +159,10 @@ Todo callback traz estes headers:
 | Header | Valor |
 | --- | --- |
 | `Content-Type` | `application/json` |
-| `X-ChatCLI-Secret` | O mesmo segredo da requisição. Confira antes de confiar no corpo. |
-| `X-ChatCLI-Delivery-ID` | Um id aleatório, **igual em todas as tentativas** do mesmo post. |
-| `X-ChatCLI-Delivery-Attempt` | `1`, `2` ou `3`. |
+| `X-ChatCLI-Timestamp` | Unix segundos de quando este callback foi assinado. |
+| `X-ChatCLI-Signature` | `sha256=<hex>`, o HMAC-SHA256 de `<timestamp>.<corpo cru>` com o segredo compartilhado, **reassinado a cada tentativa**. Verifique antes de confiar no corpo. |
+| `X-ChatCLI-Delivery-ID` | Um id aleatório, **igual em todas as tentativas** do mesmo post; não entra na assinatura. |
+| `X-ChatCLI-Delivery-Attempt` | `1`, `2` ou `3`; não entra na assinatura. |
 
 ### Entrega e retries
 
@@ -159,7 +177,7 @@ Como uma tentativa pode chegar ao seu endpoint e mesmo assim falhar no caminho d
 <Tabs>
   <Tab title="Python">
     ```python
-    import hmac, json, os
+    import hashlib, hmac, json, os, time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     SECRET = os.environ["CHATCLI_WEBHOOK_SECRET"].encode()
@@ -167,9 +185,13 @@ Como uma tentativa pode chegar ao seu endpoint e mesmo assim falhar no caminho d
 
     class Callback(BaseHTTPRequestHandler):
         def do_POST(self):
-            if not hmac.compare_digest(self.headers.get("X-ChatCLI-Secret", "").encode(), SECRET):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            ts = self.headers.get("X-ChatCLI-Timestamp", "")
+            want = "sha256=" + hmac.new(SECRET, f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
+            got = self.headers.get("X-ChatCLI-Signature", "")
+            if abs(time.time() - int(ts or 0)) > 300 or not hmac.compare_digest(got, want):
                 self.send_response(401); self.end_headers(); return
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = json.loads(raw)
             delivery = self.headers.get("X-ChatCLI-Delivery-ID")
             if delivery not in seen:
                 seen.add(delivery)
@@ -185,20 +207,24 @@ Como uma tentativa pode chegar ao seu endpoint e mesmo assim falhar no caminho d
   <Tab title="Node.js">
     ```javascript
     import { createServer } from "node:http";
-    import { timingSafeEqual } from "node:crypto";
+    import { createHmac, timingSafeEqual } from "node:crypto";
 
-    const secret = Buffer.from(process.env.CHATCLI_WEBHOOK_SECRET);
+    const secret = process.env.CHATCLI_WEBHOOK_SECRET;
     const seen = new Set(); // use um armazenamento com expiração em produção
 
     createServer((req, res) => {
-      const got = Buffer.from(req.headers["x-chatcli-secret"] ?? "");
-      if (got.length !== secret.length || !timingSafeEqual(got, secret)) {
-        res.writeHead(401).end();
-        return;
-      }
-      let raw = "";
-      req.on("data", (chunk) => (raw += chunk));
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
       req.on("end", () => {
+        const raw = Buffer.concat(chunks);
+        const ts = req.headers["x-chatcli-timestamp"] ?? "";
+        const want = "sha256=" + createHmac("sha256", secret).update(`${ts}.`).update(raw).digest("hex");
+        const got = req.headers["x-chatcli-signature"] ?? "";
+        const fresh = Math.abs(Date.now() / 1000 - Number(ts)) <= 300;
+        if (!fresh || got.length !== want.length || !timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
+          res.writeHead(401).end();
+          return;
+        }
         const body = JSON.parse(raw);
         const delivery = req.headers["x-chatcli-delivery-id"];
         if (!seen.has(delivery)) {
@@ -241,8 +267,9 @@ Para juntar identidades de propósito (você no webhook e no Telegram, por exemp
 
 ## Anexos
 
-- `audio_b64` e `image_b64` são decodificados na hora: base64 inválido é recusado com `400`.
+- `audio_b64` e `image_b64` são decodificados na hora: base64 inválido é recusado com `400`. O base64 inline não é afetado pelas regras de URL abaixo.
 - `audio_url` e `image_url` são baixados **depois** do `202`, pelo próprio gateway, até os tetos `CHATCLI_GATEWAY_MAX_AUDIO_BYTES` e `CHATCLI_GATEWAY_MAX_IMAGE_BYTES` (20 MB cada, por padrão).
+- Um anexo por URL precisa ser **`https`**, e o gateway recusa qualquer endereço que resolva para um alvo **privado, loopback, link-local ou de metadata de nuvem** — assim quem tem o segredo não consegue usar o gateway para sondar a rede dele próprio.
 - Se um download falhar, a mensagem roda assim mesmo e o agente é avisado, então a resposta diz que o anexo não chegou em vez de responder como se nada tivesse sido enviado.
 
 ## Mensagens proativas
@@ -261,9 +288,10 @@ Com `@send`, o agente posta no seu callback por conta própria, com `kind: "proa
 Cada mensagem roda o agente com suas tools e o shell, sem confirmações. Trate o segredo como uma credencial de acesso à máquina e endureça com o [modo de segurança](/pt/security/overview).
 </Warning>
 
-- **Use um segredo longo e aleatório**, e sirva o endpoint e o callback por HTTPS quando forem acessíveis de outras máquinas.
-- **Confira o `X-ChatCLI-Secret` no seu receptor**, com comparação em tempo constante, antes de confiar no corpo.
-- `audio_url` e `image_url` são baixados pelo próprio gateway, então quem tem o segredo consegue fazer o gateway buscar uma URL da rede dele.
+- **Use um segredo longo e aleatório**: ele é a chave da assinatura nos dois sentidos, e o gateway **não sobe sem `CHATCLI_WEBHOOK_SECRET`**.
+- **Verifique a assinatura no seu receptor** — recalcule `sha256=HMAC(segredo, "<timestamp>.<corpo cru>")` com comparação em tempo constante, e rejeite um timestamp fora de ±5 minutos — antes de confiar no corpo. O segredo nunca é enviado num header.
+- Sirva o endpoint e o callback por **HTTPS**; o `CHATCLI_WEBHOOK_CALLBACK_URL` precisa ser `https`, a menos que o host seja loopback.
+- `audio_url` e `image_url` são buscados pelo próprio gateway, então ficam restritos a `https` e bloqueados para endereços privados, loopback, link-local e de metadata.
 
 ## Limites
 

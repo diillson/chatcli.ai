@@ -145,33 +145,31 @@ You can add a local policy in the project directory:
 - Local: `./coder_policy.json`
 - Global: `~/.chatcli/coder_policy.json`
 
-<Tabs>
-  <Tab title="With merge (local + global)">
-    If `merge: true`, local rules **merge** with global ones (local overrides matching patterns).
+<Warning>
+**A local `coder_policy.json` loads only from a trusted workspace, and it can only *tighten* the global policy — it can never widen it.** This changed in the security release; the older merge/replace behaviour is gone.
 
-    ```json
-    {
-      "merge": true,
-      "rules": [
-        { "pattern": "@coder write", "action": "ask" },
-        { "pattern": "@coder exec --cmd 'rm -rf'", "action": "deny" }
-      ]
-    }
-    ```
-  </Tab>
-  <Tab title="Without merge (local only)">
-    If `merge: false` or absent, **only** the local policy is used.
+- A local rule may add an `ask` or `deny` on top of the global policy.
+- A local `allow` rule is **ignored** — a project file can never grant a permission your global policy does not already grant.
+- When you choose **"Always allow"** at a prompt while working in a project, that new `allow` rule is written to the **global** file (`~/.chatcli/coder_policy.json`), never to the project file.
+- In an untrusted folder the local file is not read at all (a warning is printed on stderr). Trust the folder first with `chatcli trust [dir]`.
 
-    ```json
-    {
-      "rules": [
-        { "pattern": "@coder read", "action": "allow" },
-        { "pattern": "@coder write", "action": "ask" }
-      ]
-    }
-    ```
-  </Tab>
-</Tabs>
+See the [security hardening upgrade guide](/security/hardening-upgrade) for the full workspace-trust model.
+</Warning>
+
+```json ./coder_policy.json
+{
+  "rules": [
+    { "pattern": "@coder write", "action": "ask" },
+    { "pattern": "@coder exec --cmd 'rm -rf'", "action": "deny" }
+  ]
+}
+```
+
+The local file above only tightens: it forces `@coder write` back to `ask` and denies a destructive `rm -rf` even if the global policy was more permissive. Any `allow` it contained would be dropped.
+
+<Note>
+For [evals](/agents/harness/evals), the per-case policy no longer comes from a `coder_policy.json` placed in the sandbox. It comes from `CHATCLI_CODER_POLICY_OVERLAY`, a path read only from the process environment; that overlay is a full merge and is never persisted.
+</Note>
 
 ### Policy Example (coder_policy.json)
 
@@ -321,7 +319,7 @@ The JSON embedded inside the XML `args` attribute (e.g., `{"cmd":"read",...}`) c
     Matching uses word boundary for subcommand prefixes and path-prefix for arguments. You can allow `coder exec --cmd 'ls` but block `coder exec --cmd 'rm`.
   </Step>
   <Step title="Safe Exec">
-    `@coder exec` blocks dangerous patterns by default (50+ rules). Use `--allow-unsafe` only when necessary.
+    `@coder exec` blocks dangerous patterns by default (50+ rules). A `--allow-unsafe` or `--allow-sudo` flag **coming from the model is ignored** — only the human operator can lift these guards, via `CHATCLI_CODER_ALLOW_UNSAFE=true` and `CHATCLI_AGENT_ALLOW_SUDO=true` in the environment. Set them deliberately and only when necessary.
   </Step>
 </Steps>
 
@@ -345,15 +343,19 @@ Security policies are **fully respected** by multi-agent mode workers. When `/co
 
 ## Ask Rules on Unattended Surfaces (ACP, MCP, Gateway, headless one-shot)
 
-In the interactive terminal an `ask` rule shows the security prompt. On unattended surfaces — where stdin carries a protocol or nobody is watching — the rule is resolved per surface:
+In the interactive terminal an `ask` rule shows the security prompt. On unattended surfaces — where stdin carries a protocol or nobody is watching — the rule is resolved per surface.
+
+<Warning>
+**When no human can answer, an `ask` now DENIES, fail-safe.** This is the release default across the gateway, the server pipeline, ACP/MCP without a dialog, `chatcli tool`, and [`chatcli eval`](/agents/harness/evals). To let an unattended surface auto-approve its `ask` verdicts, the operator opts in with `CHATCLI_POLICY_AUTOMODE=true` (process-wide) or `/policy mode auto` (per session). `deny` rules and the safety-immune list keep blocking regardless. See the [security hardening upgrade guide](/security/hardening-upgrade).
+</Warning>
 
 | Surface | What an `ask` rule does |
 |---------|-------------------------|
 | **ACP** (IDE) | Raises the IDE's native dialog via `session/request_permission` with the full terminal vocabulary — *Allow* / *Always allow* / *Reject* / *Always reject*; the *always* choices persist a rule exactly like `a`/`d` in the terminal prompt. A denial blocks and the model replans. The wait is bounded by the same `CHATCLI_MCP_PERMISSION_TIMEOUT` (default `600s`); an unanswered dialog denies fail-safe with unanswered-request feedback |
 | **MCP** with `elicitation` capability | Raises an `elicitation/create` form in the client with the same four-way decision; *always* choices persist rules. The wait is bounded by `CHATCLI_MCP_PERMISSION_TIMEOUT` (default `600s`): an unanswered form denies fail-safe and the model is told the request went unanswered. `CHATCLI_MCP_ELICITATION=off` disables the forms entirely |
-| **MCP** without the capability | Auto-approves (historical contract); dangerous exec commands are still refused in-band |
-| **Gateway daemon** | Auto-approves — the operator opted into full autonomy at the messaging edge |
-| **One-shot without a terminal** (`chatcli -p "/coder …"` from a script, CI, a pipe or [`chatcli eval`](/agents/harness/evals)) | Denies at once, fail-safe: nobody can answer the prompt, which would otherwise wait until the run's timeout. Parallel workers get the same denial. The model is told the action needs approval and was not executed (not that you refused it), and continues without it. Use an explicit `allow` rule, or session automode, for what a headless run must do |
+| **MCP** without the capability | **Denies** unless automode is on (`CHATCLI_POLICY_AUTOMODE=true` or `/policy mode auto`); dangerous exec commands are still refused in-band |
+| **Gateway daemon** | **Denies** unless the operator enabled automode (`CHATCLI_POLICY_AUTOMODE=true` or `/policy mode auto`) — autonomy at the messaging edge is now an explicit opt-in, not the default |
+| **One-shot without a terminal** (`chatcli -p "/coder …"` from a script, CI, a pipe or [`chatcli eval`](/agents/harness/evals)) | Denies at once, fail-safe: nobody can answer the prompt, which would otherwise wait until the run's timeout. Parallel workers get the same denial. The model is told the action needs approval and was not executed (not that you refused it), and continues without it. Use an explicit `allow` rule, or automode (`CHATCLI_POLICY_AUTOMODE=true` / `/policy mode auto`), for what a headless run must do |
 
 <Note>`exec` commands never receive the *always* choices on any surface — the same restriction the interactive prompt applies, since any shell command could be destructive.</Note>
 
@@ -370,6 +372,8 @@ Sometimes you want a session to just *flow* — a long refactor you already trus
 | `/policy` or `/policy status` | Show the current mode, rule count and policy file |
 | `/policy mode auto` | **Automode**: every policy `ask` verdict auto-approves for this session |
 | `/policy mode interactive` | Back to the default: `ask` prompts for approval |
+
+Automode is also what lets an **unattended** surface act on an `ask` instead of denying it fail-safe — set it process-wide with `CHATCLI_POLICY_AUTOMODE=true`, or per session with `/policy mode auto`. See [Ask Rules on Unattended Surfaces](#ask-rules-on-unattended-surfaces-acp-mcp-gateway-headless-one-shot).
 
 What automode does **not** change:
 

@@ -35,7 +35,7 @@ What you need to know before you start:
 - **An `Instance` is one ChatCLI gRPC server** (`chatcli server`) that the operator deploys and keeps in shape: a Deployment, a Service, ConfigMaps, a ServiceAccount and optionally a PVC and watcher RBAC.
 - **The operator always dials the server over TLS 1.3.** There is no plaintext path from the operator to an Instance. The address it dials is `<name>.<namespace>.svc.cluster.local:<port>`, so the server certificate must be valid for that name.
 - **Every Instance needs a credential.** Inside a cluster the server listens on every interface and refuses to start without a shared token, JWT material or a client CA. The operator checks this up front and does not create the Deployment when the spec has none.
-- **One Instance per cluster drives AIOps.** The WatcherBridge lists every Instance in the cluster and attaches to the first ready one it finds. You can run more Instances for chat traffic, but only one feeds the incident pipeline, and which one is not something to rely on.
+- **AIOps attaches to one pinned Instance.** You name it with `CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<name>` (Helm `aiops.instance.namespace` + `aiops.instance.name`); the WatcherBridge then streams alerts from that Instance only, and alerts outside its watch targets are discarded. **With no pin, AIOps is disabled** — the operator still manages Instances, but runs no incident pipeline. You can run more Instances for chat traffic; none is ever picked up implicitly. See the [security hardening upgrade](/security/hardening-upgrade).
 - **The REST API and web dashboard are served by the operator**, not by the Instance: Service `chatcli-operator`, port `8090`, authenticated with API keys.
 
 ### API group and CRDs
@@ -63,6 +63,10 @@ All resources are namespaced and live in `platform.chatcli.io/v1alpha1`. The ope
 | **ChaosExperiment** | `chaos` | A chaos experiment (5 working types; `network_delay`, `network_loss` and `spec.schedule` fail as not supported) |
 
 Each AIOps kind has its own page under **AIOps Platform** in the sidebar, for example [Notifications and escalation](/kubernetes/aiops/notifications), [SLOs and SLAs](/kubernetes/aiops/slo-sla) and [Approval workflow](/kubernetes/aiops/approval-workflow).
+
+<Note>
+**ClusterRegistration credentials are locked down.** A `ClusterRegistration`'s kubeconfig may carry **inline credentials only** — a bearer token or a client certificate and key. An `exec` plugin, `auth-provider`, `tokenFile`, any on-disk file path, `insecure-skip-tls-verify`, HTTP basic auth and a non-HTTPS API server are all refused. The kubeconfig Secret is read **only from the operator namespace** and must carry the binding annotation `platform.chatcli.io/cluster-registration: <namespace>/<name>` naming the ClusterRegistration that uses it. See the [security hardening upgrade](/security/hardening-upgrade).
+</Note>
 
 ## Prerequisites
 
@@ -135,6 +139,8 @@ The operator pod is Ready once its `/readyz` (port 8081) answers. Until you crea
   | `prometheusUrl` | `""` | Prometheus the operator queries for metrics during incident analysis (`PROMETHEUS_URL`) |
   | `alertTransport` | `stream` | `stream` (StreamAlerts; a server without it, older than 1.211.0, is polled, and the stream is retried every 10 minutes or as soon as that server goes away) or `poll` (GetAlerts every 30s) |
   | `decisionEngine.enabled` | `false` | Confidence and circuit-breaker gate before a plan executes ([Decision Engine](/kubernetes/aiops/decision-engine)) |
+  | `aiops.instance.namespace` / `aiops.instance.name` | `""` | The Instance that drives AIOps (`CHATCLI_OPERATOR_AIOPS_INSTANCE=<ns>/<name>`). **Unset disables AIOps**: no incident pipeline runs, and alerts outside the pinned Instance's watch targets are discarded |
+  | `remediationMode` | `approve` | `CHATCLI_OPERATOR_REMEDIATION_MODE`: `observe` (analyze only, execute nothing), `approve` (default; a plan runs only when an ApprovalPolicy or the decision engine permits, and high-risk actions always wait for a human) or `auto` (the previous behavior: plans run without waiting) |
   | `clusterName` | `""` | Name of this cluster's ClusterRegistration; its tier decides which severities wait for a human. A name no registration carries sends every plan to manual approval |
   | `apiKeys.create` / `apiKeys.entries` | `false` / `[]` | Render the dashboard key Secret `chatcli-operator-secrets` from `{key, role, description}` entries |
   | `security.devMode` | `false` | With no keys configured, admit every REST call as admin. Never in production |
@@ -511,6 +517,10 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8090/api/v1/incidents
 
 The watcher runs inside the Instance pod: it collects pod status, events, logs and optional Prometheus metrics for the targets you list and raises alerts. The operator's WatcherBridge turns those alerts into the incident pipeline.
 
+<Warning>
+AIOps is **off until you pin its Instance**. Set `CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<name>` (Helm `aiops.instance.namespace` + `aiops.instance.name`) to the Instance running the watcher; without it the operator keeps managing Instances but runs no incident pipeline, and alerts outside the pinned Instance's watch targets are discarded. Remediation also defaults to `approve` mode now: a plan executes only when an ApprovalPolicy or the decision engine clears it, and high-risk actions always wait for a human. See the [security hardening upgrade](/security/hardening-upgrade).
+</Warning>
+
 ```yaml
 spec:
   watcher:
@@ -540,7 +550,7 @@ What happens next:
 1. **Detection.** The WatcherBridge (on the operator leader) keeps the server's `StreamAlerts` stream open (heartbeat every 15s; a server without the RPC, older than 1.211.0, is polled with `GetAlerts` every 30s, and the stream is retried every 10 minutes or as soon as that server goes away; `alertTransport: poll` forces polling) and creates `Anomaly` resources, deduplicated for `aiops.dedupTTLMinutes` (default 30).
 2. **Correlation.** Anomalies on the same resource are grouped into an `Issue` with a risk score and severity.
 3. **Analysis.** An `AIInsight` is created and the server's `AnalyzeIssue` RPC asks the LLM for a root cause, enriched with Kubernetes context, logs, metrics, GitOps state and linked source code.
-4. **Remediation.** A `RemediationPlan` runs a matching Runbook, an AI-generated runbook, or an agentic observe-decide-act loop (`AgenticStep` RPC), with 54 typed actions (plus `Custom`, which the safety checks reject), a pre-action snapshot and automatic rollback. ApprovalPolicies, the decision engine and the cluster tier can park a plan for a human.
+4. **Remediation.** A `RemediationPlan` runs a matching Runbook, an AI-generated runbook, or an agentic observe-decide-act loop (`AgenticStep` RPC), with 54 typed actions (plus `Custom`, which the safety checks reject), a pre-action snapshot and automatic rollback. The remediation mode (`CHATCLI_OPERATOR_REMEDIATION_MODE` / chart `remediationMode`) gates execution: `observe` executes nothing, `approve` (the default) runs a plan only when an ApprovalPolicy or the decision engine clears it and always holds high-risk actions for a human, and `auto` restores the previous run-without-waiting behavior. ApprovalPolicies, the decision engine and the cluster tier can park a plan for a human.
 5. **Resolution.** The Issue resolves or escalates after `aiops.maxRemediationAttempts`, and a `PostMortem` is generated. Notification and escalation are driven by [NotificationPolicy and EscalationPolicy](/kubernetes/aiops/notifications).
 
 The full state machine, the action catalog and the rollback rules are in [Incident Lifecycle](/kubernetes/aiops/incident-lifecycle) and [AIOps Platform](/kubernetes/aiops-platform). Watcher collection details are in [K8s Watcher](/kubernetes/k8s-watcher).
@@ -764,7 +774,7 @@ spec:
 
 ### `spec.aiops`
 
-The AIOps pipeline reads these settings from the Instance the WatcherBridge streams alerts from (labels `platform.chatcli.io/instance` and `platform.chatcli.io/instance-namespace` on each Anomaly and Issue), falling back to the first Ready Instance.
+The AIOps pipeline reads these settings from the pinned AIOps Instance (`CHATCLI_OPERATOR_AIOPS_INSTANCE` / chart `aiops.instance.*`) — the one the WatcherBridge streams alerts from, recorded by the labels `platform.chatcli.io/instance` and `platform.chatcli.io/instance-namespace` on each Anomaly and Issue. With no pin the pipeline does not run.
 
 | Field | Default | Range | Description |
 |-------|---------|-------|-------------|
@@ -865,7 +875,8 @@ Changes to the pod template itself (image, resources, env, scheduling) roll the 
 - [ ] Dashboard API keys live in `chatcli-operator-secrets`, one per team with the least role it needs, and `security.devMode` is off.
 - [ ] NetworkPolicies restrict the Instance and operator pods, including the plain-HTTP metrics ports.
 - [ ] Images are pinned (operator chart version; `spec.image.tag` only if you want to decouple the server from the operator release).
-- [ ] Only one Instance in the cluster is meant to drive AIOps.
+- [ ] The AIOps Instance is pinned (`CHATCLI_OPERATOR_AIOPS_INSTANCE` / chart `aiops.instance.*`); without it AIOps is off.
+- [ ] `remediationMode` is set deliberately (`approve` by default: high-risk actions wait for a human).
 - [ ] The ExecDiagnostic allowlist covers your workloads' health ports.
 - [ ] Custom resources and referenced Secrets are backed up.
 
@@ -994,6 +1005,10 @@ Instance pods and the operator pod meet the `restricted` Pod Security Standard w
 
 An upgrade replaces the operator and, for every Instance that follows the operator release (no `spec.image.tag`), its server too. You can go straight from any earlier release to this one: the CRD hook re-applies the complete schema and the new operator re-renders every Instance, so there are no intermediate versions to install. Read [Crossing these releases](#crossing-these-releases) first when you come from an older one.
 
+<Warning>
+**Upgrading with no AIOps config turns AIOps off.** This release no longer attaches to an implicit "first ready" Instance: unless you set `CHATCLI_OPERATOR_AIOPS_INSTANCE` (chart `aiops.instance.namespace`/`name`), the incident pipeline does not run after the upgrade. Remediation also defaults to `approve` mode, so plans wait for an ApprovalPolicy or the decision engine and high-risk actions always wait for a human — set `remediationMode: auto` only if you deliberately want the previous unattended behavior. See the [security hardening upgrade](/security/hardening-upgrade).
+</Warning>
+
 ### Before you start
 
 1. Back up the custom resources and Secrets (see [Backup](#backup)).
@@ -1056,6 +1071,7 @@ All five conditions should read `True`. If `ServerReachable` still shows the `Fa
 
 | Coming from | What changes | What to do |
 |-------------|--------------|------------|
+| Any release before this one | AIOps now requires a **pinned Instance**, and remediation defaults to **`approve`** mode | Set `aiops.instance.namespace`/`name` (or `CHATCLI_OPERATOR_AIOPS_INSTANCE`) or AIOps stays off after the upgrade; choose `remediationMode` deliberately (`approve` holds high-risk actions for a human) |
 | Before 1.199.0 | The `GITHUB_MODELS` provider was removed. The CRD rejects it in `spec.fallback.providers[].name`, so after the CRD hook runs an Instance that lists it there fails its next write; in `spec.provider` the CRD still accepts it, but the server no longer has that provider | Move `spec.provider` and every fallback entry to another provider **before** upgrading |
 | Before 1.211.0 | The server gains `StreamAlerts` | Nothing: the bridge polls while an old pod answers and switches to the stream once it is gone (step 5 above) |
 | 1.211.x or earlier | The pod template gains the startup, readiness and liveness probes and the `chatcli.io/credentials-hash` annotation | Every Instance's pods roll once, even with `spec.image.tag` set; plan it like a server rollout |
@@ -1093,7 +1109,8 @@ Delete the Instances first, while the operator still runs: their finalizer (`pla
 | `401` `missing API key in X-API-Key header` / `invalid API key` | Header missing or wrong key | Send `X-API-Key` |
 | `403` `insufficient permissions` | The key's role is below what the endpoint needs, or not one of `viewer`, `operator`, `admin` | Use a key with the right role |
 | `429` `rate limit exceeded: 30 requests per minute` (or `600`) | Too many calls without a valid key from one host (or per key) | Honor `Retry-After`; use a valid key |
-| No Anomalies or Issues although the watcher runs | Another ready Instance was picked by the WatcherBridge, or the operator cannot reach this one | Operator log `Connected to Instance` names the one in use; keep a single AIOps Instance and make its `ServerReachable` True |
+| No Anomalies or Issues although the watcher runs | No AIOps Instance is pinned (so the pipeline is off), or the pinned Instance is unreachable | Set `CHATCLI_OPERATOR_AIOPS_INSTANCE` / chart `aiops.instance.*` to the watcher Instance and make its `ServerReachable` True; the operator log `Connected to Instance` names the one in use |
+| Remediation plans never execute, all wait for approval | `remediationMode` is `approve` (the default) or `observe`, or a high-risk action always needs a human | Approve via the dashboard/ApprovalRequest, or set `remediationMode: auto` if you want unattended execution (not recommended for high-risk actions) |
 | Watcher `forbidden` errors in the server log | `chatcli-watcher` ClusterRole missing (`rbac.create=false`), or a ClusterRole from an older chart without Jobs and CronJobs | Keep the chart's RBAC and upgrade it with the operator |
 | `ExecDiagnostic` rejected: `command "..." not in approved diagnostic commands whitelist` | The exact string is not allowlisted | Add it to `security.allowedDiagnosticCommands` |
 | Instance stuck `Terminating` | The operator is not running to remove the finalizer | Start the operator, or remove the finalizer by hand |
