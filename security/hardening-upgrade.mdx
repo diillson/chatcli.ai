@@ -1,0 +1,173 @@
+---
+title: "Security Hardening Upgrade Guide"
+sidebarTitle: "Hardening upgrade"
+description: "What changes when you update to the security-hardening release: trusted workspaces, chat-gateway sender allowlists, signed webhooks, unattended policy defaults, server role checks, operator trust boundaries and signed self-update. Every default that changed, and how to keep the old behaviour where you need it."
+icon: "shield-exclamation"
+---
+
+<Note>
+This release changes several **defaults** so that the safe behaviour is the one you get without configuration. Most changes are invisible on a single-user workstation; the ones that matter are for the chat gateway, the gRPC server and the Kubernetes operator. Read the section for each surface you run before you update.
+</Note>
+
+This guide lists every behaviour change in the hardening release and the one setting that restores the previous behaviour where a legitimate deployment still needs it. Nothing here is a feature you must adopt; it is what changed and how to stay in control of it.
+
+## At a glance
+
+| Surface | What changed | Keep the old behaviour with |
+|---|---|---|
+| Any directory | Project `.env`, `.chatcli/hooks.json` and `coder_policy.json` load only from trusted folders | `chatcli trust <dir>`, or answer `y` at the prompt |
+| Telegram / Slack / WhatsApp / Discord | The adapter refuses to start without a sender allowlist | `CHATCLI_<PLATFORM>_ALLOWED_USERS=<ids>` or `*` |
+| Webhook channel | Requests and callbacks are signed (HMAC); an http callback is refused off loopback | Sign your requests (see below); use an https callback |
+| Unattended agent (gateway, server, eval…) | A policy "ask" now denies instead of auto-approving | `CHATCLI_POLICY_AUTOMODE=true` |
+| `@coder exec` elevation | `--allow-unsafe` / `--allow-sudo` from the model are ignored | `CHATCLI_CODER_ALLOW_UNSAFE=true`, `CHATCLI_AGENT_ALLOW_SUDO=true` (operator only) |
+| gRPC server | Remote `@coder` and the DEVIN provider require the admin role; sessions are per-user | Issue admin credentials to the callers that need them |
+| gRPC server | A client-chosen provider `base_url` is refused | `CHATCLI_SERVER_PROVIDER_ENDPOINTS=<origin>` |
+| Operator | AIOps is disabled until you pin one Instance | `aiops.instance.namespace` / `aiops.instance.name` |
+| Operator | Remediation parks for approval by default | `remediationMode: auto` |
+| Self-update | `chatcli update` requires a signed checksums file | — (use the signed release; `go install` and Homebrew are unaffected) |
+
+## Trusted workspaces
+
+Starting ChatCLI inside a directory no longer loads that directory's project configuration automatically. This closes a path where cloning and opening a repository could run its code or redirect your credentials.
+
+Three files are now loaded only from a directory you have trusted:
+
+- `.chatcli/hooks.json` — its hooks run shell commands, so an untrusted hook could run code at startup.
+- `./.env` — it could point a provider's base URL at another host (sending your API key or OAuth token there), disable TLS verification, or name an MCP server that is then launched.
+- `coder_policy.json` — a project copy could previously replace your global coder policy and disable every approval prompt.
+
+**What you will see:**
+
+- In the interactive REPL, the first time you start in a folder that contains any of these files, ChatCLI lists them and asks once (`[y/N]`, default **No**). Answering `y` records trust for that folder.
+- In non-interactive modes (`-p`, ACP, `mcp-server`, `gateway`, `server`, …) nothing is ever loaded from an untrusted folder; a one-line warning on stderr names the files and the command to trust them.
+- A trusted folder's `coder_policy.json` can only **tighten** the global policy (add `ask`/`deny`); a local `allow` rule is ignored.
+- If any covered file changes, trust lapses and you are asked again.
+
+**Commands:**
+
+```bash
+chatcli trust              # trust the current directory
+chatcli trust /path/to/repo
+chatcli trust --list       # show trusted folders and which have lapsed
+chatcli trust --revoke .   # drop trust for a folder
+```
+
+Other changes in this area:
+
+- **Command history** moved from `./.chatcli_history` to `~/.chatcli/history` (mode `0600`). An existing `./.chatcli_history` is still read for up-arrow recall but no longer written; delete it when you no longer need it.
+- **ACP project overlay:** a project `.env` opened over ACP now applies only an allowlist of harmless keys (provider and model selection, region, `AWS_PROFILE`, `CHATCLI_LANG`, `CHATCLI_THEME`). Anything else needs `CHATCLI_PROJECT_ENV=all` and a trusted folder.
+- **Evaluation harness:** a per-case policy that used to live in a sandbox `coder_policy.json` now comes from `CHATCLI_CODER_POLICY_OVERLAY`, a path read only from the process environment.
+
+## Chat gateway
+
+Every chat adapter now requires an explicit **sender allowlist** and refuses to start without one. Previously Slack, WhatsApp and Discord accepted any sender, and Telegram accepted everyone when its allowlist was empty. Because the gateway runs the agent unattended, an unlisted sender could otherwise have commands run on the host.
+
+Set the ids that may talk to each adapter you run:
+
+```bash
+export CHATCLI_TELEGRAM_ALLOWED_USERS="111111111,222222222"
+export CHATCLI_SLACK_ALLOWED_USERS="U0123,TEAM1:U0456"   # U<id>, or TEAM:U<id> to pin a workspace
+export CHATCLI_WHATSAPP_ALLOWED_USERS="15551234567"       # the wa_id / phone, no '+'
+export CHATCLI_DISCORD_ALLOWED_USERS="305172394…"         # the author snowflake
+```
+
+To run a deliberately public bot, set the value to `*`. The adapter then starts and logs a warning on every launch; keep `CHATCLI_HUB_ISOLATE=true` so senders do not share one conversation.
+
+Other gateway changes:
+
+- **`/session` over chat** is limited to senders listed by id. It is no longer available over the webhook, whose `user_id` is caller-chosen.
+- A failed network call no longer writes the Telegram bot token to the logs.
+
+## Webhook channel
+
+The generic webhook now authenticates with a signature instead of a static shared secret, and signs its callbacks.
+
+**Inbound requests** must carry:
+
+- `X-ChatCLI-Timestamp: <unix seconds>` — within ±5 minutes of the receiver.
+- `X-ChatCLI-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>`
+
+The old `X-ChatCLI-Secret` header is no longer accepted. A missing or wrong signature is `401`; a stale timestamp is `401 stale_timestamp`; a replay inside the window is `409 replayed`.
+
+**Outbound callbacks** carry the same two headers, signed over the exact posted body, re-signed on each retry. The inbound secret is never sent to the callback. Verify callbacks with the same secret.
+
+**Startup:** the adapter refuses to start without `CHATCLI_WEBHOOK_SECRET`, and `CHATCLI_WEBHOOK_CALLBACK_URL` must be `https` unless its host is loopback.
+
+A reference signer and verifier are in the updated demo bridge (`chatcli-webhook-demo/bridge.py`). Minimal example:
+
+```python
+import hmac, hashlib, time
+ts = str(int(time.time()))
+sig = "sha256=" + hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+headers = {"X-ChatCLI-Timestamp": ts, "X-ChatCLI-Signature": sig}
+```
+
+Attachment URLs (`image_url` / `audio_url`) are now fetched only over https and never to private, loopback, link-local or cloud-metadata addresses; inline `image_b64` / `audio_b64` is unaffected.
+
+## Local web surfaces
+
+The local **web UI** and the **task-graph dashboard** now require their per-run token on the page request itself, not only on the API, and the token is no longer embedded in the served HTML. This stops another local user on a shared host from reading the token and driving your session. The link ChatCLI prints already contains the token; open that link as given.
+
+## Unattended agent and `@coder`
+
+When no human can answer a permission prompt, a policy **"ask" now denies** instead of auto-approving. This affects the gateway, the server pipeline, ACP and MCP clients without a permission dialog, `chatcli tool`, and `eval`.
+
+To opt a deployment into autonomy, as before this release, set:
+
+```bash
+export CHATCLI_POLICY_AUTOMODE=true
+```
+
+Explicit `deny` rules and the safety-immune list still block even with automode on. In an interactive session, `/policy mode auto` does the same per session.
+
+The `@coder exec` elevation flags `--allow-unsafe` and `--allow-sudo` are no longer honoured when they come from the model's tool call. Only the operator enables them:
+
+```bash
+export CHATCLI_CODER_ALLOW_UNSAFE=true   # lift the dangerous-command block
+export CHATCLI_AGENT_ALLOW_SUDO=true     # allow sudo
+```
+
+## gRPC server mode
+
+- **Remote `@coder` execution requires the admin role** and runs through the coder policy. A `user`-role caller can no longer run commands on the server host through `ExecuteRemotePlugin`.
+- **Agent providers (DEVIN) require admin.** A non-admin turn that resolves to DEVIN is refused on every RPC. A server whose own default provider is DEVIN refuses non-admin turns.
+- **Saved sessions are per principal.** Each caller sees only its own sessions; a `readonly` caller cannot save or delete. Sessions created before this release are reachable over gRPC by admins only and are not migrated automatically.
+- **Client-supplied endpoints are refused.** A provider `base_url` in `provider_config` is rejected unless its origin is listed in `CHATCLI_SERVER_PROVIDER_ENDPOINTS`, and even then the address is checked at dial time. An unknown `provider_config` key is now an error instead of being ignored.
+
+Role reminder: a JWT with no `role` claim, and an mTLS client certificate, resolve to the `user` role by default. Issue admin credentials only to callers that must execute on the host.
+
+## Kubernetes operator
+
+<Warning>
+Upgrading the operator with no further configuration **disables the AIOps pipeline** and makes remediation **wait for approval**. This is intentional. Set the two values below to restore automatic operation.
+</Warning>
+
+- **Pin the AIOps Instance.** The operator no longer connects to whichever Instance happens to be ready in any namespace. Pin exactly one:
+
+  ```yaml
+  aiops:
+    instance:
+      namespace: chatcli-system
+      name: aiops
+  ```
+
+  or `CHATCLI_OPERATOR_AIOPS_INSTANCE=chatcli-system/aiops`. With no pin, AIOps stays disconnected and logs what to set. Alerts for namespaces outside the pinned Instance's watch targets are dropped.
+
+- **Remediation mode.** New value `remediationMode`, default `approve`:
+  - `observe` — analyse only, never create a plan.
+  - `approve` — run a plan only when an ApprovalPolicy or the decision engine explicitly allows it; everything else, and every high-risk action, parks for a human.
+  - `auto` — the previous behaviour, now an explicit choice.
+
+- **Federation kubeconfig.** A `ClusterRegistration` kubeconfig may now contain only inline token or certificate data; `exec`, `auth-provider`, `tokenFile`, file-path credentials, `insecure-skip-tls-verify`, basic auth and a non-https server are refused. The kubeconfig Secret is read only from the operator's namespace and must carry the annotation `platform.chatcli.io/cluster-registration: <ns>/<name>` binding it to its registration.
+
+The chart's `values.schema.json` enforces the mode enum and fails rendering if only one of `aiops.instance.namespace` / `name` is set.
+
+## Self-update
+
+`chatcli update` and the auto-update channel now verify an Ed25519 signature over the release's `checksums.txt` against a public key compiled into the binary, before the existing checksum check. A release without a valid `checksums.txt.sig`, or signed with an unknown key, is refused. The `go install` and Homebrew channels keep their own integrity paths and are unaffected.
+
+Embedded speech-to-text and text-to-speech engines and models are now verified against pinned SHA-256 digests before extraction; a re-uploaded or tampered asset is refused.
+
+## MCP remote server login
+
+`/mcp login` now binds the token to the MCP server you configured, rejects protected-resource metadata that names another resource, follows a `resource_metadata` URL only on the server's own origin, and caps discovery documents. A credential stored by an earlier version for a different resource is not reused; log in again if you are prompted to.

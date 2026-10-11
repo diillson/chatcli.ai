@@ -111,7 +111,7 @@ sequenceDiagram
     end
 
     RR->>K8s: Watch RemediationPlan CRs
-    Note over RR,K8s: Gates antes da execução: ApprovalPolicy, tier do cluster, decision engine (opt-in)
+    Note over RR,K8s: Gates antes da execução: modo de remediação (observe/approve/auto), ApprovalPolicy, tier do cluster, decision engine (opt-in)
 
     alt Modo standard (Runbook)
         RR->>K8s: Executa ações (54 tipos: Deployment/StatefulSet/DaemonSet/Job/CronJob + GitOps/Infra/Storage/Security/Network)
@@ -158,7 +158,7 @@ O WatcherBridge é o ponto de entrada do pipeline. Implementa a interface `manag
 | `Start()` | Mantém a bridge ligada a uma Instance pronta: stream primeiro, fallback por polling, context cancelável |
 | `consumeStream()` | Mantém o stream StreamAlerts aberto, transforma cada alerta em Anomaly, reabre após 60s de silêncio |
 | `poll()` | Consulta GetAlerts uma vez (fallback para servidor sem StreamAlerts, com o stream tentado de novo a cada 10 minutos ou quando esse servidor para de responder, ou `CHATCLI_OPERATOR_ALERT_TRANSPORT=poll`) |
-| `discoverAndConnect()` | Descobre servidor via Instance CRs no cluster |
+| `discoverAndConnect()` | Conecta à Instance de AIOps fixada (`CHATCLI_OPERATOR_AIOPS_INSTANCE` / chart `aiops.instance.*`); sem fixar, o pipeline fica desligado |
 | `createAnomaly()` | Converte alert → Anomaly CR (nome `watcher-<tipo>-<deployment>-<timestamp>`, no namespace do alerta) com labels de referência |
 | `alertHash()` | SHA256(type\|deployment\|namespace\|UID do recurso) para dedup |
 | `InvalidateDedupForResource()` | Remove entradas de dedup para um deployment+namespace |
@@ -179,16 +179,17 @@ hash = SHA256(alertType | deployment | namespace | resourceUID)
 **Descoberta do Servidor:**
 
 <Steps>
-  <Step title="Lista Instance CRs no cluster inteiro">
+  <Step title="Lê a Instance de AIOps fixada">
+    O AIOps se conecta a uma Instance, fixada com `CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<nome>` (chart `aiops.instance.*`). Sem fixar, o pipeline fica desligado e a bridge não conecta a nada.
   </Step>
-  <Step title="Seleciona o primeiro Instance com Status.Ready=true">
-    Só uma Instance por cluster conduz o AIOps: a bridge (e os reconcilers de AIInsight e Remediation, que compartilham o mesmo client) falam com a primeira Instance pronta que encontrar.
+  <Step title="Espera essa Instance ficar Ready">
+    A bridge (e os reconcilers de AIInsight e Remediation, que compartilham o mesmo client) falam só com a Instance fixada. Alertas fora dos watch targets dela são descartados.
   </Step>
   <Step title="Conecta via gRPC com TLS 1.3">
     Alvo `dns:///<nome>.<namespace>.svc.cluster.local:<porta>`, com credencial e CA tirados do spec da Instance. O TLS é obrigatório: a Instance precisa de `spec.server.tls.enabled: true` e de um certificado válido para esse nome.
   </Step>
   <Step title="Retry">
-    Se a conexão falha, tenta de novo no próximo ciclo de poll (30s). Depois de 3 tentativas de stream sem mensagens, a bridge derruba a conexão e redescobre a Instance.
+    Se a conexão falha, tenta de novo no próximo ciclo de poll (30s). Depois de 3 tentativas de stream sem mensagens, a bridge derruba a conexão e reconecta à Instance fixada.
   </Step>
 </Steps>
 
@@ -315,7 +316,7 @@ stateDiagram-v2
 
 `Contained` significa que o plano silenciou o workload (por exemplo `ScaleDeployment` para 0 com `containment=true`) sem corrigi-lo: o Issue carrega `status.requiresHumanAction: true` e `status.requiredAction`, e só vai para `Resolved` quando o workload é restaurado. Issues `Escalated` são reavaliados a cada 30 segundos e se auto-resolvem quando o recurso volta a ficar saudável, a menos que a Instance defina `spec.aiops.enableAutoResolve: false`. A checagem de saúde entende Deployments, StatefulSets, DaemonSets, Jobs (saudáveis quando `Complete`) e Nodes (saudáveis quando `Ready`); um Issue em qualquer outro kind não é auto-resolvido. `Failed` é terminal.
 
-As configurações de AIOps (`spec.aiops`) vêm da Instance que o WatcherBridge usa: o WatcherBridge marca cada Anomaly com `platform.chatcli.io/instance` e `platform.chatcli.io/instance-namespace`, o Issue herda esses labels e, sem eles, vale a primeira Instance pronta.
+As configurações de AIOps (`spec.aiops`) vêm da Instance de AIOps fixada que o WatcherBridge usa: o WatcherBridge marca cada Anomaly com `platform.chatcli.io/instance` e `platform.chatcli.io/instance-namespace`, o Issue herda esses labels e, sem eles, vale a Instance fixada.
 
 <AccordionGroup>
   <Accordion title="handleDetected()">
@@ -490,6 +491,8 @@ Predição de impacto antes da execução de ações:
 ### 6. RemediationReconciler (`remediation_controller.go`)
 
 Executa as ações definidas em um RemediationPlan.
+
+O **modo de remediação** (`CHATCLI_OPERATOR_REMEDIATION_MODE` / chart `remediationMode`) controla a execução: `observe` analisa mas não executa nada, `approve` (o padrão) só roda um plano quando uma ApprovalPolicy ou o decision engine libera e sempre segura ações de alto risco para um humano, e `auto` restaura o comportamento anterior de rodar sem esperar. Veja [K8s Operator](/pt/kubernetes/k8s-operator#ligar-o-aiops) e o [guia de atualização de segurança](/pt/security/hardening-upgrade).
 
 **Ações Suportadas (54 tipos, mais `Custom`, que é sempre rejeitado):**
 
@@ -920,7 +923,7 @@ graph TD
 
     Um target do watcher fora do namespace da Instance usa a ClusterRole pré-provisionada `chatcli-watcher` (criada pelo chart).
 
-    Crie **uma** Instance para o AIOps por cluster: o pipeline se conecta à primeira Instance pronta que encontrar, no cluster inteiro.
+    **Fixe a Instance de AIOps:** defina `CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<nome>` (chart `aiops.instance.namespace`/`name`) apontando para esta Instance. Sem fixar, o pipeline de incidentes não roda.
   </Step>
   <Step title="Verificar servidor">
     `kubectl get instances -A` -- `READY` precisa estar `true`; confira as conditions `AuthenticationConfigured` e `ServerReachable` com `kubectl describe instance chatcli -n chatcli`.

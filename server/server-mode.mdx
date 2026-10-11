@@ -127,6 +127,7 @@ Everything the local CLI reads (provider keys such as `ANTHROPIC_API_KEY`, `OPEN
 | `CHATCLI_SERVER_PIPELINE` | `false` | `true` serves the [pipeline RPCs](#pipeline-rpcs) |
 | `CHATCLI_GATEWAY_IN_SERVER` | `false` | `true` runs the [chat gateway](/gateway/chat-gateway) inside the server process |
 | `CHATCLI_ALLOW_HTTP_PROVIDERS` | `false` | `true` lets caller-supplied provider URLs use `http://`, see [SSRF protection](#ssrf-protection) |
+| `CHATCLI_SERVER_PROVIDER_ENDPOINTS` | `""` | Comma-separated allowlist of origins (scheme + host, optional port) a caller may target with a `base_url`/`endpoint` in `provider_config`. Empty (the default) refuses every client-supplied endpoint, see [SSRF protection](#ssrf-protection) |
 | `CHATCLI_ENV` | `prod` | `dev` switches to the colored development console on stdout, see [Logs](#logs) |
 | `CHATCLI_LOG_STDERR` | auto | `true`/`false` forces the JSON log lines on stderr on or off; unset, they are on whenever stderr is not a terminal |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -227,11 +228,15 @@ Where the server enforces them:
 | RPCs | Rule |
 |---|---|
 | `RunCoder`, `RunAgent`, `RunPipelineTool`, `ListPipelineTools` | `admin` only |
-| `ExecuteRemotePlugin` | `user` or `admin` |
+| `ExecuteRemotePlugin` (how a connected client runs remote `@coder` and other plugins) | `admin` only, and the run is admitted through the server's [coder security policy](/coder/coder-security) |
 | `ListRemotePlugins` | `readonly` sees an empty list; plugins named `_*` are listed to `admin` only |
 | `DownloadPlugin` | `readonly` gets `PermissionDenied`; a plugin named `_*` is `NotFound` for anyone but `admin` |
 | Hub RPCs acting for another principal, reading another principal's conversation, listing every binding | `admin` only |
 | All other RPCs (prompts, sessions, server info, watcher, alerts, analysis) | any authenticated caller |
+
+<Note>
+Remote execution runs on the server with no human at the keyboard. `ExecuteRemotePlugin` and the pipeline exec RPCs (`RunCoder`, `RunAgent`, `RunPipelineTool`) require the **admin** role and pass through the server's coder security policy. With no one to answer a policy **`ask`**, the action **denies** unless the server runs in [policy automode](/coder/coder-security#session-policy-mode-policy) (`CHATCLI_POLICY_AUTOMODE=true`); `deny` rules and the safety-immune list always block. Any request that selects the **`DEVIN`** provider requires the admin role on every RPC. See the [security hardening upgrade](/security/hardening-upgrade).
+</Note>
 
 ### Failed-authentication limiter
 
@@ -271,7 +276,7 @@ The server calls the model with its own keys unless the request brings credentia
 | Caller's API key | `--llm-key <key> --provider <P>` | the key is sent to the server for that request only |
 | Caller's local OAuth | `--use-local-auth [--provider CLAUDEAI\|OPENAI\|COPILOT]` | reads `~/.chatcli/auth-profiles.json`; without `--provider` tries Anthropic, OpenAI, then Copilot |
 | StackSpot | `--provider STACKSPOT --client-id … --client-key … --realm … --agent-id …` | |
-| Ollama | `--provider OLLAMA --ollama-url https://…` | the URL passes the [SSRF check](#ssrf-protection): HTTPS, public address. For an Ollama on a private network, set `OLLAMA_ENABLED=true` and `OLLAMA_BASE_URL` on the **server** and connect with `--provider OLLAMA` only |
+| Ollama | `--provider OLLAMA --ollama-url https://…` | the URL's origin must be allowlisted in `CHATCLI_SERVER_PROVIDER_ENDPOINTS` **and** pass the [SSRF check](#ssrf-protection) (HTTPS, public address); otherwise the server refuses it. For an Ollama on a private network, set `OLLAMA_ENABLED=true` and `OLLAMA_BASE_URL` on the **server** and connect with `--provider OLLAMA` only |
 
 The server image does not include the Devin CLI, so `DEVIN` is not available as a server provider.
 
@@ -312,7 +317,7 @@ Service `chatcli.v1.ChatCLIService` (proto: `proto/chatcli/v1/chatcli.proto` in 
 | `SendPrompt` | unary | One prompt, the complete reply |
 | `StreamPrompt` | server stream | One prompt, the reply as the provider streams it |
 | `InteractiveSession` | bidi stream | A conversation over one stream |
-| `ListSessions`, `LoadSession`, `SaveSession`, `DeleteSession` | unary | Sessions stored on the server |
+| `ListSessions`, `LoadSession`, `SaveSession`, `DeleteSession` | unary | Sessions stored on the server, scoped to the authenticated principal (see the note below) |
 | `GetServerInfo` | unary | Version, provider, model, available providers, watcher, plugin/agent/skill counts, `pipeline_enabled` |
 | `GetWatcherStatus` | unary | K8s watcher state |
 | `Health` | unary | Liveness and version, no credential needed |
@@ -326,6 +331,10 @@ Service `chatcli.v1.ChatCLIService` (proto: `proto/chatcli/v1/chatcli.proto` in 
 | `ChatTurn` | unary | Full-pipeline chat turn on the server |
 | `RunCoder`, `RunAgent` | server stream | Coder / agent loop on the server |
 | `ListPipelineTools`, `RunPipelineTool` | unary | Tools of the server-hosted engine |
+
+<Note>
+**Sessions are per-principal.** `ListSessions`, `LoadSession`, `SaveSession` and `DeleteSession` only ever see the caller's own sessions, keyed by the authenticated subject, so two callers never read or overwrite each other's. A `readonly` caller may list and load but cannot `SaveSession` or `DeleteSession`. Sessions written before this release carry no principal: over gRPC they are visible to `admin` callers only and are not migrated automatically. See the [security hardening upgrade](/security/hardening-upgrade).
+</Note>
 
 ### Streaming
 
@@ -527,7 +536,9 @@ Keepalive: the server accepts client pings every 20 seconds or slower (even with
 
 ## SSRF protection
 
-Provider URLs that a **caller** supplies (for example `--ollama-url`, fields `base_url`, `api_base`, `endpoint`, `url`, `host`, `server_url`, `realm_url`) are checked before use:
+Provider URLs that a **caller** supplies (for example `--ollama-url`, fields `base_url`, `api_base`, `endpoint`, `url`, `host`, `server_url`, `realm_url`) are checked before use.
+
+A client-supplied `base_url` or `endpoint` is **refused outright** unless its origin (scheme, host and port) is listed in `CHATCLI_SERVER_PROVIDER_ENDPOINTS`; with that variable empty — the default — the server accepts no caller-chosen endpoint at all. An **unknown `provider_config` key is now an error**, not silently ignored. An allowlisted origin is still subject to the checks below, and the host is re-resolved and re-verified when the connection is actually made:
 
 - only `https://`; `http://` requires `CHATCLI_ALLOW_HTTP_PROVIDERS=true` on the server;
 - the host (or every address it resolves to) must not be in `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7`, `fe80::/10`, `ff00::/8` or IPv4-mapped ranges; there is no override for private addresses;
@@ -626,6 +637,8 @@ gRPC keeps one HTTP/2 connection open, so a ClusterIP Service pins each client t
 | `Unavailable desc = the pipeline RPCs are not enabled on this server (start it with CHATCLI_SERVER_PIPELINE=true)` | Pipeline off | Set `CHATCLI_SERVER_PIPELINE=true` (and not `CHATCLI_GATEWAY_IN_SERVER`) |
 | `invalid provider configuration: provider_config[base_url]: non-HTTPS provider URLs are blocked; set CHATCLI_ALLOW_HTTP_PROVIDERS=true to allow` | Caller sent an `http://` URL (for example `--ollama-url`) | Use HTTPS, set the variable on the server, or configure the URL on the server |
 | `… resolves to blocked IP …` | Caller-supplied URL points to a private address | Configure that endpoint on the server (`OLLAMA_BASE_URL`) instead |
+| A caller's `base_url`/`endpoint` is rejected although it is HTTPS and public; the message names `CHATCLI_SERVER_PROVIDER_ENDPOINTS` | The endpoint's origin is not in the allowlist (empty by default) | Add the origin to `CHATCLI_SERVER_PROVIDER_ENDPOINTS` on the server, or configure the endpoint on the server |
+| A `provider_config` field is rejected as an unknown key | The caller sent a `provider_config` key the server does not recognize | Remove it: unknown keys are now errors, not ignored |
 | `Fallback chain initialized` never appears | Fewer than two providers in the list have working credentials | Add keys, or list more providers |
 | Container `unhealthy` with mTLS on | The health check has no client certificate | Set `CHATCLI_TLS_CLIENT_CERT` and `CHATCLI_TLS_CLIENT_KEY`; `docker inspect` shows the check's message |
 

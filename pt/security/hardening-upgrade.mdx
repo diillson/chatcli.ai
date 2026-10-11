@@ -1,0 +1,173 @@
+---
+title: "Guia de atualização de segurança"
+sidebarTitle: "Atualização de segurança"
+description: "O que muda ao atualizar para a versão de endurecimento de segurança: workspaces confiáveis, allowlist de remetentes no gateway de chat, webhooks assinados, políticas padrão no modo não assistido, checagem de papéis no servidor, limites de confiança do operator e autoatualização assinada. Cada padrão que mudou e como manter o comportamento antigo onde for preciso."
+icon: "shield-exclamation"
+---
+
+<Note>
+Esta versão muda vários **padrões** para que o comportamento seguro seja o que você obtém sem configurar nada. A maioria das mudanças é invisível numa estação de trabalho de um usuário só; as que importam são as do gateway de chat, do servidor gRPC e do operator Kubernetes. Leia a seção de cada superfície que você usa antes de atualizar.
+</Note>
+
+Este guia lista cada mudança de comportamento da versão de endurecimento e a única configuração que restaura o comportamento anterior onde um deployment legítimo ainda precisa dele. Nada aqui é um recurso que você precise adotar: é o que mudou e como manter o controle.
+
+## Visão geral
+
+| Superfície | O que mudou | Manter o comportamento antigo com |
+|---|---|---|
+| Qualquer diretório | `.env`, `.chatcli/hooks.json` e `coder_policy.json` do projeto só carregam de pastas confiáveis | `chatcli trust <dir>`, ou responder `y` na pergunta |
+| Telegram / Slack / WhatsApp / Discord | O adapter não sobe sem uma allowlist de remetentes | `CHATCLI_<PLATAFORMA>_ALLOWED_USERS=<ids>` ou `*` |
+| Canal webhook | Requisições e callbacks são assinados (HMAC); callback http é recusado fora de loopback | Assine as requisições (veja abaixo); use callback https |
+| Agente não assistido (gateway, servidor, eval…) | Um "ask" da política agora nega em vez de aprovar sozinho | `CHATCLI_POLICY_AUTOMODE=true` |
+| Elevação no `@coder exec` | `--allow-unsafe` / `--allow-sudo` vindos do modelo são ignorados | `CHATCLI_CODER_ALLOW_UNSAFE=true`, `CHATCLI_AGENT_ALLOW_SUDO=true` (só operador) |
+| Servidor gRPC | `@coder` remoto e o provider DEVIN exigem papel admin; sessões são por usuário | Dar credenciais admin a quem precisa |
+| Servidor gRPC | Um `base_url` de provider escolhido pelo cliente é recusado | `CHATCLI_SERVER_PROVIDER_ENDPOINTS=<origem>` |
+| Operator | AIOps fica desligado até você fixar uma Instance | `aiops.instance.namespace` / `aiops.instance.name` |
+| Operator | A remediação espera aprovação por padrão | `remediationMode: auto` |
+| Autoatualização | `chatcli update` exige um arquivo de checksums assinado | — (use o release assinado; `go install` e Homebrew não mudam) |
+
+## Workspaces confiáveis
+
+Iniciar o ChatCLI dentro de um diretório não carrega mais, sozinho, a configuração de projeto daquele diretório. Isso fecha um caminho em que clonar e abrir um repositório podia executar o código dele ou redirecionar suas credenciais.
+
+Três arquivos agora só carregam de uma pasta que você confiou:
+
+- `.chatcli/hooks.json` — os hooks rodam comandos de shell, então um hook não confiável poderia executar código no start.
+- `./.env` — poderia apontar o base URL de um provider para outro host (mandando sua API key ou token OAuth para lá), desligar a verificação TLS ou indicar um servidor MCP que é então iniciado.
+- `coder_policy.json` — uma cópia no projeto antes substituía a sua política global do coder e desligava todas as confirmações.
+
+**O que você vai ver:**
+
+- No REPL interativo, na primeira vez que você inicia numa pasta que contém algum desses arquivos, o ChatCLI os lista e pergunta uma vez (`[y/N]`, padrão **Não**). Responder `y` registra a confiança naquela pasta.
+- Em modos não interativos (`-p`, ACP, `mcp-server`, `gateway`, `server`, …) nada é carregado de uma pasta não confiável; um aviso de uma linha no stderr nomeia os arquivos e o comando para confiar neles.
+- O `coder_policy.json` de uma pasta confiável só pode **endurecer** a política global (acrescentar `ask`/`deny`); uma regra `allow` local é ignorada.
+- Se qualquer arquivo coberto mudar, a confiança expira e você é perguntado de novo.
+
+**Comandos:**
+
+```bash
+chatcli trust              # confiar no diretório atual
+chatcli trust /caminho/do/repo
+chatcli trust --list       # listar pastas confiáveis e quais expiraram
+chatcli trust --revoke .   # retirar a confiança de uma pasta
+```
+
+Outras mudanças nesta área:
+
+- O **histórico de comandos** saiu de `./.chatcli_history` para `~/.chatcli/history` (modo `0600`). Um `./.chatcli_history` existente ainda é lido para o histórico da seta para cima, mas não recebe mais escritas; apague-o quando não precisar mais.
+- **Overlay de projeto no ACP:** um `.env` de projeto aberto via ACP agora aplica só uma allowlist de chaves inofensivas (escolha de provider e modelo, região, `AWS_PROFILE`, `CHATCLI_LANG`, `CHATCLI_THEME`). Qualquer outra exige `CHATCLI_PROJECT_ENV=all` e uma pasta confiável.
+- **Harness de avaliação:** a política por caso que antes ficava num `coder_policy.json` do sandbox agora vem de `CHATCLI_CODER_POLICY_OVERLAY`, um caminho lido só do ambiente do processo.
+
+## Gateway de chat
+
+Cada adapter de chat agora exige uma **allowlist de remetentes** explícita e não sobe sem ela. Antes, Slack, WhatsApp e Discord aceitavam qualquer remetente, e o Telegram aceitava todo mundo quando a allowlist estava vazia. Como o gateway roda o agente de forma não assistida, um remetente fora da lista poderia ter comandos executados no host.
+
+Defina os ids que podem falar com cada adapter que você usa:
+
+```bash
+export CHATCLI_TELEGRAM_ALLOWED_USERS="111111111,222222222"
+export CHATCLI_SLACK_ALLOWED_USERS="U0123,TEAM1:U0456"   # U<id>, ou TEAM:U<id> para fixar um workspace
+export CHATCLI_WHATSAPP_ALLOWED_USERS="15551234567"       # o wa_id / telefone, sem '+'
+export CHATCLI_DISCORD_ALLOWED_USERS="305172394…"         # o snowflake do autor
+```
+
+Para rodar um bot público de propósito, use o valor `*`. O adapter então sobe e registra um aviso a cada start; mantenha `CHATCLI_HUB_ISOLATE=true` para que os remetentes não compartilhem uma conversa.
+
+Outras mudanças do gateway:
+
+- **`/session` pelo chat** só vale para remetentes listados por id. Deixa de existir pelo webhook, cujo `user_id` é escolhido por quem chama.
+- Uma falha de rede não escreve mais o token do bot do Telegram nos logs.
+
+## Canal webhook
+
+O webhook genérico agora autentica com assinatura, em vez de um segredo estático, e assina os callbacks.
+
+**Requisições de entrada** precisam carregar:
+
+- `X-ChatCLI-Timestamp: <unix em segundos>` — dentro de ±5 minutos do receptor.
+- `X-ChatCLI-Signature: sha256=<hex HMAC-SHA256(segredo, "<timestamp>.<corpo cru>")>`
+
+O antigo header `X-ChatCLI-Secret` não é mais aceito. Assinatura ausente ou errada é `401`; timestamp fora da janela é `401 stale_timestamp`; um replay dentro da janela é `409 replayed`.
+
+**Callbacks de saída** levam os mesmos dois headers, assinados sobre o corpo exato enviado, reassinados a cada retentativa. O segredo de entrada nunca é enviado ao callback. Verifique os callbacks com o mesmo segredo.
+
+**Start:** o adapter não sobe sem `CHATCLI_WEBHOOK_SECRET`, e `CHATCLI_WEBHOOK_CALLBACK_URL` precisa ser `https`, exceto se o host for loopback.
+
+Um assinador e verificador de referência estão no bridge de demo atualizado (`chatcli-webhook-demo/bridge.py`). Exemplo mínimo:
+
+```python
+import hmac, hashlib, time
+ts = str(int(time.time()))
+sig = "sha256=" + hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+headers = {"X-ChatCLI-Timestamp": ts, "X-ChatCLI-Signature": sig}
+```
+
+URLs de anexo (`image_url` / `audio_url`) agora só são buscadas por https e nunca para endereços privados, loopback, link-local ou de metadata de nuvem; o `image_b64` / `audio_b64` embutido não muda.
+
+## Superfícies web locais
+
+A **web UI** local e o **dashboard do task-graph** agora exigem o token da execução na própria requisição da página, não só na API, e o token não é mais embutido no HTML servido. Isso impede que outro usuário local num host compartilhado leia o token e controle a sua sessão. O link que o ChatCLI imprime já contém o token; abra o link como ele vem.
+
+## Agente não assistido e `@coder`
+
+Quando não há humano para responder a uma confirmação, um "ask" da política **agora nega** em vez de aprovar sozinho. Isso afeta o gateway, o pipeline do servidor, o ACP e clientes MCP sem diálogo de permissão, o `chatcli tool` e o `eval`.
+
+Para optar por autonomia num deployment, como antes desta versão, defina:
+
+```bash
+export CHATCLI_POLICY_AUTOMODE=true
+```
+
+Regras `deny` explícitas e a lista de operações imunes continuam bloqueando mesmo com o automode ligado. Numa sessão interativa, `/policy mode auto` faz o mesmo por sessão.
+
+As flags de elevação do `@coder exec`, `--allow-unsafe` e `--allow-sudo`, não são mais honradas quando vêm da chamada de ferramenta do modelo. Só o operador as habilita:
+
+```bash
+export CHATCLI_CODER_ALLOW_UNSAFE=true   # suspende o bloqueio de comando perigoso
+export CHATCLI_AGENT_ALLOW_SUDO=true     # permite sudo
+```
+
+## Modo servidor gRPC
+
+- **Executar `@coder` remoto exige papel admin** e passa pela política do coder. Um chamador de papel `user` não roda mais comandos no host do servidor pelo `ExecuteRemotePlugin`.
+- **Providers de agente (DEVIN) exigem admin.** Um turno de não-admin que resolva para DEVIN é recusado em todas as RPCs. Um servidor cujo provider padrão é DEVIN recusa turnos de não-admin.
+- **Sessões salvas são por usuário.** Cada chamador só vê as próprias; um `readonly` não salva nem apaga. Sessões criadas antes desta versão são acessíveis por gRPC só para admins e não são migradas automaticamente.
+- **Endpoints escolhidos pelo cliente são recusados.** Um `base_url` de provider no `provider_config` é rejeitado, a menos que a origem esteja em `CHATCLI_SERVER_PROVIDER_ENDPOINTS`, e mesmo assim o endereço é checado na hora de conectar. Uma chave desconhecida em `provider_config` agora é erro, em vez de ser ignorada.
+
+Lembrete de papel: um JWT sem claim `role`, e um certificado de cliente mTLS, resolvem para o papel `user` por padrão. Dê credenciais admin só a quem precisa executar no host.
+
+## Operator Kubernetes
+
+<Warning>
+Atualizar o operator sem mais configuração **desliga o pipeline de AIOps** e faz a remediação **esperar aprovação**. Isso é intencional. Defina os dois valores abaixo para voltar à operação automática.
+</Warning>
+
+- **Fixe a Instance de AIOps.** O operator não conecta mais em qualquer Instance pronta de qualquer namespace. Fixe exatamente uma:
+
+  ```yaml
+  aiops:
+    instance:
+      namespace: chatcli-system
+      name: aiops
+  ```
+
+  ou `CHATCLI_OPERATOR_AIOPS_INSTANCE=chatcli-system/aiops`. Sem a fixação, o AIOps fica desconectado e loga o que definir. Alertas de namespaces fora dos alvos de watch da Instance fixada são descartados.
+
+- **Modo de remediação.** Novo valor `remediationMode`, padrão `approve`:
+  - `observe` — só analisa, nunca cria plano.
+  - `approve` — roda um plano só quando uma ApprovalPolicy ou o decision engine permite explicitamente; o resto, e toda ação de alto risco, espera um humano.
+  - `auto` — o comportamento anterior, agora uma escolha explícita.
+
+- **Kubeconfig de federação.** Um kubeconfig de `ClusterRegistration` agora só pode conter token ou certificado inline; `exec`, `auth-provider`, `tokenFile`, credenciais em arquivo, `insecure-skip-tls-verify`, basic auth e servidor não-https são recusados. O Secret do kubeconfig é lido só do namespace do operator e precisa da anotação `platform.chatcli.io/cluster-registration: <ns>/<nome>` que o vincula ao seu registration.
+
+O `values.schema.json` do chart valida o enum do modo e falha a renderização se só um entre `aiops.instance.namespace` / `name` estiver definido.
+
+## Autoatualização
+
+O `chatcli update` e o canal de autoatualização agora verificam uma assinatura Ed25519 sobre o `checksums.txt` do release contra uma chave pública compilada no binário, antes da checagem de checksum que já existia. Um release sem um `checksums.txt.sig` válido, ou assinado com uma chave desconhecida, é recusado. Os canais `go install` e Homebrew mantêm a própria verificação de integridade e não mudam.
+
+Os motores e modelos de fala embutidos (STT e TTS) agora são verificados contra digests SHA-256 fixados antes da extração; um asset reenviado ou adulterado é recusado.
+
+## Login em servidor MCP remoto
+
+O `/mcp login` agora vincula o token ao servidor MCP que você configurou, rejeita metadados de recurso protegido que nomeiem outro recurso, segue uma URL `resource_metadata` só na origem do próprio servidor e limita o tamanho dos documentos de descoberta. Uma credencial gravada por uma versão anterior para outro recurso não é reusada; faça login de novo se for solicitado.
