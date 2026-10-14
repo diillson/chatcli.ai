@@ -15581,7 +15581,7 @@ These matter only if the server runs agent work or loads plugins.
 
 - **Pipeline.** `pipeline.enabled` (Instance `spec.pipeline.enabled`) lets clients run the coder, agent and tools on the server. Those RPCs require the admin role. Leave it off unless you need it.
 - **Command allowlist.** `strict` is the default mode: only commands in the allowlist run, and `CHATCLI_AGENT_ALLOWLIST` adds more (separated by `,` or `;`). The built-in list includes shells and interpreters such as `bash`, `python`, `node` and `eval`, so it is not a sandbox. Contain the pod instead: restricted NetworkPolicy egress, no chart RBAC when the watcher is off (`rbac.create: false`), and nothing sensitive on the pod's volumes.
-- **Plugins.** At load, every tool plugin and [provider plugin](/extensions/provider-plugins) needs a detached signature (`<plugin>.sig`) that verifies against a public key in `~/.chatcli/trusted-keys/`. Unsigned plugins, and plugins on a machine with no trusted key, are skipped unless `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true`, which you must never set in production. A plugin whose signature does not verify is always skipped.
+- **Plugins.** At load, every tool plugin and [provider plugin](/extensions/provider-plugins) needs a detached signature (`<plugin>.sig`) that verifies against a trusted public key — in `~/.chatcli/trusted-keys/`, or for a fleet in the managed `/etc/chatcli/trusted-keys/` that every user trusts. Unsigned plugins, and plugins on a machine with no trusted key, are skipped unless `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true`, which you must never set in production. A plugin whose signature does not verify is always skipped.
 
   ```bash
   chatcli plugin keygen --output ./keys                    # plugin-signing.key and plugin-signing.pub
@@ -16696,7 +16696,16 @@ Install directly from a Git repository:
 /plugin install https://github.com/usuario/meu-plugin-chatcli.git
 ```
 
-ChatCLI will clone, compile (if it's Go), and install the executable in `~/.chatcli/plugins/`.
+ChatCLI will clone, compile (if it's Go), and install the executable in `~/.chatcli/plugins/`, signed with this machine's local key so it loads with signature enforcement on.
+
+Or install a prebuilt, signed binary — from disk or from a release URL:
+
+```bash
+/plugin install ./acme-tool
+/plugin install --binary https://releases.example.com/acme-tool
+```
+
+The first install from a publisher asks you to confirm its key's fingerprint once; see [Signature Verification](#signature-verification).
 
 **Security:** Installing a plugin involves downloading and executing third-party code. Only install plugins from sources you trust.
 
@@ -16897,38 +16906,81 @@ The four atomic plugins (`@read`, `@search`, `@tree`, `@todo`) — see [Atomic T
 
 ## Signature Verification
 
-Starting with this version, plugins require **Ed25519 digital signatures** by default. This ensures that only plugins from trusted sources are loaded and executed.
+A plugin runs only when it is signed by a key this machine trusts: an Ed25519 signature over the binary's SHA-256, in a detached `<plugin>.sig` next to it. The publisher's public key can travel with the plugin as `<plugin>.pub`, but **a bundled key is never trusted on its own** — anyone can sign a binary with their own key and ship that key along, so trusting it automatically would make the signature prove nothing. A key becomes trusted through a decision made outside the bundle, in one of three ways:
 
-### How It Works
+    The first install from a publisher shows the key's fingerprint and asks once. The key is trusted and **pinned** to that plugin: updates install silently, a different key is refused.
+  
+    An administrator places the publisher's key next to `managed.env`. Every user of the machine trusts it, with nothing to copy.
+  
+    `/plugin install <git-url>` builds on your machine after you confirm, and signs the result with this machine's own key.
+  
+### Install a signed plugin
 
-Each plugin must have a corresponding `.sig` file in the same directory:
-
-```text
-~/.chatcli/plugins/
-  my-plugin          # plugin executable
-  my-plugin.sig      # Ed25519 signature of the executable
+```bash
+/plugin install ./acme-tool                                   # REPL: a prebuilt binary on disk
+/plugin install --binary https://releases.example.com/acme-tool
+chatcli plugin install https://releases.example.com/acme-tool  # outside the REPL
 ```
 
-ChatCLI verifies the signature against registered public keys before loading the plugin. If verification fails, the plugin is rejected.
+ChatCLI fetches `<src>`, `<src>.sig` and `<src>.pub` (https only), checks them, and writes nothing to the plugins directory until the publisher is trusted:
 
-### Managing Trusted Keys
+| The bundle | What happens |
+| --- | --- |
+| Signed by a key you or your administrator already trust | Installs |
+| Signed by an unknown publisher whose key is bundled | Shows the fingerprint and asks once; on yes the key is trusted and pinned to the plugin |
+| Same, with no person at the terminal (CI, scripts) | Refused, naming the fingerprint — repeat with `--trust SHA256:…` |
+| Same plugin, signed by a different key than the pinned one | Refused, even if you would confirm. If the publisher really rotated its key, uninstall the plugin and install it again |
+| Signature does not match the bundled key or any trusted key | Refused: the binary or the signature was altered |
+| Unsigned | Refused, unless `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` |
 
-Ed25519 public keys are stored in the `~/.chatcli/trusted-keys/` directory:
+Compare the fingerprint ChatCLI shows with the one the publisher announces — on the release page or the internal portal — before you trust it. That comparison is what makes trust on first use safe.
+
+### Publish a signed plugin
 
     ```bash
-    # Generate private and public keys
-    chatcli plugin keygen --name my-org
-    # Creates: ~/.chatcli/trusted-keys/my-org.pub
-    # Creates: ~/.chatcli/signing-keys/my-org.key (private - protect it!)
+    chatcli plugin keygen --output ~/acme-signing
+    # plugin-signing.key (0600, keep it secret) and plugin-signing.pub,
+    # plus the fingerprint to announce: SHA256:…
     ```
   
     ```bash
-    chatcli plugin sign --key ~/.chatcli/signing-keys/my-org.key my-plugin
-    # Creates: my-plugin.sig
+    chatcli plugin sign --binary dist/acme-tool --key ~/acme-signing/plugin-signing.key
+    # writes dist/acme-tool.sig
     ```
   
-    Share the `.pub` file with users who should trust your plugins. They should place it in `~/.chatcli/trusted-keys/`.
+    Publish `acme-tool`, `acme-tool.sig` and the public key renamed `acme-tool.pub` side by side, and show the fingerprint where users download the plugin.
   
+### Managed keys for organizations
+
+Put the publisher's `.pub` in the managed trusted-keys directory, next to `managed.env`:
+
+| OS | Directory |
+| --- | --- |
+| macOS, Linux | `/etc/chatcli/trusted-keys/` |
+| Windows | `%ProgramData%\chatcli\trusted-keys\` |
+
+Every user of the machine then trusts that publisher, including users who never created a trusted-keys directory of their own. The directory is owned by the administrator, so a user cannot remove the key.
+
+### Plugins built from source
+
+`/plugin install <git-url>` clones and builds the plugin on your machine after you confirm the install. The resulting binary is signed with a local machine key — created in `~/.chatcli/local-signing/` on first use and trusted as `local-machine` — so it loads with signature enforcement on, with no keygen or trust step.
+
+### Inspect and manage trust
+
+```bash
+chatcli plugin trust list                          # trusted keys (user and managed) and pinned publishers
+chatcli plugin trust --key ./publisher.pub         # trust a key by hand
+chatcli plugin verify --binary ~/.chatcli/plugins/acme-tool
+```
+
+```text
+Trusted keys:
+  local-machine                    SHA256:ZC681egmth0i2DM1adI+3ZmmrqXyyRvftD/bxF4dW+s  (user)
+  acme                             SHA256:qVrckaw/nhbU80swrHGK9e7icHuwzZE3MkfGQlm3m+A  (managed)
+Pinned publishers:
+  tool:acme-tool                   SHA256:qVrckaw/nhbU80swrHGK9e7icHuwzZE3MkfGQlm3m+A
+```
+
 ### File Permissions
 
 The plugins directory uses **0o700** permissions (owner-only read, write, and execute). ChatCLI checks permissions on startup and warns if they are more permissive.
@@ -16967,13 +17019,14 @@ A provider plugin behaves like a built-in provider: it appears in `/switch`, `/p
 
 ## Install and use
 
-    Copy the plugin executable — and its `.sig` signature — into `~/.chatcli/providers/`. ChatCLI starts every executable there at startup, under the same signature policy as tool plugins: signed by a key in `~/.chatcli/trusted-keys/`, or tolerated with `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` and the quarantine window when one is configured.
+    Install the signed bundle — the binary with its `acme-provider.sig` and `acme-provider.pub` beside it — from disk or from a release URL. The first install from a publisher shows its key's fingerprint and asks once; the key is then trusted and pinned to the plugin (see [Signature Verification](/extensions/plugin-system#signature-verification)). Without a terminal, pass the fingerprint you verified with `--trust`.
 
     ```bash
-    mkdir -p ~/.chatcli/providers
-    cp acme-provider acme-provider.sig ~/.chatcli/providers/
+    chatcli provider install https://releases.example.com/acme-provider
     chatcli provider list
     ```
+
+    Plugins live in `~/.chatcli/providers/` and start with ChatCLI under the same signature policy as tool plugins: a key you or your administrator trust, or `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` with the quarantine window when one is configured.
   
     In the REPL, `/auth login acme` renders the plugin's login steps — prompts (secret fields are not echoed), a browser URL or a device code. For CI, servers and scripts, answer the fields up front:
 
@@ -17219,7 +17272,7 @@ The command exits `0` when nothing failed, `1` when a check failed and `2` on a 
 
 ## Security model
 
-    Sign provider plugins with the same trusted-key tooling as tool plugins — `chatcli plugin keygen | sign | verify | trust` — and ChatCLI verifies them with that mechanism when it loads them. See [Signature Verification](/extensions/plugin-system#signature-verification).
+    Sign provider plugins with the same tooling as tool plugins (`chatcli plugin keygen` and `sign`) and ship the `.pub` beside them. Users trust a publisher once by fingerprint, administrators through managed keys, and ChatCLI verifies every plugin when it loads it. See [Signature Verification](/extensions/plugin-system#signature-verification).
   
     A plugin declares the env vars it reads (`authEnv`). Those are the only credentials it should receive, and the secret redactor always treats them as secrets.
   
@@ -47035,7 +47088,7 @@ Isto só importa se o servidor roda trabalho de agente ou carrega plugins.
 
 - **Pipeline.** `pipeline.enabled` (Instance `spec.pipeline.enabled`) permite que clientes rodem o coder, o agente e ferramentas no servidor. Essas RPCs exigem papel admin. Deixe desligado a menos que precise.
 - **Allowlist de comandos.** `strict` é o modo padrão: só rodam os comandos da allowlist, e `CHATCLI_AGENT_ALLOWLIST` acrescenta outros (separados por `,` ou `;`). A lista embutida inclui shells e interpretadores como `bash`, `python`, `node` e `eval`, então ela não é uma sandbox. Contenha o pod: egress restrito na NetworkPolicy, sem RBAC do chart quando o watcher está desligado (`rbac.create: false`) e nada sensível nos volumes do pod.
-- **Plugins.** Na carga, todo plugin de tool e todo [plugin de provider](/pt/extensions/provider-plugins) precisa de uma assinatura destacada (`<plugin>.sig`) que confira com uma chave pública em `~/.chatcli/trusted-keys/`. Plugins sem assinatura, e plugins numa máquina sem nenhuma chave confiável, são ignorados, a menos que `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true`, que você nunca deve usar em produção. Um plugin cuja assinatura não confere é sempre ignorado.
+- **Plugins.** Na carga, todo plugin de tool e todo [plugin de provider](/pt/extensions/provider-plugins) precisa de uma assinatura destacada (`<plugin>.sig`) que confira com uma chave pública confiável — em `~/.chatcli/trusted-keys/`, ou, para uma frota, no diretório gerenciado `/etc/chatcli/trusted-keys/`, em que todo usuário confia. Plugins sem assinatura, e plugins numa máquina sem nenhuma chave confiável, são ignorados, a menos que `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true`, que você nunca deve usar em produção. Um plugin cuja assinatura não confere é sempre ignorado.
 
   ```bash
   chatcli plugin keygen --output ./keys                    # plugin-signing.key e plugin-signing.pub
@@ -48150,7 +48203,16 @@ Instale diretamente de um repositório Git:
 /plugin install https://github.com/usuário/meu-plugin-chatcli.git
 ```
 
-O ChatCLI irá clonar, compilar (se for Go) e instalar o executável em `~/.chatcli/plugins/`.
+O ChatCLI irá clonar, compilar (se for Go) e instalar o executável em `~/.chatcli/plugins/`, assinado com a chave local desta máquina para carregar com a exigência de assinatura ligada.
+
+Ou instale um binário pronto e assinado — do disco ou da URL de uma release:
+
+```bash
+/plugin install ./acme-tool
+/plugin install --binary https://releases.example.com/acme-tool
+```
+
+A primeira instalação de um publicador pede que você confirme o fingerprint da chave uma vez; veja [Verificação de Assinatura](#verificação-de-assinatura).
 
 **Segurança:** A instalação de um plugin envolve baixar e executar código de terceiros. Instale plugins apenas de fontes que você confia.
 
@@ -48351,38 +48413,81 @@ Os 4 plugins atômicos (`@read`, `@search`, `@tree`, `@todo`) — veja [Tools At
 
 ## Verificação de Assinatura
 
-A partir desta versão, plugins requerem **assinatura digital Ed25519** por padrão. Isso garante que apenas plugins de fontes confiáveis sejam carregados e executados.
+Um plugin só roda quando está assinado por uma chave em que esta máquina confia: uma assinatura Ed25519 sobre o SHA-256 do binário, num `<plugin>.sig` separado, ao lado dele. A chave pública do publicador pode acompanhar o plugin como `<plugin>.pub`, mas **uma chave que vem no pacote nunca é confiável por si só** — qualquer pessoa pode assinar um binário com a própria chave e mandar essa chave junto, então confiar nela automaticamente faria a assinatura não provar nada. Uma chave passa a ser confiável por uma decisão tomada fora do pacote, de uma de três formas:
 
-### Como Funciona
+    A primeira instalação de um publicador mostra o fingerprint da chave e pergunta uma vez. A chave passa a ser confiável e fica **fixada** naquele plugin: atualizações instalam sem perguntar, uma chave diferente é recusada.
+  
+    Um administrador coloca a chave do publicador ao lado do `managed.env`. Todo usuário da máquina confia nela, sem copiar nada.
+  
+    O `/plugin install <url-git>` compila na sua máquina depois que você confirma, e assina o resultado com a chave própria desta máquina.
+  
+### Instalar um plugin assinado
 
-Cada plugin deve ter um arquivo `.sig` correspondente no mesmo diretório:
-
-```text
-~/.chatcli/plugins/
-  meu-plugin          # executável do plugin
-  meu-plugin.sig      # assinatura Ed25519 do executável
+```bash
+/plugin install ./acme-tool                                   # REPL: um binário pronto no disco
+/plugin install --binary https://releases.example.com/acme-tool
+chatcli plugin install https://releases.example.com/acme-tool  # fora do REPL
 ```
 
-O ChatCLI verifica a assinatura contra as chaves públicas registradas antes de carregar o plugin. Se a verificação falhar, o plugin é rejeitado.
+O ChatCLI baixa `<origem>`, `<origem>.sig` e `<origem>.pub` (só https), confere tudo e não grava nada no diretório de plugins até o publicador ser confiável:
 
-### Gerenciando Chaves Confiáveis
+| O pacote | O que acontece |
+| --- | --- |
+| Assinado por uma chave em que você ou seu administrador já confiam | Instala |
+| Assinado por um publicador desconhecido, com a chave no pacote | Mostra o fingerprint e pergunta uma vez; se você aceitar, a chave passa a ser confiável e fica fixada no plugin |
+| O mesmo, sem uma pessoa no terminal (CI, scripts) | Recusado, informando o fingerprint — repita com `--trust SHA256:…` |
+| Mesmo plugin, assinado por uma chave diferente da fixada | Recusado, mesmo que você confirmasse. Se o publicador trocou mesmo de chave, desinstale o plugin e instale de novo |
+| A assinatura não confere com a chave do pacote nem com nenhuma chave confiável | Recusado: o binário ou a assinatura foi alterado |
+| Não assinado | Recusado, a menos que `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` |
 
-As chaves públicas Ed25519 ficam no diretório `~/.chatcli/trusted-keys/`:
+Compare o fingerprint que o ChatCLI mostra com o que o publicador divulga — na página da release ou no portal interno — antes de confiar. É essa comparação que torna segura a confiança no primeiro uso.
+
+### Publicar um plugin assinado
 
     ```bash
-    # Gera chave privada e pública
-    chatcli plugin keygen --name minha-org
-    # Cria: ~/.chatcli/trusted-keys/minha-org.pub
-    # Cria: ~/.chatcli/signing-keys/minha-org.key (privada - proteja!)
+    chatcli plugin keygen --output ~/acme-signing
+    # plugin-signing.key (0600, mantenha em segredo) e plugin-signing.pub,
+    # mais o fingerprint a divulgar: SHA256:…
     ```
   
     ```bash
-    chatcli plugin sign --key ~/.chatcli/signing-keys/minha-org.key meu-plugin
-    # Cria: meu-plugin.sig
+    chatcli plugin sign --binary dist/acme-tool --key ~/acme-signing/plugin-signing.key
+    # grava dist/acme-tool.sig
     ```
   
-    Compartilhe o arquivo `.pub` com os usuários que devem confiar nos seus plugins. Eles devem colocá-lo em `~/.chatcli/trusted-keys/`.
+    Publique `acme-tool`, `acme-tool.sig` e a chave pública renomeada para `acme-tool.pub`, lado a lado, e mostre o fingerprint onde os usuários baixam o plugin.
   
+### Chaves gerenciadas para organizações
+
+Coloque o `.pub` do publicador no diretório de chaves gerenciadas, ao lado do `managed.env`:
+
+| Sistema | Diretório |
+| --- | --- |
+| macOS, Linux | `/etc/chatcli/trusted-keys/` |
+| Windows | `%ProgramData%\chatcli\trusted-keys\` |
+
+A partir daí, todo usuário da máquina confia nesse publicador, inclusive quem nunca criou um diretório de chaves próprio. O diretório pertence ao administrador, então um usuário não consegue remover a chave.
+
+### Plugins compilados do código-fonte
+
+O `/plugin install <url-git>` clona e compila o plugin na sua máquina depois que você confirma a instalação. O binário resultante é assinado com uma chave local da máquina — criada em `~/.chatcli/local-signing/` no primeiro uso e confiável como `local-machine` —, então ele carrega com a exigência de assinatura ligada, sem passo de keygen ou de trust.
+
+### Inspecionar e gerenciar a confiança
+
+```bash
+chatcli plugin trust list                          # chaves confiáveis (do usuário e gerenciadas) e publicadores fixados
+chatcli plugin trust --key ./publisher.pub         # confiar numa chave manualmente
+chatcli plugin verify --binary ~/.chatcli/plugins/acme-tool
+```
+
+```text
+Chaves confiáveis:
+  local-machine                    SHA256:ZC681egmth0i2DM1adI+3ZmmrqXyyRvftD/bxF4dW+s  (user)
+  acme                             SHA256:qVrckaw/nhbU80swrHGK9e7icHuwzZE3MkfGQlm3m+A  (managed)
+Publicadores fixados:
+  tool:acme-tool                   SHA256:qVrckaw/nhbU80swrHGK9e7icHuwzZE3MkfGQlm3m+A
+```
+
 ### Permissões de Arquivo
 
 O diretório de plugins usa permissões **0o700** (somente o dono pode ler, escrever e executar). O ChatCLI verifica as permissões na inicialização e emite um aviso se estiverem mais permissivas.
@@ -48421,13 +48526,14 @@ Um plugin de provider se comporta como um provider embutido: ele aparece no `/sw
 
 ## Instalar e usar
 
-    Copie o executável do plugin — e a assinatura `.sig` — para `~/.chatcli/providers/`. O ChatCLI inicia todo executável dali na inicialização, sob a mesma política de assinatura dos plugins de tool: assinado por uma chave em `~/.chatcli/trusted-keys/`, ou tolerado com `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` e a janela de quarentena quando ela estiver configurada.
+    Instale o pacote assinado — o binário com o `acme-provider.sig` e o `acme-provider.pub` ao lado — do disco ou da URL de uma release. A primeira instalação de um publicador mostra o fingerprint da chave e pergunta uma vez; a chave passa a ser confiável e fica fixada no plugin (veja [Verificação de Assinatura](/pt/extensions/plugin-system#verificação-de-assinatura)). Sem terminal, passe com `--trust` o fingerprint que você conferiu.
 
     ```bash
-    mkdir -p ~/.chatcli/providers
-    cp acme-provider acme-provider.sig ~/.chatcli/providers/
+    chatcli provider install https://releases.example.com/acme-provider
     chatcli provider list
     ```
+
+    Os plugins ficam em `~/.chatcli/providers/` e iniciam junto com o ChatCLI, sob a mesma política de assinatura dos plugins de tool: uma chave em que você ou seu administrador confiam, ou `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` com a janela de quarentena quando ela estiver configurada.
   
     No REPL, `/auth login acme` desenha os passos de login do plugin — prompts (campos secretos não aparecem na tela), uma URL no navegador ou um device code. Para CI, servidores e scripts, responda os campos de antemão:
 
@@ -48674,7 +48780,7 @@ O comando sai com `0` quando nada falhou, `1` quando alguma checagem falhou e `2
 
 ## Modelo de segurança
 
-    Assine plugins de provider com as mesmas ferramentas de chave confiável dos plugins de tool — `chatcli plugin keygen | sign | verify | trust` —, e o ChatCLI os verifica com esse mecanismo ao carregá-los. Veja [Verificação de Assinatura](/pt/extensions/plugin-system#verificação-de-assinatura).
+    Assine plugins de provider com as mesmas ferramentas dos plugins de tool (`chatcli plugin keygen` e `sign`) e publique o `.pub` ao lado deles. Usuários confiam num publicador uma vez, pelo fingerprint, administradores pelas chaves gerenciadas, e o ChatCLI verifica cada plugin ao carregá-lo. Veja [Verificação de Assinatura](/pt/extensions/plugin-system#verificação-de-assinatura).
   
     O plugin declara as variáveis de ambiente que lê (`authEnv`). São as únicas credenciais que ele deve receber, e o redator de segredos sempre as trata como segredo.
   
@@ -68729,6 +68835,7 @@ Quando conectado a um servidor remoto, sessões podem ser salvas/carregadas loca
 
     | Forma | Descrição |
     | --- | --- |
+    | `chatcli provider install <caminho\|url> [--trust <fingerprint>]` | Instala o pacote assinado de um plugin de provider, confiando no publicador uma vez (veja [Verificação de Assinatura](/pt/extensions/plugin-system#verificação-de-assinatura)) |
     | `chatcli provider list` | Plugins instalados com versão, modo e estado do login, mais os que não carregaram |
     | `chatcli provider login <nome> [--input id=valor]…` | Faz login; `--input` responde campos do prompt, para CI e servidores não precisarem de uma pessoa |
     | `chatcli provider logout <nome>` | Revoga a credencial no backend (quando suportado) e a apaga |
@@ -84926,7 +85033,7 @@ A tabela abaixo resume todas as proteções ativas em cada camada da stack.
 | **Políticas** | `ask` não assistido nega fail-safe quando não há humano para aprovar (gateway, pipeline do server, ACP/MCP sem diálogo, `chatcli tool`, eval); opt-in com `CHATCLI_POLICY_AUTOMODE` ou `/policy mode auto` | Ativo |
 | **Políticas** | `--allow-unsafe` / `--allow-sudo` vindos do modelo são ignorados; só o operador habilita via `CHATCLI_CODER_ALLOW_UNSAFE` / `CHATCLI_AGENT_ALLOW_SUDO` | Ativo |
 | **Plugins** | Verificação de assinatura Ed25519 dos binários de plugin | Ativo |
-| **Plugins** | Ferramental de assinatura: `chatcli plugin keygen`, `sign`, `verify`, `trust` | Ativo |
+| **Plugins** | Ferramental de assinatura (`chatcli plugin keygen`, `sign`, `verify`, `trust`), confiança no publicador no primeiro uso com fixação, chaves gerenciadas | Ativo |
 | **Plugins** | Janela de quarentena para plugins não assinados recém-vistos | Opt-in |
 | **gRPC** | Prevenção de SSRF com bloqueio de IPs privados nas URLs de provedor | Ativo |
 | **gRPC** | Rate limiting (token bucket) por sujeito autenticado — `sub` do JWT ou principal do certificado; por endereço para chamadores anônimos | Ativo |
@@ -85421,7 +85528,7 @@ O binário `stty` (usado para restaurar o terminal) é resolvido **uma vez** no 
 
 ### Verificação de Assinatura Ed25519
 
-Binários de plugin são verificados com **assinaturas Ed25519**. Um plugin é assinado com a chave privada do desenvolvedor, e a chave pública correspondente precisa estar registrada em toda máquina que o instala.
+Binários de plugin são verificados com **assinaturas Ed25519**. Um plugin é assinado com a chave privada do publicador; uma máquina passa a confiar na chave pública correspondente por uma decisão tomada fora do pacote do plugin — um fingerprint confirmado uma vez na instalação (e fixado naquele plugin), uma chave que o administrador colocou no diretório gerenciado, ou a chave própria desta máquina para plugins compilados aqui a partir do fonte. A chave que acompanha um plugin nunca é confiável por si só. O fluxo completo do usuário está em [Verificação de Assinatura](/pt/extensions/plugin-system#verificação-de-assinatura).
 
     ```bash
     chatcli plugin keygen --output ~/.chatcli/plugin-keys/
@@ -85437,16 +85544,17 @@ Binários de plugin são verificados com **assinaturas Ed25519**. Um plugin é a
     # grava ./my-plugin.sig
     ```
   
+    Publique a chave pública ao lado do plugin como `my-plugin.pub` e divulgue o fingerprint dela (o `keygen` mostra): as instalações confirmam uma vez e o fixam. Para uma frota, coloque a chave no diretório gerenciado (`/etc/chatcli/trusted-keys/`, ou `%ProgramData%\chatcli\trusted-keys\`). Para confiar manualmente numa única máquina:
+
     ```bash
     chatcli plugin trust --key plugin-signing.pub --name acme
     # → ~/.chatcli/trusted-keys/acme.pub
     ```
-
-    Sem esse passo a assinatura é inverificável: o verificador só lê chaves que encontra no diretório de confiança.
   
     ```text
     my-plugin          # binário do plugin
     my-plugin.sig      # assinatura Ed25519
+    my-plugin.pub      # chave do publicador (confirmada pelo fingerprint, nunca confiável por si só)
     ```
 
     ```bash
@@ -85456,6 +85564,7 @@ Binários de plugin são verificados com **assinaturas Ed25519**. Um plugin é a
     O verify diz qual das três coisas está errada — sem assinatura, sem chave confiável para conferir, ou assinatura que não bate — porque cada uma pede uma correção diferente. O ChatCLI faz a mesma checagem toda vez que carrega o diretório de plugins.
   
 A assinatura é **destacada**, num arquivo `.sig` ao lado do binário, e cobre o SHA-256 do binário. Não existe manifesto de plugin: trocar o binário quebra a assinatura, que é o que importa. O diretório de plugins e `~/.chatcli/trusted-keys/` são criados com `0700`; a chave privada é gravada com `0600`, a chave pública e o `.sig` com `0644`.
+
 
 ### O que acontece com um plugin não assinado
 
@@ -85469,7 +85578,6 @@ A assinatura é **destacada**, num arquivo `.sig` ao lado do binário, e cobre o
 A mesma política vale para os [plugins de provider](/pt/extensions/provider-plugins) em `~/.chatcli/providers/`: as mesmas chaves confiáveis, o mesmo opt-in para não assinados, a mesma quarentena, e o que roda é a mesma cópia preparada dos bytes verificados.
 
 Com o padrão em vigor e nenhuma chave confiável registrada, **nenhum plugin externo carrega**. Essa é a postura pretendida, e significa que adotar plugins é um ato deliberado: assine e registre a chave, ou defina `CHATCLI_ALLOW_UNSIGNED_PLUGINS=true` e aceite o que isso quer dizer.
-
 
 ### Quarentena de Plugins Não Assinados
 
@@ -86188,7 +86296,7 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     export CHATCLI_AGENT_WORKSPACE_STRICT=true
     ```
   
-    Mantenha `CHATCLI_ALLOW_UNSIGNED_PLUGINS` como `false` (padrão), assine seus plugins e registre a chave pública:
+    Mantenha `CHATCLI_ALLOW_UNSIGNED_PLUGINS` como `false` (padrão), assine seus plugins e distribua a chave pública pelo diretório de chaves gerenciadas (`/etc/chatcli/trusted-keys/`), ou confie nela máquina a máquina:
 
     ```bash
     chatcli plugin keygen --output ~/.chatcli/plugin-keys/
@@ -98753,6 +98861,7 @@ When connected to a remote server, sessions can be saved/loaded locally, remotel
 
     | Form | Description |
     | --- | --- |
+    | `chatcli provider install <path\|url> [--trust <fingerprint>]` | Install a signed provider plugin bundle, trusting its publisher once (see [Signature Verification](/extensions/plugin-system#signature-verification)) |
     | `chatcli provider list` | Installed plugins with version, mode and login state, plus any that failed to load |
     | `chatcli provider login <name> [--input id=value]…` | Log in; `--input` answers prompt fields so CI and servers need no person |
     | `chatcli provider logout <name>` | Revoke the credential upstream (when supported) and delete it |
@@ -114086,7 +114195,7 @@ The table below summarizes all active protections across every layer of the stac
 | **Policies** | Unattended `ask` denies fail-safe when no human can approve (gateway, server pipeline, ACP/MCP without a dialog, `chatcli tool`, eval); opt in with `CHATCLI_POLICY_AUTOMODE` or `/policy mode auto` | Active |
 | **Policies** | Model-supplied `--allow-unsafe` / `--allow-sudo` are ignored; only the operator enables them via `CHATCLI_CODER_ALLOW_UNSAFE` / `CHATCLI_AGENT_ALLOW_SUDO` | Active |
 | **Plugins** | Ed25519 signature verification for plugin binaries | Active |
-| **Plugins** | Signing toolchain: `chatcli plugin keygen`, `sign`, `verify`, `trust` | Active |
+| **Plugins** | Signing toolchain (`chatcli plugin keygen`, `sign`, `verify`, `trust`), publisher trust on first use with pinning, managed keys | Active |
 | **Plugins** | Quarantine window for newly seen unsigned plugins | Opt-in |
 | **gRPC** | SSRF prevention with private IP blocking on provider URLs | Active |
 | **gRPC** | Rate limiting (token bucket) per authenticated subject — JWT `sub` or certificate principal; per address for anonymous callers | Active |
@@ -114581,7 +114690,7 @@ The `stty` binary (used to restore the terminal) is resolved **once** at startup
 
 ### Ed25519 Signature Verification
 
-Plugin binaries are verified with **Ed25519 signatures**. A plugin is signed with a developer's private key, and the matching public key must be registered on every machine that installs it.
+Plugin binaries are verified with **Ed25519 signatures**. A plugin is signed with the publisher's private key; a machine trusts the matching public key through a decision made outside the plugin bundle — a fingerprint confirmed once at install (and pinned to that plugin), a key the administrator placed in the managed directory, or this machine's own key for plugins built here from source. The key that ships beside a plugin is never trusted on its own. The full user flow is in [Signature Verification](/extensions/plugin-system#signature-verification).
 
     ```bash
     chatcli plugin keygen --output ~/.chatcli/plugin-keys/
@@ -114597,16 +114706,17 @@ Plugin binaries are verified with **Ed25519 signatures**. A plugin is signed wit
     # writes ./my-plugin.sig
     ```
   
+    Ship the public key beside the plugin as `my-plugin.pub` and announce its fingerprint (`keygen` prints it): installs confirm it once and pin it. For a fleet, place the key in the managed directory (`/etc/chatcli/trusted-keys/`, or `%ProgramData%\chatcli\trusted-keys\`). To trust it on one machine by hand:
+
     ```bash
     chatcli plugin trust --key plugin-signing.pub --name acme
     # → ~/.chatcli/trusted-keys/acme.pub
     ```
-
-    Without this step a signature is unverifiable: the verifier only reads keys it finds in the trusted directory.
   
     ```text
     my-plugin          # plugin binary
     my-plugin.sig      # Ed25519 signature
+    my-plugin.pub      # publisher key (confirmed by fingerprint, never trusted on its own)
     ```
 
     ```bash
@@ -115348,7 +115458,7 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     export CHATCLI_AGENT_WORKSPACE_STRICT=true
     ```
   
-    Keep `CHATCLI_ALLOW_UNSIGNED_PLUGINS` as `false` (default), sign your plugins and register the public key:
+    Keep `CHATCLI_ALLOW_UNSIGNED_PLUGINS` as `false` (default), sign your plugins and distribute the public key through the managed trusted-keys directory (`/etc/chatcli/trusted-keys/`), or trust it per machine:
 
     ```bash
     chatcli plugin keygen --output ~/.chatcli/plugin-keys/
