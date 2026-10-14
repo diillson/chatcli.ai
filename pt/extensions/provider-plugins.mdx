@@ -1,0 +1,289 @@
+---
+title: "Plugins de Provider"
+sidebarTitle: "Plugins de Provider"
+description: "Adicione um provider de LLM ao ChatCLI como plugin externo — um gateway corporativo, um SDK interno, qualquer backend — com o protocolo de providers, o SDK Go e o kit de conformidade chatcli provider test."
+icon: "plug-circle-bolt"
+---
+
+Um **plugin de provider** é um executável que adiciona um provider de LLM ao ChatCLI. Use um quando o backend de que você precisa não é embutido — um gateway corporativo que reúne vários fornecedores de modelos atrás de uma autenticação própria, ou um SDK interno que é o único caminho autorizado até um modelo.
+
+Um plugin de provider foi desenhado para se comportar como um provider embutido: ele aparece no `/switch`, no `/provider` e na paleta de comandos, e controle de custo, cadeias de failover, roteamento de modelos, compactação e memória funcionam sobre ele.
+
+<Note>
+**Preview.** O protocolo, o SDK Go e o kit de conformidade `chatcli provider test` já estão disponíveis, então plugins podem ser construídos e verificados hoje. O carregamento de plugins de provider num ChatCLI em execução — supervisão do processo, `/switch`, login e o cofre cifrado de credenciais — é a próxima etapa desta funcionalidade e ainda não está disponível.
+</Note>
+
+## Como se encaixa
+
+O ChatCLI mantém tudo o que fica acima da rede: o loop do coder, a execução de tools, o histórico, a memória, a compactação, o planejamento do cache de prompt, o custo e o failover. O plugin cuida só de como chegar ao backend.
+
+```text
+ChatCLI ── loop do agente · tools · memória · compactação · custo · failover
+   │
+   │  contrato de provider (o mesmo dos providers embutidos)
+   ▼
+plugin de provider ── processo filho, JSON-RPC 2.0 via stdin/stdout
+   │
+   │  seu SDK · sua autenticação
+   ▼
+gateway ou backend ──► fornecedores de modelos
+```
+
+### Dois modos
+
+<CardGroup cols={2}>
+  <Card title="dialect" icon="arrows-left-right">
+    O plugin implementa a **autenticação** (login, token, renovação) e a **lista de modelos**. O ChatCLI fala com o backend usando o seu **client embutido** para o formato da API — `openai-chat`, `openai-responses`, `anthropic-messages` ou `gemini` — enviando os headers do plugin.
+
+    Tools nativas, streaming, cache de prompt e usage exato vêm de graça. **Prefira este modo** sempre que o backend falar um desses formatos.
+  </Card>
+  <Card title="full" icon="layer-group">
+    O plugin também implementa o **chat** sobre um esquema normalizado de mensagens: mensagens, chamadas de tools, imagens, blocos de raciocínio, deltas de streaming e usage.
+
+    Use quando o backend — ou o SDK que você é obrigado a usar — tem um formato de requisição próprio.
+  </Card>
+</CardGroup>
+
+### As credenciais ficam com o ChatCLI
+
+O plugin nunca guarda segredos. O login termina com uma **credencial** — um objeto chave/valor simples — que o ChatCLI cifra, armazena e devolve em cada chamada que precisa dela.
+
+O login em si é uma sequência de passos que o plugin descreve e o ChatCLI desenha: campos de `prompt`, `open_url` e `device_code`. O plugin nunca mexe no terminal, então o mesmo fluxo funciona na CLI, na interface web, em clientes de IDE e em canais de mensagem.
+
+### Modelos de gateway mantêm limites e preços reais
+
+Cada modelo listado pode indicar o modelo embutido que ele representa com uma entrada `upstream`, por exemplo `{"provider": "CLAUDEAI", "model": "claude-sonnet-4-6"}`. O ChatCLI então reaproveita o que já sabe sobre esse modelo — janela de contexto, limite de saída, preço e capacidades — a menos que o plugin os informe explicitamente. O custo por chamada informado pelo gateway (`costUSD`) é tratado como definitivo.
+
+---
+
+## Construir um plugin
+
+<Tabs>
+  <Tab title="Go (SDK)">
+    O SDK Go, `github.com/diillson/chatcli/pkg/providersdk`, implementa o protocolo. Implemente `Provider` e as interfaces que correspondem ao seu backend; as capacidades anunciadas ao ChatCLI são derivadas delas, então um plugin nunca anuncia algo que não atende.
+
+    | Interface | Atende |
+    | --- | --- |
+    | `Provider` (obrigatória) | Identidade (`Info`) e `Mode` |
+    | `DialectProvider` | Formato da API e URL base (modo `dialect`) |
+    | `Authenticator` | `auth/status`, `auth/login`, `auth/continue`, `auth/token` |
+    | `Logouter` | `auth/logout` |
+    | `ModelLister` | `models/list` |
+    | `Chatter` + `ChatFeatures` | `chat/send` com streaming, tools, imagens e raciocínio (modo `full`) |
+    | `TokenCounter` | `tokens/count` |
+    | `AuthEnvDeclarer` | Variáveis de ambiente que o plugin lê — repassadas e tratadas como segredo |
+
+    Um plugin `dialect` mínimo para um gateway compatível com OpenAI:
+
+    ```go
+    package main
+
+    import (
+    	"context"
+    	"fmt"
+    	"os"
+    	"time"
+
+    	"github.com/diillson/chatcli/pkg/providerproto"
+    	"github.com/diillson/chatcli/pkg/providersdk"
+    )
+
+    type acme struct{}
+
+    func (acme) Info() providerproto.ProviderInfo {
+    	return providerproto.ProviderInfo{
+    		Name:        "ACME", // o valor que o usuário passa em LLM_PROVIDER e no /switch
+    		DisplayName: map[string]string{"en": "Acme Gateway", "pt-BR": "Gateway Acme"},
+    		Version:     "1.0.0",
+    	}
+    }
+
+    func (acme) Mode() providerproto.Mode { return providerproto.ModeDialect }
+
+    func (acme) Dialect() providerproto.Dialect {
+    	return providerproto.Dialect{API: providerproto.DialectOpenAIChat, BaseURL: "https://llm.acme.example/v1"}
+    }
+
+    func (acme) AuthStatus(_ context.Context, c providerproto.Credential) (providerproto.AuthStatusResult, error) {
+    	if c["client_secret"] == "" {
+    		return providerproto.AuthStatusResult{State: providerproto.AuthLoggedOut}, nil
+    	}
+    	return providerproto.AuthStatusResult{State: providerproto.AuthLoggedIn}, nil
+    }
+
+    func (acme) Login(context.Context, providerproto.AuthLoginParams) (providerproto.AuthStep, error) {
+    	return providerproto.AuthStep{Kind: providerproto.StepPrompt, Session: "login", Fields: []providerproto.PromptField{
+    		{ID: "client_id", Label: map[string]string{"en": "Client ID"}},
+    		{ID: "client_secret", Label: map[string]string{"en": "Client secret", "pt-BR": "Segredo do client"}, Secret: true},
+    	}}, nil
+    }
+
+    func (acme) Continue(_ context.Context, p providerproto.AuthContinueParams) (providerproto.AuthStep, error) {
+    	return providerproto.AuthStep{Kind: providerproto.StepDone, Credential: providerproto.Credential(p.Inputs)}, nil
+    }
+
+    func (acme) Token(ctx context.Context, c providerproto.Credential) (providerproto.AuthTokenResult, error) {
+    	tok, expires, err := exchange(ctx, c["client_id"], c["client_secret"]) // sua chamada OAuth client-credentials
+    	if err != nil {
+    		return providerproto.AuthTokenResult{}, providerproto.NewError(providerproto.ErrCodeAuthRequired, err.Error())
+    	}
+    	return providerproto.AuthTokenResult{
+    		Headers:   map[string]string{"Authorization": "Bearer " + tok},
+    		ExpiresAt: expires.UTC().Format(time.RFC3339),
+    	}, nil
+    }
+
+    func (acme) ListModels(context.Context, providerproto.Credential) ([]providerproto.Model, error) {
+    	return []providerproto.Model{
+    		{ID: "claude-sonnet-4-6", Upstream: &providerproto.Upstream{Provider: "CLAUDEAI", Model: "claude-sonnet-4-6"}},
+    		{ID: "gpt-5.4-mini", Upstream: &providerproto.Upstream{Provider: "OPENAI", Model: "gpt-5.4-mini"}},
+    	}, nil
+    }
+
+    func main() {
+    	if err := providersdk.Serve(context.Background(), acme{}); err != nil {
+    		fmt.Fprintln(os.Stderr, err)
+    		os.Exit(1)
+    	}
+    }
+    ```
+
+    <Tip>
+    Enquanto `providersdk.Serve` roda, `os.Stdout` aponta para o stderr, então um `fmt.Println` perdido no código do plugin vai para o log em vez de corromper o protocolo. Use `providersdk.Log(ctx, "info", "…")` para linhas de log estruturadas.
+    </Tip>
+
+    O repositório traz um plugin de referência completo em modo `full` — login, lista de modelos, streaming com cancelamento, contagem de tokens e logout — em [`pkg/providersdk/examples/echo`](https://github.com/diillson/chatcli/tree/main/pkg/providersdk/examples/echo). Ele passa em todas as checagens de conformidade e é o melhor ponto de partida.
+  </Tab>
+  <Tab title="Qualquer linguagem">
+    O protocolo independe de linguagem: JSON-RPC 2.0, uma mensagem por linha no stdin e no stdout do plugin. Quando o único client autorizado de um backend é um SDK em Python, Java ou Node, escreva o plugin nessa linguagem e chame o SDK a partir dele.
+
+    A especificação completa — exemplos de mensagem para todos os métodos e um esqueleto em Python — está em [`pkg/providerproto/SPEC.md`](https://github.com/diillson/chatcli/blob/main/pkg/providerproto/SPEC.md).
+
+    | Método | Direção | Finalidade |
+    | --- | --- | --- |
+    | `initialize`, `initialized` | host → plugin | Negociação de versão, identidade, modo e capacidades |
+    | `auth/login`, `auth/continue` | host → plugin | Login em passos que termina com uma credencial |
+    | `auth/token` | host → plugin | Headers e validade para anexar às requisições |
+    | `auth/status`, `auth/logout` | host → plugin | Estado da credencial e revogação |
+    | `models/list` | host → plugin | Modelos com `upstream`, limites, preços e headers por modelo |
+    | `chat/send`, `chat/delta` | host ⇄ plugin | Chat (modo `full`) com deltas de streaming |
+    | `tokens/count` | host → plugin | Contagem exata de tokens (opcional) |
+    | `$/cancelRequest` | ambos | Abandona uma requisição em andamento |
+    | `$/log` | plugin → host | Linha de log estruturada |
+    | `shutdown`, `exit` | host → plugin | Conclui requisições anteriores, recusa as posteriores e encerra com status 0 |
+  </Tab>
+</Tabs>
+
+### Regras que todo plugin precisa seguir
+
+<AccordionGroup>
+  <Accordion title="O stdout carrega só mensagens do protocolo" icon="terminal">
+    Qualquer outra coisa no stdout corrompe o fluxo. Escreva logs no stderr — o ChatCLI guarda o final dele — ou envie notificações `$/log`.
+  </Accordion>
+  <Accordion title="Nomes de provider são únicos e nunca usam o nome de um embutido" icon="signature">
+    O nome precisa casar com `^[A-Z][A-Z0-9_]{1,31}$` e nunca pode ser o nome de um provider embutido (`OPENAI`, `CLAUDEAI`, `BEDROCK`, …). É o valor que o usuário passa em `LLM_PROVIDER` e no `/switch`.
+  </Accordion>
+  <Accordion title="O shutdown respeita a ordem de chegada" icon="power-off">
+    Requisições que **chegaram** antes do `shutdown` ainda são atendidas; as posteriores falham com `-32600`. Depois do `exit`, o processo encerra com status 0.
+  </Accordion>
+  <Accordion title="Os códigos de erro guiam a reação do ChatCLI" icon="triangle-exclamation">
+    | Código | Significado | Reação do ChatCLI |
+    | --- | --- | --- |
+    | `-33001` | Autenticação necessária | Executa o login, ou falha com uma dica de login quando não há uma pessoa presente |
+    | `-33002` | Rate limit (`data.retryAfterMs`) | Espera e tenta de novo |
+    | `-33003` | Contexto longo demais | Compacta o histórico e tenta de novo |
+    | `-33004` | Modelo desconhecido | Falha e sugere `/switch --model` |
+    | `-33005` | Backend indisponível | Tenta de novo e depois faz failover |
+    | `-33006` | Requisição inválida | Falha sem tentar de novo |
+    | `-33007` | Cancelada | — |
+    | `-33008` | Recusada por política | Falha com a mensagem |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Verificar um plugin com `chatcli provider test`
+
+O `chatcli provider test` roda o kit de conformidade contra o binário de um plugin, conversando com ele pelo stdin e pelo stdout exatamente como o ChatCLI faz — o veredito é o mesmo para um plugin em Go, Python ou Java.
+
+```bash
+chatcli provider test [flags] <plugin> [args do plugin...]
+```
+
+| Flag | Descrição |
+| --- | --- |
+| `--input id=valor` | Responde um campo do prompt de `auth/login` (repetível) |
+| `--credential-file path` | Credencial JSON usada no lugar do login |
+| `--model id` | Modelo das checagens de chat (padrão: o primeiro listado) |
+| `--timeout 30s` | Timeout por checagem |
+| `--json` | Imprime o relatório em JSON — cada checagem tem `id` e `key` estáveis |
+
+```bash
+$ chatcli provider test --input token=demo ./echo-provider
+Conformidade do plugin de provider: ECHO 1.0.0 (full)
+  ✓ lifecycle.before_initialize
+  ✓ initialize                       ECHO 1.0.0 (modo full)
+  ✓ protocol.unknown_method
+  ✓ auth.login                       1 passo(s)
+  ✓ auth.status
+  ✓ auth.token                       1 header(s)
+  ✓ auth.status_without_credential
+  ✓ models.list                      2 modelo(s)
+  ✓ chat.send                        usage in=13 out=7
+  ✓ chat.unknown_model
+  ✓ chat.stream                      7 delta(s)
+  ✓ chat.cancel
+  ✓ tokens.count                     13 token(s)
+  ✓ lifecycle.exit
+  ✓ protocol.stdout_clean
+15 aprovadas, 0 reprovadas, 0 puladas
+```
+
+As checagens cobrem a ordem do ciclo de vida, a negociação de versão, as regras de nome, a máquina de estados do login, os headers e a validade do token, a sanidade da lista de modelos (ids únicos, `upstream` válido, limites e preços não negativos), os resultados de chat, o streaming (os deltas precisam formar o texto final), a continuidade do serviço depois de uma requisição cancelada, a contagem de tokens, o encerramento limpo e a higiene do stdout.
+
+<Info>
+Uma checagem que precisa de algo que a execução não tem é **pulada com uma dica**, nunca reprovada: `auth.login` pede `--input` quando um campo do prompt não tem valor, e um login por navegador ou por device code pede `--credential-file`.
+</Info>
+
+O comando sai com `0` quando nada falhou, `1` quando alguma checagem falhou e `2` em erro de uso, então o repositório de um plugin pode usá-lo como gate no CI:
+
+```yaml
+- name: Conformidade do plugin de provider
+  run: chatcli provider test --credential-file "$RUNNER_TEMP/cred.json" ./dist/acme-provider
+```
+
+---
+
+## Modelo de segurança
+
+<CardGroup cols={2}>
+  <Card title="Binários assinados" icon="file-signature">
+    Assine plugins de provider com as mesmas ferramentas de chave confiável dos plugins de tool — `chatcli plugin keygen | sign | verify | trust` —, e o ChatCLI os verifica com esse mecanismo ao carregá-los. Veja [Verificação de Assinatura](/pt/extensions/plugin-system#verificação-de-assinatura).
+  </Card>
+  <Card title="Ambiente mínimo" icon="filter">
+    O plugin declara as variáveis de ambiente que lê (`authEnv`). São as únicas credenciais que ele deve receber, e o redator de segredos sempre as trata como segredo.
+  </Card>
+  <Card title="Nenhum segredo no plugin" icon="vault">
+    As credenciais ficam no cofre cifrado do ChatCLI e são passadas a cada chamada. Um plugin que escreve um segredo no stdout ou no stderr está com defeito.
+  </Card>
+  <Card title="As conversas chegam ao plugin" icon="eye">
+    Um plugin de provider vê todo prompt enviado por ele, exatamente como o fornecedor que ele representa. Instale só plugins em que você confia.
+  </Card>
+</CardGroup>
+
+## Veja também
+
+<CardGroup cols={2}>
+  <Card title="Sistema de Plugins" icon="plug" href="/pt/extensions/plugin-system">
+    Plugins de tool (`@comando`) que o modelo pode chamar.
+  </Card>
+  <Card title="Modelos Suportados" icon="microchip" href="/pt/providers/supported-models">
+    Os providers embutidos e seus modelos.
+  </Card>
+  <Card title="Fallback de Provedores" icon="route" href="/pt/providers/provider-fallback">
+    Cadeias de failover entre providers.
+  </Card>
+  <Card title="Cost Tracking" icon="coins" href="/pt/providers/cost-tracking">
+    Como usage e preços viram o `/cost`.
+  </Card>
+</CardGroup>
