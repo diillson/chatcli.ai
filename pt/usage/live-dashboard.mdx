@@ -57,19 +57,31 @@ Ela é lida ao vivo: mudar no `.env` passa a valer no `/reload`.
 
 Sessões e agents são **um nó cada**, ligados pelo pai real, então um dispatch multi-agent aparece como árvore. Todo o resto é um **hub agregado por nome** (a tool `@coder`, o servidor MCP `github`, o padrão `self-refine`) mostrando chamadas, quantas estão ativas agora, erros e latência média. O grafo fica estável e *dispara*, em vez de explodir em um nó por chamada.
 
+### Quem chamou quem
+
+Todo trabalho fica pendurado **no nó que o iniciou**, não só na sessão. Um turno de chat é o pai da requisição de LLM que ele faz; uma chamada de tool é o pai do modelo, da conexão ou da chamada MCP que ela inicia; um painel de [MoA](/pt/agents/mixture-of-agents) é o pai dos seus membros e do agregador; uma cadeia de fallback é o pai do provider que a atendeu; uma compaction é o pai da requisição do seu sumarizador. As arestas, então, mostram o caminho que a requisição percorreu, como o mapa de serviços de um APM.
+
+As colunas são lidas da esquerda para a direita na mesma ordem em que uma requisição flui:
+
+```text
+sessão → turn / rpc → agents → patterns / background → tools / mcp / skills → llm / conn
+```
+
+Uma chamada dentro da mesma coluna (uma tool iniciando outra, um job retomando um run estacionado) faz uma volta pelo lado direito da coluna. A segunda linha de cada card também mostra o último veredito do nó, quando há um: quem atendeu um fallback (`→ claudeai:…`), quanto de um rate limit já foi gasto (`92%`), o que a policy decidiu (`deny · rule`), o que a pessoa respondeu num prompt de aprovação (`allow_always`).
+
 | Tipo de nó | O que é reportado |
 |---|---|
 | **session** | O processo: superfície (`repl`, `acp`, `gateway`, `mcp`, `daemon`, `tool`, …), pid, o **par que atende a próxima requisição** e o que o decidiu (`route`: `session`, `override` depois de [`@model use`](/pt/agents/model-routing), ou `skill` por hint de modelo de uma skill; `via`: `@model use`, `/switch`, `/provider`, `run start`, `gateway`, …), o **custo** acumulado da sessão, tokens e requisições, e **o quanto da janela de contexto está ocupado** (`ctx 37%`, a mesma projeção que o rodapé do turno imprime; acima de 100% significa que o próximo turno compacta). Toda troca de par vira uma linha própria no feed (`modelo → PROVIDER:modelo · override · @model use`) e o card guarda as últimas trocas |
-| **agent** | Todo orquestrador, [squad worker](/pt/agents/agent-squad), subagent, membro de [MoA](/pt/agents/mixture-of-agents) e run de [task graph](/pt/agents/task-graph): turno `3/30`, chamadas de tool, ação atual, desfecho |
-| **llm** | Um hub por `PROVIDER:modelo`. Cada requisição fica pendurada **no agent que a fez**, com tamanho do payload, tamanho do histórico e quantidade de tools. Cada relatório de usage acrescenta o que a chamada consumiu (tokens de entrada, saída, leitura e escrita de cache), a lane em que rodou (main, worker, background) e o acumulado do modelo em tokens, requisições e **custo**: os números que o [`/cost`](/pt/providers/cost-tracking) mostra, conforme mudam |
-| **tool** | Toda execução de tool: o loop do orquestrador, os squad workers e o caminho RPC / `chatcli tool`. Uma chamada recusada pela [policy de segurança](/pt/coder/coder-security) aparece como `blocked` |
+| **agent** | Todo orquestrador, [squad worker](/pt/agents/agent-squad), subagent, run de [task graph](/pt/agents/task-graph), e todo painel de [MoA](/pt/agents/mixture-of-agents) com seus membros e o agregador (cada membro mostra a rodada, `turn 2/2`, e se `kept` ou `revised` sua posição): turno `3/30`, chamadas de tool, ação atual, desfecho. Um run iniciado por um job do scheduler leva o id do job em `call_id` |
+| **llm** | Um hub por `PROVIDER:modelo`, incluindo providers via plugin. Cada requisição fica pendurada **no nó que a fez** (um agent, um turno de chat, uma tool, um membro de MoA, uma cadeia de fallback), com tamanho do payload, tamanho do histórico e quantidade de tools. Requisições de keep-alive de cache aparecem como `kind=keepalive` sob o nó `cache-keepalive`. Cada relatório de usage acrescenta o que a chamada consumiu (tokens de entrada, saída, leitura e escrita de cache), a lane em que rodou (main, worker, background) e o acumulado do modelo em tokens, requisições e **custo**: os números que o [`/cost`](/pt/providers/cost-tracking) mostra, conforme mudam |
+| **tool** | Toda execução de tool: o loop do orquestrador, os squad workers e seus scripts de skill, as tools que um turno de chat ou um membro de MoA podem usar, e o caminho RPC / `chatcli tool`, com o subcomando, de onde rodou e o tamanho da saída. Plugins externos ganham um filho `plugin-process` (exit code, sinal, binário verificado). Mídia e documentos também são tools: `image:generate`/`image:edit`, `tts:synthesize`, `stt:transcribe`, `embed`, `pdf:extract`, `docs:flatten` e seu `docs:describe-image`, `tokens:count`, cada `browser:<ação>` (só o host), `eval:judge`. Uma chamada recusada pela [policy de segurança](/pt/coder/coder-security) aparece como `blocked` |
 | **skill** | Uma [skill](/pt/tools/builtin-skills) conta como ativada quando é de fato entregue ao modelo (depois do match de trigger, do dedup e do cooldown): no início do run, no meio do loop ou num turno de chat. Envelhecer e sair da janela aparece como `collapsed` |
 | **mcp** | Um nó por [servidor MCP](/pt/extensions/mcp-integration) com seu estado (`starting`, `connected`, `failed`, `disconnected`, `stopped`, `auth required`) e a contagem de tools; cada `tools/call` é um span cronometrado com o nome da tool |
-| **pattern** | Os [sete padrões do harness](/pt/agents/harness/overview), cada um com **o que concluiu** (veja abaixo) |
-| **background** | Jobs do [scheduler](/pt/tools/scheduler), processos do `@proc`, o memory worker, a **auto-evolução de skills** (`skill-evolution`: candidatos, depois `1 authored · 2 evolved`, `3 suggested`, `no change`; cada skill escrita é um ponto no próprio nó, `created` ou `evolved`), a compaction do histórico, language servers, a sessão do `@browser`, o staging do auto-update |
-| **conn** | HTTP de saída por **hostname**: método, status, latência, bytes. Um stream de tokens aparece como uma conexão viva com a duração real |
-| **rpc** | O chatcli atuando como servidor ([servidor MCP](/pt/server/mcp-server), [ACP](/pt/server/acp)): cada método recebido, e o que o servidor pede ao cliente |
-| **turn** | Turnos de chat em toda superfície — REPL, [web UI](/pt/usage/web-ui), MCP, ACP e gateway — e turnos one-shot. O filho `chatcli web` que o `/web` inicia é um processo próprio e ganha janela própria, rotulada `web` |
+| **pattern** | Os [sete padrões do harness](/pt/agents/harness/overview), cada um com **o que concluiu** (veja abaixo), e mais: `fallback` (a cadeia de [fallback de providers](/pt/providers/provider-fallback): uma atualização por tentativa falha com o provider e a classe do erro, depois quem atendeu, as tentativas e os providers pulados em cooldown), `retry` (cada requisição repetida: tentativa, backoff, status code), `policy` (todo veredito da [policy do coder](/pt/coder/coder-security): tool, `allow`/`ask`/`deny`, o que decidiu e a tool e o subcomando da regra), `approval` (um prompt de confirmação, cronometrado enquanto a pessoa decide, com a resposta, no terminal ou no diálogo do cliente), `budget` (cada chamada que o [hard stop de orçamento](/pt/providers/cost-tracking) recusou), `vision:describe`, `pdf:route`, `pdf:transcribe`, `taskgraph:task` (cada tentativa de tarefa, com o desfecho) |
+| **background** | Jobs do [scheduler](/pt/tools/scheduler) (dono, ação, tipo de agenda, próximo disparo), processos do `@proc`, o memory worker, o trabalho de memória (`memory:bootstrap`, `memory:auto-recall`, `memory:session-recall`, `memory:retrieve`, `memory:remember`), conhecimento e RAG (`knowledge:search`, `knowledge:get`, `context:retrieve`, `context:auto-rag`), compressão (`compress:tool-output` com tamanhos e razão, `compress:archive`, `compress:recall` com acerto ou não), hooks (`hook:<evento>`: tipo, exit code ou classe do status HTTP, timeout, se bloqueou a ação), park e resume, `cache-keepalive`, a folga de rate limit por provider (`ratelimit:<provider>`, vermelho acima de 90% gasto), o hub de conversas (`hub:open`, `hub:pull`, `hub:mirror`), as respostas de voz e entregas do gateway, salvar e carregar sessão, as tentativas de eval (`eval:case`), a **auto-evolução de skills** (`skill-evolution`: candidatos, depois `1 authored · 2 evolved`, `3 suggested`, `no change`; cada skill escrita é um ponto no próprio nó, `created` ou `evolved`), a compaction do histórico (com mensagens e caracteres antes e depois, e a requisição do sumarizador sob ela), language servers, a sessão do `@browser`, o staging do auto-update |
+| **conn** | HTTP de saída por **hostname**: método, status, latência, bytes. Um stream de tokens aparece como uma conexão viva com a duração real. Todo cliente é medido: providers de modelo (incluindo o AWS Bedrock), login OAuth, MCP via HTTP/SSE, registries de skills, web tools, plataformas do gateway, hooks, o DevTools do navegador, Prometheus |
+| **rpc** | O chatcli atuando como servidor: cada método [MCP](/pt/server/mcp-server) e [ACP](/pt/server/acp) recebido e o que o servidor pede ao cliente, cada chamada [gRPC](/pt/server/server-mode) (`grpc:<Serviço>/<Método>` com o status code; health probes ficam de fora), cada rota da [web UI](/pt/usage/web-ui) pelo template (`web:POST turn`), cada mensagem do [gateway](/pt/gateway/chat-gateway) por plataforma (`gateway:telegram`, com a mídia e o tipo de resposta). O trabalho que uma requisição inicia fica pendurado nela |
+| **turn** | Turnos de chat em toda superfície — REPL, [web UI](/pt/usage/web-ui), MCP, ACP e gateway — turnos one-shot e turnos de [`/moa`](/pt/agents/mixture-of-agents), com provider e modelo. O filho `chatcli web` que o `/web` inicia é um processo próprio e ganha janela própria, rotulada `web` |
 
 ### Os sete padrões, com desfecho
 
@@ -95,6 +107,9 @@ Um padrão desligado, ou cujos guards rejeitam o resultado, não fez nada e fica
 - **Um diálogo de permissão que ninguém respondeu.** Via ACP/MCP ele aparece como uma chamada `client:session/request_permission` que não termina.
 - **O dev server que você subiu há uma hora.** Os processos do `@proc` são reapresentados quando a dash abre, então aparecem mesmo tendo começado muito antes.
 - **Qual worker gastou as requisições.** Cada requisição de LLM fica pendurada no agent que a fez.
+- **Um provider que trocou em silêncio.** O nó `fallback` mostra qual provider respondeu e quais falharam ou estavam em cooldown.
+- **O agente esperando por você.** Um nó `approval` fica aberto enquanto um prompt de confirmação espera resposta.
+- **Um rate limit prestes a morder.** `ratelimit:<provider>` fica vermelho antes de o provider começar a recusar.
 
 ### Usando a página
 
@@ -143,6 +158,11 @@ O agent tem o mesmo controle da dash que o `/dash`, e mais um jeito de ler o que
 - **caminho e query string** de URL (onde viajam chaves de API e tokens de bot): só o hostname é mostrado
 - a **linha de comando** de um processo: só o nome do programa, e só quando a primeira palavra é um programa e não uma atribuição `VAR=valor`
 - a URL do browser ou qualquer coisa de uma página; o payload, a mensagem ou a saída de um job agendado
+- fatos da memória, consultas, caminhos de bases de conhecimento, conteúdo comprimido e suas chaves
+- ids de chat, ids de usuário, nomes de sessão, o id ou o texto de uma tarefa, os argumentos de uma regra de policy (só a tool e o subcomando)
+- os valores posicionais de uma tool: um subcomando só é reportado quando é um identificador curto, então uma URL do `@webfetch` ou uma busca do `@websearch` nunca são
+
+O `caller` que o log de requisições e a [trilha de auditoria](/pt/security/overview) registram continua sendo o run do agente; o pai mais fino da dash viaja num campo próprio (`pulse_parent`).
 
 **O servidor é local, mas não é aberto.** Ele sobe em `127.0.0.1` numa porta efêmera e, além disso:
 
