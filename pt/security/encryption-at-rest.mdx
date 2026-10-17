@@ -1,0 +1,190 @@
+---
+title: "Criptografia em Repouso"
+sidebarTitle: "Criptografia em Repouso"
+description: "O ChatCLI cifra por padrão as conversas, a memória, os contextos e os outros dados que guarda em disco, com uma chave mantida no keychain do sistema no macOS, no Linux e no Windows. Como a chave funciona, como uma instalação antiga é migrada e como verificar, rotacionar ou desligar."
+icon: "lock"
+---
+
+O ChatCLI guarda em disco, sob `~/.chatcli`, suas sessões, transcrições, histórico de prompts, memória de longo prazo, contextos de conhecimento e anexos. **Tudo isso é cifrado por padrão** com AES-256-GCM. Não há nada a configurar: no primeiro início o ChatCLI cria uma chave, guarda no keychain do sistema operacional e cifra todos os stores com ela.
+
+Quem copiar seu diretório `~/.chatcli`, um backup dele ou a imagem de um disco roubado leva texto cifrado. Suas conversas não vão junto.
+
+<Note>
+A criptografia em repouso protege os dados **em disco**. Um processo rodando como o seu usuário, com o ChatCLI destravado, ainda lê o que o ChatCLI lê. Ela complementa a criptografia de disco inteiro (FileVault, LUKS, BitLocker), não a substitui.
+</Note>
+
+## O que é cifrado
+
+| Store | Local | Como |
+|---|---|---|
+| Sessões salvas, autosaves, espelhos de sessão MCP | `~/.chatcli/sessions/` | arquivo inteiro |
+| Journal de transcrição | `~/.chatcli/transcripts/` | cada linha |
+| Histórico de prompts | `~/.chatcli/history` | cada linha |
+| Memória de longo prazo: fatos, perfil, tópicos, projetos, episódios, grafo de conhecimento, resumos, notas diárias, fila pendente | `~/.chatcli/memory/` | arquivo inteiro |
+| Índice vetorial da memória, vetores dos contextos | `memory/vector_index.json`, `contexts/*.vec.json` | arquivo inteiro |
+| Contextos de conhecimento (`/context`) | `~/.chatcli/contexts/` | arquivo inteiro |
+| Arquivo de compressão (CCR) | `~/.chatcli/ccr/` | arquivo inteiro |
+| Snapshots de custo | `~/.chatcli/costs/` | arquivo inteiro |
+| Anexos (imagens e PDFs da web UI, dos canais, do ACP) | `~/.chatcli/attachments/` | arquivo inteiro |
+| Snapshots de park | o diretório de configuração do sistema (`chatcli/parked`) | arquivo inteiro |
+| Stores por tenant da gateway | `~/.chatcli/tenants/<tenant>/…` | como acima, vinculados ao tenant |
+
+Cada conteúdo cifrado fica vinculado ao próprio caminho e ao tenant (dados autenticados), então um arquivo copiado para outro store ou outro tenant não abre lá.
+
+As credenciais em `auth-profiles.json` (OAuth e API keys) já eram cifradas, com uma chave própria. Essa chave agora também fica no keychain.
+
+**Não cifrados, de propósito:**
+- o contador do orçamento diário, `costs/daily-spend.json`, que é lido antes de qualquer chave ser necessária;
+- as exportações que você pede (`/session export`, `/memory export`, `/context export`), que são arquivos para levar a outro lugar (veja [Exportações](#exportações));
+- a trilha de auditoria encadeada por hash (`CHATCLI_AUDIT_LOG_PATH`), selada linha a linha só com uma chave de `CHATCLI_ENCRYPTION_KEY`: é um arquivo que operadores enviam a um pipeline de logs;
+- os checkpoints do coder, que são cópias dos arquivos do projeto que já estão em disco em texto puro;
+- o diretório de rascunho de uma sessão de agente, que é removido quando a sessão termina.
+
+## Onde fica a chave
+
+O ChatCLI guarda um segredo no repositório de credenciais do sistema operacional. A chave que cifra seus dados é derivada dele (HKDF-SHA256), assim como uma chave separada para o store de credenciais. As duas vêm do mesmo segredo, mas são criptograficamente separadas.
+
+| SO | Store | Observações |
+|---|---|---|
+| macOS | Keychain (keychain de login), pela ferramenta `security` | Sem prompt: o item pertence à ferramenta `security` |
+| Linux | Secret Service (GNOME Keyring, KWallet) via `secret-tool` | Precisa do `libsecret-tools` e de uma sessão de desktop (D-Bus) |
+| Windows | Gerenciador de Credenciais | Nativo |
+
+**Onde não há keychain** (um servidor, um contêiner, Linux sem `secret-tool`, ou `CHATCLI_KEYCHAIN_BACKEND=file`), o segredo fica no arquivo `~/.chatcli/.auth-key`, com modo `0600`. Os dados continuam cifrados, mas quem copiar esse arquivo junto com os dados consegue abri-los. O `/config security` avisa nesse caso. Para uma proteção maior ali, defina `CHATCLI_ENCRYPTION_KEY` a partir de um gerenciador de segredos.
+
+Depois que a chave vai para o keychain, um marcador ao lado de onde ficava o arquivo de chave (`~/.chatcli/.auth-key.keychain`) registra isso. A partir daí o ChatCLI nunca cria uma chave nova para esta instalação: um contexto que não alcança o keychain (uma sessão SSH, um contêiner, um cron com `CHATCLI_KEYCHAIN_BACKEND=file`) recebe um erro em vez de uma chave nova que deixaria seus dados órfãos, e um arquivo de chave que apareça depois (um backup restaurado) não substitui a chave do keychain.
+
+`CHATCLI_KEYCHAIN_BACKEND` escolhe o store:
+- `auto` (padrão): o keychain onde houver um, o arquivo nos demais casos.
+- `keychain`: sempre o keychain.
+- `file`: sempre o arquivo.
+
+## Guarde uma chave de recuperação
+
+O keychain guarda a única cópia da chave padrão. Se ela se perder — sistema reinstalado, keychain resetado, máquina nova — os stores cifrados não abrem mais. Guarde uma cópia fora da máquina uma vez:
+
+```text
+/config security recovery-key
+```
+
+O comando mostra a chave de recuperação (só num terminal interativo; ela nunca vai para o log). Guarde-a num gerenciador de senhas, não num arquivo ao lado dos dados. Em qualquer máquina, defini-la como `CHATCLI_ENCRYPTION_KEY` abre todo store cifrado com a chave padrão:
+
+```bash
+export CHATCLI_ENCRYPTION_KEY="<chave de recuperação>"
+```
+
+É também esse valor que um cron, um contêiner ou uma sessão SSH sem acesso ao keychain precisam.
+
+## Escolhendo a chave você mesmo
+
+`CHATCLI_ENCRYPTION_KEY` tem precedência sobre o keychain. Use quando a chave precisa vir de fora da máquina:
+- servidores e a gateway em produção;
+- Kubernetes, onde o operator a injeta a partir de um Secret (`spec.features.encryptionKeyRef`);
+- CI;
+- compartilhar stores cifrados entre máquinas.
+
+```bash
+export CHATCLI_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+```
+
+Não é um caminho sem volta: `/config security use-keychain` move seus dados de volta para a chave do keychain, e os dados cifrados com a chave do keychain continuam abrindo enquanto a variável estiver definida.
+
+Um segredo com 32 caracteres ou mais é usado diretamente. Um mais curto é tratado como frase-senha e fortalecido com Argon2id. Guarde-o num gerenciador de segredos: dados cifrados com ele não abrem sem ele.
+
+<Warning>
+O `chatcli server` não cria uma chave sozinho. Os stores de um servidor costumam ficar num volume enquanto o diretório home não fica, e uma chave criada dentro de um contêiner se perderia no próximo restart. Dê a chave ao servidor com `CHATCLI_ENCRYPTION_KEY`, ou com `encryptionKeyRef` numa Instance do operator.
+</Warning>
+
+## Atualizando de uma versão anterior
+
+As versões anteriores gravavam tudo em texto puro, a menos que `CHATCLI_ENCRYPTION_KEY` estivesse definida. O primeiro início de uma versão com criptografia ligada por padrão migra seus dados:
+
+1. A chave é criada e guardada no keychain.
+2. Um arquivo `~/.chatcli/.auth-key` existente é movido para o keychain quando o keychain ainda não tem chave. O arquivo só é removido depois que o keychain devolve a mesma chave. Se o keychain já tiver uma chave diferente (outra instalação pode depender dela), nada se move: o arquivo continua em uso e o keychain fica intocado.
+3. Todo store ainda em texto puro é cifrado em segundo plano. Cada arquivo é trocado de forma atômica, então uma passada interrompida não perde nada e o próximo início continua de onde parou.
+   - Arquivos modificados nos últimos 10 minutos ficam para o próximo início, porque outra janela do ChatCLI pode estar gravando neles. De todo modo, quem grava cifra os próprios arquivos no próximo save.
+   - Comandos curtos (`chatcli -p`) migram uma parte dos arquivos a cada execução.
+4. Quando tudo está cifrado, o ChatCLI registra isso e para de verificar.
+
+A passada em segundo plano roda só com a chave padrão do keychain. Com `CHATCLI_ENCRYPTION_KEY` definida (um servidor, o operator, ou você que já tinha ativado antes), nada é regravado pelas suas costas: cada store é cifrado no próximo save, e o `/config security reseal` cifra o resto quando você pedir. A passada só mexe nos arquivos que cada store lê cifrados; uma exportação, uma nota ou um repositório que você guarde nessas pastas fica intocado, e cada arquivo mantém a data de modificação.
+
+Seus dados continuam abrindo durante e depois da migração: um arquivo em texto puro é lido como está e cifrado no próximo save. Para cifrar tudo de uma vez em vez de esperar, rode:
+
+```text
+/config security reseal
+```
+
+<Note>
+Uma versão **anterior** do ChatCLI não lê os stores cifrados: ela não sabe onde a chave está. Para voltar a uma delas, primeiro regrave os stores em texto puro com a versão nova:
+
+```bash
+export CHATCLI_ENCRYPTION_KEY=off
+```
+
+```text
+/config security reseal
+```
+
+Com a criptografia desligada, o `reseal` decifra os stores em vez de cifrá-los. Depois instale a versão anterior, e mantenha `CHATCLI_ENCRYPTION_KEY=off` enquanto usar a nova.
+</Note>
+
+## Verificando o estado
+
+O `/config security` mostra:
+
+| Linha | Significado |
+|---|---|
+| Criptografia em repouso | `ligada — chave derivada do segredo no keychain do sistema`, `ligada — chave de CHATCLI_ENCRYPTION_KEY`, `ligada — chave derivada de <arquivo>` (sem keychain: mais fraca), `desligada`, ou `indisponível` com o motivo |
+| Fingerprint da chave | Os 8 primeiros caracteres hex de um hash da chave, para comparar máquinas sem mostrar a chave |
+| Dados locais cifrados | `sim`, `em andamento`, quantos arquivos ficaram para o próximo início, ou `pendente` |
+| Stores travados | Stores da memória cifrados com uma chave que este processo não tem. Ficam somente leitura para que nada os sobrescreva |
+
+**Indisponível** significa que a chave não pôde ser lida: um keychain do macOS travado numa sessão SSH, ou um Linux com `secret-tool` mas sem sessão de desktop. O ChatCLI então grava os dados novos em texto puro e não abre os arquivos cifrados até a chave voltar a ficar acessível. Ele nunca gera uma chave nova nesse estado, porque uma chave nova deixaria órfãos os dados cifrados com a antiga. Destrave o keychain, ou defina `CHATCLI_KEYCHAIN_BACKEND=file` em máquinas que nunca têm sessão de desktop.
+
+## Rotacionando a chave
+
+**Da chave padrão do keychain para uma chave sua:** defina `CHATCLI_ENCRYPTION_KEY` e rode `/config security reseal`. A chave do keychain continua abrindo o que cifrou, e o reseal move todos os stores para a chave nova.
+
+**De uma chave sua de volta para a chave do keychain:** com `CHATCLI_ENCRYPTION_KEY` ainda definida, rode `/config security use-keychain`. Ele move todos os stores para a chave do keychain; depois remova a variável do seu ambiente. Se esquecer de remover, nada quebra: os dados cifrados com qualquer uma das duas continuam abrindo.
+
+**De uma `CHATCLI_ENCRYPTION_KEY` para outra:**
+
+1. Coloque a chave nova em `CHATCLI_ENCRYPTION_KEY` e a antiga em `CHATCLI_ENCRYPTION_KEY_PREVIOUS` (lista separada por vírgulas).
+2. Rode `/config security reseal`. Todos os stores são regravados com a chave nova.
+3. Quando ele não reportar erros, remova `CHATCLI_ENCRYPTION_KEY_PREVIOUS`.
+
+## Desligando
+
+```bash
+export CHATCLI_ENCRYPTION_KEY=off   # também: none, disabled, false, 0
+```
+
+As gravações novas saem em texto puro. Os arquivos que já estavam cifrados **continuam abrindo** com a chave do keychain, então desligar a criptografia nunca te tranca para fora dos seus próprios dados. Para regravar também os stores existentes em texto puro, rode `/config security reseal` com ela desligada.
+
+## Exportações
+
+Exportações são arquivos para levar a outro lugar, então saem em texto puro (modo `0600`) e o comando avisa:
+
+| Comando | Saída |
+|---|---|
+| `/session export` | Markdown ou JSONL, texto puro |
+| `/export` | JSONL da trajetória, texto puro |
+| `/context export` | JSON do contexto, texto puro |
+| `/cost export` | JSON ou CSV, texto puro |
+| `/memory export` | JSONL: texto puro com a chave padrão do keychain; selado linha a linha com uma chave de `CHATCLI_ENCRYPTION_KEY`, que você consegue levar para a máquina que vai importar |
+
+Uma exportação em texto puro importa em qualquer lugar. Guarde-a com o mesmo cuidado que os dados que ela contém e apague-a quando não precisar mais.
+
+## Relacionados
+
+Para o que fazer quando algo dá errado — keychain travado, máquina nova, um cron, um downgrade — veja [Dados cifrados: proteger e recuperar](/pt/help/troubleshooting#dados-cifrados-proteger-e-recuperar).
+
+
+<CardGroup cols={2}>
+  <Card title="Visão geral de segurança" icon="shield-halved" href="/pt/security/overview">
+    Cada camada de proteção e o seu estado.
+  </Card>
+  <Card title="Gerenciamento de sessões" icon="floppy-disk" href="/pt/context/session-management">
+    Sessões, autosave e o journal de transcrição.
+  </Card>
+</CardGroup>

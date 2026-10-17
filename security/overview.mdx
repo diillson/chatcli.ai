@@ -34,12 +34,12 @@ The table below summarizes all active protections across every layer of the stac
 | **Authorization** | Remote `@coder` (ExecuteRemotePlugin) requires the admin role and still passes the policy; the DEVIN provider requires admin on every RPC | Active |
 | **Authorization** | Per-principal sessions: each caller sees only its own; read-only never persists or deletes; old shared sessions are admin-only, with no automatic migration | Active |
 | **Encryption** | AES-256-GCM encryption for stored OAuth credentials | Active |
-| **Encryption** | Credential key in the OS keychain instead of a file | Opt-in |
-| **Encryption** | Encryption at rest for sessions, memory, contexts, transcripts, archives, costs | Opt-in |
+| **Encryption** | Credential key in the OS keychain instead of a file (an existing key file is moved there) | Active |
+| **Encryption** | Encryption at rest for sessions, transcripts, prompt history, memory, contexts, attachments, archives, costs ([details](/security/encryption-at-rest)) | Active (CLI); server: with `CHATCLI_ENCRYPTION_KEY` |
 | **Transport** | TLS 1.3 for the gRPC server and the operator REST API | Opt-in |
 | **Transport** | The operator always dials ChatCLI servers over TLS 1.3; there is no plaintext mode | Active |
 | **Transport** | Mutual TLS: the server requires and verifies a client certificate, and identifies the caller by it (`CHATCLI_MTLS_ROLE`) | Opt-in |
-| **Keychain** | OS keychain integration (macOS Keychain, Linux secret-service, Windows Credential Manager) | Opt-in |
+| **Keychain** | OS keychain integration (macOS Keychain, Linux secret-service, Windows Credential Manager) | Active where a keychain exists |
 | **Shell** | POSIX quoting to prevent shell injection in arguments | Active |
 | **Editors** | EDITOR validation against an allowlist of known editors | Active |
 | **Agent Commands** | 200+ command allowlist (strict mode, the default), applied to every command on the line | Active |
@@ -237,46 +237,33 @@ All OAuth credentials are encrypted at rest using **AES-256-GCM** in `~/.chatcli
 | `~/.chatcli/.auth-key` | `0600` | AES-256-GCM encryption key |
 | `~/.chatcli/coder_policy.json` | `0600` | Coder policy rules |
 
-### Encryption at Rest (sessions, memory, contexts, archives, costs)
+### Encryption at Rest
 
-<Info>One key covers every store, derived per store class with HKDF — there is no separate key per profile. It is opt-in and off until `CHATCLI_ENCRYPTION_KEY` is set.</Info>
+<Info>On by default for the CLI, the REPL, the web UI, the gateway and every other local surface, with a key kept in the OS keychain. [Encryption at Rest](/security/encryption-at-rest) covers the key, the migration of an older installation, the status rows, rotation and turning it off.</Info>
 
-**Version 2 payloads are bound to their store.** A sealed file carries, as authenticated data, its relative store path and tenant slug: a session, memory or park file copied from one tenant's directory into another's (or renamed) no longer opens as if it belonged there. Secrets shorter than 32 bytes are treated as passphrases and stretched with Argon2id before key derivation; a random key of at least 32 bytes keeps the direct derivation, so the documented key stays best practice. Version-1 payloads keep loading and are rewritten as bound v2 by their next save or by `/config security reseal`, which now fsyncs. Tenant roots carry a 16-byte digest (roots created with the older short digest keep being used).
+Every store that embeds conversation content is sealed with AES-256-GCM before it touches disk and opened transparently on read: sessions, autosaves and MCP/ACP mirrors, park snapshots, the transcript journal and the prompt history (line by line), long-term memory (JSON stores, daily notes, summaries, the vector index), knowledge contexts and their vectors, the CCR archive, cost snapshots and attachments.
 
-Encryption at rest is an **explicit opt-in**: it is active while `CHATCLI_ENCRYPTION_KEY` is set in the process environment. When it is, every store that embeds conversation content is sealed before it touches disk and opened transparently on read:
+**The key.** With `CHATCLI_ENCRYPTION_KEY` unset, the data key is derived (HKDF-SHA256, its own context) from the secret ChatCLI keeps in the OS keychain, the same secret that protects stored credentials, so one key protects everything while the two uses stay cryptographically separate. `CHATCLI_ENCRYPTION_KEY` takes precedence; `CHATCLI_ENCRYPTION_KEY=off` stops sealing new writes and still opens sealed files. `chatcli server` never creates a key on its own: give it `CHATCLI_ENCRYPTION_KEY` (the operator's `encryptionKeyRef`).
 
-- saved sessions (`/session save`, `/session attach` write-through)
-- exit autosaves and MCP/ACP session mirrors (`autosave-*`, `mcp-*`)
-- agent park snapshots (`/park`, `/resume`)
-- the transcript journal (line by line) and `/memory export` files
-- long-term memory JSON stores (`facts`, `episodes`, `profile`, `topics`, `projects`, `patterns`, graph cache, compactor state — daily notes and rollups stay human-editable Markdown)
-- knowledge contexts (`~/.chatcli/contexts/*.json`; `/context export` files stay plaintext on purpose)
-- the CCR archive (`~/.chatcli/ccr/*.ccr`, the originals behind `@recall`)
-- cost snapshots (`~/.chatcli/costs/*.json`)
+**Payloads are bound to their store.** A sealed file carries, as authenticated data, its relative store path and tenant slug: a session, memory or park file copied from one tenant's directory into another's (or renamed) does not open there. Secrets shorter than 32 bytes are treated as passphrases and stretched with Argon2id; a random key of at least 32 bytes keeps the direct derivation. Version-1 payloads keep loading and are rewritten as bound v2 by their next save or by `/config security reseal`.
 
-The conversation hub database (SQLite) is the remaining plaintext store; keep it on an encrypted volume.
-
-```bash
-export CHATCLI_ENCRYPTION_KEY="a-long-random-secret"
-```
-
-Format: `CHATCLI_ENC_v1` header + 12-byte nonce + AES-256-GCM ciphertext. The key is derived with HKDF-SHA256 from `SHA-256(CHATCLI_ENCRYPTION_KEY)`; the secret itself is never written anywhere.
+The conversation hub database (SQLite) and the scheduler and reflexion queues are not sealed yet; keep them on an encrypted volume.
 
 <Note>
-**Transparent migration.** Plaintext files written before the key existed keep loading and are re-written encrypted on their next save. An encrypted file opened without the key fails with a clear error naming `CHATCLI_ENCRYPTION_KEY` — it is never silently treated as empty or corrupt.
+**Transparent migration.** Plaintext files written by an older version keep loading. With the default keychain key a background pass seals them on the first start (files modified in the last 10 minutes wait for the next start), and every writer seals what it saves. An encrypted file opened without the key fails with an error that names the cause (a locked keychain, a missing key); it is never treated as empty or corrupt.
 
-**Persisted redaction and the REPL history.** Secret redaction always runs on the LLM path; under `CHATCLI_ENV_REDACT_MODE=strict` it also masks what ChatCLI persists for itself — session files, the transcript journal, CCR archives, hub mirrors — always on a copy, never the live history (the permissive default keeps stores verbatim so `/rewind` and exports stay faithful). The redactor covers Slack tokens and webhooks, PEM private keys, connection strings with credentials, AWS secret keys, GCP service-account key ids and Azure account/SAS keys. With the at-rest key set, the REPL prompt history (`.chatcli_history`) is sealed line by line. Retention re-runs every 6 h in the gateway daemon and expires tenant parks, sessions and queued memory segments past the session window (your own named sessions are never touched).
+**Persisted redaction.** Secret redaction always runs on the LLM path; under `CHATCLI_ENV_REDACT_MODE=strict` it also masks what ChatCLI persists for itself (session files, the transcript journal, CCR archives, hub mirrors), always on a copy, never the live history. Retention re-runs every 6 h in the gateway daemon and expires tenant parks, sessions and queued memory segments past the session window.
 
-**Read-only latch.** A memory store whose sealed file this process cannot open (key unset, wrong, or retired without `CHATCLI_ENCRYPTION_KEY_PREVIOUS`) is **locked**: it loads empty in memory, logs an error, refuses every write, and is listed under "Locked stores" in `/config security` and `/memory stats`. A gateway daemon, a cron job or a shell started without the key can therefore never overwrite your memory. Daily notes and rollups stay plain Markdown by contract; the memory worker's pending queue is redacted and sealed like the other stores.
+**Read-only latch.** A memory store, or the vector index, whose sealed file this process cannot open is **locked**: it loads empty in memory, refuses every write, and is listed under "Locked stores" in `/config security` and `/memory stats`. A daemon, a cron job or a shell started without the key can never overwrite your data.
 </Note>
 
 #### Key rotation
 
-1. Set the new secret in `CHATCLI_ENCRYPTION_KEY` and list the retired one in `CHATCLI_ENCRYPTION_KEY_PREVIOUS` (comma-separated when several). Reads try the current key first, then the retired ones; writes always use the current key.
-2. Run `/config security reseal`: every store file under the state root (sessions, transcripts, memory, contexts, CCR, costs — per tenant under the gateway) is rewritten with the current key; plaintext files get sealed on the way. The command reports how many files changed and the key fingerprint.
+1. Set the new secret in `CHATCLI_ENCRYPTION_KEY`. Moving off the default keychain key needs nothing else; moving off an earlier `CHATCLI_ENCRYPTION_KEY`, list it in `CHATCLI_ENCRYPTION_KEY_PREVIOUS` (comma-separated). Reads try the current key first, then the retired ones; writes always use the current key.
+2. Run `/config security reseal`: every store under the state root (sessions, transcripts, memory, contexts, CCR, costs, attachments, park snapshots, the prompt history, per tenant under the gateway) is rewritten with the current key. With encryption off, the same command writes the stores back in plaintext.
 3. Unset `CHATCLI_ENCRYPTION_KEY_PREVIOUS`.
 
-`/config security` shows whether encryption is on, the current key's fingerprint, how many retired keys are configured and what the seal covers.
+`/config security` shows whether encryption is on and where the key comes from, the key fingerprint, whether every store is sealed, how many retired keys are configured and what the seal covers.
 
 #### Tamper-evident audit trail
 
@@ -345,7 +332,7 @@ Humans still see the full output in the terminal and `PostToolUse` hooks still r
 
 ### OS Keychain Integration
 
-The key that encrypts stored OAuth credentials (`~/.chatcli/auth-profiles.json`) can live in the OS keychain instead of a file:
+The secret behind stored credentials (`~/.chatcli/auth-profiles.json`) and the encryption at rest of every local store lives in the OS keychain:
 
 ```bash
 # Options: "auto" (default), "file", "keychain"
@@ -356,15 +343,15 @@ export CHATCLI_KEYCHAIN_BACKEND=keychain
 |---------|-------|-------|---------|
 | `keychain` | Keychain (`security`) | secret-service (`secret-tool`) | Credential Manager (advapi32) |
 | `file` | `~/.chatcli/.auth-key` | `~/.chatcli/.auth-key` | `%USERPROFILE%\.chatcli\.auth-key` |
-| `auto` | existing file key kept; a new key goes to the keychain when one is available | same | same |
+| `auto` | keychain where available, file otherwise | same | same |
 
 The three backends differ in what happens to a key that already exists on disk:
 
-- **`file`** — the file, always. The keychain is never consulted.
-- **`keychain`** — the keychain. A key already on disk is migrated into it once, and **the file is removed only after the keychain has handed that key back**. A write that appeared to succeed and a read that returned nothing would otherwise leave credentials no future process can decrypt.
-- **`auto`** (default) — an existing file key keeps being used, untouched. Only a key being created for the first time goes to the keychain, and only where one is available. Relocating a working installation's key without being asked is not a default's business.
+- **`file`**: the file, always. The keychain is never consulted.
+- **`keychain`**: the keychain. A key already on disk is migrated into it once, and **the file is removed only after the keychain has handed that key back**.
+- **`auto`** (default): the same move, for the default key file (`CHATCLI_AUTH_DIR` unset) and only into an empty keychain. A keychain that already holds a different key is never overwritten; the file keeps being used. A custom `CHATCLI_AUTH_DIR`, or a machine without a keychain, keeps using the file.
 
-Every failure keeps the file: an unreachable keychain, a refused write, a lost write, or a stored value that is not a 32-byte key all leave the on-disk key exactly where it is, with one warning per process. `/config server` prints the backend actually in effect, which is not always the one requested.
+Every failure keeps the file: an unreachable keychain, a refused write, a lost write, or a stored value that is not a 32-byte key all leave the on-disk key where it is, with one warning per process. A keychain that cannot be read never causes a new key to be generated, since a new key would orphan everything sealed with the old one. Once the key is in the keychain, a marker next to the key file (`.auth-key.keychain`) records it: from then on no process creates a new key for this installation — not a cron job on the file backend, not a container without a keychain, not a keychain that answers "no such item" — and a key file that shows up later never replaces the keychain key.
 
 <Info>Windows support uses the Credential Manager API directly (`CredReadW`/`CredWriteW`/`CredDeleteW`), because `cmdkey` can create and list credentials but never reveals a secret. Entries are stored per machine rather than roaming.</Info>
 
@@ -1334,7 +1321,7 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_ALLOW_INSECURE` | Let `chatcli connect` dial a plaintext server when `--tls` is not given (read by the client only) | `false` |
 | `CHATCLI_TLS_CLIENT_CERT` | Client certificate `chatcli connect --tls` presents for mTLS | `""` |
 | `CHATCLI_TLS_CLIENT_KEY` | Key of that client certificate | `""` |
-| `CHATCLI_ENCRYPTION_KEY` | Opt-in encryption at rest for sessions, memory, contexts, transcripts, the CCR archive and costs (AES-256-GCM, HKDF-derived) | `""` (off) |
+| `CHATCLI_ENCRYPTION_KEY` | Your own key for encryption at rest, in place of the OS keychain key used by default; `off` stops sealing new writes. Required for `chatcli server` to seal ([details](/security/encryption-at-rest)) | `""` (keychain key) |
 | `CHATCLI_ENCRYPTION_KEY_PREVIOUS` | Retired keys still accepted on read during a rotation (comma-separated) | `""` |
 | `CHATCLI_KEYCHAIN_BACKEND` | Where the credential-encryption key lives: `auto`, `file`, `keychain`. A Go test binary never reaches the OS keychain on `auto` — only an explicit `keychain` does — so running the suite neither prompts for access nor rewrites the developer's key | `auto` |
 | `CHATCLI_DISABLE_HISTORY` | Disable conversation history recording | `false` |

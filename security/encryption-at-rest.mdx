@@ -1,0 +1,190 @@
+---
+title: "Encryption at Rest"
+sidebarTitle: "Encryption at Rest"
+description: "ChatCLI encrypts the conversations, memory, contexts and other data it keeps on disk by default, with a key held in the OS keychain on macOS, Linux and Windows. How the key works, how an older installation is migrated, and how to check, rotate or turn it off."
+icon: "lock"
+---
+
+ChatCLI keeps your sessions, transcripts, prompt history, long-term memory, knowledge contexts and attachments on disk under `~/.chatcli`. **All of it is encrypted by default** with AES-256-GCM. There is nothing to configure: on the first start ChatCLI creates a key, keeps it in the operating system's keychain, and seals every store with it.
+
+Someone who copies your `~/.chatcli` directory, a backup of it, or a stolen disk image gets ciphertext. They do not get your conversations.
+
+<Note>
+Encryption at rest protects data **on disk**. A process running as your user while ChatCLI is unlocked can still read what ChatCLI can read. It complements full-disk encryption (FileVault, LUKS, BitLocker) and does not replace it.
+</Note>
+
+## What is encrypted
+
+| Store | Location | How |
+|---|---|---|
+| Saved sessions, autosaves, MCP session mirrors | `~/.chatcli/sessions/` | whole file |
+| Transcript journal | `~/.chatcli/transcripts/` | each line |
+| Prompt history | `~/.chatcli/history` | each line |
+| Long-term memory: facts, profile, topics, projects, episodes, knowledge graph, summaries, daily notes, pending queue | `~/.chatcli/memory/` | whole file |
+| Memory vector index, knowledge-context vectors | `memory/vector_index.json`, `contexts/*.vec.json` | whole file |
+| Knowledge contexts (`/context`) | `~/.chatcli/contexts/` | whole file |
+| Compression archive (CCR) | `~/.chatcli/ccr/` | whole file |
+| Cost snapshots | `~/.chatcli/costs/` | whole file |
+| Attachments (images and PDFs from the web UI, channels, ACP) | `~/.chatcli/attachments/` | whole file |
+| Park snapshots | the OS config directory (`chatcli/parked`) | whole file |
+| Gateway tenant stores | `~/.chatcli/tenants/<tenant>/…` | as above, bound to the tenant |
+
+Each payload is bound to its own path and tenant (authenticated data), so a file copied to another store or another tenant does not open there.
+
+The credentials in `auth-profiles.json` (OAuth and API keys) were already encrypted, with their own key. That key now lives in the keychain too.
+
+**Not encrypted, on purpose:**
+- the daily budget counter, `costs/daily-spend.json`, which is read before any key is needed;
+- exports you ask for (`/session export`, `/memory export`, `/context export`), which are files you take somewhere else (see [Exports](#exports));
+- the hash-chained audit trail (`CHATCLI_AUDIT_LOG_PATH`), which is sealed line by line only under a key from `CHATCLI_ENCRYPTION_KEY`: it is a file operators ship to a log pipeline;
+- coder checkpoints, which are copies of the project files that are already on disk in plaintext;
+- the scratch directory of an agent session, which is removed when the session ends.
+
+## Where the key lives
+
+ChatCLI keeps one secret in the operating system's credential store. The key that seals your data is derived from it (HKDF-SHA256), and so is a separate key for the credential store. Both come from the same secret but are cryptographically separate.
+
+| OS | Store | Notes |
+|---|---|---|
+| macOS | Keychain (login keychain), through the `security` tool | No prompt: the item belongs to the `security` tool |
+| Linux | Secret Service (GNOME Keyring, KWallet) through `secret-tool` | Needs `libsecret-tools` and a desktop session (D-Bus) |
+| Windows | Credential Manager | Built in |
+
+**Where there is no keychain** (a server, a container, Linux without `secret-tool`, or `CHATCLI_KEYCHAIN_BACKEND=file`), the secret is the file `~/.chatcli/.auth-key`, mode `0600`. The data is still encrypted, but whoever copies that file together with the data can open it. `/config security` warns about this case. For stronger protection there, set `CHATCLI_ENCRYPTION_KEY` from a secret manager.
+
+Once the key is in the keychain, a marker next to where the key file was (`~/.chatcli/.auth-key.keychain`) records it. From then on ChatCLI never creates a new key for this installation: a context that cannot reach the keychain (an SSH session, a container, a cron job with `CHATCLI_KEYCHAIN_BACKEND=file`) gets an error instead of a fresh key that would orphan your data, and a key file that shows up later (a restored backup) does not replace the keychain key.
+
+`CHATCLI_KEYCHAIN_BACKEND` chooses the store:
+- `auto` (default): the keychain where one is available, the file otherwise.
+- `keychain`: the keychain always.
+- `file`: the file always.
+
+## Keep a recovery key
+
+The keychain holds the only copy of the default key. If it is lost — a reinstalled system, a reset keychain, a new machine — the encrypted stores cannot be opened. Keep a copy outside the machine once:
+
+```text
+/config security recovery-key
+```
+
+It prints the recovery key (only in an interactive terminal; it is never logged). Store it in a password manager, not in a file next to your data. On any machine, setting it as `CHATCLI_ENCRYPTION_KEY` opens every store sealed with the default key:
+
+```bash
+export CHATCLI_ENCRYPTION_KEY="<recovery key>"
+```
+
+The same value is what a cron job, a container or an SSH session that cannot reach the keychain needs.
+
+## Choosing the key yourself
+
+`CHATCLI_ENCRYPTION_KEY` takes precedence over the keychain. Use it when the key must come from outside the machine:
+- servers and the gateway in production;
+- Kubernetes, where the operator injects it from a Secret (`spec.features.encryptionKeyRef`);
+- CI;
+- sharing encrypted stores between machines.
+
+```bash
+export CHATCLI_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+```
+
+It is not a one-way choice: `/config security use-keychain` moves your data back to the keychain key, and data sealed with the keychain key keeps opening while the variable is set.
+
+A secret of 32 characters or more is used directly. A shorter one is treated as a passphrase and stretched with Argon2id. Keep it in a secret manager: data sealed with it does not open without it.
+
+<Warning>
+`chatcli server` does not create a key by itself. A server's stores usually live on a volume while its home directory does not, and a key created inside a container would be lost on the next restart. Give a server its key with `CHATCLI_ENCRYPTION_KEY`, or with `encryptionKeyRef` on an operator Instance.
+</Warning>
+
+## Upgrading from an older version
+
+Older versions wrote everything in plaintext unless `CHATCLI_ENCRYPTION_KEY` was set. The first start of a version with encryption on by default migrates your data:
+
+1. The key is created and kept in the keychain.
+2. An existing `~/.chatcli/.auth-key` file is moved into the keychain when the keychain holds no key yet. The file is removed only after the keychain returns the same key. If the keychain already holds a different key (another installation may depend on it), nothing moves: the file keeps being used and the keychain is left untouched.
+3. Every store still in plaintext is sealed in the background. Each file is replaced atomically, so an interrupted pass loses nothing and the next start resumes it.
+   - Files modified in the last 10 minutes are left for the next start, because another ChatCLI window may still be writing them. A writer seals its own files on its next save anyway.
+   - Short-lived commands (`chatcli -p`) migrate a share of the files per run.
+4. When everything is sealed, ChatCLI records it and stops checking.
+
+The background pass runs with the default keychain key only. With `CHATCLI_ENCRYPTION_KEY` set (a server, the operator, or you opted in earlier), nothing is rewritten behind your back: each store is sealed on its next save, and `/config security reseal` seals the rest when you ask. The pass only touches the files each store reads sealed; an export, a note or a repository you keep in those directories is left alone, and each file keeps its modification time.
+
+Your existing data keeps opening during and after the migration: a plaintext file is read as it is and sealed on its next save. To seal everything at once instead of waiting, run:
+
+```text
+/config security reseal
+```
+
+<Note>
+An **older** ChatCLI version cannot read the encrypted stores: it does not know where the key lives. To go back to one, first write the stores back in plaintext with the new version:
+
+```bash
+export CHATCLI_ENCRYPTION_KEY=off
+```
+
+```text
+/config security reseal
+```
+
+With encryption off, `reseal` decrypts every store instead of sealing it. Then install the older version and keep `CHATCLI_ENCRYPTION_KEY=off` while you use the new one.
+</Note>
+
+## Checking the status
+
+`/config security` shows:
+
+| Row | Meaning |
+|---|---|
+| Encryption at rest | `on — key derived from the secret in the OS keychain`, `on — key from CHATCLI_ENCRYPTION_KEY`, `on — key derived from <file>` (no keychain: weaker), `off`, or `unavailable` with the reason |
+| Key fingerprint | First 8 hex characters of a hash of the key, to compare machines without showing the key |
+| Local data sealed | `yes`, `in progress`, how many files are left for the next start, or `pending` |
+| Locked stores | Memory stores sealed with a key this process does not have. They are kept read-only so nothing overwrites them |
+
+**Unavailable** means the key could not be read: a locked macOS keychain in an SSH session, or Linux with `secret-tool` but no desktop session. ChatCLI then writes new data in plaintext and cannot open sealed files until the key is reachable again. It never generates a new key in that state, because a new key would orphan the data sealed with the old one. Unlock the keychain, or set `CHATCLI_KEYCHAIN_BACKEND=file` on machines that never have a desktop session.
+
+## Rotating the key
+
+**From the default keychain key to a key of your own:** set `CHATCLI_ENCRYPTION_KEY` and run `/config security reseal`. The keychain key still opens what it sealed, and the reseal moves every store to the new key.
+
+**From a key of your own back to the keychain key:** with `CHATCLI_ENCRYPTION_KEY` still set, run `/config security use-keychain`. It moves every store to the keychain key; then remove the variable from your environment. If you forget to remove it, nothing breaks: data sealed with either key keeps opening.
+
+**From one `CHATCLI_ENCRYPTION_KEY` to another:**
+
+1. Set the new key in `CHATCLI_ENCRYPTION_KEY`, and the old one in `CHATCLI_ENCRYPTION_KEY_PREVIOUS` (a comma-separated list).
+2. Run `/config security reseal`. Every store is rewritten with the new key.
+3. When it reports no errors, unset `CHATCLI_ENCRYPTION_KEY_PREVIOUS`.
+
+## Turning it off
+
+```bash
+export CHATCLI_ENCRYPTION_KEY=off   # also: none, disabled, false, 0
+```
+
+New writes are plaintext. Files that were already sealed **keep opening** with the key from the keychain, so turning encryption off never locks you out of your own data. To also write the existing stores back in plaintext, run `/config security reseal` while it is off.
+
+## Exports
+
+Exports are files you take somewhere else, so they come out in plaintext (mode `0600`) and the command says so:
+
+| Command | Output |
+|---|---|
+| `/session export` | Markdown or JSONL, plaintext |
+| `/export` | Trajectory JSONL, plaintext |
+| `/context export` | Context JSON, plaintext |
+| `/cost export` | JSON or CSV, plaintext |
+| `/memory export` | JSONL: plaintext with the default keychain key; sealed line by line with a key from `CHATCLI_ENCRYPTION_KEY`, which you can carry to the machine that imports it |
+
+A plaintext export imports anywhere. Keep it as carefully as the data it holds, and delete it when you no longer need it.
+
+## Related
+
+For what to do when something goes wrong — a locked keychain, a new machine, a cron job, a downgrade — see [Encrypted data: protect it and recover it](/help/troubleshooting#encrypted-data-protect-it-and-recover-it).
+
+
+<CardGroup cols={2}>
+  <Card title="Security overview" icon="shield-halved" href="/security/overview">
+    Every protection layer and its status.
+  </Card>
+  <Card title="Session management" icon="floppy-disk" href="/context/session-management">
+    Sessions, autosave and the transcript journal.
+  </Card>
+</CardGroup>
