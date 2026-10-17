@@ -795,7 +795,7 @@ The AIOps pipeline reads these settings from the pinned AIOps Instance (`CHATCLI
 | `features.caBundleSecretName` | Secret `ca.crt` at `/etc/chatcli/ca`, `CHATCLI_CA_BUNDLE` | Corporate CA for every outbound TLS connection |
 | `features.allowHTTPProviders` | `CHATCLI_ALLOW_HTTP_PROVIDERS=true` | Allow plain-HTTP provider endpoints |
 | `features.encryptionKeyRef` | `CHATCLI_ENCRYPTION_KEY` | At-rest encryption key for the server's stores |
-| `features.encryptionAtRest` | `CHATCLI_ENCRYPTION_KEY_SECRET` | Default `true`: without `encryptionKeyRef` (or an `extraEnv` key) the operator creates `<instance>-atrest-key`, owned by the Instance and never overwritten, and lets the server only `get` it. A deleted key Secret is not recreated (see [Encryption at Rest](/security/encryption-at-rest#kubernetes)). `false` turns the managed key off |
+| `features.encryptionAtRest` | `CHATCLI_ENCRYPTION_KEY_SECRET` | Default `true`: without `encryptionKeyRef` (or an `extraEnv` key) the operator creates `<instance>-atrest-key`, kept when the Instance is deleted and never overwritten, and lets the server only `get` it. A deleted key Secret is not recreated (see [Encryption at Rest](/security/encryption-at-rest#kubernetes)). `false` turns the managed key off |
 | `features.logRotation.*` | `CHATCLI_LOG_MAX_SIZE_MB`, `_MAX_BACKUPS`, `_MAX_AGE_DAYS`, `_COMPRESS` | Rotation of the server's log file (defaults 100 MB, 3 backups, 28 days, compressed); the same entries also go to stderr, so `kubectl logs` carries them |
 | `pipeline.enabled` | `CHATCLI_SERVER_PIPELINE=true` | Serve the [pipeline RPCs](/server/server-mode#pipeline-rpcs) (the exec RPCs require the admin role) |
 
@@ -990,6 +990,18 @@ Instance pods and the operator pod meet the `restricted` Pod Security Standard w
 - Custom resources, for example `kubectl get instances,runbooks,notificationpolicies,escalationpolicies,approvalpolicies,incidentslas,servicelevelobjectives,sourcerepositories,clusterregistrations -A -o yaml`; add `issues,postmortems,auditevents` if you keep incident history in the cluster. Tools such as Velero back up namespaces with their custom resources.
 - The Secrets the Instances reference, and `chatcli-operator-secrets`, from your secret store.
 - The sessions PVC holds server sessions. It is owned by the Instance: deleting the Instance deletes the claim (the volume follows its StorageClass reclaim policy).
+- The encryption-at-rest key `<instance>-atrest-key`, together with the PVC data: without it the sealed data cannot be read. Deleting the Instance keeps it. Back up the key, not the whole object: a Secret restored with the `ownerReferences` of an Instance that no longer exists (1.221.0 and 1.221.1 set one) is deleted again by the garbage collector.
+
+```bash
+# Back up (the file holds the key: store it like a password)
+kubectl -n <namespace> get secret <instance>-atrest-key \
+  -o jsonpath='{.data.encryption-key}' | base64 -d > <instance>-atrest-key.txt
+
+# Restore
+kubectl -n <namespace> create secret generic <instance>-atrest-key \
+  --from-file=encryption-key=<instance>-atrest-key.txt
+```
+
 - LLM spend booked by the pipeline is kept in ConfigMaps `chatcli-cost-ledger` in the namespaces where Issues occur.
 
 ### What does not exist
@@ -1077,6 +1089,8 @@ All five conditions should read `True`. If `ServerReachable` still shows the `Fa
 | Before 1.199.0 | The `GITHUB_MODELS` provider was removed. CRDs from 1.199.0 reject it in `spec.fallback.providers[].name`, so after the CRD hook runs an Instance that lists it there fails its next write; CRDs that accept provider plugin names admit it again, and in `spec.provider` it was always accepted — but the server no longer has that provider | Move `spec.provider` and every fallback entry to another provider **before** upgrading |
 | Before 1.211.0 | The server gains `StreamAlerts` | Nothing: the bridge polls while an old pod answers and switches to the stream once it is gone (step 5 above) |
 | 1.211.x or earlier | The pod template gains the startup, readiness and liveness probes and the `chatcli.io/credentials-hash` annotation | Every Instance's pods roll once, even with `spec.image.tag` set; plan it like a server rollout |
+| Before 1.221.0 | Encryption at rest is on by default: the operator creates `<instance>-atrest-key` (unless `encryptionKeyRef` or an `extraEnv` key is set), the pods roll once and the stores are sealed as they are rewritten | Back up the key right after the upgrade (see [Backup](#backup)), or set `features.encryptionAtRest: false` before upgrading to stay in plaintext |
+| 1.221.0 or 1.221.1 | Their key Secret has an owner reference to the Instance, so deleting the Instance deleted the key | Nothing: later releases remove the owner reference on the first reconcile and log `Released the encryption-at-rest key Secret` |
 
 ### Uninstall
 
@@ -1096,6 +1110,9 @@ Delete the Instances first, while the operator still runs: their finalizer (`pla
 | `ServerReachable=False` / `NotServing` | The server is shutting down | Transient during rollouts; otherwise read the server log |
 | `ServerReachable=False`, `ProbeFailed` with `DeadlineExceeded ... while waiting for connections to become ready`, `connection refused` or `i/o timeout`, while `Available=True` and `VERSION` already shows the new release | The probe ran while the pods were being replaced | Transient: a failed probe is retried after 30 seconds. To re-probe now: `kubectl annotate instance <name> -n <ns> chatcli.io/reprobe="$(date +%s)" --overwrite`. If it stays `False`, the new pods are not answering: read the server log |
 | Operator log `Server has no StreamAlerts RPC; polling GetAlerts` right after an upgrade | The WatcherBridge reached a server older than 1.211.0 (an old pod still running) | Nothing to do: it switches to the stream as soon as that pod is gone. If the log keeps repeating, the Instance still runs an old server: check `VERSION` and `spec.image.tag` |
+| Operator log `Alert stream ended; reopening` with `no children to pick from` or `graceful_stop` during an upgrade | The Instance pods are being replaced (`Recreate` with persistence) | Nothing: the bridge reconnects with backoff and logs `Connected to Instance` and `Alert stream open` once the new pods serve |
+| Operator log `Reconciler error` / `failed to reconcile Deployment` with `the object has been modified; please apply your changes to the latest version` during a rollout (1.221.1 and earlier) | Optimistic concurrency: the Deployment or the Instance changed between the operator's read and its write | Nothing: the next reconcile uses the latest version. Later releases retry it without logging an error |
+| `encryption-at-rest key Secret ... is missing`, the Instance pods do not start | The key Secret the operator created was deleted | Restore it from your backup (see [Backup](#backup)); to discard the sealed data, remove the `platform.chatcli.io/atrest-key-created` annotation |
 | An Instance update is rejected with `spec.fallback.providers[0].name: Unsupported value: "GITHUB_MODELS"` after an upgrade | The provider was removed in 1.199.0 and the CRD no longer admits it in the fallback chain | Replace the entry (and `spec.provider`, if it names `GITHUB_MODELS`) with a supported provider |
 | `AuthenticationConfigured=False` / `CredentialMissing`, no Deployment | No credential on a reachable bind | Set one of the fields the message lists |
 | `TLSConfigured=False` / `SecretNameMissing`, no Deployment | `tls.enabled` without `secretName` | Set `spec.server.tls.secretName` |
