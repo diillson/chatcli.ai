@@ -1,0 +1,192 @@
+---
+title: "Receita: Escalando Instances"
+sidebarTitle: "Escalando Instances"
+description: "Rode mais de um servidor ChatCLI com o operator: réplicas de uma Instance, várias Instances e o equilíbrio entre persistência e rolling update, medido num cluster real."
+icon: "arrows-left-right"
+---
+
+Uma Instance escala de dois jeitos: mais **réplicas** da mesma Instance, ou mais **Instances**. Qual serve depende do que o servidor guarda em disco e de ele conduzir ou não o AIOps. Esta receita explica as escolhas, traz um layout que funciona em produção e mostra quanto custa um rollout em cada caso, medido num cluster de três nós.
+
+---
+
+## Os dois jeitos de escalar
+
+<CardGroup cols={2}>
+<Card title="Réplicas de uma Instance" icon="clone">
+`spec.replicas: N`. Um Service, uma credencial, uma configuração; o operator distribui entre os pods.
+</Card>
+<Card title="Várias Instances" icon="layer-group">
+Uma `Instance` por finalidade (AIOps, chat de um time, outro provider). Cada uma tem Deployment, Service, credenciais e chave de criptografia próprios.
+</Card>
+</CardGroup>
+
+### Réplicas
+
+- Com `replicas` > 1 o Service é headless, e cada conexão nova resolve para um dos pods prontos.
+- Cada pod é um **servidor independente**: memória, watcher e estado em `emptyDir` próprios. As réplicas não compartilham nada além do volume de sessões, quando existe.
+- O stream de alertas do operator se conecta a um pod por vez, então a Instance que conduz o AIOps não ganha nada com réplicas extras.
+
+### Várias Instances
+
+- Crie quantas precisar, num namespace ou em vários.
+- **O AIOps se liga a exatamente uma Instance**, a fixada com `aiops.instance` no chart do operator (`CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<nome>`). As outras Instances atendem chat e API e nunca são escolhidas implicitamente.
+- Cada Instance ganha seu próprio Secret de chave de criptografia em repouso, `<instance>-atrest-key`. Faça backup de cada um (veja [Criptografia em Repouso](/pt/security/encryption-at-rest#kubernetes)).
+
+---
+
+## A persistência decide o rollout
+
+`spec.persistence.enabled` dá às sessões um PVC `ReadWriteOnce`. Essa única opção muda como a Instance pode escalar e como ela é atualizada:
+
+| | Sem persistência | Com persistência (`ReadWriteOnce`) |
+|---|---|---|
+| Estratégia do Deployment | `RollingUpdate` | `Recreate` |
+| Rollout | Os pods novos sobem antes de os antigos pararem; sem indisponibilidade | Todo pod antigo para antes de qualquer novo subir; breve indisponibilidade |
+| Réplicas em nós diferentes | Sim | Não: toda réplica precisa rodar no nó que tem o volume |
+| Sessões depois de um restart do pod | Perdidas (ficam em `emptyDir`) | Mantidas |
+| Drenagem no desligamento (`CHATCLI_SERVER_SHUTDOWN_DELAY`) | `5s`, definido pelo operator | Não definida: só aumentaria a indisponibilidade |
+
+<Warning>
+Não force réplicas de uma Instance com persistência em nós diferentes. Um volume `ReadWriteOnce` se anexa a um nó. Em storage local do nó (local-path, `hostPath`), o segundo pod fica `Pending` para sempre com `didn't match pod anti-affinity rules` e os outros nós filtrados pela afinidade de nó do volume. Em storage de bloco em rede (EBS, Persistent Disk, Azure Disk), ele é agendado em outro nó e fica em `ContainerCreating` com `Multi-Attach error`.
+</Warning>
+
+### A drenagem no desligamento
+
+Quando um pod é substituído, ele sai dos endpoints do Service e do DNS do cluster alguns segundos depois de receber o SIGTERM (o DNS guarda os registros de Service por 5 segundos). Um servidor que parasse de escutar na hora recusaria as conexões que ainda o resolvem. Com `CHATCLI_SERVER_SHUTDOWN_DELAY`, o servidor responde `NOT_SERVING` aos health checks na hora, para que load balancers e clientes que fazem health check se afastem, mas continua atendendo requisições durante o intervalo, e só então para.
+
+- O operator define `5s` em toda Instance sem persistência. Uma entrada `CHATCLI_SERVER_SHUTDOWN_DELAY` em `spec.extraEnv` substitui o valor (`0s` desliga).
+- O Helm chart do servidor o define por `server.shutdownDelay` (veja [Docker & Kubernetes](/pt/start/docker-deployment)).
+- Mantenha bem abaixo do `terminationGracePeriodSeconds` do pod (30 segundos por padrão).
+
+---
+
+## Layout recomendado
+
+Uma Instance para o AIOps que guarda seu estado, e um pool de réplicas sem estado para o tráfego de chat.
+
+<Steps>
+<Step title="Mantenha a Instance do AIOps com uma réplica e persistência">
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-aiops
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 1Gi
+  server:
+    tls: { enabled: true, secretName: chatcli-tls }
+    token: { name: chatcli-auth, key: token }
+  watcher:
+    enabled: true
+    targets:
+      - { kind: Deployment, name: api, namespace: default }
+```
+
+Fixe-a nos values do operator e passe o arquivo em todo upgrade:
+
+```yaml
+aiops:
+  instance:
+    namespace: chatcli-system
+    name: chatcli-aiops
+```
+
+Cada rollout dessa Instance tem uma breve indisponibilidade (`Recreate`). Nesse meio-tempo o WatcherBridge loga `Alert stream ended; reopening` e reconecta sozinho.
+
+</Step>
+<Step title="Acrescente um pool sem estado para o chat">
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chat-pool
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 3
+  persistence:
+    enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  server:
+    tls: { enabled: true, secretName: chat-pool-tls }
+    token: { name: chatcli-auth, key: token }
+  scheduling:
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: chat-pool
+```
+
+- A anti-afinidade `preferred` espalha os pods entre os nós quando dá, e ainda os agenda quando há menos nós do que réplicas. Use `required` só quando tiver pelo menos tantos nós quanto réplicas.
+- O certificado TLS precisa valer para `chat-pool.<namespace>.svc.cluster.local`. Dá para reusar um Secret em várias Instances se os SANs dele cobrirem todos os nomes.
+- As sessões ficam em `emptyDir`: um cliente cujo pod é substituído começa uma sessão nova.
+
+</Step>
+<Step title="Confira as duas">
+
+```bash
+kubectl get instances -n chatcli-system
+kubectl -n chatcli-system get pods -l app.kubernetes.io/instance=chat-pool -o wide
+kubectl -n chatcli-system get deploy chat-pool -o jsonpath='{.spec.strategy.type}{"\n"}'
+kubectl -n chatcli-system logs deploy/chatcli-operator | grep "Connected to Instance"
+```
+
+As duas Instances mostram `READY true`, os pods do pool estão em nós diferentes, a estratégia dele é `RollingUpdate`, e a linha `Connected to Instance` do operator cita só a Instance do AIOps.
+
+</Step>
+</Steps>
+
+---
+
+## Quanto custa um rollout, medido
+
+Um pod de sonda rodou `chatcli healthcheck` contra o Service de cada Instance a cada 0,3 segundo enquanto uma mudança em `spec.extraEnv` fazia o rollout. O cluster era um kind com um control plane e dois workers, storage local do nó, ChatCLI 1.221.1, mais um build do servidor com a drenagem.
+
+| Instance | Estratégia | Checagens | Falhas | O que aconteceu |
+|---|---|---|---|---|
+| 2 réplicas, persistência | `Recreate` | 222 | 9 | Cerca de 20 segundos sem nenhum pod: os antigos param, depois os novos sobem |
+| 3 réplicas, sem persistência, sem drenagem | `RollingUpdate` | 313 | 1 | Uma conexão nova resolveu um pod que já tinha parado e estourou o tempo |
+| 3 réplicas, sem persistência, drenagem de `5s`, dois rollouts | `RollingUpdate` | 395 | 0 | 25 checagens foram respondidas `NOT_SERVING` por um pod drenando (uma requisição teria sido atendida) |
+
+As duas réplicas com persistência caíram no mesmo nó, aquele em que o volume local-path foi criado. Exigir que ficassem em nós diferentes deixou o segundo pod `Pending`, como descrito no aviso acima.
+
+Para reproduzir, monte um pod de sonda a partir do `busybox` com um binário `chatcli` da arquitetura do nó e a CA da Instance montada, e rode o laço:
+
+```bash
+while true; do
+  chatcli healthcheck -timeout 2s \
+    -addr chat-pool.chatcli-system.svc.cluster.local:50051 \
+    -tls-cert /tls/ca.crt >/dev/null 2>&1 && echo ok || echo FAIL
+  sleep 0.3
+done
+```
+
+A imagem do servidor é distroless (não tem shell), por isso o laço roda em outra imagem.
+
+---
+
+## Limites que vale conhecer
+
+- O operator não cria HorizontalPodAutoscaler nem PodDisruptionBudget para Instances. Acrescente os seus se usar autoscaling ou drenar nós com frequência; um HPA numa Instance disputa com `spec.replicas`, então prefira ajustar `spec.replicas`.
+- Réplicas não compartilham memória nem sessões. Estado que precisa sobreviver a um pod vai na persistência (uma réplica) ou fora do servidor.
+- O próprio operator escala à parte: `replicaCount: 2` ou mais com `leaderElect: true` no chart dele. Os controllers rodam no líder; o dashboard e a API REST respondem em todas as réplicas.
+
+## Relacionados
+
+- [Kubernetes Operator](/pt/kubernetes/k8s-operator#alta-disponibilidade)
+- [AIOps em produção](/pt/cookbook/aiops-production-setup)
+- [Criptografia em Repouso](/pt/security/encryption-at-rest#kubernetes)

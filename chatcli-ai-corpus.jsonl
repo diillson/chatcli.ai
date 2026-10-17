@@ -13287,7 +13287,7 @@ tmpVolume:
 
 ```bash
 helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-  --version 1.221.1 \
+  --version 1.221.2 \
   --namespace chatcli-system --create-namespace \
   -f values-operator.yaml
 ```
@@ -13988,7 +13988,7 @@ spec:
 The repository ships four dashboards in `deploy/grafana/`. Their panels reference the datasource `${DS_PROMETHEUS}`, which the Grafana import dialog resolves, but sidecar provisioning does not. For the sidecar, substitute your Prometheus datasource UID first (`prometheus` in kube-prometheus-stack; check **Connections → Data sources** in Grafana):
 
 ```bash
-git clone --depth 1 --branch v1.221.1 https://github.com/diillson/chatcli.git
+git clone --depth 1 --branch v1.221.2 https://github.com/diillson/chatcli.git
 mkdir -p chatcli-dashboards
 for f in chatcli/deploy/grafana/*.json; do
   sed 's/\${DS_PROMETHEUS}/prometheus/g' "$f" > "chatcli-dashboards/$(basename "$f")"
@@ -14477,7 +14477,7 @@ Each run collects once (up to 10 seconds) before asking, so the answer reflects 
 
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --namespace monitoring --create-namespace \
       --set llm.provider=CLAUDEAI \
       --set secrets.anthropicApiKey="$ANTHROPIC_API_KEY" \
@@ -14508,7 +14508,7 @@ Each run collects once (up to 10 seconds) before asking, so the answer reflects 
     ```
 
     ```text
-    Connected to ChatCLI server (version: 1.221.1, provider: CLAUDEAI, model: claude-sonnet-5)
+    Connected to ChatCLI server (version: 1.221.2, provider: CLAUDEAI, model: claude-sonnet-5)
     K8s watcher active: multi/1 targets (context injected into all prompts)
     ```
 
@@ -14545,7 +14545,7 @@ The operator provisions the server from an `Instance`, reads the watcher's alert
 
     ```bash
     helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 \
+      --version 1.221.2 \
       -n chatcli-system --create-namespace
     ```
   
@@ -14649,7 +14649,7 @@ The operator provisions the server from an `Instance`, reads the watcher's alert
     - [ ] Server: credential set, TLS before exposing it
     - [ ] Test: "Is the deployment healthy?"
   
-    - [ ] Operator installed with `--version 1.221.1`
+    - [ ] Operator installed with `--version 1.221.2`
     - [ ] Secrets: provider key, server token, TLS (`tls.crt`, `tls.key`, `ca.crt`)
     - [ ] Instance with `server.token`, `server.tls`, `watcher.enabled` and targets with `namespace`
     - [ ] Conditions all `True`, `ServerReachable=True`
@@ -15279,6 +15279,180 @@ This allows devs to save sessions on the server to share with the team, or local
 
 
 
+===== FILE: cookbook/scaling-instances.mdx =====
+TITLE: Recipe: Scaling Instances
+
+# Recipe: Scaling Instances
+
+An Instance scales two ways: more **replicas** of the same Instance, or more **Instances**. Which one fits depends on what the server keeps on disk and on whether it drives AIOps. This recipe explains the trade-offs, gives a layout that works in production, and shows what a rollout costs in each case, as measured on a three-node cluster.
+
+---
+
+## The two ways to scale
+
+`spec.replicas: N`. One Service, one credential, one configuration; the operator balances across the pods.
+
+One `Instance` per purpose (AIOps, chat for a team, another provider). Each has its own Deployment, Service, credentials and encryption key.
+
+### Replicas
+
+- With `replicas` > 1 the Service is headless, and every new connection resolves to one of the ready pods.
+- Each pod is an **independent server**: its own memory, watcher and `emptyDir` state. Nothing is shared between replicas except the sessions volume, when there is one.
+- The operator's alert stream attaches to one pod at a time, so the Instance that drives AIOps gains nothing from extra replicas.
+
+### Several Instances
+
+- Create as many as you need, in one namespace or several.
+- **AIOps attaches to exactly one Instance**, the one pinned with `aiops.instance` in the operator chart (`CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<name>`). The other Instances serve chat and API traffic and are never picked up implicitly.
+- Each Instance gets its own encryption-at-rest key Secret, `<instance>-atrest-key`. Back up each one (see [Encryption at Rest](/security/encryption-at-rest#kubernetes)).
+
+---
+
+## Persistence decides the rollout
+
+`spec.persistence.enabled` gives the sessions a `ReadWriteOnce` PVC. That one setting changes how the Instance can scale and how it rolls:
+
+| | Without persistence | With persistence (`ReadWriteOnce`) |
+|---|---|---|
+| Deployment strategy | `RollingUpdate` | `Recreate` |
+| Rollout | New pods start before old ones stop; no downtime | Every old pod stops before any new one starts; brief downtime |
+| Replicas on different nodes | Yes | No: every replica must run on the node that holds the volume |
+| Sessions after a pod restart | Lost (kept in `emptyDir`) | Kept |
+| Shutdown drain (`CHATCLI_SERVER_SHUTDOWN_DELAY`) | `5s`, set by the operator | Not set: it would only lengthen the downtime |
+
+Do not force replicas of a persistent Instance onto different nodes. A `ReadWriteOnce` volume attaches to one node. On node-local storage (local-path, `hostPath`), the second pod stays `Pending` forever with `didn't match pod anti-affinity rules` and the other nodes filtered out by the volume's node affinity. On network block storage (EBS, Persistent Disk, Azure Disk), it is scheduled on another node and stays in `ContainerCreating` with `Multi-Attach error`.
+
+### The shutdown drain
+
+When a pod is replaced, it leaves the Service endpoints and the cluster DNS a few seconds after it receives SIGTERM (DNS caches Service records for 5 seconds). A server that stopped listening at once would refuse the connections that still resolve it. With `CHATCLI_SERVER_SHUTDOWN_DELAY`, the server answers health checks with `NOT_SERVING` at once, so load balancers and health-checking clients move away, but keeps serving requests for the delay, and only then stops.
+
+- The operator sets `5s` on every Instance without persistence. A `CHATCLI_SERVER_SHUTDOWN_DELAY` entry in `spec.extraEnv` replaces it (`0s` turns it off).
+- The Helm chart of the server sets it through `server.shutdownDelay` (see [Docker & Kubernetes](/start/docker-deployment)).
+- Keep it well below the pod's `terminationGracePeriodSeconds` (30 seconds by default).
+
+---
+
+## Recommended layout
+
+One Instance for AIOps that keeps its state, and a pool of stateless replicas for chat traffic.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-aiops
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 1Gi
+  server:
+    tls: { enabled: true, secretName: chatcli-tls }
+    token: { name: chatcli-auth, key: token }
+  watcher:
+    enabled: true
+    targets:
+      - { kind: Deployment, name: api, namespace: default }
+```
+
+Pin it in the operator values and pass the file on every upgrade:
+
+```yaml
+aiops:
+  instance:
+    namespace: chatcli-system
+    name: chatcli-aiops
+```
+
+Each rollout of this Instance has a brief downtime (`Recreate`). During it the WatcherBridge logs `Alert stream ended; reopening` and reconnects by itself.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chat-pool
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 3
+  persistence:
+    enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  server:
+    tls: { enabled: true, secretName: chat-pool-tls }
+    token: { name: chatcli-auth, key: token }
+  scheduling:
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: chat-pool
+```
+
+- `preferred` anti-affinity spreads the pods across nodes when it can, and still schedules them when there are fewer nodes than replicas. Use `required` only when you have at least as many nodes as replicas.
+- The TLS certificate must be valid for `chat-pool.<namespace>.svc.cluster.local`. You can reuse one Secret for several Instances if its SANs cover all of their names.
+- Sessions live in `emptyDir`: a client whose pod is replaced starts a new session.
+
+```bash
+kubectl get instances -n chatcli-system
+kubectl -n chatcli-system get pods -l app.kubernetes.io/instance=chat-pool -o wide
+kubectl -n chatcli-system get deploy chat-pool -o jsonpath='{.spec.strategy.type}{"\n"}'
+kubectl -n chatcli-system logs deploy/chatcli-operator | grep "Connected to Instance"
+```
+
+Both Instances report `READY true`, the pool's pods are on different nodes, its strategy is `RollingUpdate`, and the operator's `Connected to Instance` line names only the AIOps Instance.
+
+---
+
+## What a rollout costs, measured
+
+A probe pod ran `chatcli healthcheck` against each Instance's Service every 0.3 seconds while a change to `spec.extraEnv` rolled it. The cluster was kind with one control plane and two workers, node-local storage, ChatCLI 1.221.1, plus a build of the server with the shutdown drain.
+
+| Instance | Strategy | Checks | Failed | What happened |
+|---|---|---|---|---|
+| 2 replicas, persistence | `Recreate` | 222 | 9 | About 20 seconds without any pod: the old pods stop, then the new ones start |
+| 3 replicas, no persistence, no drain | `RollingUpdate` | 313 | 1 | One new connection resolved a pod that had already stopped and timed out |
+| 3 replicas, no persistence, `5s` drain, two rollouts | `RollingUpdate` | 395 | 0 | 25 checks were answered `NOT_SERVING` by a draining pod (a request would have been served) |
+
+The two persistent replicas landed on the same node, the one the local-path volume was bound to. Requiring them on different nodes left the second pod `Pending`, as described in the warning above.
+
+To reproduce it, build a probe pod from `busybox` with a `chatcli` binary for the node's architecture and the CA of the Instance mounted, then loop:
+
+```bash
+while true; do
+  chatcli healthcheck -timeout 2s \
+    -addr chat-pool.chatcli-system.svc.cluster.local:50051 \
+    -tls-cert /tls/ca.crt >/dev/null 2>&1 && echo ok || echo FAIL
+  sleep 0.3
+done
+```
+
+The server image is distroless (it has no shell), which is why the loop runs in another image.
+
+---
+
+## Limits to know
+
+- The operator creates no HorizontalPodAutoscaler or PodDisruptionBudget for Instances. Add your own if you autoscale or drain nodes often; an HPA on an Instance competes with `spec.replicas`, so prefer adjusting `spec.replicas`.
+- Replicas do not share memory or sessions. Put state that must survive a pod in persistence (one replica) or outside the server.
+- The operator itself scales separately: `replicaCount: 2` or more with `leaderElect: true` in its chart. The controllers run on the leader; the dashboard and REST API answer on every replica.
+
+## Related
+
+- [Kubernetes Operator](/kubernetes/k8s-operator#high-availability)
+- [AIOps production setup](/cookbook/aiops-production-setup)
+- [Encryption at Rest](/security/encryption-at-rest#kubernetes)
+
+
+
 ===== FILE: cookbook/scheduler-automations.mdx =====
 TITLE: Scheduler automation recipes
 
@@ -15786,7 +15960,7 @@ serviceMonitor:
 
 ```bash
 helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --version 1.221.1 \
+  --version 1.221.2 \
   --namespace chatcli \
   -f values-prod.yaml
 ```
@@ -15892,12 +16066,12 @@ These matter only if the server runs agent work or loads plugins.
 Release images are signed with cosign (keyless) and carry SBOM and provenance attestations.
 
 ```bash
-cosign verify ghcr.io/diillson/chatcli:1.221.1 \
+cosign verify ghcr.io/diillson/chatcli:1.221.2 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/diillson/chatcli/\.github/workflows/(3-publish-release|image-refresh)\.yml@refs/heads/main$'
 ```
 
-Use the same command for `ghcr.io/diillson/chatcli-operator:1.221.1`. Pin image tags, or digests, in production instead of `latest`.
+Use the same command for `ghcr.io/diillson/chatcli-operator:1.221.2`. Pin image tags, or digests, in production instead of `latest`.
 
 ## Step 9: Verify the hardening
 
@@ -20676,7 +20850,7 @@ TITLE: ChatCLI
 <p className="chatcli-banner-tagline"><strong>Your terminal becomes an AI engineer.</strong><br />Fourteen providers, coder mode, agents, a gRPC server and a Kubernetes operator: one Go binary.</p>
 
 {/* release-strip:start */}
-<a className="cc-release" href="/releases/1.221.1"><span className="cc-release-label">New release</span><span className="cc-release-version">v1.221.1</span><span className="cc-release-summary">let use-keychain move the key file when the keychain holds another key</span><span className="cc-release-cta">Read release notes →</span></a>
+<a className="cc-release" href="/releases/1.221.2"><span className="cc-release-label">New release</span><span className="cc-release-version">v1.221.2</span><span className="cc-release-summary">keep the at-rest key when the Instance is deleted and retry write conflicts quietly</span><span className="cc-release-cta">Read release notes →</span></a>
 {/* release-strip:end */}
 
 <div className="cc-entry">
@@ -20913,16 +21087,16 @@ Text: group: 💻 Local; group: ☁️ Server / Operator; group: 🤖 LLM provid
   
 ## Current versions
 
-    **1.221.1** — The binary you install and use in your terminal. Interactive mode, agent, coder, smart context, and remote server connection. <br />
+    **1.221.2** — The binary you install and use in your terminal. Interactive mode, agent, coder, smart context, and remote server connection. <br />
     `brew install chatcli` · `go install` · [binary](https://github.com/diillson/chatcli/releases)
   
-    **1.221.1** — Centralized deployment for teams. Clients connect via `chatcli connect` and share LLM providers, sessions, and plugins. <br />
-    `ghcr.io/diillson/chatcli:1.221.1`
+    **1.221.2** — Centralized deployment for teams. Clients connect via `chatcli connect` and share LLM providers, sessions, and plugins. <br />
+    `ghcr.io/diillson/chatcli:1.221.2`
   
-    **1.221.1** — Autonomous incident detection, AI-powered analysis, and automated remediation for Kubernetes clusters. 17 CRDs, 54+ actions. <br />
-    `ghcr.io/diillson/chatcli-operator:1.221.1`
+    **1.221.2** — Autonomous incident detection, AI-powered analysis, and automated remediation for Kubernetes clusters. 17 CRDs, 54+ actions. <br />
+    `ghcr.io/diillson/chatcli-operator:1.221.2`
   
-    **1.221.1** — Distributed via ArtifactHub and OCI registry on GHCR. <br />
+    **1.221.2** — Distributed via ArtifactHub and OCI registry on GHCR. <br />
     `oci://ghcr.io/diillson/charts/chatcli` <br />
     `oci://ghcr.io/diillson/charts/chatcli-operator`
   
@@ -28407,7 +28581,7 @@ Elements: Instance CR; Deployment; Service; ConfigMap; ServiceAccount; PVC; Role
     ```bash
     helm install chatcli-operator \
       oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --namespace chatcli-system --create-namespace
     ```
   
@@ -28906,7 +29080,7 @@ Each AIOps kind has its own page under **AIOps Platform** in the sidebar, for ex
 
     ```bash
     helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 \
+      --version 1.221.2 \
       -n chatcli-system --create-namespace
     ```
 
@@ -28925,7 +29099,7 @@ Each AIOps kind has its own page under **AIOps Platform** in the sidebar, for ex
 
     `make deploy` runs `kubectl apply` on `config/crd/bases/` (the 17 CRDs), then `config/rbac/role.yaml` (creates the Namespace `chatcli-system`, the ServiceAccount, the operator ClusterRole and binding, and the shared ClusterRoles), then `config/manager/manager.yaml` (the Service and Deployment `chatcli-operator`).
 
-    - The image in `manager.yaml` is pinned to the release (`ghcr.io/diillson/chatcli-operator:1.221.1` for this release) and `make deploy` keeps it. It is replaced only when you pass `IMG` explicitly: `make deploy IMG=registry.example.com/chatcli-operator:dev`.
+    - The image in `manager.yaml` is pinned to the release (`ghcr.io/diillson/chatcli-operator:1.221.2` for this release) and `make deploy` keeps it. It is replaced only when you pass `IMG` explicitly: `make deploy IMG=registry.example.com/chatcli-operator:dev`.
     - `manager.yaml` sets `CHATCLI_OPERATOR_APP_VERSION` to the same release, so Instances without `spec.image.tag` run the matching server image. Passing `IMG` does not change it.
     - `make deploy-network-policy` applies the optional NetworkPolicy in `config/network-policy/` (remove it with `make undeploy-network-policy`).
     - `make undeploy` deletes the manager, the RBAC (including the `chatcli-system` Namespace that `role.yaml` declares) and the CRDs, and with them every custom resource.
@@ -29149,7 +29323,7 @@ The walkthrough creates an Instance named `chatcli` in the namespace `chatcli`. 
     kubectl apply -f instance.yaml
     ```
 
-    `spec.image.tag` is omitted on purpose: the operator runs the server image that matches its own release (`ghcr.io/diillson/chatcli:1.221.1`).
+    `spec.image.tag` is omitted on purpose: the operator runs the server image that matches its own release (`ghcr.io/diillson/chatcli:1.221.2`).
   
     ```bash
     kubectl -n chatcli get instance chatcli
@@ -29157,7 +29331,7 @@ The walkthrough creates an Instance named `chatcli` in the namespace `chatcli`. 
 
     ```text
     NAME      READY   REPLICAS   PROVIDER   VERSION             AGE
-    chatcli   true    1          CLAUDEAI   v1.221.1   2m
+    chatcli   true    1          CLAUDEAI   v1.221.2   2m
     ```
 
     `READY` means the Deployment has all its replicas ready. `VERSION` is what the running server reported to the operator's own probe: it is only filled once the operator reached the server over TLS with its credential. Read every condition at once:
@@ -29172,7 +29346,7 @@ The walkthrough creates an Instance named `chatcli` in the namespace `chatcli`. 
     AuthenticationConfigured=True CredentialConfigured: server has a credential, or binds loopback only
     OperatorCredentialConfigured=True CredentialAvailable: operator authenticates with spec.server.token
     Available=True DeploymentReady: All replicas are ready
-    ServerReachable=True Serving: server v1.221.1 serving (CLAUDEAI/claude-sonnet-5)
+    ServerReachable=True Serving: server v1.221.2 serving (CLAUDEAI/claude-sonnet-5)
     ```
   
 ### Instance conditions
@@ -29354,7 +29528,7 @@ The list is read by the **operator** process, so extend it on the operator chart
 
 ```bash
 helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-  --version 1.221.1 -n chatcli-system -f operator-values.yaml \
+  --version 1.221.2 -n chatcli-system -f operator-values.yaml \
   --set security.allowedDiagnosticCommands="curl -s localhost:5678/health\,nc -zv redis.default.svc.cluster.local 6379"
 
 kubectl -n chatcli-system logs deploy/chatcli-operator | grep 'Effective ExecDiagnostic allowlist loaded'
@@ -29620,7 +29794,7 @@ Everything is named after the Instance, labeled `app.kubernetes.io/name: chatcli
 
 **The Deployment** runs `chatcli server --port <port> --metrics-port <metricsPort> --provider ... [--model ...] [--tls-cert ... --tls-key ... [--tls-client-ca ...]] [--mcp-config ...] [--watch-config ... | --watch-deployment ...]` with:
 
-- strategy `Recreate` when `persistence.enabled` (the sessions PVC is ReadWriteOnce, so the old pod releases it before the new one starts; each rollout has a brief downtime), otherwise `RollingUpdate`;
+- strategy `Recreate` when `persistence.enabled` (the sessions PVC is ReadWriteOnce, so the old pod releases it before the new one starts; each rollout has a brief downtime), otherwise `RollingUpdate` with `CHATCLI_SERVER_SHUTDOWN_DELAY=5s`: on SIGTERM the server reports `NOT_SERVING` but keeps answering for 5 seconds while the pod leaves the Service endpoints and DNS (a `spec.extraEnv` entry replaces the value; see [Scaling Instances](/cookbook/scaling-instances));
 - probes on `GET /healthz` of the `metrics` port (plain HTTP, no credential): startup every 5s up to 5 minutes, readiness every 10s (out of the Service after 30s of failures), liveness every 20s (restart after 2 minutes);
 - pod security context `runAsNonRoot`, UID 1000, `fsGroup: 1000` with `fsGroupChangePolicy: OnRootMismatch` (so a fresh sessions volume is writable whatever the provisioner does), `seccompProfile: RuntimeDefault` (unless `spec.securityContext`), and for every container, the `plugin-loader` init container included, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, all capabilities dropped: the pod passes the `restricted` Pod Security Standard;
 - writable emptyDirs `/tmp` (100Mi) and `/home/chatcli/.chatcli` (200Mi); anything outside the sessions PVC is lost when the pod restarts;
@@ -29687,6 +29861,8 @@ Rotating the shared token rolls the server and switches the operator at the same
 The operator applies **no** requests or limits to Instances, which leaves the pods BestEffort: first to be evicted under node pressure. Start from `requests: {cpu: 250m, memory: 256Mi}` and `limits: {cpu: "1", memory: 1Gi}` and adjust to your traffic; the watcher, MCP servers and the pipeline RPCs add to the footprint. The operator itself defaults to 100m/128Mi requests and 500m/256Mi limits; raise them on clusters with many Issues.
 
 ### High availability
+
+For a layout that combines a persistent AIOps Instance with a stateless pool, and what a rollout costs in each case, see [Scaling Instances](/cookbook/scaling-instances).
 
 - **Operator:** run `replicaCount: 2` or more with `leaderElect: true`. The controllers and the WatcherBridge run on the leader only; the REST API and dashboard are served by every replica, so the Service keeps answering during a failover. The chart creates no PodDisruptionBudget for the operator; add one if you drain nodes often.
 - **Instances:** `replicas` > 1 turns the Service headless and the operator balances round-robin across pods. Each pod is an independent server (its own memory, watcher and emptyDir state), and the alert stream attaches to one pod at a time. For an AIOps Instance, one replica is usually right.
@@ -29757,7 +29933,7 @@ Instance pods and the operator pod meet the `restricted` Pod Security Standard w
 - Operator and server images are published as `ghcr.io/diillson/chatcli-operator:<version>` and `ghcr.io/diillson/chatcli:<version>` (plus `latest`), multi-arch (amd64, arm64), with SBOM and provenance, signed keyless with cosign:
 
   ```bash
-  cosign verify ghcr.io/diillson/chatcli-operator:1.221.1 \
+  cosign verify ghcr.io/diillson/chatcli-operator:1.221.2 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-identity-regexp '^https://github.com/diillson/chatcli/'
   ```
@@ -29818,7 +29994,7 @@ An upgrade replaces the operator and, for every Instance that follows the operat
 
     ```bash
     helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 -n chatcli-system -f operator-values.yaml
+      --version 1.221.2 -n chatcli-system -f operator-values.yaml
     ```
 
     Without a values file, `--reset-then-reuse-values` (Helm 3.14+) starts from the new chart's defaults and re-applies your previous overrides. Do not use plain `--reuse-values`: it skips the defaults of keys added by the new chart and can fail to render (`nil pointer evaluating`).
@@ -29826,7 +30002,7 @@ An upgrade replaces the operator and, for every Instance that follows the operat
     From a checkout of the new release:
 
     ```bash
-    git checkout v1.221.1
+    git checkout v1.221.2
     cd operator
     make deploy
     ```
@@ -29844,10 +30020,10 @@ An upgrade replaces the operator and, for every Instance that follows the operat
 ### Verify
 
 ```bash
-helm -n chatcli-system list                                    # CHART chatcli-operator-1.221.1
+helm -n chatcli-system list                                    # CHART chatcli-operator-1.221.2
 kubectl get crd -o name | grep -c 'platform.chatcli.io'        # 17
 kubectl -n chatcli-system rollout status deploy/chatcli-operator
-kubectl get instances -A                                       # READY true, VERSION v1.221.1
+kubectl get instances -A                                       # READY true, VERSION v1.221.2
 kubectl -n chatcli get instance chatcli \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
@@ -45508,7 +45684,7 @@ tmpVolume:
 
 ```bash
 helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-  --version 1.221.1 \
+  --version 1.221.2 \
   --namespace chatcli-system --create-namespace \
   -f values-operator.yaml
 ```
@@ -46209,7 +46385,7 @@ spec:
 O repositório traz quatro dashboards em `deploy/grafana/`. Os painéis referenciam o datasource `${DS_PROMETHEUS}`, que a tela de importação do Grafana resolve, mas o provisionamento pelo sidecar não. Para o sidecar, troque antes pelo UID do seu datasource do Prometheus (`prometheus` no kube-prometheus-stack; confira em **Connections → Data sources** no Grafana):
 
 ```bash
-git clone --depth 1 --branch v1.221.1 https://github.com/diillson/chatcli.git
+git clone --depth 1 --branch v1.221.2 https://github.com/diillson/chatcli.git
 mkdir -p chatcli-dashboards
 for f in chatcli/deploy/grafana/*.json; do
   sed 's/\${DS_PROMETHEUS}/prometheus/g' "$f" > "chatcli-dashboards/$(basename "$f")"
@@ -46698,7 +46874,7 @@ Cada execução coleta uma vez (até 10 segundos) antes de perguntar, então a r
 
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --namespace monitoring --create-namespace \
       --set llm.provider=CLAUDEAI \
       --set secrets.anthropicApiKey="$ANTHROPIC_API_KEY" \
@@ -46729,7 +46905,7 @@ Cada execução coleta uma vez (até 10 segundos) antes de perguntar, então a r
     ```
 
     ```text
-    Connected to ChatCLI server (version: 1.221.1, provider: CLAUDEAI, model: claude-sonnet-5)
+    Connected to ChatCLI server (version: 1.221.2, provider: CLAUDEAI, model: claude-sonnet-5)
     K8s watcher active: multi/1 targets (context injected into all prompts)
     ```
 
@@ -46766,7 +46942,7 @@ O operator provisiona o servidor a partir de uma `Instance`, lê os alertas do w
 
     ```bash
     helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 \
+      --version 1.221.2 \
       -n chatcli-system --create-namespace
     ```
   
@@ -46870,7 +47046,7 @@ O operator provisiona o servidor a partir de uma `Instance`, lê os alertas do w
     - [ ] Servidor: credencial definida, TLS antes de expor
     - [ ] Teste: "O deployment está saudável?"
   
-    - [ ] Operator instalado com `--version 1.221.1`
+    - [ ] Operator instalado com `--version 1.221.2`
     - [ ] Secrets: chave do provedor, token do servidor, TLS (`tls.crt`, `tls.key`, `ca.crt`)
     - [ ] Instance com `server.token`, `server.tls`, `watcher.enabled` e alvos com `namespace`
     - [ ] Conditions todas `True`, `ServerReachable=True`
@@ -47500,6 +47676,180 @@ Isso permite que devs salvem sessões no servidor para compartilhar com a equipe
 
 
 
+===== FILE: pt/cookbook/scaling-instances.mdx =====
+TITLE: Receita: Escalando Instances
+
+# Receita: Escalando Instances
+
+Uma Instance escala de dois jeitos: mais **réplicas** da mesma Instance, ou mais **Instances**. Qual serve depende do que o servidor guarda em disco e de ele conduzir ou não o AIOps. Esta receita explica as escolhas, traz um layout que funciona em produção e mostra quanto custa um rollout em cada caso, medido num cluster de três nós.
+
+---
+
+## Os dois jeitos de escalar
+
+`spec.replicas: N`. Um Service, uma credencial, uma configuração; o operator distribui entre os pods.
+
+Uma `Instance` por finalidade (AIOps, chat de um time, outro provider). Cada uma tem Deployment, Service, credenciais e chave de criptografia próprios.
+
+### Réplicas
+
+- Com `replicas` > 1 o Service é headless, e cada conexão nova resolve para um dos pods prontos.
+- Cada pod é um **servidor independente**: memória, watcher e estado em `emptyDir` próprios. As réplicas não compartilham nada além do volume de sessões, quando existe.
+- O stream de alertas do operator se conecta a um pod por vez, então a Instance que conduz o AIOps não ganha nada com réplicas extras.
+
+### Várias Instances
+
+- Crie quantas precisar, num namespace ou em vários.
+- **O AIOps se liga a exatamente uma Instance**, a fixada com `aiops.instance` no chart do operator (`CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<nome>`). As outras Instances atendem chat e API e nunca são escolhidas implicitamente.
+- Cada Instance ganha seu próprio Secret de chave de criptografia em repouso, `<instance>-atrest-key`. Faça backup de cada um (veja [Criptografia em Repouso](/pt/security/encryption-at-rest#kubernetes)).
+
+---
+
+## A persistência decide o rollout
+
+`spec.persistence.enabled` dá às sessões um PVC `ReadWriteOnce`. Essa única opção muda como a Instance pode escalar e como ela é atualizada:
+
+| | Sem persistência | Com persistência (`ReadWriteOnce`) |
+|---|---|---|
+| Estratégia do Deployment | `RollingUpdate` | `Recreate` |
+| Rollout | Os pods novos sobem antes de os antigos pararem; sem indisponibilidade | Todo pod antigo para antes de qualquer novo subir; breve indisponibilidade |
+| Réplicas em nós diferentes | Sim | Não: toda réplica precisa rodar no nó que tem o volume |
+| Sessões depois de um restart do pod | Perdidas (ficam em `emptyDir`) | Mantidas |
+| Drenagem no desligamento (`CHATCLI_SERVER_SHUTDOWN_DELAY`) | `5s`, definido pelo operator | Não definida: só aumentaria a indisponibilidade |
+
+Não force réplicas de uma Instance com persistência em nós diferentes. Um volume `ReadWriteOnce` se anexa a um nó. Em storage local do nó (local-path, `hostPath`), o segundo pod fica `Pending` para sempre com `didn't match pod anti-affinity rules` e os outros nós filtrados pela afinidade de nó do volume. Em storage de bloco em rede (EBS, Persistent Disk, Azure Disk), ele é agendado em outro nó e fica em `ContainerCreating` com `Multi-Attach error`.
+
+### A drenagem no desligamento
+
+Quando um pod é substituído, ele sai dos endpoints do Service e do DNS do cluster alguns segundos depois de receber o SIGTERM (o DNS guarda os registros de Service por 5 segundos). Um servidor que parasse de escutar na hora recusaria as conexões que ainda o resolvem. Com `CHATCLI_SERVER_SHUTDOWN_DELAY`, o servidor responde `NOT_SERVING` aos health checks na hora, para que load balancers e clientes que fazem health check se afastem, mas continua atendendo requisições durante o intervalo, e só então para.
+
+- O operator define `5s` em toda Instance sem persistência. Uma entrada `CHATCLI_SERVER_SHUTDOWN_DELAY` em `spec.extraEnv` substitui o valor (`0s` desliga).
+- O Helm chart do servidor o define por `server.shutdownDelay` (veja [Docker & Kubernetes](/pt/start/docker-deployment)).
+- Mantenha bem abaixo do `terminationGracePeriodSeconds` do pod (30 segundos por padrão).
+
+---
+
+## Layout recomendado
+
+Uma Instance para o AIOps que guarda seu estado, e um pool de réplicas sem estado para o tráfego de chat.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-aiops
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 1Gi
+  server:
+    tls: { enabled: true, secretName: chatcli-tls }
+    token: { name: chatcli-auth, key: token }
+  watcher:
+    enabled: true
+    targets:
+      - { kind: Deployment, name: api, namespace: default }
+```
+
+Fixe-a nos values do operator e passe o arquivo em todo upgrade:
+
+```yaml
+aiops:
+  instance:
+    namespace: chatcli-system
+    name: chatcli-aiops
+```
+
+Cada rollout dessa Instance tem uma breve indisponibilidade (`Recreate`). Nesse meio-tempo o WatcherBridge loga `Alert stream ended; reopening` e reconecta sozinho.
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chat-pool
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 3
+  persistence:
+    enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  server:
+    tls: { enabled: true, secretName: chat-pool-tls }
+    token: { name: chatcli-auth, key: token }
+  scheduling:
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: chat-pool
+```
+
+- A anti-afinidade `preferred` espalha os pods entre os nós quando dá, e ainda os agenda quando há menos nós do que réplicas. Use `required` só quando tiver pelo menos tantos nós quanto réplicas.
+- O certificado TLS precisa valer para `chat-pool.<namespace>.svc.cluster.local`. Dá para reusar um Secret em várias Instances se os SANs dele cobrirem todos os nomes.
+- As sessões ficam em `emptyDir`: um cliente cujo pod é substituído começa uma sessão nova.
+
+```bash
+kubectl get instances -n chatcli-system
+kubectl -n chatcli-system get pods -l app.kubernetes.io/instance=chat-pool -o wide
+kubectl -n chatcli-system get deploy chat-pool -o jsonpath='{.spec.strategy.type}{"\n"}'
+kubectl -n chatcli-system logs deploy/chatcli-operator | grep "Connected to Instance"
+```
+
+As duas Instances mostram `READY true`, os pods do pool estão em nós diferentes, a estratégia dele é `RollingUpdate`, e a linha `Connected to Instance` do operator cita só a Instance do AIOps.
+
+---
+
+## Quanto custa um rollout, medido
+
+Um pod de sonda rodou `chatcli healthcheck` contra o Service de cada Instance a cada 0,3 segundo enquanto uma mudança em `spec.extraEnv` fazia o rollout. O cluster era um kind com um control plane e dois workers, storage local do nó, ChatCLI 1.221.1, mais um build do servidor com a drenagem.
+
+| Instance | Estratégia | Checagens | Falhas | O que aconteceu |
+|---|---|---|---|---|
+| 2 réplicas, persistência | `Recreate` | 222 | 9 | Cerca de 20 segundos sem nenhum pod: os antigos param, depois os novos sobem |
+| 3 réplicas, sem persistência, sem drenagem | `RollingUpdate` | 313 | 1 | Uma conexão nova resolveu um pod que já tinha parado e estourou o tempo |
+| 3 réplicas, sem persistência, drenagem de `5s`, dois rollouts | `RollingUpdate` | 395 | 0 | 25 checagens foram respondidas `NOT_SERVING` por um pod drenando (uma requisição teria sido atendida) |
+
+As duas réplicas com persistência caíram no mesmo nó, aquele em que o volume local-path foi criado. Exigir que ficassem em nós diferentes deixou o segundo pod `Pending`, como descrito no aviso acima.
+
+Para reproduzir, monte um pod de sonda a partir do `busybox` com um binário `chatcli` da arquitetura do nó e a CA da Instance montada, e rode o laço:
+
+```bash
+while true; do
+  chatcli healthcheck -timeout 2s \
+    -addr chat-pool.chatcli-system.svc.cluster.local:50051 \
+    -tls-cert /tls/ca.crt >/dev/null 2>&1 && echo ok || echo FAIL
+  sleep 0.3
+done
+```
+
+A imagem do servidor é distroless (não tem shell), por isso o laço roda em outra imagem.
+
+---
+
+## Limites que vale conhecer
+
+- O operator não cria HorizontalPodAutoscaler nem PodDisruptionBudget para Instances. Acrescente os seus se usar autoscaling ou drenar nós com frequência; um HPA numa Instance disputa com `spec.replicas`, então prefira ajustar `spec.replicas`.
+- Réplicas não compartilham memória nem sessões. Estado que precisa sobreviver a um pod vai na persistência (uma réplica) ou fora do servidor.
+- O próprio operator escala à parte: `replicaCount: 2` ou mais com `leaderElect: true` no chart dele. Os controllers rodam no líder; o dashboard e a API REST respondem em todas as réplicas.
+
+## Relacionados
+
+- [Kubernetes Operator](/pt/kubernetes/k8s-operator#alta-disponibilidade)
+- [AIOps em produção](/pt/cookbook/aiops-production-setup)
+- [Criptografia em Repouso](/pt/security/encryption-at-rest#kubernetes)
+
+
+
 ===== FILE: pt/cookbook/scheduler-automations.mdx =====
 TITLE: Automações com Scheduler
 
@@ -48008,7 +48358,7 @@ serviceMonitor:
 
 ```bash
 helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-  --version 1.221.1 \
+  --version 1.221.2 \
   --namespace chatcli \
   -f values-prod.yaml
 ```
@@ -48114,12 +48464,12 @@ Isto só importa se o servidor roda trabalho de agente ou carrega plugins.
 As imagens de release são assinadas com cosign (keyless) e trazem atestados de SBOM e proveniência.
 
 ```bash
-cosign verify ghcr.io/diillson/chatcli:1.221.1 \
+cosign verify ghcr.io/diillson/chatcli:1.221.2 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/diillson/chatcli/\.github/workflows/(3-publish-release|image-refresh)\.yml@refs/heads/main$'
 ```
 
-Use o mesmo comando para `ghcr.io/diillson/chatcli-operator:1.221.1`. Em produção, fixe as tags das imagens, ou os digests, em vez de `latest`.
+Use o mesmo comando para `ghcr.io/diillson/chatcli-operator:1.221.2`. Em produção, fixe as tags das imagens, ou os digests, em vez de `latest`.
 
 ## Passo 9: Verificar o hardening
 
@@ -53005,7 +53355,7 @@ TITLE: ChatCLI
 <p className="chatcli-banner-tagline"><strong>O terminal vira um engenheiro de IA.</strong><br />Catorze provedores, coder mode, agentes, um servidor gRPC e um operator Kubernetes: um único binário Go.</p>
 
 {/* release-strip:start */}
-<a className="cc-release" href="/pt/releases/1.221.1"><span className="cc-release-label">Nova release</span><span className="cc-release-version">v1.221.1</span><span className="cc-release-summary">let use-keychain move the key file when the keychain holds another key</span><span className="cc-release-cta">Ler as notas →</span></a>
+<a className="cc-release" href="/pt/releases/1.221.2"><span className="cc-release-label">Nova release</span><span className="cc-release-version">v1.221.2</span><span className="cc-release-summary">keep the at-rest key when the Instance is deleted and retry write conflicts quietly</span><span className="cc-release-cta">Ler as notas →</span></a>
 {/* release-strip:end */}
 
 <div className="cc-entry">
@@ -53242,16 +53592,16 @@ Text: group: 💻 Local; group: ☁️ Servidor / Operator; group: 🤖 Provedor
   
 ## Versões atuais
 
-    **1.221.1** — O binário que você instala e usa no seu terminal. Modo interativo, agente, coder, contexto inteligente e conexão remota a servidores. <br />
+    **1.221.2** — O binário que você instala e usa no seu terminal. Modo interativo, agente, coder, contexto inteligente e conexão remota a servidores. <br />
     `brew install chatcli` · `go install` · [binário](https://github.com/diillson/chatcli/releases)
   
-    **1.221.1** — Deploy centralizado para equipes. Clientes conectam via `chatcli connect` e compartilham provedores LLM, sessões e plugins. <br />
-    `ghcr.io/diillson/chatcli:1.221.1`
+    **1.221.2** — Deploy centralizado para equipes. Clientes conectam via `chatcli connect` e compartilham provedores LLM, sessões e plugins. <br />
+    `ghcr.io/diillson/chatcli:1.221.2`
   
-    **1.221.1** — Detecção autônoma de incidentes, análise com IA e remediação automática em clusters Kubernetes. 17 CRDs, 54+ ações. <br />
-    `ghcr.io/diillson/chatcli-operator:1.221.1`
+    **1.221.2** — Detecção autônoma de incidentes, análise com IA e remediação automática em clusters Kubernetes. 17 CRDs, 54+ ações. <br />
+    `ghcr.io/diillson/chatcli-operator:1.221.2`
   
-    **1.221.1** — Distribuídos via ArtifactHub e registro OCI no GHCR. <br />
+    **1.221.2** — Distribuídos via ArtifactHub e registro OCI no GHCR. <br />
     `oci://ghcr.io/diillson/charts/chatcli` <br />
     `oci://ghcr.io/diillson/charts/chatcli-operator`
   
@@ -60746,7 +61096,7 @@ Elements: Instance CR; Deployment; Service; ConfigMap; ServiceAccount; PVC; Role
     ```bash
     helm install chatcli-operator \
       oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --namespace chatcli-system --create-namespace
     ```
   
@@ -61245,7 +61595,7 @@ Cada kind de AIOps tem sua página em **AIOps Platform** na barra lateral, por e
 
     ```bash
     helm install chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 \
+      --version 1.221.2 \
       -n chatcli-system --create-namespace
     ```
 
@@ -61264,7 +61614,7 @@ Cada kind de AIOps tem sua página em **AIOps Platform** na barra lateral, por e
 
     O `make deploy` roda `kubectl apply` em `config/crd/bases/` (os 17 CRDs), depois em `config/rbac/role.yaml` (cria o Namespace `chatcli-system`, a ServiceAccount, a ClusterRole do operator com binding e as ClusterRoles compartilhadas) e por fim em `config/manager/manager.yaml` (o Service e o Deployment `chatcli-operator`).
 
-    - A imagem do `manager.yaml` é fixada na release (`ghcr.io/diillson/chatcli-operator:1.221.1` nesta release) e o `make deploy` a mantém. Ela só é trocada quando você passa `IMG` explicitamente: `make deploy IMG=registry.example.com/chatcli-operator:dev`.
+    - A imagem do `manager.yaml` é fixada na release (`ghcr.io/diillson/chatcli-operator:1.221.2` nesta release) e o `make deploy` a mantém. Ela só é trocada quando você passa `IMG` explicitamente: `make deploy IMG=registry.example.com/chatcli-operator:dev`.
     - O `manager.yaml` define `CHATCLI_OPERATOR_APP_VERSION` com a mesma release, então Instances sem `spec.image.tag` rodam a imagem de servidor correspondente. Passar `IMG` não altera esse valor.
     - `make deploy-network-policy` aplica a NetworkPolicy opcional de `config/network-policy/` (remova com `make undeploy-network-policy`).
     - `make undeploy` apaga o manager, o RBAC (inclusive o Namespace `chatcli-system` que o `role.yaml` declara) e os CRDs, e com eles todos os recursos customizados.
@@ -61488,7 +61838,7 @@ O passo a passo cria uma Instance chamada `chatcli` no namespace `chatcli`. O op
     kubectl apply -f instance.yaml
     ```
 
-    O `spec.image.tag` fica de fora de propósito: o operator roda a imagem de servidor da mesma release que ele (`ghcr.io/diillson/chatcli:1.221.1`).
+    O `spec.image.tag` fica de fora de propósito: o operator roda a imagem de servidor da mesma release que ele (`ghcr.io/diillson/chatcli:1.221.2`).
   
     ```bash
     kubectl -n chatcli get instance chatcli
@@ -61496,7 +61846,7 @@ O passo a passo cria uma Instance chamada `chatcli` no namespace `chatcli`. O op
 
     ```text
     NAME      READY   REPLICAS   PROVIDER   VERSION             AGE
-    chatcli   true    1          CLAUDEAI   v1.221.1   2m
+    chatcli   true    1          CLAUDEAI   v1.221.2   2m
     ```
 
     `READY` significa que o Deployment está com todas as réplicas prontas. `VERSION` é o que o servidor em execução informou à sonda do próprio operator: só aparece depois que o operator alcançou o servidor via TLS com a sua credencial. Leia todas as conditions de uma vez:
@@ -61511,7 +61861,7 @@ O passo a passo cria uma Instance chamada `chatcli` no namespace `chatcli`. O op
     AuthenticationConfigured=True CredentialConfigured: server has a credential, or binds loopback only
     OperatorCredentialConfigured=True CredentialAvailable: operator authenticates with spec.server.token
     Available=True DeploymentReady: All replicas are ready
-    ServerReachable=True Serving: server v1.221.1 serving (CLAUDEAI/claude-sonnet-5)
+    ServerReachable=True Serving: server v1.221.2 serving (CLAUDEAI/claude-sonnet-5)
     ```
   
 ### Condições da Instance
@@ -61693,7 +62043,7 @@ A lista é lida pelo processo do **operator**, então estenda no chart do operat
 
 ```bash
 helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-  --version 1.221.1 -n chatcli-system -f operator-values.yaml \
+  --version 1.221.2 -n chatcli-system -f operator-values.yaml \
   --set security.allowedDiagnosticCommands="curl -s localhost:5678/health\,nc -zv redis.default.svc.cluster.local 6379"
 
 kubectl -n chatcli-system logs deploy/chatcli-operator | grep 'Effective ExecDiagnostic allowlist loaded'
@@ -61960,7 +62310,7 @@ Tudo recebe o nome da Instance, os labels `app.kubernetes.io/name: chatcli`, `ap
 
 **O Deployment** roda `chatcli server --port <port> --metrics-port <metricsPort> --provider ... [--model ...] [--tls-cert ... --tls-key ... [--tls-client-ca ...]] [--mcp-config ...] [--watch-config ... | --watch-deployment ...]` com:
 
-- estratégia `Recreate` quando `persistence.enabled` (o PVC de sessões é ReadWriteOnce, então o pod antigo o libera antes de o novo subir; cada rollout tem uma breve indisponibilidade), senão `RollingUpdate`;
+- estratégia `Recreate` quando `persistence.enabled` (o PVC de sessões é ReadWriteOnce, então o pod antigo o libera antes de o novo subir; cada rollout tem uma breve indisponibilidade), senão `RollingUpdate` com `CHATCLI_SERVER_SHUTDOWN_DELAY=5s`: no SIGTERM o servidor responde `NOT_SERVING` mas continua atendendo por 5 segundos enquanto o pod sai dos endpoints do Service e do DNS (uma entrada em `spec.extraEnv` substitui o valor; veja [Escalando Instances](/pt/cookbook/scaling-instances));
 - probes em `GET /healthz` da porta `metrics` (HTTP puro, sem credencial): startup a cada 5s por até 5 minutos, readiness a cada 10s (sai do Service após 30s de falhas), liveness a cada 20s (reinicia após 2 minutos);
 - security context do pod `runAsNonRoot`, UID 1000, `fsGroup: 1000` com `fsGroupChangePolicy: OnRootMismatch` (para que um volume de sessões novo seja gravável seja qual for o provisioner), `seccompProfile: RuntimeDefault` (a menos que haja `spec.securityContext`) e, em todo container, inclusive o init container `plugin-loader`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` e todas as capabilities removidas: o pod passa no Pod Security Standard `restricted`;
 - emptyDirs graváveis `/tmp` (100Mi) e `/home/chatcli/.chatcli` (200Mi); tudo o que estiver fora do PVC de sessões se perde quando o pod reinicia;
@@ -62027,6 +62377,8 @@ O operator **não** aplica requests nem limits às Instances, o que deixa os pod
 
 ### Alta disponibilidade
 
+Para um layout que combina uma Instance de AIOps com persistência e um pool sem estado, e quanto custa um rollout em cada caso, veja [Escalando Instances](/pt/cookbook/scaling-instances).
+
 - **Operator:** rode `replicaCount: 2` ou mais com `leaderElect: true`. Os controllers e o WatcherBridge rodam só no líder; a API REST e o dashboard são servidos por todas as réplicas, então o Service continua respondendo durante um failover. O chart não cria PodDisruptionBudget para o operator; crie um se você drena nós com frequência.
 - **Instances:** `replicas` > 1 torna o Service headless e o operator balanceia em round-robin entre os pods. Cada pod é um servidor independente (memória, watcher e emptyDir próprios), e o stream de alertas se prende a um pod por vez. Para uma Instance de AIOps, uma réplica costuma ser o certo.
 - **Persistência e réplicas:** o PVC de sessões é ReadWriteOnce, então com `persistence.enabled` o Deployment usa a estratégia `Recreate`: o pod antigo para e libera o volume antes de o novo subir, e cada rollout (imagem, configuração ou credencial) tem uma breve indisponibilidade. Sem persistência a estratégia é `RollingUpdate`. Uma segunda réplica agendada em outro nó continua sem conseguir anexar o volume (`Multi-Attach error`): mantenha uma réplica com persistência e fixe-a com `scheduling.affinity` se o storage for zonal, ou rode sem persistência quando escalar horizontalmente.
@@ -62063,10 +62415,10 @@ O operator **não** aplica requests nem limits às Instances, o que deixa os pod
 
   Acrescente um `from` para os seus clientes na 50051, e saída para o `metricsPort` dos alvos do watcher quando coletar métricas deles. O tráfego das probes do kubelet fica isento de NetworkPolicy na maioria dos CNIs, mas não em todos, por isso o exemplo deixa a 9090 aberta para qualquer origem.
 
+
 ### Pod Security
 
 Os pods da Instance e do operator atendem ao Pod Security Standard `restricted` com os padrões, então você pode rotular os namespaces com `pod-security.kubernetes.io/enforce: restricted`. Se definir `spec.securityContext`, ele substitui o padrão inteiro: mantenha `runAsNonRoot: true` e `seccompProfile: {type: RuntimeDefault}`. O padrão também define `fsGroup: 1000` com `fsGroupChangePolicy: OnRootMismatch`, para que um volume de sessões novo seja gravável seja qual for o provisioner; mantenha `fsGroup: 1000` no seu próprio contexto quando ligar a persistência.
-
 
 ### Métricas e monitoramento
 
@@ -62097,7 +62449,7 @@ Os pods da Instance e do operator atendem ao Pod Security Standard `restricted` 
 - As imagens do operator e do servidor são publicadas como `ghcr.io/diillson/chatcli-operator:<version>` e `ghcr.io/diillson/chatcli:<version>` (mais `latest`), multi-arch (amd64, arm64), com SBOM e provenance, assinadas keyless com cosign:
 
   ```bash
-  cosign verify ghcr.io/diillson/chatcli-operator:1.221.1 \
+  cosign verify ghcr.io/diillson/chatcli-operator:1.221.2 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-identity-regexp '^https://github.com/diillson/chatcli/'
   ```
@@ -62157,7 +62509,7 @@ Um upgrade troca o operator e, em toda Instance que segue a release do operator 
 
     ```bash
     helm upgrade chatcli-operator oci://ghcr.io/diillson/charts/chatcli-operator \
-      --version 1.221.1 -n chatcli-system -f operator-values.yaml
+      --version 1.221.2 -n chatcli-system -f operator-values.yaml
     ```
 
     Sem arquivo de values, o `--reset-then-reuse-values` (Helm 3.14+) parte dos padrões do chart novo e reaplica seus overrides anteriores. Não use o `--reuse-values` puro: ele ignora os padrões das chaves que o chart novo adicionou e pode falhar na renderização (`nil pointer evaluating`).
@@ -62165,7 +62517,7 @@ Um upgrade troca o operator e, em toda Instance que segue a release do operator 
     A partir de um checkout da release nova:
 
     ```bash
-    git checkout v1.221.1
+    git checkout v1.221.2
     cd operator
     make deploy
     ```
@@ -62183,10 +62535,10 @@ Um upgrade troca o operator e, em toda Instance que segue a release do operator 
 ### Verificar
 
 ```bash
-helm -n chatcli-system list                                    # CHART chatcli-operator-1.221.1
+helm -n chatcli-system list                                    # CHART chatcli-operator-1.221.2
 kubectl get crd -o name | grep -c 'platform.chatcli.io'        # 17
 kubectl -n chatcli-system rollout status deploy/chatcli-operator
-kubectl get instances -A                                       # READY true, VERSION v1.221.1
+kubectl get instances -A                                       # READY true, VERSION v1.221.2
 kubectl -n chatcli get instance chatcli \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
@@ -70179,6 +70531,7 @@ Quando conectado a um servidor remoto, sessões podem ser salvas/carregadas loca
     | `--provider <nome>` | `LLM_PROVIDER` | Provedor LLM padrão | Primeiro provedor configurado |
     | `--model <nome>` | — | Modelo padrão | Padrão do provedor |
     | `--metrics-port <int>` | `CHATCLI_METRICS_PORT` | `/metrics` do Prometheus e `/healthz` em HTTP puro, sem autenticação, em todas as interfaces; `0` desliga | `9090` |
+    | `--shutdown-delay <dur>` | `CHATCLI_SERVER_SHUTDOWN_DELAY` | Quanto tempo o servidor continua atendendo depois do SIGTERM, com o health já em `NOT_SERVING`, antes de parar; deixa um pod sendo substituído sair dos endpoints do Service e do DNS antes de recusar conexões. `0` para na hora | `0` |
     | `--enable-reflection` | `CHATCLI_GRPC_REFLECTION=true` | Registra o reflection do gRPC; mantenha desligado em produção | `false` |
     | `--fallback-providers <lista>` | `CHATCLI_FALLBACK_PROVIDERS` | Cadeia de provedores separada por vírgula, em ordem; só é instalada quando pelo menos dois dos provedores listados resolvem | `""` |
     | `--fallback-max-retries <n>` | `CHATCLI_FALLBACK_MAX_RETRIES` | Tentativas por provedor antes de passar ao próximo | `2` |
@@ -70258,6 +70611,7 @@ Quando conectado a um servidor remoto, sessões podem ser salvas/carregadas loca
   
 ---
 
+
 ## Memória
 
 | Comando | Descrição |
@@ -70285,7 +70639,6 @@ Quando conectado a um servidor remoto, sessões podem ser salvas/carregadas loca
 | `/memory why` | Por que o último turno lembrou o que lembrou |
 
 ---
-
 
 ## Compactação e Rewind
 
@@ -70670,6 +71023,7 @@ O Bedrock **não usa API key** — a autenticação é feita pela cadeia de cred
 | `CHATCLI_SERVER_TLS_KEY` | Caminho da chave TLS do servidor (flag `--tls-key`). | `""` |
 | `CHATCLI_SERVER_TLS_CLIENT_CA` | Bundle de CA contra o qual os certificados de cliente são verificados (flag `--tls-client-ca`); liga o TLS mútuo e exige o certificado e a chave acima. | `""` |
 | `CHATCLI_METRICS_PORT` | Porta HTTP de `/metrics` e `/healthz` (flag `--metrics-port`); HTTP puro, sem autenticação, em todas as interfaces. `0` desliga. | `9090` |
+| `CHATCLI_SERVER_SHUTDOWN_DELAY` | Quanto tempo o servidor continua atendendo depois do SIGTERM, com o health já em `NOT_SERVING`, antes de parar; deixa um pod sendo substituído sair dos endpoints do Service e do DNS antes de recusar conexões. `0` para na hora (flag `--shutdown-delay`). O operator define `5s` em Instances sem persistência; o Helm chart define `5s` quando os pods novos sobem antes de os antigos pararem. | `0` |
 | `CHATCLI_GRPC_REFLECTION` | `true` registra o gRPC reflection (é o padrão de `--enable-reflection`). Só para desenvolvimento — **mantenha desligado em produção.** | `false` |
 
 A lista completa — JWT, papel do mTLS, rate limit, tamanhos de mensagem, endereço de bind, audit log, pipeline — está em [Variáveis de Ambiente → Segurança do Servidor](/pt/reference/environment-variables#segurança-do-servidor) e [Servidor Remoto](/pt/reference/environment-variables#servidor-remoto).
@@ -80379,7 +80733,35 @@ As entradas vêm do changelog do projeto e ficam em inglês, como foram escritas
 
 ---
 
+    keep the at-rest key when the Instance is deleted and retry write conflicts quietly
+  
     encrypt at rest by default in Kubernetes, key in a Secret; encrypt local data at rest by default with an OS keychain key; passphrase-protected recovery file to save and restore…
+  
+
+
+===== FILE: pt/releases/1.221.2.mdx =====
+TITLE: v1.221.2
+
+# v1.221.2
+
+{/* Generated by scripts/docs/gen-release-notes.py in the chatcli repo from its CHANGELOG.md. Edits here are overwritten on the next release. */}
+
+<div className="cc-release-meta">
+  <span>Lançada em 17 de outubro de 2026</span>
+  <span>1 correção</span>
+  <a href="https://github.com/diillson/chatcli/releases/tag/v1.221.2">Release no GitHub</a>
+  <a href="https://github.com/diillson/chatcli/compare/v1.221.1...v1.221.2">Comparar mudanças</a>
+</div>
+
+As entradas vêm do changelog do projeto e ficam em inglês, como foram escritas nos commits.
+
+## Correções
+
+- <a className="cc-scope" href="/pt/kubernetes/k8s-operator">operator</a> keep the at-rest key when the Instance is deleted and retry write conflicts quietly <span className="cc-refs">[#1818](https://github.com/diillson/chatcli/issues/1818) · [5616342](https://github.com/diillson/chatcli/commit/56163422a90adf03d2d1ae8ba0957de5ed4b3c09)</span>
+
+---
+
+    let use-keychain move the key file when the keychain holds another key
   
 
 
@@ -85883,12 +86265,13 @@ TITLE: Notas de release
 
 Cada release tem uma página própria com as novidades, as correções e os links para as mudanças no código. As mesmas notas saem no [GitHub Releases](https://github.com/diillson/chatcli/releases), e o histórico completo está no [CHANGELOG.md](https://github.com/diillson/chatcli/blob/main/CHANGELOG.md).
 
-  17 de outubro de 2026 · let use-keychain move the key file when the keychain holds another key
+  17 de outubro de 2026 · keep the at-rest key when the Instance is deleted and retry write conflicts quietly
 
 ## 2026
 
 ### Outubro
 
+- [**v1.221.2**](/pt/releases/1.221.2) — keep the at-rest key when the Instance is deleted and retry write conflicts quietly
 - [**v1.221.1**](/pt/releases/1.221.1) — let use-keychain move the key file when the keychain holds another key
 - [**v1.221.0**](/pt/releases/1.221.0) — encrypt at rest by default in Kubernetes, key in a Secret; encrypt local data at rest by default with an OS keychain key; passphrase-protected recovery file to save and restore…
 - [**v1.220.0**](/pt/releases/1.220.0) — show each panel member's position and where the answers diverged
@@ -87734,7 +88117,7 @@ Uma allowlist com várias origens devolve a origem da própria requisição depo
   
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --set server.token="$(openssl rand -hex 32)" \
       --set rbac.clusterWide=true \
       --set watcher.enabled=true
@@ -87931,7 +88314,7 @@ O pipeline de CI/CD do ChatCLI inclui várias verificações de segurança:
 
     ```bash
     # Verificar uma imagem do ChatCLI (o mesmo vale para ghcr.io/diillson/chatcli-operator)
-    cosign verify ghcr.io/diillson/chatcli:1.221.1 \
+    cosign verify ghcr.io/diillson/chatcli:1.221.2 \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       --certificate-identity-regexp '^https://github\.com/diillson/chatcli/\.github/workflows/(3-publish-release|image-refresh)\.yml@refs/heads/main$'
     ```
@@ -88605,7 +88988,7 @@ chatcli connect --addr chatcli.example.com:50051 --tls --token "$CHATCLI_REMOTE_
 Quando dá certo:
 
 ```text
-Connected to ChatCLI server (version: 1.221.1, provider: CLAUDEAI, model: claude-sonnet-5)
+Connected to ChatCLI server (version: 1.221.2, provider: CLAUDEAI, model: claude-sonnet-5)
 ```
 
 Quando o servidor roda um [K8s watcher](/pt/kubernetes/k8s-watcher), uma segunda linha avisa, e o contexto dele é somado a todo prompt do lado do servidor.
@@ -88886,6 +89269,7 @@ A recusa vai para o log estruturado. Num container, numa unit do systemd ou num 
 | `--provider` | `LLM_PROVIDER` | primeiro provedor com credenciais | Provedor LLM padrão |
 | `--model` | — | modelo padrão do provedor (por exemplo `ANTHROPIC_MODEL`) | Modelo padrão |
 | `--metrics-port` | `CHATCLI_METRICS_PORT` | `9090` | Porta HTTP de `/metrics` e `/healthz`; `0` desliga os dois |
+| `--shutdown-delay` | `CHATCLI_SERVER_SHUTDOWN_DELAY` | `0` | Quanto tempo o servidor continua atendendo depois do SIGTERM, com o health já em `NOT_SERVING`, antes de parar; deixa um pod sendo substituído sair dos endpoints do Service e do DNS antes de recusar conexões. `0` para na hora |
 | `--enable-reflection` | `CHATCLI_GRPC_REFLECTION` | `false` | Registra o gRPC reflection; veja [gRPC reflection](#grpc-reflection) |
 | `--fallback-providers` | `CHATCLI_FALLBACK_PROVIDERS` | `""` | Cadeia de provedores separada por vírgula; veja [Cadeia de fallback](#cadeia-de-fallback) |
 | `--fallback-max-retries` | `CHATCLI_FALLBACK_MAX_RETRIES` | `2` | Tentativas por provedor antes do próximo |
@@ -89390,8 +89774,8 @@ O gRPC mantém uma conexão HTTP/2 aberta, então um Service ClusterIP prende ca
     O certificado e o bundle de CA de clientes são carregados na inicialização. Depois de renovar os arquivos (ou o Secret), reinicie o servidor. O operator recria os pods da Instance quando um Secret referenciado muda; com o Helm chart rode `kubectl rollout restart`.
   
     - Binário: `/update` dentro do ChatCLI ou o gerenciador de pacotes, e reinicie o servidor.
-    - Imagem: fixe a tag (`ghcr.io/diillson/chatcli:1.221.1`) e troque de propósito; `latest` se move.
-    - Helm: `helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 -n chatcli --reset-then-reuse-values`.
+    - Imagem: fixe a tag (`ghcr.io/diillson/chatcli:1.221.2`) e troque de propósito; `latest` se move.
+    - Helm: `helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 -n chatcli --reset-then-reuse-values`.
 
     `GetServerInfo` e `chatcli_server_info{version=…}` informam a versão em execução.
   
@@ -89487,19 +89871,19 @@ O `/update` puro é um pedido explícito: quando existe release mais nova num ca
 
   Verificando atualizações...
   Método de instalação: binário oficial da release
-  Atual: v1.169.0 · Última: v1.221.1
+  Atual: v1.169.0 · Última: v1.221.2
 
-── Novidades da v1.221.1 ─────────────────────────────────────────
+── Novidades da v1.221.2 ─────────────────────────────────────────
 
   Features
     • update: aviso de release nova dentro da própria sessão (#1300)
   Bug Fixes
     • banner de boas-vindas não fica mais um dia atrás da release
 
-  https://github.com/diillson/chatcli/releases/tag/v1.221.1
+  https://github.com/diillson/chatcli/releases/tag/v1.221.2
 
-  Baixando v1.221.1 (chatcli-darwin-arm64)...
-  ✓ Atualizado para v1.221.1 — reinicie o chatcli para usar a nova versão.
+  Baixando v1.221.2 (chatcli-darwin-arm64)...
+  ✓ Atualizado para v1.221.2 — reinicie o chatcli para usar a nova versão.
 ```
 
 Antes de aplicar qualquer coisa — e no `/update check` — o ChatCLI mostra a seção de **Novidades**: os destaques extraídos direto das release notes do GitHub, que chegam na mesma resposta de API da checagem de versão (nenhuma chamada extra de rede).
@@ -89538,7 +89922,7 @@ Se o diretório de instalação não for gravável (ex.: `/usr/local/bin` do roo
 
 ```text
 ❌ Sem permissão de escrita em /usr/local/bin. Atualize manualmente:
-sudo curl -fsSL -o /usr/local/bin/chatcli https://github.com/diillson/chatcli/releases/download/v1.221.1/chatcli-darwin-arm64 && sudo chmod +x /usr/local/bin/chatcli
+sudo curl -fsSL -o /usr/local/bin/chatcli https://github.com/diillson/chatcli/releases/download/v1.221.2/chatcli-darwin-arm64 && sudo chmod +x /usr/local/bin/chatcli
 ```
 
 ---
@@ -89556,21 +89940,21 @@ Defina `CHATCLI_AUTO_UPDATE` para controlar o comportamento no boot:
 O modo auto usa **staging**, o mesmo modelo do Claude Code: o processo em execução nunca é reiniciado nem interrompido. O binário novo pousa no disco enquanto você trabalha, e o *próximo* start já abre na versão nova — anunciada uma única vez na tela de boas-vindas:
 
 ```text
-  Versão: 1.221.1 (commit: 52441581)
-  ✓ Atualizado automaticamente para v1.221.1
+  Versão: 1.221.2 (commit: 52441581)
+  ✓ Atualizado automaticamente para v1.221.2
 ```
 
 No modo `notify` (o default), a tela de boas-vindas mostra o convite — o mesmo que o card do `/version` renderiza, incluindo o comando nativo do canal de instalação detectado:
 
 ```text
-  ⬆ v1.221.1 disponível — rode /update para atualizar
+  ⬆ v1.221.2 disponível — rode /update para atualizar
     ou pelo canal de instalação: brew upgrade diillson/chatcli/chatcli
 ```
 
 O banner é instantâneo e atual ao mesmo tempo: ele confia no último dado de release conhecido mesmo depois da janela diária de re-checagem, e quando esse cache está vencido o boot dá ao refresh um orçamento síncrono curto (cerca de 1,5 s) antes de imprimir — então uma release publicada de madrugada aparece já no primeiro banner, não um boot depois. Cache fresco (no máximo uma consulta por dia) não custa nada, e o modo `off` nem toca a rede. Só quando a checagem não termina dentro do orçamento (rede lenta ou ausente) o anúncio cai para a própria sessão, no turno seguinte do prompt — você continua sem precisar reiniciar (nem rodar `/version`) para ficar sabendo:
 
 ```text
-  ⬆ ChatCLI v1.221.1 disponível — rode /update para atualizar.
+  ⬆ ChatCLI v1.221.2 disponível — rode /update para atualizar.
 ```
 
 O mesmo aviso in-session dispara no modo `auto` quando o staging silencioso falha (por exemplo, module proxy inacessível) — um update em background quebrado nunca esconde uma release nova de você.
@@ -89589,8 +89973,8 @@ O mesmo aviso in-session dispara no modo `auto` quando o staging silencioso falh
 🔄 Auto-update
    Modo                            notify
    Método de instalação            Homebrew
-   Versão atual                    1.221.1
-   Última release                  1.221.1
+   Versão atual                    1.221.2
+   Última release                  1.221.2
 
    Ambiente
    CHATCLI_AUTO_UPDATE             (default) notify
@@ -89768,18 +90152,18 @@ Todas as receitas abaixo definem uma credencial. Um servidor que escuta além do
 
 | Imagem | Tags | Runtime |
 |---|---|---|
-| `ghcr.io/diillson/chatcli` | `<versão>` (sem `v`, ex.: `1.221.1`) e `latest` | `gcr.io/distroless/static-debian12:nonroot`, UID 65532, sem shell |
+| `ghcr.io/diillson/chatcli` | `<versão>` (sem `v`, ex.: `1.221.2`) e `latest` | `gcr.io/distroless/static-debian12:nonroot`, UID 65532, sem shell |
 | `ghcr.io/diillson/chatcli-operator` | `<versão>` e `latest` | Alpine (o `SourceRepository` precisa de git e, com `authType: ssh`, de `openssh-client`), UID 65532 |
 
 ```bash
-docker pull ghcr.io/diillson/chatcli:1.221.1
-docker pull ghcr.io/diillson/chatcli-operator:1.221.1
+docker pull ghcr.io/diillson/chatcli:1.221.2
+docker pull ghcr.io/diillson/chatcli-operator:1.221.2
 ```
 
 As duas são multi-arch (`linux/amd64`, `linux/arm64`), trazem atestados de SBOM e proveniência e são assinadas com cosign (keyless):
 
 ```bash
-cosign verify ghcr.io/diillson/chatcli:1.221.1 \
+cosign verify ghcr.io/diillson/chatcli:1.221.2 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'https://github.com/diillson/chatcli/'
 ```
@@ -89813,7 +90197,7 @@ docker run -d --name chatcli \
   -e LLM_PROVIDER=CLAUDEAI \
   -e ANTHROPIC_API_KEY \
   -v chatcli-home:/home/nonroot \
-  ghcr.io/diillson/chatcli:1.221.1
+  ghcr.io/diillson/chatcli:1.221.2
 ```
 
 | Configuração | Por quê |
@@ -89846,7 +90230,7 @@ docker run -d --name chatcli -p 50051:50051 \
   -e CHATCLI_SERVER_TLS_KEY=/etc/chatcli/tls/server.key \
   -v "$PWD/tls:/etc/chatcli/tls:ro" \
   -v chatcli-home:/home/nonroot \
-  ghcr.io/diillson/chatcli:1.221.1
+  ghcr.io/diillson/chatcli:1.221.2
 
 chatcli connect localhost:50051 --tls --ca-cert tls/ca.crt --token "$CHATCLI_SERVER_TOKEN"
 ```
@@ -89886,7 +90270,7 @@ O chart do servidor é publicado como artefato OCI em `oci://ghcr.io/diillson/ch
 
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --namespace chatcli --create-namespace \
       --set llm.provider=CLAUDEAI \
       --set secrets.anthropicApiKey="$ANTHROPIC_API_KEY" \
@@ -89939,7 +90323,7 @@ Com `server.metricsPort: 0`, startup e liveness caem para uma checagem TCP na po
 
 ```bash
 kubectl -n chatcli create secret generic chatcli-jwt --from-literal=secret="$(openssl rand -hex 32)"
-helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 -n chatcli \
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 -n chatcli \
   --reset-then-reuse-values --set security.jwtSecretRef.name=chatcli-jwt --set security.jwtSecretRef.key=secret
 ```
 
@@ -89970,6 +90354,7 @@ Para mTLS com uma CA de cliente no mesmo Secret use `security.tlsClientCA: /etc/
 | `imagePullSecrets` | `[]` | Pull secrets |
 | `server.port` | `50051` | Porta gRPC |
 | `server.metricsPort` | `9090` | `/metrics` e `/healthz`; `0` desliga os dois |
+| `server.shutdownDelay` | `""` | Drenagem depois do SIGTERM (`CHATCLI_SERVER_SHUTDOWN_DELAY`). Vazio = `5s` quando os pods novos sobem antes de os antigos pararem (sem persistência, `ReadWriteMany`, `RollingUpdate` explícito), desligado quando o pod antigo para primeiro (volume de sessões `ReadWriteOnce`, `Recreate`). `"0s"` desliga |
 | `server.token` | `""` | Token compartilhado (obrigatório sem JWT ou mTLS) |
 | `server.grpcReflection` | `false` | Define `CHATCLI_GRPC_REFLECTION=true`, que registra o reflection gRPC do servidor; as chamadas de reflection continuam exigindo a credencial do servidor. Deixe desligado em produção |
 | `extraEnv` | `[]` | Variáveis extras (por exemplo `LOG_LEVEL=debug`); uma entrada para uma variável `CHATCLI_LOG_*` substitui o valor de `logging` do chart |
@@ -89998,7 +90383,7 @@ Com `secrets.existingSecret`, crie o Secret com nomes de variáveis como chaves,
 kubectl -n chatcli create secret generic chatcli-llm-keys \
   --from-literal=CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)" \
   --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 -n chatcli \
+helm install chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 -n chatcli \
   --set llm.provider=CLAUDEAI --set secrets.existingSecret=chatcli-llm-keys
 ```
 
@@ -90246,7 +90631,7 @@ extraEnv:
 ### Upgrade, rollback, desinstalação
 
 ```bash
-helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 \
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 \
   -n chatcli --reset-then-reuse-values
 helm history chatcli -n chatcli
 helm rollback chatcli <revisão> -n chatcli
@@ -101018,6 +101403,7 @@ When connected to a remote server, sessions can be saved/loaded locally, remotel
     | `--provider <name>` | `LLM_PROVIDER` | Default LLM provider | First configured provider |
     | `--model <name>` | — | Default model | Provider default |
     | `--metrics-port <int>` | `CHATCLI_METRICS_PORT` | Prometheus `/metrics` and `/healthz` over plain HTTP, no authentication, on all interfaces; `0` disables it | `9090` |
+    | `--shutdown-delay <dur>` | `CHATCLI_SERVER_SHUTDOWN_DELAY` | How long the server keeps serving after SIGTERM, with health already `NOT_SERVING`, before it stops; lets a pod being replaced leave the Service endpoints and DNS before it refuses connections. `0` stops at once | `0` |
     | `--enable-reflection` | `CHATCLI_GRPC_REFLECTION=true` | Registers gRPC server reflection; keep off in production | `false` |
     | `--fallback-providers <list>` | `CHATCLI_FALLBACK_PROVIDERS` | Comma-separated provider chain, in order; installed only when at least two of the listed providers resolve | `""` |
     | `--fallback-max-retries <n>` | `CHATCLI_FALLBACK_MAX_RETRIES` | Retries per provider before moving on | `2` |
@@ -101125,6 +101511,7 @@ When connected to a remote server, sessions can be saved/loaded locally, remotel
 
 ---
 
+
 ## Compaction and Rewind
 
 | Command | Description |
@@ -101139,7 +101526,6 @@ When connected to a remote server, sessions can be saved/loaded locally, remotel
 `/compact` accepts a natural language instruction. Example: `/compact preserve file paths and decisions`.
 
 ---
-
 
 ## Keyboard Shortcuts
 
@@ -101509,6 +101895,7 @@ Bedrock **does not use an API key** — authentication uses the AWS SDK credenti
 | `CHATCLI_SERVER_TLS_KEY` | Path to the server TLS key (flag `--tls-key`). | `""` |
 | `CHATCLI_SERVER_TLS_CLIENT_CA` | CA bundle that client certificates are verified against (flag `--tls-client-ca`); enables mutual TLS and requires the certificate and key above. | `""` |
 | `CHATCLI_METRICS_PORT` | HTTP port for `/metrics` and `/healthz` (flag `--metrics-port`); plain HTTP, no authentication, all interfaces. `0` disables it. | `9090` |
+| `CHATCLI_SERVER_SHUTDOWN_DELAY` | How long the server keeps serving after SIGTERM, with health already `NOT_SERVING`, before it stops; lets a pod being replaced leave the Service endpoints and DNS before it refuses connections. `0` stops at once (flag `--shutdown-delay`). The operator sets `5s` on Instances without persistence; the Helm chart sets `5s` when new pods start before old ones stop. | `0` |
 | `CHATCLI_GRPC_REFLECTION` | `true` registers gRPC reflection (the default of `--enable-reflection`). Development only — **keep it off in production.** | `false` |
 
 The full list — JWT, mTLS role, rate limits, message sizes, bind address, audit log, pipeline — is in [Environment Variables → Server Security](/reference/environment-variables#server-security) and [Remote Server](/reference/environment-variables#remote-server).
@@ -110712,7 +111099,33 @@ TITLE: v1.221.1
 
 ---
 
+    keep the at-rest key when the Instance is deleted and retry write conflicts quietly
+  
     encrypt at rest by default in Kubernetes, key in a Secret; encrypt local data at rest by default with an OS keychain key; passphrase-protected recovery file to save and restore…
+  
+
+
+===== FILE: releases/1.221.2.mdx =====
+TITLE: v1.221.2
+
+# v1.221.2
+
+{/* Generated by scripts/docs/gen-release-notes.py in the chatcli repo from its CHANGELOG.md. Edits here are overwritten on the next release. */}
+
+<div className="cc-release-meta">
+  <span>Released October 17, 2026</span>
+  <span>1 fix</span>
+  <a href="https://github.com/diillson/chatcli/releases/tag/v1.221.2">GitHub release</a>
+  <a href="https://github.com/diillson/chatcli/compare/v1.221.1...v1.221.2">Compare changes</a>
+</div>
+
+## Fixes
+
+- <a className="cc-scope" href="/kubernetes/k8s-operator">operator</a> keep the at-rest key when the Instance is deleted and retry write conflicts quietly <span className="cc-refs">[#1818](https://github.com/diillson/chatcli/issues/1818) · [5616342](https://github.com/diillson/chatcli/commit/56163422a90adf03d2d1ae8ba0957de5ed4b3c09)</span>
+
+---
+
+    let use-keychain move the key file when the keychain holds another key
   
 
 
@@ -115840,12 +116253,13 @@ TITLE: Release notes
 
 Each release has its own page with the new features, fixes and links to the source changes. The same notes ship on [GitHub Releases](https://github.com/diillson/chatcli/releases), and the full history is in [CHANGELOG.md](https://github.com/diillson/chatcli/blob/main/CHANGELOG.md).
 
-  October 17, 2026 · let use-keychain move the key file when the keychain holds another key
+  October 17, 2026 · keep the at-rest key when the Instance is deleted and retry write conflicts quietly
 
 ## 2026
 
 ### October
 
+- [**v1.221.2**](/releases/1.221.2) — keep the at-rest key when the Instance is deleted and retry write conflicts quietly
 - [**v1.221.1**](/releases/1.221.1) — let use-keychain move the key file when the keychain holds another key
 - [**v1.221.0**](/releases/1.221.0) — encrypt at rest by default in Kubernetes, key in a Secret; encrypt local data at rest by default with an OS keychain key; passphrase-protected recovery file to save and restore…
 - [**v1.220.0**](/releases/1.220.0) — show each panel member's position and where the answers diverged
@@ -117690,7 +118104,7 @@ An allowlist of several origins echoes the request's own origin after matching i
   
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --set server.token="$(openssl rand -hex 32)" \
       --set rbac.clusterWide=true \
       --set watcher.enabled=true
@@ -117887,7 +118301,7 @@ ChatCLI's CI/CD pipeline includes multiple security checks:
 
     ```bash
     # Verify a ChatCLI image (same for ghcr.io/diillson/chatcli-operator)
-    cosign verify ghcr.io/diillson/chatcli:1.221.1 \
+    cosign verify ghcr.io/diillson/chatcli:1.221.2 \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       --certificate-identity-regexp '^https://github\.com/diillson/chatcli/\.github/workflows/(3-publish-release|image-refresh)\.yml@refs/heads/main$'
     ```
@@ -118560,7 +118974,7 @@ chatcli connect --addr chatcli.example.com:50051 --tls --token "$CHATCLI_REMOTE_
 On success:
 
 ```text
-Connected to ChatCLI server (version: 1.221.1, provider: CLAUDEAI, model: claude-sonnet-5)
+Connected to ChatCLI server (version: 1.221.2, provider: CLAUDEAI, model: claude-sonnet-5)
 ```
 
 When the server runs a [K8s watcher](/kubernetes/k8s-watcher), a second line says so and its context is added to every prompt on the server side.
@@ -118841,6 +119255,7 @@ The refusal is written to the structured log. In a container, a systemd unit or 
 | `--provider` | `LLM_PROVIDER` | first provider with credentials | Default LLM provider |
 | `--model` | — | the provider's default model (for example `ANTHROPIC_MODEL`) | Default model |
 | `--metrics-port` | `CHATCLI_METRICS_PORT` | `9090` | HTTP port for `/metrics` and `/healthz`; `0` turns both off |
+| `--shutdown-delay` | `CHATCLI_SERVER_SHUTDOWN_DELAY` | `0` | How long the server keeps serving after SIGTERM, with health already `NOT_SERVING`, before it stops; lets a pod being replaced leave the Service endpoints and DNS before it refuses connections. `0` stops at once |
 | `--enable-reflection` | `CHATCLI_GRPC_REFLECTION` | `false` | Register gRPC server reflection, see [gRPC reflection](#grpc-reflection) |
 | `--fallback-providers` | `CHATCLI_FALLBACK_PROVIDERS` | `""` | Comma-separated provider chain, see [Fallback chain](#fallback-chain) |
 | `--fallback-max-retries` | `CHATCLI_FALLBACK_MAX_RETRIES` | `2` | Attempts per provider before the next one |
@@ -119345,8 +119760,8 @@ gRPC keeps one HTTP/2 connection open, so a ClusterIP Service pins each client t
     The certificate and the client CA bundle are loaded at startup. After renewing the files (or the Secret), restart the server. The operator rolls Instance pods when a referenced Secret changes; with the Helm chart run `kubectl rollout restart`.
   
     - Binary: `/update` inside ChatCLI or your package manager, then restart the server.
-    - Image: pin the tag (`ghcr.io/diillson/chatcli:1.221.1`) and change it deliberately; `latest` moves.
-    - Helm: `helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 -n chatcli --reset-then-reuse-values`.
+    - Image: pin the tag (`ghcr.io/diillson/chatcli:1.221.2`) and change it deliberately; `latest` moves.
+    - Helm: `helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 -n chatcli --reset-then-reuse-values`.
 
     `GetServerInfo` and `chatcli_server_info{version=…}` report the running version.
   
@@ -119442,19 +119857,19 @@ Bare `/update` is an explicit request: when a newer release exists on an automat
 
   Checking for updates...
   Install method: official release binary
-  Current: v1.169.0 · Latest: v1.221.1
+  Current: v1.169.0 · Latest: v1.221.2
 
-── What's new in v1.221.1 ────────────────────────────────────────
+── What's new in v1.221.2 ────────────────────────────────────────
 
   Features
     • update: new-release notice inside the running session (#1300)
   Bug Fixes
     • welcome banner no longer lags a day behind a new release
 
-  https://github.com/diillson/chatcli/releases/tag/v1.221.1
+  https://github.com/diillson/chatcli/releases/tag/v1.221.2
 
-  Downloading v1.221.1 (chatcli-darwin-arm64)...
-  ✓ Updated to v1.221.1 — restart chatcli to use the new version.
+  Downloading v1.221.2 (chatcli-darwin-arm64)...
+  ✓ Updated to v1.221.2 — restart chatcli to use the new version.
 ```
 
 Before applying anything — and on `/update check` — ChatCLI shows the **What's new** section: the highlights parsed straight from the GitHub release notes, which arrive in the same API response as the version check (no extra network call).
@@ -119493,7 +119908,7 @@ If the install directory isn't writable (say, `/usr/local/bin` owned by root), t
 
 ```text
 ❌ No write permission on /usr/local/bin. Update manually:
-sudo curl -fsSL -o /usr/local/bin/chatcli https://github.com/diillson/chatcli/releases/download/v1.221.1/chatcli-darwin-arm64 && sudo chmod +x /usr/local/bin/chatcli
+sudo curl -fsSL -o /usr/local/bin/chatcli https://github.com/diillson/chatcli/releases/download/v1.221.2/chatcli-darwin-arm64 && sudo chmod +x /usr/local/bin/chatcli
 ```
 
 ---
@@ -119511,21 +119926,21 @@ Set `CHATCLI_AUTO_UPDATE` to control the boot-time behavior:
 Auto mode uses **staging**, the same model as Claude Code: the running process is never restarted or interrupted. The new binary lands on disk while you work, and the *next* start opens on the new version — announced once on the welcome screen:
 
 ```text
-  Version: 1.221.1 (commit: 52441581)
-  ✓ Auto-updated to v1.221.1
+  Version: 1.221.2 (commit: 52441581)
+  ✓ Auto-updated to v1.221.2
 ```
 
 In `notify` mode (the default) the welcome screen shows the invitation instead — the same one the `/version` card renders, including the native command of your detected install channel:
 
 ```text
-  ⬆ v1.221.1 available — run /update to upgrade
+  ⬆ v1.221.2 available — run /update to upgrade
     or via your install channel: brew upgrade diillson/chatcli/chatcli
 ```
 
 The banner is both instant and current: it trusts the last known release data even past the daily re-check window, and when that cache is stale the boot gives the refresh a short synchronous budget (about 1.5 s) before printing — so a release published overnight shows up on the very first banner, not one boot later. A fresh cache (at most one query per day) costs nothing, and `off` mode skips the network entirely. Only when the check can't finish inside the budget (slow or absent network) does the announcement fall back to the running session, at the next prompt turn — you still don't have to restart (or run `/version`) to find out:
 
 ```text
-  ⬆ ChatCLI v1.221.1 is available — run /update to upgrade.
+  ⬆ ChatCLI v1.221.2 is available — run /update to upgrade.
 ```
 
 The same in-session notice fires in `auto` mode when the silent staging fails (for example, the module proxy is unreachable), so a broken background update never hides a new release from you.
@@ -119544,8 +119959,8 @@ The same in-session notice fires in `auto` mode when the silent staging fails (f
 🔄 Auto-update
    Mode                            notify
    Install method                  Homebrew
-   Current version                 1.221.1
-   Latest release                  1.221.1
+   Current version                 1.221.2
+   Latest release                  1.221.2
 
    Environment
    CHATCLI_AUTO_UPDATE             (default) notify
@@ -119723,18 +120138,18 @@ Every recipe below sets a credential. A server that listens beyond loopback (any
 
 | Image | Tags | Runtime |
 |---|---|---|
-| `ghcr.io/diillson/chatcli` | `<version>` (no `v`, e.g. `1.221.1`) and `latest` | `gcr.io/distroless/static-debian12:nonroot`, UID 65532, no shell |
+| `ghcr.io/diillson/chatcli` | `<version>` (no `v`, e.g. `1.221.2`) and `latest` | `gcr.io/distroless/static-debian12:nonroot`, UID 65532, no shell |
 | `ghcr.io/diillson/chatcli-operator` | `<version>` and `latest` | Alpine (`SourceRepository` needs git and, for `authType: ssh`, `openssh-client`), UID 65532 |
 
 ```bash
-docker pull ghcr.io/diillson/chatcli:1.221.1
-docker pull ghcr.io/diillson/chatcli-operator:1.221.1
+docker pull ghcr.io/diillson/chatcli:1.221.2
+docker pull ghcr.io/diillson/chatcli-operator:1.221.2
 ```
 
 Both are multi-arch (`linux/amd64`, `linux/arm64`), carry SBOM and provenance attestations and are signed with cosign (keyless):
 
 ```bash
-cosign verify ghcr.io/diillson/chatcli:1.221.1 \
+cosign verify ghcr.io/diillson/chatcli:1.221.2 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'https://github.com/diillson/chatcli/'
 ```
@@ -119768,7 +120183,7 @@ docker run -d --name chatcli \
   -e LLM_PROVIDER=CLAUDEAI \
   -e ANTHROPIC_API_KEY \
   -v chatcli-home:/home/nonroot \
-  ghcr.io/diillson/chatcli:1.221.1
+  ghcr.io/diillson/chatcli:1.221.2
 ```
 
 | Setting | Why |
@@ -119801,7 +120216,7 @@ docker run -d --name chatcli -p 50051:50051 \
   -e CHATCLI_SERVER_TLS_KEY=/etc/chatcli/tls/server.key \
   -v "$PWD/tls:/etc/chatcli/tls:ro" \
   -v chatcli-home:/home/nonroot \
-  ghcr.io/diillson/chatcli:1.221.1
+  ghcr.io/diillson/chatcli:1.221.2
 
 chatcli connect localhost:50051 --tls --ca-cert tls/ca.crt --token "$CHATCLI_SERVER_TOKEN"
 ```
@@ -119841,7 +120256,7 @@ The server chart is published as an OCI artifact at `oci://ghcr.io/diillson/char
 
     ```bash
     helm install chatcli oci://ghcr.io/diillson/charts/chatcli \
-      --version 1.221.1 \
+      --version 1.221.2 \
       --namespace chatcli --create-namespace \
       --set llm.provider=CLAUDEAI \
       --set secrets.anthropicApiKey="$ANTHROPIC_API_KEY" \
@@ -119894,7 +120309,7 @@ With `server.metricsPort: 0` startup and liveness fall back to a TCP check on th
 
 ```bash
 kubectl -n chatcli create secret generic chatcli-jwt --from-literal=secret="$(openssl rand -hex 32)"
-helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 -n chatcli \
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 -n chatcli \
   --reset-then-reuse-values --set security.jwtSecretRef.name=chatcli-jwt --set security.jwtSecretRef.key=secret
 ```
 
@@ -119925,6 +120340,7 @@ For mTLS with a client CA that lives in the same Secret use `security.tlsClientC
 | `imagePullSecrets` | `[]` | Pull secrets |
 | `server.port` | `50051` | gRPC port |
 | `server.metricsPort` | `9090` | `/metrics` and `/healthz`; `0` disables both |
+| `server.shutdownDelay` | `""` | Drain after SIGTERM (`CHATCLI_SERVER_SHUTDOWN_DELAY`). Empty = `5s` when new pods start before old ones stop (no persistence, `ReadWriteMany`, explicit `RollingUpdate`), off when the old pod stops first (`ReadWriteOnce` sessions volume, `Recreate`). `"0s"` turns it off |
 | `server.token` | `""` | Shared token (required unless JWT or mTLS) |
 | `server.grpcReflection` | `false` | Sets `CHATCLI_GRPC_REFLECTION=true`, which registers gRPC server reflection; reflection calls still need the server credential. Keep it off in production |
 | `extraEnv` | `[]` | Extra environment variables (for example `LOG_LEVEL=debug`); an entry for a `CHATCLI_LOG_*` variable replaces the chart's `logging` value |
@@ -119952,7 +120368,7 @@ With `secrets.existingSecret`, create the Secret with variable names as keys, th
 kubectl -n chatcli create secret generic chatcli-llm-keys \
   --from-literal=CHATCLI_SERVER_TOKEN="$(openssl rand -hex 32)" \
   --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
-helm install chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 -n chatcli \
+helm install chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 -n chatcli \
   --set llm.provider=CLAUDEAI --set secrets.existingSecret=chatcli-llm-keys
 ```
 
@@ -120201,7 +120617,7 @@ extraEnv:
 ### Upgrade, rollback, uninstall
 
 ```bash
-helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.1 \
+helm upgrade chatcli oci://ghcr.io/diillson/charts/chatcli --version 1.221.2 \
   -n chatcli --reset-then-reuse-values
 helm history chatcli -n chatcli
 helm rollback chatcli <revision> -n chatcli

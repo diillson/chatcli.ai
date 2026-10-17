@@ -1,0 +1,192 @@
+---
+title: "Recipe: Scaling Instances"
+sidebarTitle: "Scaling Instances"
+description: "Run more than one ChatCLI server with the operator: replicas of one Instance, several Instances, and the trade-off between persistence and rolling updates, measured on a real cluster."
+icon: "arrows-left-right"
+---
+
+An Instance scales two ways: more **replicas** of the same Instance, or more **Instances**. Which one fits depends on what the server keeps on disk and on whether it drives AIOps. This recipe explains the trade-offs, gives a layout that works in production, and shows what a rollout costs in each case, as measured on a three-node cluster.
+
+---
+
+## The two ways to scale
+
+<CardGroup cols={2}>
+<Card title="Replicas of one Instance" icon="clone">
+`spec.replicas: N`. One Service, one credential, one configuration; the operator balances across the pods.
+</Card>
+<Card title="Several Instances" icon="layer-group">
+One `Instance` per purpose (AIOps, chat for a team, another provider). Each has its own Deployment, Service, credentials and encryption key.
+</Card>
+</CardGroup>
+
+### Replicas
+
+- With `replicas` > 1 the Service is headless, and every new connection resolves to one of the ready pods.
+- Each pod is an **independent server**: its own memory, watcher and `emptyDir` state. Nothing is shared between replicas except the sessions volume, when there is one.
+- The operator's alert stream attaches to one pod at a time, so the Instance that drives AIOps gains nothing from extra replicas.
+
+### Several Instances
+
+- Create as many as you need, in one namespace or several.
+- **AIOps attaches to exactly one Instance**, the one pinned with `aiops.instance` in the operator chart (`CHATCLI_OPERATOR_AIOPS_INSTANCE=<namespace>/<name>`). The other Instances serve chat and API traffic and are never picked up implicitly.
+- Each Instance gets its own encryption-at-rest key Secret, `<instance>-atrest-key`. Back up each one (see [Encryption at Rest](/security/encryption-at-rest#kubernetes)).
+
+---
+
+## Persistence decides the rollout
+
+`spec.persistence.enabled` gives the sessions a `ReadWriteOnce` PVC. That one setting changes how the Instance can scale and how it rolls:
+
+| | Without persistence | With persistence (`ReadWriteOnce`) |
+|---|---|---|
+| Deployment strategy | `RollingUpdate` | `Recreate` |
+| Rollout | New pods start before old ones stop; no downtime | Every old pod stops before any new one starts; brief downtime |
+| Replicas on different nodes | Yes | No: every replica must run on the node that holds the volume |
+| Sessions after a pod restart | Lost (kept in `emptyDir`) | Kept |
+| Shutdown drain (`CHATCLI_SERVER_SHUTDOWN_DELAY`) | `5s`, set by the operator | Not set: it would only lengthen the downtime |
+
+<Warning>
+Do not force replicas of a persistent Instance onto different nodes. A `ReadWriteOnce` volume attaches to one node. On node-local storage (local-path, `hostPath`), the second pod stays `Pending` forever with `didn't match pod anti-affinity rules` and the other nodes filtered out by the volume's node affinity. On network block storage (EBS, Persistent Disk, Azure Disk), it is scheduled on another node and stays in `ContainerCreating` with `Multi-Attach error`.
+</Warning>
+
+### The shutdown drain
+
+When a pod is replaced, it leaves the Service endpoints and the cluster DNS a few seconds after it receives SIGTERM (DNS caches Service records for 5 seconds). A server that stopped listening at once would refuse the connections that still resolve it. With `CHATCLI_SERVER_SHUTDOWN_DELAY`, the server answers health checks with `NOT_SERVING` at once, so load balancers and health-checking clients move away, but keeps serving requests for the delay, and only then stops.
+
+- The operator sets `5s` on every Instance without persistence. A `CHATCLI_SERVER_SHUTDOWN_DELAY` entry in `spec.extraEnv` replaces it (`0s` turns it off).
+- The Helm chart of the server sets it through `server.shutdownDelay` (see [Docker & Kubernetes](/start/docker-deployment)).
+- Keep it well below the pod's `terminationGracePeriodSeconds` (30 seconds by default).
+
+---
+
+## Recommended layout
+
+One Instance for AIOps that keeps its state, and a pool of stateless replicas for chat traffic.
+
+<Steps>
+<Step title="Keep the AIOps Instance at one replica, with persistence">
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chatcli-aiops
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 1Gi
+  server:
+    tls: { enabled: true, secretName: chatcli-tls }
+    token: { name: chatcli-auth, key: token }
+  watcher:
+    enabled: true
+    targets:
+      - { kind: Deployment, name: api, namespace: default }
+```
+
+Pin it in the operator values and pass the file on every upgrade:
+
+```yaml
+aiops:
+  instance:
+    namespace: chatcli-system
+    name: chatcli-aiops
+```
+
+Each rollout of this Instance has a brief downtime (`Recreate`). During it the WatcherBridge logs `Alert stream ended; reopening` and reconnects by itself.
+
+</Step>
+<Step title="Add a stateless pool for chat traffic">
+
+```yaml
+apiVersion: platform.chatcli.io/v1alpha1
+kind: Instance
+metadata:
+  name: chat-pool
+  namespace: chatcli-system
+spec:
+  provider: CLAUDEAI
+  replicas: 3
+  persistence:
+    enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  server:
+    tls: { enabled: true, secretName: chat-pool-tls }
+    token: { name: chatcli-auth, key: token }
+  scheduling:
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: chat-pool
+```
+
+- `preferred` anti-affinity spreads the pods across nodes when it can, and still schedules them when there are fewer nodes than replicas. Use `required` only when you have at least as many nodes as replicas.
+- The TLS certificate must be valid for `chat-pool.<namespace>.svc.cluster.local`. You can reuse one Secret for several Instances if its SANs cover all of their names.
+- Sessions live in `emptyDir`: a client whose pod is replaced starts a new session.
+
+</Step>
+<Step title="Check both">
+
+```bash
+kubectl get instances -n chatcli-system
+kubectl -n chatcli-system get pods -l app.kubernetes.io/instance=chat-pool -o wide
+kubectl -n chatcli-system get deploy chat-pool -o jsonpath='{.spec.strategy.type}{"\n"}'
+kubectl -n chatcli-system logs deploy/chatcli-operator | grep "Connected to Instance"
+```
+
+Both Instances report `READY true`, the pool's pods are on different nodes, its strategy is `RollingUpdate`, and the operator's `Connected to Instance` line names only the AIOps Instance.
+
+</Step>
+</Steps>
+
+---
+
+## What a rollout costs, measured
+
+A probe pod ran `chatcli healthcheck` against each Instance's Service every 0.3 seconds while a change to `spec.extraEnv` rolled it. The cluster was kind with one control plane and two workers, node-local storage, ChatCLI 1.221.1, plus a build of the server with the shutdown drain.
+
+| Instance | Strategy | Checks | Failed | What happened |
+|---|---|---|---|---|
+| 2 replicas, persistence | `Recreate` | 222 | 9 | About 20 seconds without any pod: the old pods stop, then the new ones start |
+| 3 replicas, no persistence, no drain | `RollingUpdate` | 313 | 1 | One new connection resolved a pod that had already stopped and timed out |
+| 3 replicas, no persistence, `5s` drain, two rollouts | `RollingUpdate` | 395 | 0 | 25 checks were answered `NOT_SERVING` by a draining pod (a request would have been served) |
+
+The two persistent replicas landed on the same node, the one the local-path volume was bound to. Requiring them on different nodes left the second pod `Pending`, as described in the warning above.
+
+To reproduce it, build a probe pod from `busybox` with a `chatcli` binary for the node's architecture and the CA of the Instance mounted, then loop:
+
+```bash
+while true; do
+  chatcli healthcheck -timeout 2s \
+    -addr chat-pool.chatcli-system.svc.cluster.local:50051 \
+    -tls-cert /tls/ca.crt >/dev/null 2>&1 && echo ok || echo FAIL
+  sleep 0.3
+done
+```
+
+The server image is distroless (it has no shell), which is why the loop runs in another image.
+
+---
+
+## Limits to know
+
+- The operator creates no HorizontalPodAutoscaler or PodDisruptionBudget for Instances. Add your own if you autoscale or drain nodes often; an HPA on an Instance competes with `spec.replicas`, so prefer adjusting `spec.replicas`.
+- Replicas do not share memory or sessions. Put state that must survive a pod in persistence (one replica) or outside the server.
+- The operator itself scales separately: `replicaCount: 2` or more with `leaderElect: true` in its chart. The controllers run on the leader; the dashboard and REST API answer on every replica.
+
+## Related
+
+- [Kubernetes Operator](/kubernetes/k8s-operator#high-availability)
+- [AIOps production setup](/cookbook/aiops-production-setup)
+- [Encryption at Rest](/security/encryption-at-rest#kubernetes)
