@@ -3087,7 +3087,7 @@ cases:
 | `id` | Unique within the suite. Reports key cases as `<suite>/<id>` |
 | `prompt` | What the candidate receives |
 | `mode` | `chat` (plain one-shot) or `coder` (the full ReAct loop with tools) |
-| `fixture` / `files` / `setup` | Sandbox contents: a directory to copy, inline files, shell commands to run first |
+| `fixture` / `files` / `setup` | Sandbox contents: a directory to copy, files inline or read with `!file` ([details](#files-on-disk-or-inline)), shell commands to run first |
 | `trials` / `pass_policy` / `timeout` / `env` | Per-case overrides of the defaults (`trials` 1–20) |
 | `policy` | Coder policy rules for the sandbox, `{pattern, action: allow\|deny\|ask}` |
 | `skip` | Keep the case in the suite without running it; the value is the reason |
@@ -3095,15 +3095,15 @@ cases:
 
 ### Files on disk or inline
 
-A case gets its workspace from two places, and they work differently:
+A case gets its workspace from two places:
 
 | | `fixture:` | `files:` |
 | --- | --- | --- |
-| What you give it | A **directory**, relative to the suite file | A map of path → **content** |
-| Where the code lives | Ordinary files on disk, which you edit in your IDE | Inside the YAML |
-| Copied as | The whole tree, keeping file modes; symlinks are copied as links, never followed | Each value written as the file's text |
+| What you give it | A **directory**, relative to the suite file | A map of sandbox path → content, written **inline** or read from a file with **`!file <path>`** |
+| Use it for | A whole tree, copied as is | Single files: small ones inline, real files on disk with `!file` |
+| Permissions | Kept; symlinks are copied as links, never followed | `!file` keeps the source file's bits, so a script stays executable; inline entries are written `0600` |
 
-**`files:` never reads a file from disk.** The value is the content itself: `go.mod: ./go.mod` creates a `go.mod` whose text is `./go.mod`. To keep a file as a real file and only reference it from the suite, put it in a directory and point `fixture:` at the directory:
+A plain `files:` value is the file's content. To keep a file on disk and only reference it from the suite, tag the value with `!file`. The path resolves against the suite file, like `fixture:`:
 
 ```text
 evals/
@@ -3117,13 +3117,31 @@ evals/
 ```yaml
   - id: coder-reverse-unicode
     mode: coder
-    fixture: testdata/strutil      # relative to core.yaml; no code in the suite
+    files:
+      go.mod: !file testdata/strutil/go.mod
+      reverse.go: !file testdata/strutil/reverse.go
+      reverse_test.go: !file testdata/strutil/reverse_test.go
+      notes.md: "inline content, as before"
     prompt: "Fix Reverse so it works for any UTF-8 string."
 ```
 
-- **`fixture:` must be a directory, even for one file.** A path to a file is rejected when the suite loads, with `fixture directory "testdata/strutil/go.mod" not found`, although the file exists.
-- **The two combine.** The sandbox is built in this order: the fixture is copied, then `files:` are written over it, then `setup:` runs. A fixture shared by several cases can carry the module, and each case can replace one small file inline.
-- **Keep a broken fixture away from the host repository's tooling.** Name the directory `testdata/`, which `go build`, `go test ./...` and `go vet` skip, and give a Go fixture its own `go.mod`. In a repository whose gates still scan every `.go` file (coverage, license headers), keep small fixtures inline under `files:` instead and share them between cases with a YAML anchor (`files: &name` … `files: *name`). ChatCLI's starter suite does this.
+For the whole directory, `fixture: testdata/strutil` does the same in one line.
+
+- **The sandbox is built in this order:** the fixture is copied, then `files:` are written over it (inline and `!file` alike), then `setup:` runs. A fixture shared by several cases can carry the module, and each case can replace one file.
+- **`!file` works under YAML anchors** (`files: &name` … `files: *name`), so several cases can share the same entries.
+- **What is refused when the suite loads**, so `chatcli eval validate` catches it for free:
+
+  | Mistake | Message |
+  | --- | --- |
+  | A path that does not exist | `files entry "go.mod": !file "testdata/nope.go" not found` |
+  | A directory | `… is a directory; use fixture: to copy a directory` |
+  | A file over 16 MiB | `… use fixture: for large files` |
+  | A misspelled tag, such as `!fiel` | `line 6: unknown tag !fiel (the only tag a suite accepts is !file, on a files: entry)` |
+  | `!file` anywhere but a `files:` entry, such as `prompt:` | `line 3: !file works only as the value of a files: entry` |
+  | `fixture:` pointing at a file | `fixture "testdata/strutil/go.mod" is a file, not a directory: point fixture: at the directory that holds it, or use files: with !file for a single file` |
+
+  A misspelled tag is an error, never content: without that rule, `!fiel testdata/go.mod` would quietly become a file whose text is the path.
+- **Keep a broken fixture away from the host repository's tooling.** Name the directory `testdata/`, which `go build`, `go test ./...` and `go vet` skip, and give a Go fixture its own `go.mod`. In a repository whose gates scan every `.go` file anyway (coverage, license headers), keep small fixtures inline under `files:`. ChatCLI's starter suite does this.
 
 ---
 
@@ -14438,7 +14456,7 @@ TITLE: Recipe: Catching a Regression with Evals
 
 [Evals](/agents/harness/evals) tell you whether a change made ChatCLI better or worse, with numbers instead of an impression. This recipe walks through the whole loop on a small suite:
 
-1. Write two cases: a coder case checked by real Go tests, and a chat case graded by an LLM judge. The code goes inline in the suite or, as real files, in a fixture directory.
+1. Write two cases: a coder case checked by real Go tests, and a chat case graded by an LLM judge. The code goes inline in the suite or stays in real files that the suite reads with `!file`.
 2. Run them and save the result as a **baseline**.
 3. Lay out one folder per change you want to test, each holding a copy of the suite with that one change.
 4. Test a configuration change that looks dangerous but turns out to only cost more.
@@ -14545,11 +14563,9 @@ What each part is for:
 | `max_turns` / `max_cost_usd` | A fix that passes but takes 40 turns is still a regression. |
 | `judge:` | Only for what code cannot check: language, length and conceptual correctness. Deterministic checks come first. |
 
-### Prefer real files? Use a fixture directory
+### Prefer real files? Read them with `!file`
 
-**`files:` takes the content of each file, never a path.** `go.mod: ./go.mod` does not read your `go.mod`: it writes a `go.mod` whose text is `./go.mod`, and the module no longer builds. To reference files on disk, use `fixture:`.
-
-To keep the module as ordinary files you edit in your IDE, move them into a directory next to the suite and point `fixture:` at it. The suite then holds no code:
+To keep the module as ordinary files you edit in your IDE, put them in a directory next to the suite and tag each `files:` entry with `!file`. The suite then holds no code:
 
 ```text
 evals-demo/
@@ -14560,30 +14576,22 @@ evals-demo/
 ```yaml
   - id: coder-reverse-unicode
     mode: coder
-    fixture: testdata/strutil      # replaces the whole files: block
+    files:                                     # replaces the inline blocks
+      go.mod: !file testdata/strutil/go.mod
+      reverse.go: !file testdata/strutil/reverse.go
+      reverse_test.go: !file testdata/strutil/reverse_test.go
     setup:
       - "git init -q && git add -A && git -c user.email=e@x -c user.name=e commit -qm fixture"
 ```
 
-- **`fixture:` must name a directory, even when it holds a single file.** A path to a file fails when the suite loads, with a message that says the directory was not found although the file exists:
+**Without the tag, a value is content.** `go.mod: testdata/strutil/go.mod` writes a `go.mod` whose text is that path, and the module no longer builds. Write `!file` before the path.
 
-  ```text
-  demo.yaml: case "coder-reverse-unicode": fixture directory "testdata/strutil/go.mod" not found
-  ```
+- **Paths resolve against the suite file**, like `fixture:`, and `!file` keeps the source's permission bits, so a script you run in `setup:` stays executable.
+- **For the whole directory, use `fixture: testdata/strutil`** instead: it copies the tree in one line. `fixture:` must name a directory; pointing it at a file fails with a message that says so and suggests `!file`.
+- **They mix.** The fixture is copied first, then `files:` are written over it, then `setup:` runs. Keep the module in a fixture and replace one file per case, inline or with `!file`.
+- **Name the directory `testdata/`.** `go build`, `go test ./...` and `go vet` skip it, so the broken module stays out of the repository that hosts the suite.
 
-- **The two mix.** The fixture is copied first, then `files:` are written over it, then `setup:` runs. Keep the module on disk and change one file inline per case:
-
-  ```yaml
-      fixture: testdata/strutil      # go.mod and reverse_test.go on disk
-      files:
-        reverse.go: |                # this case's starting point, inline
-          package strutil
-          ...
-  ```
-
-- **Name the directory `testdata/`.** `go build`, `go test ./...` and `go vet` skip it, so the broken module stays out of the repository that hosts the suite. Give it its own `go.mod` as well.
-
-[Files on disk or inline](/agents/harness/evals#files-on-disk-or-inline) has the details.
+`chatcli eval validate` reads every `!file` while it checks the suite, so a wrong path, a directory or a misspelled tag (`!fiel`) shows up before you spend anything. [Files on disk or inline](/agents/harness/evals#files-on-disk-or-inline) lists every message.
 
 ---
 
@@ -14912,8 +14920,8 @@ jobs:
 | `compare` reports cases as new and removed instead of comparing them | The suite `name` or a case `id` changed between runs | Keep both identical in every variant |
 | A risky change passes | The agent recovered, as it did with the low token ceiling | Compare `turns`, `output_tokens` and `cost_usd` between reports |
 | CI stays green on a regression | A pipe swallowed the exit code | `set -o pipefail`, or no pipe |
-| The module in the sandbox does not build, or `go.mod` contains a path | A path was given under `files:`, which writes each value as the file's text | Put the files in a directory and use `fixture:` |
-| `fixture directory "…" not found` for a file that exists | `fixture:` points at a file | Point it at the directory that holds the file |
+| The module in the sandbox does not build, or `go.mod` contains a path | A path was given under `files:` without `!file`, so it was written as the file's text | Write `!file` before the path |
+| `fixture "…" is a file, not a directory` | `fixture:` points at a file | Point it at the directory that holds the file, or use `!file` under `files:` |
 | A case reports `self_judged` | The judge is the same model as the candidate | Pass a different `--judge-model` |
 | A run uses your own memory | `--with-memory` was set | Keep baselines hermetic (the default) |
 
@@ -36044,7 +36052,7 @@ cases:
 | `id` | Único dentro da suíte. Os relatórios identificam o caso como `<suíte>/<id>` |
 | `prompt` | O que o candidato recebe |
 | `mode` | `chat` (one-shot simples) ou `coder` (o loop ReAct completo, com ferramentas) |
-| `fixture` / `files` / `setup` | Conteúdo do sandbox: diretório a copiar, arquivos inline e comandos de shell a rodar antes |
+| `fixture` / `files` / `setup` | Conteúdo do sandbox: diretório a copiar, arquivos inline ou lidos com `!file` ([detalhes](#arquivos-no-disco-ou-inline)) e comandos de shell a rodar antes |
 | `trials` / `pass_policy` / `timeout` / `env` | Sobrescritas por caso dos defaults (`trials` de 1 a 20) |
 | `policy` | Regras da policy do coder para o sandbox, `{pattern, action: allow\|deny\|ask}` |
 | `skip` | Mantém o caso na suíte sem rodá-lo; o valor é o motivo |
@@ -36052,15 +36060,15 @@ cases:
 
 ### Arquivos no disco ou inline
 
-Um caso recebe o workspace de dois lugares, e eles funcionam de jeitos diferentes:
+Um caso recebe o workspace de dois lugares:
 
 | | `fixture:` | `files:` |
 | --- | --- | --- |
-| O que você passa | Um **diretório**, relativo ao arquivo da suíte | Um mapa de caminho → **conteúdo** |
-| Onde o código fica | Arquivos normais no disco, que você edita no IDE | Dentro do YAML |
-| Copiado como | A árvore inteira, preservando as permissões; links simbólicos são copiados como links, nunca seguidos | Cada valor gravado como o texto do arquivo |
+| O que você passa | Um **diretório**, relativo ao arquivo da suíte | Um mapa de caminho no sandbox → conteúdo, escrito **inline** ou lido de um arquivo com **`!file <caminho>`** |
+| Use para | Uma árvore inteira, copiada como está | Arquivos avulsos: pequenos inline, arquivos de verdade no disco com `!file` |
+| Permissões | Preservadas; links simbólicos são copiados como links, nunca seguidos | O `!file` mantém as permissões do arquivo de origem, então um script continua executável; entradas inline são gravadas com `0600` |
 
-**O `files:` nunca lê um arquivo do disco.** O valor é o próprio conteúdo: `go.mod: ./go.mod` cria um `go.mod` cujo texto é `./go.mod`. Para manter um arquivo como arquivo de verdade e só referenciá-lo na suíte, coloque-o numa pasta e aponte o `fixture:` para a pasta:
+Um valor comum de `files:` é o conteúdo do arquivo. Para manter um arquivo no disco e só referenciá-lo na suíte, marque o valor com `!file`. O caminho é resolvido em relação ao arquivo da suíte, como no `fixture:`:
 
 ```text
 evals/
@@ -36074,13 +36082,31 @@ evals/
 ```yaml
   - id: coder-reverse-unicode
     mode: coder
-    fixture: testdata/strutil      # relativo ao core.yaml; nenhum código na suíte
+    files:
+      go.mod: !file testdata/strutil/go.mod
+      reverse.go: !file testdata/strutil/reverse.go
+      reverse_test.go: !file testdata/strutil/reverse_test.go
+      notes.md: "conteúdo inline, como antes"
     prompt: "Fix Reverse so it works for any UTF-8 string."
 ```
 
-- **O `fixture:` precisa ser um diretório, mesmo para um arquivo só.** Um caminho para arquivo é recusado ao carregar a suíte, com `fixture directory "testdata/strutil/go.mod" not found`, mesmo que o arquivo exista.
-- **Os dois se combinam.** O sandbox é montado nesta ordem: a fixture é copiada, depois os `files:` são gravados por cima, depois o `setup:` roda. Uma fixture compartilhada por vários casos pode trazer o módulo, e cada caso pode trocar um arquivo pequeno inline.
-- **Mantenha uma fixture quebrada longe das ferramentas do repositório que a hospeda.** Chame a pasta de `testdata/`, que `go build`, `go test ./...` e `go vet` ignoram, e dê a uma fixture Go o seu próprio `go.mod`. Num repositório cujos gates ainda varrem todo arquivo `.go` (cobertura, cabeçalho de licença), deixe fixtures pequenas inline em `files:` e compartilhe-as entre casos com uma âncora YAML (`files: &nome` … `files: *nome`). É o que a suíte inicial do ChatCLI faz.
+Para a pasta inteira, `fixture: testdata/strutil` faz o mesmo numa linha.
+
+- **O sandbox é montado nesta ordem:** a fixture é copiada, depois os `files:` são gravados por cima (inline e `!file` da mesma forma), depois o `setup:` roda. Uma fixture compartilhada por vários casos pode trazer o módulo, e cada caso pode trocar um arquivo.
+- **O `!file` funciona com âncoras YAML** (`files: &nome` … `files: *nome`), então vários casos podem compartilhar as mesmas entradas.
+- **O que é recusado ao carregar a suíte**, então o `chatcli eval validate` pega de graça:
+
+  | Erro | Mensagem |
+  | --- | --- |
+  | Um caminho que não existe | `entrada "go.mod" de files: !file "testdata/nope.go" não encontrado` |
+  | Um diretório | `… é um diretório; use fixture: para copiar um diretório` |
+  | Um arquivo com mais de 16 MiB | `… use fixture: para arquivos grandes` |
+  | Uma tag escrita errada, como `!fiel` | `linha 6: tag desconhecida !fiel (a única tag que uma suíte aceita é !file, numa entrada de files:)` |
+  | `!file` fora de uma entrada de `files:`, como em `prompt:` | `linha 3: !file só funciona como valor de uma entrada de files:` |
+  | `fixture:` apontando para um arquivo | `a fixture "testdata/strutil/go.mod" é um arquivo, não um diretório: aponte o fixture: para o diretório que o contém, ou use files: com !file para um arquivo só` |
+
+  Uma tag escrita errada é erro, nunca conteúdo: sem essa regra, `!fiel testdata/go.mod` viraria em silêncio um arquivo cujo texto é o caminho.
+- **Mantenha uma fixture quebrada longe das ferramentas do repositório que a hospeda.** Chame a pasta de `testdata/`, que `go build`, `go test ./...` e `go vet` ignoram, e dê a uma fixture Go o seu próprio `go.mod`. Num repositório cujos gates varrem todo arquivo `.go` de qualquer jeito (cobertura, cabeçalho de licença), deixe fixtures pequenas inline em `files:`. É o que a suíte inicial do ChatCLI faz.
 
 ---
 
@@ -36128,6 +36154,7 @@ O veredito do caso segue a `pass_policy`. `all` (o padrão, pass^k) é rígido: 
 
 ---
 
+
 ## Baselines e o gate de CI
 
 `--out` salva o relatório JSON. Uma execução posterior com `--baseline` compara caso a caso:
@@ -36153,7 +36180,6 @@ chatcli eval compare runs/main.json runs/branch.json                   # offline
 `--markdown` grava o mesmo resultado em Markdown (tabela de resumo, delta contra o baseline e checagens que falharam), pronto para comentário de PR ou resumo de job de CI.
 
 ---
-
 
 ## Testando uma mudança
 
@@ -47390,7 +47416,7 @@ TITLE: Receita: Pegando uma Regressão com Evals
 
 Os [evals](/pt/agents/harness/evals) dizem se uma mudança deixou o ChatCLI melhor ou pior, com números em vez de impressão. Esta receita percorre o ciclo completo numa suíte pequena:
 
-1. Escrever dois casos: um de coder, verificado por testes Go reais, e um de chat, avaliado por um LLM-juiz. O código vai inline na suíte ou, como arquivos de verdade, numa pasta de fixture.
+1. Escrever dois casos: um de coder, verificado por testes Go reais, e um de chat, avaliado por um LLM-juiz. O código vai inline na suíte ou fica em arquivos de verdade que a suíte lê com `!file`.
 2. Rodar e salvar o resultado como **baseline**.
 3. Montar uma pasta por mudança a testar, cada uma com uma cópia da suíte com aquela única mudança.
 4. Testar uma mudança de configuração que parece perigosa, mas que no fim só custa mais.
@@ -47497,11 +47523,9 @@ Para que serve cada parte:
 | `max_turns` / `max_cost_usd` | Uma correção que passa mas leva 40 turnos também é regressão. |
 | `judge:` | Só para o que código não consegue checar: idioma, tamanho e correção conceitual. As checagens determinísticas vêm primeiro. |
 
-### Prefere arquivos de verdade? Use uma pasta de fixture
+### Prefere arquivos de verdade? Leia-os com `!file`
 
-**O `files:` recebe o conteúdo de cada arquivo, nunca um caminho.** `go.mod: ./go.mod` não lê o seu `go.mod`: grava um `go.mod` cujo texto é `./go.mod`, e o módulo deixa de compilar. Para referenciar arquivos no disco, use `fixture:`.
-
-Para manter o módulo como arquivos normais que você edita no IDE, mova-os para uma pasta ao lado da suíte e aponte o `fixture:` para ela. A suíte fica sem nenhum código:
+Para manter o módulo como arquivos normais que você edita no IDE, coloque-os numa pasta ao lado da suíte e marque cada entrada de `files:` com `!file`. A suíte fica sem nenhum código:
 
 ```text
 evals-demo/
@@ -47512,30 +47536,22 @@ evals-demo/
 ```yaml
   - id: coder-reverse-unicode
     mode: coder
-    fixture: testdata/strutil      # substitui o bloco files: inteiro
+    files:                                     # substitui os blocos inline
+      go.mod: !file testdata/strutil/go.mod
+      reverse.go: !file testdata/strutil/reverse.go
+      reverse_test.go: !file testdata/strutil/reverse_test.go
     setup:
       - "git init -q && git add -A && git -c user.email=e@x -c user.name=e commit -qm fixture"
 ```
 
-- **O `fixture:` precisa apontar para um diretório, mesmo que ele tenha um arquivo só.** Um caminho para arquivo falha ao carregar a suíte, com uma mensagem dizendo que o diretório não foi encontrado, mesmo que o arquivo exista:
+**Sem a tag, o valor é conteúdo.** `go.mod: testdata/strutil/go.mod` grava um `go.mod` cujo texto é esse caminho, e o módulo deixa de compilar. Escreva `!file` antes do caminho.
 
-  ```text
-  demo.yaml: case "coder-reverse-unicode": diretório de fixture "testdata/strutil/go.mod" não encontrado
-  ```
+- **Os caminhos são resolvidos em relação ao arquivo da suíte**, como no `fixture:`, e o `!file` mantém as permissões do arquivo de origem, então um script que você roda no `setup:` continua executável.
+- **Para a pasta inteira, use `fixture: testdata/strutil`**: copia a árvore numa linha. O `fixture:` precisa apontar para um diretório; apontar para um arquivo falha com uma mensagem que diz isso e sugere o `!file`.
+- **Os dois se misturam.** A fixture é copiada primeiro, depois os `files:` são gravados por cima, depois o `setup:` roda. Mantenha o módulo numa fixture e troque um arquivo por caso, inline ou com `!file`.
+- **Chame a pasta de `testdata/`.** `go build`, `go test ./...` e `go vet` a ignoram, então o módulo quebrado fica fora do repositório que hospeda a suíte.
 
-- **Os dois se misturam.** A fixture é copiada primeiro, depois os `files:` são gravados por cima, depois o `setup:` roda. Mantenha o módulo no disco e troque um arquivo inline por caso:
-
-  ```yaml
-      fixture: testdata/strutil      # go.mod e reverse_test.go no disco
-      files:
-        reverse.go: |                # o ponto de partida deste caso, inline
-          package strutil
-          ...
-  ```
-
-- **Chame a pasta de `testdata/`.** `go build`, `go test ./...` e `go vet` a ignoram, então o módulo quebrado fica fora do repositório que hospeda a suíte. Dê a ela também um `go.mod` próprio.
-
-[Arquivos no disco ou inline](/pt/agents/harness/evals#arquivos-no-disco-ou-inline) tem os detalhes.
+O `chatcli eval validate` lê todo `!file` enquanto confere a suíte, então um caminho errado, um diretório ou uma tag escrita errada (`!fiel`) aparecem antes de você gastar qualquer coisa. [Arquivos no disco ou inline](/pt/agents/harness/evals#arquivos-no-disco-ou-inline) lista todas as mensagens.
 
 ---
 
@@ -47866,8 +47882,8 @@ jobs:
 | O `compare` informa casos como novos e removidos em vez de compará-los | O `name` da suíte ou o `id` de um caso mudou entre as execuções | Mantenha os dois idênticos em toda variante |
 | Uma mudança arriscada passa | O agente se recuperou, como fez com o teto de tokens baixo | Compare `turns`, `output_tokens` e `cost_usd` entre os relatórios |
 | O CI fica verde numa regressão | Um pipe engoliu o exit code | `set -o pipefail`, ou sem pipe |
-| O módulo no sandbox não compila, ou o `go.mod` contém um caminho | Um caminho foi passado em `files:`, que grava cada valor como o texto do arquivo | Coloque os arquivos numa pasta e use `fixture:` |
-| `diretório de fixture "…" não encontrado` para um arquivo que existe | O `fixture:` aponta para um arquivo | Aponte para a pasta que contém o arquivo |
+| O módulo no sandbox não compila, ou o `go.mod` contém um caminho | Um caminho foi passado em `files:` sem `!file`, então foi gravado como o texto do arquivo | Escreva `!file` antes do caminho |
+| `a fixture "…" é um arquivo, não um diretório` | O `fixture:` aponta para um arquivo | Aponte para a pasta que contém o arquivo, ou use `!file` em `files:` |
 | Um caso aparece como `self_judged` | O juiz é o mesmo modelo do candidato | Passe outro `--judge-model` |
 | Uma execução usa a sua própria memória | `--with-memory` estava ligado | Mantenha os baselines herméticos (o padrão) |
 
