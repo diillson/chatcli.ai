@@ -229,12 +229,12 @@ ChatCLI supports OAuth 2.0 with PKCE for the following providers:
 
 ### AES-256-GCM Credential Encryption
 
-All OAuth credentials are encrypted at rest using **AES-256-GCM** in `~/.chatcli/auth-profiles.json`. The encryption key is automatically generated and stored with strict permissions.
+All OAuth credentials are encrypted at rest using **AES-256-GCM** in `~/.chatcli/auth-profiles.json`. The key is generated on first use and kept in the OS keychain; it stays in a file only where no keychain is available or `CHATCLI_AUTH_DIR` points elsewhere ([OS Keychain Integration](#os-keychain-integration)).
 
 | File | Permission | Content |
 |------|------------|---------|
 | `~/.chatcli/auth-profiles.json` | `0600` | AES-256-GCM encrypted OAuth credentials |
-| `~/.chatcli/.auth-key` | `0600` | AES-256-GCM encryption key |
+| `~/.chatcli/.auth-key` | `0600` | The key, only while it is not in the keychain; once moved there the file is removed and `.auth-key.keychain` records it |
 | `~/.chatcli/coder_policy.json` | `0600` | Coder policy rules |
 
 ### Encryption at Rest
@@ -244,6 +244,8 @@ All OAuth credentials are encrypted at rest using **AES-256-GCM** in `~/.chatcli
 Every store that embeds conversation content is sealed with AES-256-GCM before it touches disk and opened transparently on read: sessions, autosaves and MCP/ACP mirrors, park snapshots, the transcript journal and the prompt history (line by line), long-term memory (JSON stores, daily notes, summaries, the vector index), knowledge contexts and their vectors, the CCR archive, cost snapshots and attachments.
 
 **The key.** With `CHATCLI_ENCRYPTION_KEY` unset, the data key is derived (HKDF-SHA256, its own context) from the secret ChatCLI keeps in the OS keychain, the same secret that protects stored credentials, so one key protects everything while the two uses stay cryptographically separate. `CHATCLI_ENCRYPTION_KEY` takes precedence; `CHATCLI_ENCRYPTION_KEY=off` stops sealing new writes and still opens sealed files. `chatcli server` never creates a key on its own: on Kubernetes it reads it from a Secret the chart or the operator sets up ([details](/security/encryption-at-rest#kubernetes)).
+
+**Keep a recovery key.** The keychain key never leaves the machine on its own, so a lost or reset keychain means sealed data cannot be opened. `/config security recovery-key` prints it (interactive terminal only, never logged); `--save <file>` writes it sealed with a passphrase of at least 12 characters (Argon2id + AES-256-GCM) and `--restore <file>` brings it back on a new machine ([details](/security/encryption-at-rest#keep-a-recovery-key)).
 
 **Payloads are bound to their store.** A sealed file carries, as authenticated data, its relative store path and tenant slug: a session, memory or park file copied from one tenant's directory into another's (or renamed) does not open there. Secrets shorter than 32 bytes are treated as passphrases and stretched with Argon2id; a random key of at least 32 bytes keeps the direct derivation. Version-1 payloads keep loading and are rewritten as bound v2 by their next save or by `/config security reseal`.
 
@@ -267,7 +269,7 @@ The conversation hub database (SQLite) and the scheduler and reflexion queues ar
 
 #### Tamper-evident audit trail
 
-Every line of the audit trail (`CHATCLI_AUDIT_LOG_PATH`) carries `seq`, `prev_hash`, `chain_v` and `hash` — `hash = SHA-256(prev_hash ‖ canonical sorted-key JSON of the entry)`, a form independent of which process wrote it. An edited, removed or reordered line breaks the chain from that point on. Several writers share one file safely: every append takes an exclusive file lock, re-reads the tail when the file changed under it (another writer appended, or the file rotated) and only then links the new line — the REPL, a gateway daemon and the gRPC server (`kind: "grpc"`) form one chain. The file rotates at 64 MiB; the first line of the new file names the file it continues (`rotated_from`) and links to its last hash, so verification follows the boundary, and the retention pass removes rotated files past the session window (the live file is never touched). With encryption at rest enabled every line is sealed on disk (`enc:` prefix) and opened transparently on verify. A torn last line (a crash mid-write) is reported as such, never as tampering, and the next entry continues from the last complete line. `/config security verify-audit [path]` re-hashes the trail and reports the first broken line, the sealed count, the rotation origin, a torn tail and the rotated siblings; trails written before the shared chain still verify with their original hash.
+Every line of the audit trail (`CHATCLI_AUDIT_LOG_PATH`) carries `seq`, `prev_hash`, `chain_v` and `hash` — `hash = SHA-256(prev_hash ‖ canonical sorted-key JSON of the entry)`, a form independent of which process wrote it. An edited, removed or reordered line breaks the chain from that point on. Several writers share one file safely: every append takes an exclusive file lock, re-reads the tail when the file changed under it (another writer appended, or the file rotated) and only then links the new line — the REPL, a gateway daemon and the gRPC server (`kind: "grpc"`) form one chain. The file rotates at 64 MiB; the first line of the new file names the file it continues (`rotated_from`) and links to its last hash, so verification follows the boundary, and the retention pass removes rotated files past the session window (the live file is never touched). Under a key from `CHATCLI_ENCRYPTION_KEY` every line is sealed on disk (`enc:` prefix) and opened transparently on verify; with the default keychain key the trail stays plaintext, because it is a file operators ship to a log pipeline. A torn last line (a crash mid-write) is reported as such, never as tampering, and the next entry continues from the last complete line. `/config security verify-audit [path]` re-hashes the trail and reports the first broken line, the sealed count, the rotation origin, a torn tail and the rotated siblings; trails written before the shared chain still verify with their original hash.
 
 ### TLS 1.3 Transport Security
 
@@ -1400,12 +1402,14 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     chatcli server --tls-cert cert.pem --tls-key key.pem --tls-client-ca ca.pem
     ```
   </Step>
-  <Step title="Turn on encryption at rest">
-    ```bash
-    export CHATCLI_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+  <Step title="Keep encryption at rest on and back up its key">
+    Encryption at rest is on by default. Save the recovery key somewhere other than the machine it protects:
+
+    ```text
+    /config security recovery-key --save ~/chatcli-recovery.json
     ```
 
-    Verify the audit trail periodically with `/config security verify-audit`.
+    On Kubernetes, give the server a key you manage (`security.encryptionKeySecret.name` in the chart, `spec.features.encryptionKeyRef` in the operator) and back that Secret up with the volume. Setting `CHATCLI_ENCRYPTION_KEY` yourself also seals the audit trail. Verify the trail periodically with `/config security verify-audit`.
   </Step>
   <Step title="Sandbox coder execution">
     ```bash

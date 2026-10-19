@@ -229,12 +229,12 @@ O ChatCLI aceita OAuth 2.0 com PKCE para os seguintes provedores:
 
 ### Criptografia AES-256-GCM de Credenciais
 
-Todas as credenciais OAuth são criptografadas em repouso com **AES-256-GCM** em `~/.chatcli/auth-profiles.json`. A chave de criptografia é gerada automaticamente e guardada com permissões estritas.
+Todas as credenciais OAuth são criptografadas em repouso com **AES-256-GCM** em `~/.chatcli/auth-profiles.json`. A chave é gerada no primeiro uso e guardada no keychain do SO; ela só fica num arquivo onde não há keychain disponível ou quando `CHATCLI_AUTH_DIR` aponta para outro lugar ([Integração com o keychain do SO](#integração-com-o-keychain-do-so)).
 
 | Arquivo | Permissão | Conteúdo |
 |---------|-----------|----------|
 | `~/.chatcli/auth-profiles.json` | `0600` | Credenciais OAuth criptografadas com AES-256-GCM |
-| `~/.chatcli/.auth-key` | `0600` | Chave de criptografia AES-256-GCM |
+| `~/.chatcli/.auth-key` | `0600` | A chave, só enquanto não está no keychain; depois de movida para lá o arquivo é removido e `.auth-key.keychain` registra isso |
 | `~/.chatcli/coder_policy.json` | `0600` | Regras de política do coder |
 
 ### Criptografia em Repouso
@@ -244,6 +244,8 @@ Todas as credenciais OAuth são criptografadas em repouso com **AES-256-GCM** em
 Todo store que embute conteúdo de conversa é selado com AES-256-GCM antes de tocar o disco e aberto de forma transparente na leitura: sessões, autosaves e espelhos MCP/ACP, snapshots de park, o journal de transcrição e o histórico de prompts (linha a linha), a memória de longo prazo (stores JSON, notas diárias, resumos, índice vetorial), os contextos de conhecimento e seus vetores, o arquivo CCR, os snapshots de custo e os anexos.
 
 **A chave.** Com `CHATCLI_ENCRYPTION_KEY` vazia, a chave de dados é derivada (HKDF-SHA256, com contexto próprio) do segredo que o ChatCLI guarda no keychain do sistema, o mesmo que protege as credenciais guardadas. Assim uma chave protege tudo, e os dois usos continuam criptograficamente separados. `CHATCLI_ENCRYPTION_KEY` tem precedência; `CHATCLI_ENCRYPTION_KEY=off` para de selar as gravações novas e continua abrindo os arquivos selados. O `chatcli server` nunca cria uma chave sozinho: no Kubernetes ele a lê de um Secret que o chart ou o operator preparam ([detalhes](/pt/security/encryption-at-rest#kubernetes)).
+
+**Guarde uma chave de recuperação.** A chave do keychain nunca sai da máquina sozinha, então um keychain perdido ou resetado significa dados selados que não abrem mais. `/config security recovery-key` mostra a chave (só em terminal interativo, nunca vai para log); `--save <arquivo>` grava a chave selada com uma senha de pelo menos 12 caracteres (Argon2id + AES-256-GCM) e `--restore <arquivo>` traz a chave de volta numa máquina nova ([detalhes](/pt/security/encryption-at-rest#guarde-uma-chave-de-recuperação)).
 
 **Payloads ficam presos ao seu store.** Um arquivo selado carrega, como dado autenticado, o caminho relativo do store e o slug do tenant: um arquivo de sessão, memória ou park copiado do diretório de um tenant para o de outro (ou renomeado) não abre lá. Segredos com menos de 32 bytes são tratados como senha e esticados com Argon2id; uma chave aleatória de pelo menos 32 bytes mantém a derivação direta. Payloads versão 1 continuam carregando e são reescritos como v2 presos no próximo save ou pelo `/config security reseal`.
 
@@ -267,7 +269,7 @@ O `/config security` mostra se a criptografia está ligada e de onde vem a chave
 
 #### Trilha de auditoria à prova de adulteração
 
-Toda linha da trilha de auditoria (`CHATCLI_AUDIT_LOG_PATH`) carrega `seq`, `prev_hash`, `chain_v` e `hash` — `hash = SHA-256(prev_hash ‖ JSON canônico com chaves ordenadas da entrada)`, uma forma independente de qual processo escreveu. Uma linha editada, removida ou reordenada quebra a cadeia dali em diante. Vários escritores compartilham um arquivo com segurança: cada append toma um lock exclusivo do arquivo, relê o fim quando o arquivo mudou por baixo (outro escritor anexou, ou o arquivo rotacionou) e só então encadeia a nova linha — o REPL, um daemon de gateway e o servidor gRPC (`kind: "grpc"`) formam uma única cadeia. O arquivo rotaciona em 64 MiB; a primeira linha do novo arquivo nomeia o arquivo que ela continua (`rotated_from`) e aponta para o último hash dele, então a verificação atravessa a fronteira, e a passada de retenção remove arquivos rotacionados fora da janela de sessão (o arquivo vivo nunca é tocado). Com criptografia em repouso habilitada, toda linha é selada em disco (prefixo `enc:`) e aberta de forma transparente na verificação. Uma última linha truncada (crash no meio da escrita) é reportada como tal, nunca como adulteração, e a próxima entrada continua a partir da última linha completa. `/config security verify-audit [caminho]` re-hasheia a trilha e informa a primeira linha quebrada, a contagem de linhas seladas, a origem da rotação, a cauda truncada e os arquivos rotacionados ao lado; trilhas escritas antes da cadeia compartilhada continuam verificando com o hash original.
+Toda linha da trilha de auditoria (`CHATCLI_AUDIT_LOG_PATH`) carrega `seq`, `prev_hash`, `chain_v` e `hash` — `hash = SHA-256(prev_hash ‖ JSON canônico com chaves ordenadas da entrada)`, uma forma independente de qual processo escreveu. Uma linha editada, removida ou reordenada quebra a cadeia dali em diante. Vários escritores compartilham um arquivo com segurança: cada append toma um lock exclusivo do arquivo, relê o fim quando o arquivo mudou por baixo (outro escritor anexou, ou o arquivo rotacionou) e só então encadeia a nova linha — o REPL, um daemon de gateway e o servidor gRPC (`kind: "grpc"`) formam uma única cadeia. O arquivo rotaciona em 64 MiB; a primeira linha do novo arquivo nomeia o arquivo que ela continua (`rotated_from`) e aponta para o último hash dele, então a verificação atravessa a fronteira, e a passada de retenção remove arquivos rotacionados fora da janela de sessão (o arquivo vivo nunca é tocado). Com uma chave de `CHATCLI_ENCRYPTION_KEY`, toda linha é selada em disco (prefixo `enc:`) e aberta de forma transparente na verificação; com a chave padrão do keychain a trilha fica em texto puro, porque é um arquivo que operadores enviam a um pipeline de logs. Uma última linha truncada (crash no meio da escrita) é reportada como tal, nunca como adulteração, e a próxima entrada continua a partir da última linha completa. `/config security verify-audit [caminho]` re-hasheia a trilha e informa a primeira linha quebrada, a contagem de linhas seladas, a origem da rotação, a cauda truncada e os arquivos rotacionados ao lado; trilhas escritas antes da cadeia compartilhada continuam verificando com o hash original.
 
 ### Segurança de Transporte TLS 1.3
 
@@ -1400,12 +1402,14 @@ export CHATCLI_DISABLE_VERSION_CHECK=true
     chatcli server --tls-cert cert.pem --tls-key key.pem --tls-client-ca ca.pem
     ```
   </Step>
-  <Step title="Ligue a criptografia em repouso">
-    ```bash
-    export CHATCLI_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+  <Step title="Mantenha a criptografia em repouso ligada e faça backup da chave">
+    A criptografia em repouso vem ligada por padrão. Guarde a chave de recuperação fora da máquina que ela protege:
+
+    ```text
+    /config security recovery-key --save ~/chatcli-recovery.json
     ```
 
-    Verifique a trilha de auditoria periodicamente com `/config security verify-audit`.
+    No Kubernetes, dê ao servidor uma chave que você gerencia (`security.encryptionKeySecret.name` no chart, `spec.features.encryptionKeyRef` no operator) e faça backup desse Secret junto com o volume. Definir `CHATCLI_ENCRYPTION_KEY` você mesmo também sela a trilha de auditoria. Verifique a trilha periodicamente com `/config security verify-audit`.
   </Step>
   <Step title="Coloque a execução do coder em sandbox">
     ```bash
