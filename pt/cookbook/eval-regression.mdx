@@ -1,0 +1,463 @@
+---
+title: "Receita: Pegando uma Regressão com Evals"
+sidebarTitle: "Pegando uma Regressão com Evals"
+description: "Escreva uma suíte de evals com um caso de coder e um de chat, salve um baseline e teste duas mudanças contra ele: uma que só custa mais e outra que quebra o coder e faz a execução sair com exit code 3. Execuções reais, saídas reais."
+icon: "flask"
+---
+
+Os [evals](/pt/agents/harness/evals) dizem se uma mudança deixou o ChatCLI melhor ou pior, com números em vez de impressão. Esta receita percorre o ciclo completo numa suíte pequena:
+
+1. Escrever dois casos: um de coder, verificado por testes Go reais, e um de chat, avaliado por um LLM-juiz.
+2. Rodar e salvar o resultado como **baseline**.
+3. Montar uma pasta por mudança a testar, cada uma com uma cópia da suíte com aquela única mudança.
+4. Testar uma mudança de configuração que parece perigosa, mas que no fim só custa mais.
+5. Testar uma mudança de policy que quebra o coder de verdade e ver a execução sair com **exit code 3**.
+6. Comparar as três execuções, offline, e ligar o gate no CI.
+
+Todas as saídas abaixo vêm de execuções reais: Claude Haiku 5.5 como candidato e Claude Sonnet 5.5 como juiz. As três execuções juntas custaram cerca de **US$ 0,07** e levaram mais ou menos um minuto cada.
+
+<Info>Evals gastam tokens de verdade. `chatcli eval validate` e `chatcli eval list` não custam nada: use-os enquanto escreve a suíte, e ponha um teto em toda execução com `--max-cost`.</Info>
+
+---
+
+## 1. Escreva a suíte
+
+Crie `evals-demo/demo.yaml`. O caso de coder entrega ao agente um módulo Go cuja `Reverse` inverte **bytes**, o que quebra acentos, ideogramas e emoji; os testes já cobrem esses casos e falham. O caso de chat pede uma explicação curta em português.
+
+```yaml evals-demo/demo.yaml
+name: demo
+description: Unicode-safe string reversal in coder mode, and a concept explanation in chat mode.
+
+defaults:
+  timeout: 4m
+  trials: 1
+  pass_policy: all
+
+cases:
+  - id: coder-reverse-unicode
+    description: Implements Reverse so it is rune-safe, without touching the tests.
+    tags: [coder, go]
+    mode: coder
+    files:
+      go.mod: |
+        module example.com/strutil
+
+        go 1.22
+      reverse.go: |
+        package strutil
+
+        // Reverse returns s with its characters in reverse order.
+        func Reverse(s string) string {
+        	b := []byte(s)
+        	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+        		b[i], b[j] = b[j], b[i]
+        	}
+        	return string(b)
+        }
+      reverse_test.go: |
+        package strutil
+
+        import "testing"
+
+        func TestReverse(t *testing.T) {
+        	cases := map[string]string{
+        		"":         "",
+        		"abc":      "cba",
+        		"olá":      "álo",
+        		"Go, 世界!": "!界世 ,oG",
+        		"a😀b":     "b😀a",
+        	}
+        	for in, want := range cases {
+        		if got := Reverse(in); got != want {
+        			t.Errorf("Reverse(%q) = %q, want %q", in, got, want)
+        		}
+        	}
+        }
+    setup:
+      - "git init -q && git add -A && git -c user.email=e@x -c user.name=e commit -qm fixture"
+    prompt: "The tests in this Go module fail on non-ASCII input. Fix Reverse so it works for any UTF-8 string. Do not modify the tests."
+    checks:
+      - name: tests pass
+        command: {run: "go test ./...", timeout: 2m}
+      - name: tests untouched
+        command: {run: "git diff --exit-code -- reverse_test.go"}
+      - name: works on runes
+        file_regex: {path: reverse.go, text: '\brune\b'}
+      - tool_called: "@coder"
+      - max_turns: 15
+      - max_cost_usd: 0.30
+
+  - id: chat-explain-pass-k
+    description: Explains pass@k versus pass^k correctly, in Portuguese, briefly.
+    tags: [chat, i18n]
+    prompt: "Em no máximo três frases, explique a diferença entre pass@k e pass^k na avaliação de LLMs."
+    checks:
+      - regex: '(?i)pass@k'
+      - judge:
+          rubric: |
+            Written in Brazilian Portuguese, at most three sentences, and correct:
+            pass@k means at least one of k attempts succeeds; pass^k means all k attempts succeed,
+            so pass^k measures consistency/reliability and is never higher than pass@k.
+          reference: "pass@k: pelo menos uma das k tentativas acerta. pass^k: todas as k tentativas acertam, medindo confiabilidade."
+          threshold: 0.7
+```
+
+Para que serve cada parte:
+
+| Parte | Por que está lá |
+|---|---|
+| `files:` | O módulo fica inline na suíte. Um `.go` quebrado de propósito commitado no seu repositório seria pego por toda ferramenta que varre arquivos Go. |
+| `setup:` com `git commit` | Dá à checagem `tests untouched` uma árvore limpa para comparar. |
+| `tests pass` | O próprio harness roda o `go test`, no sandbox, depois que o agente termina. Ele nunca acredita na palavra do agente de que os testes passam. |
+| `tests untouched` | Pega o atalho de editar o teste em vez do código. |
+| `works on runes` | Uma checagem barata de *como* a correção foi feita, não só de que funciona. |
+| `max_turns` / `max_cost_usd` | Uma correção que passa mas leva 40 turnos também é regressão. |
+| `judge:` | Só para o que código não consegue checar: idioma, tamanho e correção conceitual. As checagens determinísticas vêm primeiro. |
+
+---
+
+## 2. Confira de graça
+
+```bash
+chatcli eval validate evals-demo/demo.yaml
+chatcli eval list evals-demo/demo.yaml
+```
+
+```text
+OK: 1 suíte(s), 2 caso(s).
+demo  (evals-demo/demo.yaml)
+  Unicode-safe string reversal in coder mode, and a concept explanation in chat mode.
+  coder-reverse-unicode                coder  1 tentativa(s), 6 checagem(ns)  [coder, go]
+  chat-explain-pass-k                  chat   1 tentativa(s), 2 checagem(ns)  [chat, i18n]
+```
+
+Nenhum dos dois comandos sobe um provider. Uma chave escrita errada dá erro aqui, e nunca vira uma checagem ignorada em silêncio.
+
+---
+
+## 3. Rode e salve um baseline
+
+Use um juiz que seja um modelo diferente do candidato: um modelo avaliando a si mesmo carrega os próprios pontos cegos, e o relatório marca uma execução assim como `self_judged`. Duas tentativas por caso mostram se a aprovação é consistente.
+
+```bash
+cd evals-demo
+chatcli eval run demo.yaml \
+  --provider CLAUDEAI --model claude-haiku-5-5 \
+  --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+  --trials 2 --max-cost 1 --out run1.json --markdown run1.md
+```
+
+```text
+[1/4] ✓ demo/coder-reverse-unicode #1  1.00 · 42.9s · $0.0073
+[2/4] ✓ demo/coder-reverse-unicode #2  1.00 · 48.6s · $0.0082
+[3/4] ✓ demo/chat-explain-pass-k #1  0.95 · 5.2s · $0.0035
+[4/4] ✓ demo/chat-explain-pass-k #2  0.97 · 6.9s · $0.0033
+
+✓ demo/coder-reverse-unicode               coder   2/2 tentativas  1.00  $0.0155
+✓ demo/chat-explain-pass-k                 chat    2/2 tentativas  0.96  $0.0068
+
+Aprovados 2 de 2 (100.0%) · reprovados 0 · erros 0 · pulados 0 · instáveis 0
+Nota média 0,98 · custo $0.0157 + juiz $0.0065 · tokens 402.544 entrada / 7.304 saída
+Latência p50 6.9s · p95 48.6s · tempo total 1m3.9s
+Avaliado: CLAUDEAI claude-haiku-5-5
+Juiz: CLAUDEAI claude-sonnet-5-5
+```
+
+Como ler:
+
+- Cada linha de tentativa e de caso mostra o custo do candidato **mais** o do juiz. As tentativas de chat custaram uns US$ 0,0035, mas quase tudo é do juiz: o candidato gastou cerca de US$ 0,00014 por resposta. A linha de resumo separa os dois (`custo $0.0157 + juiz $0.0065`).
+- `2/2 tentativas` com a `pass_policy: all` padrão é o pass^k: todas as tentativas passaram. Duas em três mostrariam o caso como **instável**, e ele reprovaria.
+- O `run1.json` é o seu baseline. Guarde-o.
+
+---
+
+## 4. Leia o relatório
+
+O relatório JSON guarda toda checagem de toda tentativa, o raciocínio do juiz, as ferramentas chamadas e a resposta final. Algumas linhas de `jq` respondem à maioria das perguntas:
+
+```bash
+# Toda checagem de toda tentativa, com o detalhe (o raciocínio do juiz nas checagens de juiz)
+jq -r '.cases[] | .id as $c | .trials[] | .n as $n | .checks[] |
+  "\($c) #\($n) [\(if .passed then "ok" else "FAIL" end)] \(.label) \(.score) \(.detail // "")"' run1.json
+
+# Turnos, tokens de saída e custo por tentativa: onde uma mudança aparece antes de reprovar
+jq -r '.cases[] | .id as $c | .trials[] |
+  "\($c) #\(.n) turns=\(.turns) out=\(.output_tokens) cost=\(.cost_usd)"' run1.json
+
+# As respostas finais do candidato
+jq -r '.cases[] | .trials[] | "--- \(.n)\n\(.final)"' run1.json
+```
+
+O juiz explica cada nota. Na primeira tentativa de chat ele deu 0,90:
+
+```text
+nota do juiz 0,90 (precisa de 0,70) — The answer is in Brazilian Portuguese, has exactly three sentences,
+and correctly defines pass@k (at least one of k succeeds) and pass^k (all k succeed, measuring
+reliability/consistency). It does not explicitly state that pass^k is never higher than pass@k,
+though this is implied by 'otimista' vs 'exigente'.
+```
+
+E a resposta final do coder disse o que mudou:
+
+```text
+A função `Reverse` em `reverse.go` agora inverte por runas (`[]rune(s)`) em vez de bytes, então strings
+UTF-8 com caracteres multibyte (como "olá", "世界" e emoji) são revertidas corretamente. O arquivo
+`reverse_test.go` não foi alterado. `go test ./... -count=1` passou.
+```
+
+O harness não confiou nessa frase: `tests pass` e `tests untouched` rodaram por conta própria no sandbox.
+
+---
+
+## 5. Monte o baseline e as variantes
+
+Para testar uma mudança, rode **a mesma suíte com aquela única mudança** contra o baseline. Guarde cada variante numa pasta própria, ao lado da suíte que ela altera:
+
+```text
+evals-demo/
+├── demo.yaml              # a suíte como está hoje: gera o baseline
+├── badcfg/
+│   └── demo.yaml          # a mesma suíte + um teto de tokens de saída mais baixo
+├── badpolicy/
+│   └── demo.yaml          # a mesma suíte + uma policy que bloqueia edição de arquivos
+├── run1.json  run1.md     # execução do baseline   (demo.yaml)
+├── run2.json  run2.md     # variante de config     (badcfg/demo.yaml)
+└── run3.json  run3.md     # variante de policy     (badpolicy/demo.yaml)
+```
+
+Por que esse layout funciona:
+
+- **Uma mudança por variante.** Quando uma variante regride, você sabe qual mudança causou. Duas mudanças na mesma variante deixam você adivinhando.
+- **O mesmo `name` de suíte e os mesmos `id`s de caso em toda cópia.** A comparação casa os casos por `<suíte>/<id>`. Renomeie um dos dois e o `compare` informa o caso como removido e um novo como adicionado, em vez de compará-los.
+- **Variantes em subpastas ficam fora das execuções normais.** `chatcli eval run evals-demo/` carrega só os `*.yaml` que estão diretamente naquela pasta; subpastas não são varridas. A execução do baseline nunca pega uma variante por acidente, e cada variante só roda quando você indica o arquivo dela.
+- **Um relatório por execução, numerado.** Toda variante é comparada com o mesmo `run1.json`.
+
+Crie uma variante copiando a suíte e fazendo a única mudança, e confira com `diff` que nada mais mudou:
+
+```bash
+mkdir -p badcfg && cp demo.yaml badcfg/demo.yaml
+# edite badcfg/demo.yaml: acrescente o bloco env mostrado no próximo passo
+diff demo.yaml badcfg/demo.yaml
+```
+
+```text
+8a9,10
+>   env:
+>     ANTHROPIC_MAX_TOKENS: "200"   # the change under test
+```
+
+`chatcli eval validate badcfg/demo.yaml` confere a cópia de graça, antes de você gastar qualquer coisa com ela.
+
+---
+
+## 6. Teste uma mudança que só custa mais
+
+Imagine que alguém baixa o teto de tokens de saída para economizar. Coloque a mudança no `env:` da suíte, não na sua linha de comando:
+
+```yaml
+defaults:
+  timeout: 4m
+  trials: 1
+  pass_policy: all
+  env:
+    ANTHROPIC_MAX_TOKENS: "200"   # the change under test
+```
+
+<Warning>
+**Defina o que está testando no `env:`, não no seu shell.** Cada candidato é um processo `chatcli` separado, que recebe o seu ambiente mais o `env:` da suíte. O juiz roda dentro do próprio processo do `chatcli eval`, então `ANTHROPIC_MAX_TOKENS=200 chatcli eval run …` também limitaria o juiz, truncaria os vereditos dele e corromperia as notas. Uma variável no `env:` chega só aos candidatos.
+</Warning>
+
+Mantenha o `name` da suíte e os ids dos casos, para que a comparação case caso a caso, e rode contra o baseline:
+
+```bash
+chatcli eval run badcfg/demo.yaml \
+  --provider CLAUDEAI --model claude-haiku-5-5 \
+  --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+  --trials 2 --max-cost 1 --baseline run1.json --max-regressions 0 --out run2.json
+```
+
+```text
+✓ demo/coder-reverse-unicode               coder   2/2 tentativas  1.00  $0.0164
+✓ demo/chat-explain-pass-k                 chat    2/2 tentativas  0.97  $0.0068
+
+Contra o baseline:
+  aprovação 100.0% → 100.0%
+  nota 0,98 → 0,98
+  custo $0.0223 → $0.0232
+```
+
+Continua passando, com exit code `0`. O loop do coder percebe uma resposta cortada no limite de tokens, aumenta o limite e continua, então um teto baixo não o quebra. Mesmo assim a mudança aparece no relatório, como turnos a mais:
+
+```text
+                     baseline          ANTHROPIC_MAX_TOKENS=200
+coder #1             turns=6           turns=9
+coder #2             turns=7           turns=8
+```
+
+Aprovar ou reprovar é só metade do que um eval diz. Uma mudança pode manter todos os casos verdes e ainda custar mais turnos, tokens ou tempo; compare `turns`, `output_tokens` e `cost_usd` entre os relatórios para ver isso.
+
+---
+
+## 7. Teste uma mudança que quebra o coder
+
+Agora imagine que alguém endurece a policy do coder de modo que ele não consiga mais alterar arquivos. O `policy:` de um caso instala regras só para aquele caso, mescladas sobre a sua policy global:
+
+```yaml
+  - id: coder-reverse-unicode
+    mode: coder
+    policy:   # the change under test: the coder may read, not change files
+      - {pattern: "@coder write", action: deny}
+      - {pattern: "@coder patch", action: deny}
+      - {pattern: "@coder multipatch", action: deny}
+      - {pattern: "@coder exec", action: deny}
+```
+
+`write`, `patch` e `multipatch` são os subcomandos que editam arquivos. O `exec` também é negado: sem isso, o agente ainda conseguiria editar pelo shell.
+
+```bash
+chatcli eval run badpolicy/demo.yaml \
+  --provider CLAUDEAI --model claude-haiku-5-5 \
+  --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+  --trials 2 --max-cost 1 --baseline run1.json --max-regressions 0 --out run3.json --markdown run3.md
+echo "exit=$?"
+```
+
+```text
+[1/4] ✗ demo/coder-reverse-unicode #2  0.67 · 36.3s · $0.0071
+[2/4] ✓ demo/chat-explain-pass-k #1  0.97 · 5.3s · $0.0033
+[3/4] ✓ demo/chat-explain-pass-k #2  0.95 · 4.7s · $0.0035
+[4/4] ✗ demo/coder-reverse-unicode #1  0.67 · 1m4.3s · $0.0102
+
+✗ demo/coder-reverse-unicode               coder   0/2 tentativas  0.67  $0.0173
+    ✗ tests pass: saiu com 1 (esperado 0): --- FAIL: TestReverse (0.00s)
+    ✗ works on runes: reverse.go não bate com "\\brune\\b"
+✓ demo/chat-explain-pass-k                 chat    2/2 tentativas  0.96  $0.0068
+
+Aprovados 1 de 2 (50.0%) · reprovados 1 · erros 0 · pulados 0 · instáveis 0
+
+Contra o baseline:
+  aprovação 100.0% → 50.0%
+  nota 0,98 → 0,81
+  custo $0.0223 → $0.0241
+  ✗ demo/coder-reverse-unicode regrediu (pass → fail)
+exit=3
+```
+
+O que a execução mostra:
+
+- **Só o caso afetado reprova.** O caso de chat não usa ferramentas e continua passando.
+- **A nota diz o quanto piorou.** Quatro das seis checagens continuam passando (os testes estão intactos, o `@coder` foi chamado, turnos e custo ficaram no orçamento), então a tentativa fica com 0,67, não 0. O veredito continua sendo reprovação, porque uma tentativa só passa quando todas as checagens passam.
+- **Exit code 3** significa regressão contra o baseline. É o código que faz um job de CI falhar.
+- **O comportamento do agente diante do bloqueio também fica visível.** A resposta final dele não afirmou ter corrigido e não ficou tentando outras formas de contornar a regra:
+
+  ```text
+  Três tentativas de alterar `reverse.go` foram bloqueadas pela regra de segurança: o patch com
+  `[]byte(s)`, o `exec` com `perl` e o `write` em texto puro. Não vou reenviar variações do mesmo
+  comando para contornar o bloqueio. […]
+  ```
+
+  Num eval ninguém pode responder à pergunta do agente, então o caso reprova. É exatamente o ponto: foi a mudança de policy que o quebrou.
+
+---
+
+## 8. Compare as três execuções
+
+Lado a lado, os três relatórios contam três histórias diferentes:
+
+| | Baseline (`run1`) | Teto de tokens baixo (`run2`) | Edição de arquivos bloqueada (`run3`) |
+|---|---|---|---|
+| Suíte | `demo.yaml` | `badcfg/demo.yaml` | `badpolicy/demo.yaml` |
+| Aprovação | 100% | 100% | 50% |
+| Nota média | 0,98 | 0,98 | 0,81 |
+| Turnos do coder por tentativa | 6, 7 | 9, 8 | 8, 5 |
+| Custo (candidato + juiz) | US$ 0,0223 | US$ 0,0232 | US$ 0,0241 |
+| Exit code contra o `run1` | — | `0` | `3` |
+| Veredito | Referência | Se recupera, com custo: mais turnos | Regressão: o coder não consegue corrigir o bug |
+
+Os turnos vêm dos relatórios (`jq '.cases[].trials[] | .turns' runN.json`). Nem a taxa de aprovação nem o exit code mostram o custo da segunda mudança; os turnos mostram.
+
+### Offline, sem chamar modelo
+
+O `compare` refaz a comparação a partir de dois relatórios salvos, sem chamar modelo, com os mesmos gates e exit codes do `run`:
+
+```bash
+chatcli eval compare run1.json run3.json --max-regressions 0; echo "exit=$?"   # exit=3
+chatcli eval compare run1.json run2.json --max-regressions 0; echo "exit=$?"   # exit=0
+```
+
+<Warning>
+**Um pipe esconde o exit code.** Em `chatcli eval compare … | tail -5; echo $?`, o `$?` é o exit code do `tail`, que é sempre `0`. Leia o exit code sem pipe, ou ligue `set -o pipefail` em scripts e passos de CI.
+</Warning>
+
+| Exit code | Significado |
+|---|---|
+| `0` | Dentro de todos os gates |
+| `1` | Taxa de aprovação abaixo de `--min-pass-rate` (padrão `1.0`) |
+| `2` | Erro de uso ou suíte inválida |
+| `3` | Regressão contra o `--baseline` |
+
+---
+
+## 9. Gate de pull requests no CI
+
+Commite a suíte e um baseline gerado na `main`, e rode a suíte contra esse baseline em todo pull request. Um job de GitHub Actions:
+
+```yaml .github/workflows/evals.yml
+name: evals
+on: pull_request
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install ChatCLI
+        run: go install github.com/diillson/chatcli@latest
+      - name: Run evals against the baseline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -o pipefail
+          chatcli eval run evals/ \
+            --provider CLAUDEAI --model claude-haiku-5-5 \
+            --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+            --trials 2 --max-cost 2 \
+            --baseline evals/baseline.json --max-regressions 0 \
+            --markdown eval.md
+      - name: Publish the report
+        if: always()
+        run: cat eval.md >> "$GITHUB_STEP_SUMMARY"
+```
+
+- O `--max-cost` limita cada execução: quando o gasto de candidato mais juiz chega ao valor, nenhuma tentativa nova começa e as restantes aparecem como puladas.
+- O `--markdown` grava o resumo, o delta contra o baseline e as checagens que falharam, pronto para o resumo do job ou um comentário de pull request.
+- Atualize o baseline de propósito, depois de uma mudança que você aceita, rodando de novo na `main` com `--out evals/baseline.json`.
+
+---
+
+## Armadilhas
+
+| Sintoma | Causa | Correção |
+|---|---|---|
+| As notas do juiz caem junto com as do candidato | A variável testada foi definida no shell, então chegou também ao juiz, que roda no mesmo processo | Coloque-a no `env:` da suíte |
+| O `compare` informa casos como novos e removidos em vez de compará-los | O `name` da suíte ou o `id` de um caso mudou entre as execuções | Mantenha os dois idênticos em toda variante |
+| Uma mudança arriscada passa | O agente se recuperou, como fez com o teto de tokens baixo | Compare `turns`, `output_tokens` e `cost_usd` entre os relatórios |
+| O CI fica verde numa regressão | Um pipe engoliu o exit code | `set -o pipefail`, ou sem pipe |
+| Um caso aparece como `self_judged` | O juiz é o mesmo modelo do candidato | Passe outro `--judge-model` |
+| Uma execução usa a sua própria memória | `--with-memory` estava ligado | Mantenha os baselines herméticos (o padrão) |
+
+---
+
+## Relacionados
+
+<CardGroup cols={2}>
+<Card title="Evals" icon="flask" href="/pt/agents/harness/evals">
+Todo campo, checagem, flag e exit code.
+</Card>
+<Card title="Segurança do Coder" icon="shield" href="/pt/coder/coder-security">
+As regras de policy que o campo `policy:` de um caso usa.
+</Card>
+</CardGroup>

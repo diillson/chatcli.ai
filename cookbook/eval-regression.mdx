@@ -1,0 +1,461 @@
+---
+title: "Recipe: Catching a Regression with Evals"
+sidebarTitle: "Catching a Regression with Evals"
+description: "Write an eval suite with a coder case and a chat case, save a baseline, then test two changes against it: one that only costs more, and one that breaks the coder and fails the run with exit code 3. Real runs, real output."
+icon: "flask"
+---
+
+[Evals](/agents/harness/evals) tell you whether a change made ChatCLI better or worse, with numbers instead of an impression. This recipe walks through the whole loop on a small suite:
+
+1. Write two cases: a coder case checked by real Go tests, and a chat case graded by an LLM judge.
+2. Run them and save the result as a **baseline**.
+3. Lay out one folder per change you want to test, each holding a copy of the suite with that one change.
+4. Test a configuration change that looks dangerous but turns out to only cost more.
+5. Test a policy change that really breaks the coder, and watch the run fail with **exit code 3**.
+6. Compare the three runs, offline, and wire the gate into CI.
+
+Every output below comes from real runs: Claude Haiku 5.5 as the candidate, Claude Sonnet 5.5 as the judge. The three runs together cost about **$0.07** and took about a minute each.
+
+<Info>Evals spend real tokens. `chatcli eval validate` and `chatcli eval list` cost nothing; use them while you write a suite, and put a ceiling on every run with `--max-cost`.</Info>
+
+---
+
+## 1. Write the suite
+
+Create `evals-demo/demo.yaml`. The coder case gives the agent a Go module whose `Reverse` swaps **bytes**, which breaks accents, CJK characters and emoji; the tests already cover those and fail. The chat case asks for a short explanation in Portuguese.
+
+```yaml evals-demo/demo.yaml
+name: demo
+description: Unicode-safe string reversal in coder mode, and a concept explanation in chat mode.
+
+defaults:
+  timeout: 4m
+  trials: 1
+  pass_policy: all
+
+cases:
+  - id: coder-reverse-unicode
+    description: Implements Reverse so it is rune-safe, without touching the tests.
+    tags: [coder, go]
+    mode: coder
+    files:
+      go.mod: |
+        module example.com/strutil
+
+        go 1.22
+      reverse.go: |
+        package strutil
+
+        // Reverse returns s with its characters in reverse order.
+        func Reverse(s string) string {
+        	b := []byte(s)
+        	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+        		b[i], b[j] = b[j], b[i]
+        	}
+        	return string(b)
+        }
+      reverse_test.go: |
+        package strutil
+
+        import "testing"
+
+        func TestReverse(t *testing.T) {
+        	cases := map[string]string{
+        		"":         "",
+        		"abc":      "cba",
+        		"olá":      "álo",
+        		"Go, 世界!": "!界世 ,oG",
+        		"a😀b":     "b😀a",
+        	}
+        	for in, want := range cases {
+        		if got := Reverse(in); got != want {
+        			t.Errorf("Reverse(%q) = %q, want %q", in, got, want)
+        		}
+        	}
+        }
+    setup:
+      - "git init -q && git add -A && git -c user.email=e@x -c user.name=e commit -qm fixture"
+    prompt: "The tests in this Go module fail on non-ASCII input. Fix Reverse so it works for any UTF-8 string. Do not modify the tests."
+    checks:
+      - name: tests pass
+        command: {run: "go test ./...", timeout: 2m}
+      - name: tests untouched
+        command: {run: "git diff --exit-code -- reverse_test.go"}
+      - name: works on runes
+        file_regex: {path: reverse.go, text: '\brune\b'}
+      - tool_called: "@coder"
+      - max_turns: 15
+      - max_cost_usd: 0.30
+
+  - id: chat-explain-pass-k
+    description: Explains pass@k versus pass^k correctly, in Portuguese, briefly.
+    tags: [chat, i18n]
+    prompt: "Em no máximo três frases, explique a diferença entre pass@k e pass^k na avaliação de LLMs."
+    checks:
+      - regex: '(?i)pass@k'
+      - judge:
+          rubric: |
+            Written in Brazilian Portuguese, at most three sentences, and correct:
+            pass@k means at least one of k attempts succeeds; pass^k means all k attempts succeed,
+            so pass^k measures consistency/reliability and is never higher than pass@k.
+          reference: "pass@k: pelo menos uma das k tentativas acerta. pass^k: todas as k tentativas acertam, medindo confiabilidade."
+          threshold: 0.7
+```
+
+What each part is for:
+
+| Part | Why it is there |
+|---|---|
+| `files:` | The module lives inline in the suite. A deliberately broken `.go` file committed to your repository would be picked up by every tool that scans Go files. |
+| `setup:` with `git commit` | Gives the `tests untouched` check a clean tree to diff against. |
+| `tests pass` | The harness runs `go test` itself, in the sandbox, after the agent finishes. It never takes the agent's word that the tests pass. |
+| `tests untouched` | Catches the shortcut of editing the test instead of the code. |
+| `works on runes` | A cheap check on how the fix was made, not only that it works. |
+| `max_turns` / `max_cost_usd` | A fix that passes but takes 40 turns is still a regression. |
+| `judge:` | Only for what code cannot check: language, length and conceptual correctness. Deterministic checks come first. |
+
+---
+
+## 2. Check it for free
+
+```bash
+chatcli eval validate evals-demo/demo.yaml
+chatcli eval list evals-demo/demo.yaml
+```
+
+```text
+OK: 1 suite(s), 2 case(s).
+demo  (evals-demo/demo.yaml)
+  Unicode-safe string reversal in coder mode, and a concept explanation in chat mode.
+  coder-reverse-unicode                coder  1 trial(s), 6 check(s)  [coder, go]
+  chat-explain-pass-k                  chat   1 trial(s), 2 check(s)  [chat, i18n]
+```
+
+Neither command starts a provider. A misspelled key is an error here, never a check that is silently ignored.
+
+---
+
+## 3. Run it and save a baseline
+
+Use a judge that is a different model from the candidate: a model grading itself shares its own blind spots, and the report flags such a run as `self_judged`. Two trials per case show whether a pass is consistent.
+
+```bash
+cd evals-demo
+chatcli eval run demo.yaml \
+  --provider CLAUDEAI --model claude-haiku-5-5 \
+  --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+  --trials 2 --max-cost 1 --out run1.json --markdown run1.md
+```
+
+```text
+[1/4] ✓ demo/coder-reverse-unicode #1  1.00 · 42.9s · $0.0073
+[2/4] ✓ demo/coder-reverse-unicode #2  1.00 · 48.6s · $0.0082
+[3/4] ✓ demo/chat-explain-pass-k #1  0.95 · 5.2s · $0.0035
+[4/4] ✓ demo/chat-explain-pass-k #2  0.97 · 6.9s · $0.0033
+
+✓ demo/coder-reverse-unicode               coder   2/2 trials  1.00  $0.0155
+✓ demo/chat-explain-pass-k                 chat    2/2 trials  0.96  $0.0068
+
+Passed 2 of 2 (100.0%) · failed 0 · errors 0 · skipped 0 · flaky 0
+Mean score 0.98 · cost $0.0157 + judge $0.0065 · tokens 402,544 in / 7,304 out
+Latency p50 6.9s · p95 48.6s · wall time 1m3.9s
+Candidate: CLAUDEAI claude-haiku-5-5
+Judge: CLAUDEAI claude-sonnet-5-5
+```
+
+How to read it:
+
+- Each trial and each case line shows the candidate's cost **plus** the judge's. The chat trials cost about $0.0035, but almost all of that is the judge: the candidate spent about $0.00014 per answer. The summary line splits the two (`cost $0.0157 + judge $0.0065`).
+- `2/2 trials` with the default `pass_policy: all` means pass^k: every trial passed. Two out of three would show the case as **flaky**, and it would fail.
+- `run1.json` is your baseline. Keep it.
+
+---
+
+## 4. Read the report
+
+The JSON report holds every check of every trial, the judge's reasoning, the tools called and the final answer. A few `jq` lines answer most questions:
+
+```bash
+# Every check of every trial, with its detail (the judge's reasoning for judge checks)
+jq -r '.cases[] | .id as $c | .trials[] | .n as $n | .checks[] |
+  "\($c) #\($n) [\(if .passed then "ok" else "FAIL" end)] \(.label) \(.score) \(.detail // "")"' run1.json
+
+# Turns, output tokens and cost per trial: where a change shows up before it fails
+jq -r '.cases[] | .id as $c | .trials[] |
+  "\($c) #\(.n) turns=\(.turns) out=\(.output_tokens) cost=\(.cost_usd)"' run1.json
+
+# The candidate's final answers
+jq -r '.cases[] | .trials[] | "--- \(.n)\n\(.final)"' run1.json
+```
+
+The judge explains every score. On the first chat trial it gave 0.90:
+
+```text
+judge 0.90 (needs 0.70) — The answer is in Brazilian Portuguese, has exactly three sentences, and correctly
+defines pass@k (at least one of k succeeds) and pass^k (all k succeed, measuring reliability/consistency).
+It does not explicitly state that pass^k is never higher than pass@k, though this is implied by
+'otimista' vs 'exigente'.
+```
+
+And the coder's final answer said what it changed:
+
+```text
+Reverse in reverse.go now reverses runes ([]rune(s)) instead of bytes, so multibyte UTF-8 strings
+("olá", "世界", emoji) come out right. reverse_test.go was not changed. go test ./... passed.
+```
+
+The harness did not rely on that sentence: `tests pass` and `tests untouched` ran on their own in the sandbox.
+
+---
+
+## 5. Lay out the baseline and its variants
+
+To test a change, run the **same suite with that one change** against the baseline. Keep each variant in its own folder, next to the suite it changes:
+
+```text
+evals-demo/
+├── demo.yaml              # the suite as it is today: produces the baseline
+├── badcfg/
+│   └── demo.yaml          # the same suite + a lower output-token ceiling
+├── badpolicy/
+│   └── demo.yaml          # the same suite + a policy that blocks file edits
+├── run1.json  run1.md     # baseline run       (demo.yaml)
+├── run2.json  run2.md     # config variant     (badcfg/demo.yaml)
+└── run3.json  run3.md     # policy variant     (badpolicy/demo.yaml)
+```
+
+Why this layout works:
+
+- **One change per variant.** When a variant regresses, you know which change did it. Two changes in one variant leave you guessing.
+- **The same suite `name` and the same case `id`s in every copy.** The comparison matches cases by `<suite>/<id>`. Rename either one and `compare` reports the case as removed and a new one added, instead of comparing them.
+- **Variants in subfolders stay out of normal runs.** `chatcli eval run evals-demo/` loads only the `*.yaml` files directly in that folder; subfolders are not scanned. The baseline run never picks up a variant by accident, and each variant runs only when you name its file.
+- **One report per run, numbered.** Every variant is compared against the same `run1.json`.
+
+Create a variant by copying the suite and making the one change, then check with `diff` that nothing else moved:
+
+```bash
+mkdir -p badcfg && cp demo.yaml badcfg/demo.yaml
+# edit badcfg/demo.yaml: add the env block shown in the next step
+diff demo.yaml badcfg/demo.yaml
+```
+
+```text
+8a9,10
+>   env:
+>     ANTHROPIC_MAX_TOKENS: "200"   # the change under test
+```
+
+`chatcli eval validate badcfg/demo.yaml` checks the copy for free before you spend anything on it.
+
+---
+
+## 6. Test a change that only costs more
+
+Suppose someone lowers the output-token ceiling to save money. Put the change in the suite's `env:`, not on your command line:
+
+```yaml
+defaults:
+  timeout: 4m
+  trials: 1
+  pass_policy: all
+  env:
+    ANTHROPIC_MAX_TOKENS: "200"   # the change under test
+```
+
+<Warning>
+**Set what you are testing in `env:`, not in your shell.** Each candidate is a separate `chatcli` process that gets your environment plus the suite's `env:`. The judge runs inside the `chatcli eval` process itself, so `ANTHROPIC_MAX_TOKENS=200 chatcli eval run …` would also cap the judge, truncate its verdicts and corrupt the scores. A variable in `env:` reaches the candidates only.
+</Warning>
+
+Keep the suite `name` and the case ids unchanged, so the comparison matches case by case, and run against the baseline:
+
+```bash
+chatcli eval run badcfg/demo.yaml \
+  --provider CLAUDEAI --model claude-haiku-5-5 \
+  --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+  --trials 2 --max-cost 1 --baseline run1.json --max-regressions 0 --out run2.json
+```
+
+```text
+✓ demo/coder-reverse-unicode               coder   2/2 trials  1.00  $0.0164
+✓ demo/chat-explain-pass-k                 chat    2/2 trials  0.97  $0.0068
+
+Against the baseline:
+  pass rate 100.0% → 100.0%
+  score 0.98 → 0.98
+  cost $0.0223 → $0.0232
+```
+
+It still passes, with exit code `0`. The coder loop notices a reply cut off at the token limit, raises the limit and continues, so a low ceiling does not break it. The change still shows up in the report, though, as extra turns:
+
+```text
+                     baseline          ANTHROPIC_MAX_TOKENS=200
+coder #1             turns=6           turns=9
+coder #2             turns=7           turns=8
+```
+
+Pass/fail is only half of what an eval tells you. A change can keep every case green and still cost more turns, tokens or time; compare `turns`, `output_tokens` and `cost_usd` between reports to see it.
+
+---
+
+## 7. Test a change that breaks the coder
+
+Now suppose someone tightens the coder policy so that it can no longer change files. A case's `policy:` installs rules for that case only, merged over your global policy:
+
+```yaml
+  - id: coder-reverse-unicode
+    mode: coder
+    policy:   # the change under test: the coder may read, not change files
+      - {pattern: "@coder write", action: deny}
+      - {pattern: "@coder patch", action: deny}
+      - {pattern: "@coder multipatch", action: deny}
+      - {pattern: "@coder exec", action: deny}
+```
+
+`write`, `patch` and `multipatch` are the subcommands that edit files. `exec` is denied too: without that, the agent could still edit through the shell.
+
+```bash
+chatcli eval run badpolicy/demo.yaml \
+  --provider CLAUDEAI --model claude-haiku-5-5 \
+  --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+  --trials 2 --max-cost 1 --baseline run1.json --max-regressions 0 --out run3.json --markdown run3.md
+echo "exit=$?"
+```
+
+```text
+[1/4] ✗ demo/coder-reverse-unicode #2  0.67 · 36.3s · $0.0071
+[2/4] ✓ demo/chat-explain-pass-k #1  0.97 · 5.3s · $0.0033
+[3/4] ✓ demo/chat-explain-pass-k #2  0.95 · 4.7s · $0.0035
+[4/4] ✗ demo/coder-reverse-unicode #1  0.67 · 1m4.3s · $0.0102
+
+✗ demo/coder-reverse-unicode               coder   0/2 trials  0.67  $0.0173
+    ✗ tests pass: exited 1 (expected 0): --- FAIL: TestReverse (0.00s)
+    ✗ works on runes: reverse.go does not match "\\brune\\b"
+✓ demo/chat-explain-pass-k                 chat    2/2 trials  0.96  $0.0068
+
+Passed 1 of 2 (50.0%) · failed 1 · errors 0 · skipped 0 · flaky 0
+
+Against the baseline:
+  pass rate 100.0% → 50.0%
+  score 0.98 → 0.81
+  cost $0.0223 → $0.0241
+  ✗ demo/coder-reverse-unicode regressed (pass → fail)
+exit=3
+```
+
+What the run shows:
+
+- **Only the affected case fails.** The chat case uses no tools and still passes.
+- **The score says how much it got worse.** Four of the six checks still pass (the tests are untouched, `@coder` was called, turns and cost stayed in budget), so the trial scores 0.67, not 0. The verdict is still a failure, because a trial passes only when every check does.
+- **Exit code 3** means a regression against the baseline. It is the code that fails a CI job.
+- **The agent's behavior under the block is visible too.** Its final answer did not claim a fix and did not keep trying other ways around the rule:
+
+  ```text
+  Three attempts to change reverse.go were blocked by the security rule: the patch, the exec with perl
+  and the write. I will not resend variations of the same command to get around the block. […]
+  ```
+
+  Nobody can answer the agent's question in an eval, so the case fails. That is the point: the policy change is what broke it.
+
+---
+
+## 8. Compare the three runs
+
+Side by side, the three reports tell three different stories:
+
+| | Baseline (`run1`) | Low token ceiling (`run2`) | Blocked file edits (`run3`) |
+|---|---|---|---|
+| Suite | `demo.yaml` | `badcfg/demo.yaml` | `badpolicy/demo.yaml` |
+| Pass rate | 100% | 100% | 50% |
+| Mean score | 0.98 | 0.98 | 0.81 |
+| Coder turns per trial | 6, 7 | 9, 8 | 8, 5 |
+| Cost (candidate + judge) | $0.0223 | $0.0232 | $0.0241 |
+| Exit code against `run1` | — | `0` | `3` |
+| Verdict | Reference | Recovers, at a cost: more turns | Regression: the coder cannot fix the bug |
+
+The turn counts come from the reports (`jq '.cases[].trials[] | .turns' runN.json`). Neither the pass rate nor the exit code shows the cost of the second change; the turns do.
+
+### Offline, without calling a model
+
+`compare` reruns the comparison from two saved reports, without calling a model, with the same gates and exit codes as `run`:
+
+```bash
+chatcli eval compare run1.json run3.json --max-regressions 0; echo "exit=$?"   # exit=3
+chatcli eval compare run1.json run2.json --max-regressions 0; echo "exit=$?"   # exit=0
+```
+
+<Warning>
+**A pipe hides the exit code.** In `chatcli eval compare … | tail -5; echo $?`, `$?` is the exit code of `tail`, which is always `0`. Read the exit code without a pipe, or turn on `set -o pipefail` in scripts and CI steps.
+</Warning>
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Within every gate |
+| `1` | Pass rate below `--min-pass-rate` (default `1.0`) |
+| `2` | Usage error or invalid suite |
+| `3` | Regression against `--baseline` |
+
+---
+
+## 9. Gate pull requests in CI
+
+Commit the suite and a baseline produced on `main`, then run the suite against that baseline on every pull request. A GitHub Actions job:
+
+```yaml .github/workflows/evals.yml
+name: evals
+on: pull_request
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install ChatCLI
+        run: go install github.com/diillson/chatcli@latest
+      - name: Run evals against the baseline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -o pipefail
+          chatcli eval run evals/ \
+            --provider CLAUDEAI --model claude-haiku-5-5 \
+            --judge-provider CLAUDEAI --judge-model claude-sonnet-5-5 \
+            --trials 2 --max-cost 2 \
+            --baseline evals/baseline.json --max-regressions 0 \
+            --markdown eval.md
+      - name: Publish the report
+        if: always()
+        run: cat eval.md >> "$GITHUB_STEP_SUMMARY"
+```
+
+- `--max-cost` caps every run: once candidate and judge spending reach it, no new trials start and the rest are reported as skipped.
+- `--markdown` writes the summary, the delta against the baseline and the failed checks, ready for the job summary or a pull request comment.
+- Refresh the baseline on purpose, after a change you accept, by rerunning on `main` with `--out evals/baseline.json`.
+
+---
+
+## Pitfalls
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The judge's scores drop together with the candidate's | The variable under test was set in the shell, so it reached the in-process judge too | Put it in the suite's `env:` |
+| `compare` reports cases as new and removed instead of comparing them | The suite `name` or a case `id` changed between runs | Keep both identical in every variant |
+| A risky change passes | The agent recovered, as it did with the low token ceiling | Compare `turns`, `output_tokens` and `cost_usd` between reports |
+| CI stays green on a regression | A pipe swallowed the exit code | `set -o pipefail`, or no pipe |
+| A case reports `self_judged` | The judge is the same model as the candidate | Pass a different `--judge-model` |
+| A run uses your own memory | `--with-memory` was set | Keep baselines hermetic (the default) |
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Evals" icon="flask" href="/agents/harness/evals">
+Every field, check, flag and exit code.
+</Card>
+<Card title="Coder Security" icon="shield" href="/coder/coder-security">
+The policy rules the `policy:` field of a case uses.
+</Card>
+</CardGroup>
