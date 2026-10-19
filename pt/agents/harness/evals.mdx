@@ -193,6 +193,195 @@ Para a pasta inteira, `fixture: testdata/strutil` faz o mesmo numa linha.
   Uma tag escrita errada é erro, nunca conteúdo: sem essa regra, `!fiel testdata/go.mod` viraria em silêncio um arquivo cujo texto é o caminho.
 - **Mantenha uma fixture quebrada longe das ferramentas do repositório que a hospeda.** Chame a pasta de `testdata/`, que `go build`, `go test ./...` e `go vet` ignoram, e dê a uma fixture Go o seu próprio `go.mod`. Num repositório cujos gates varrem todo arquivo `.go` de qualquer jeito (cobertura, cabeçalho de licença), deixe fixtures pequenas inline em `files:`. É o que a suíte inicial do ChatCLI faz.
 
+### Padrões de workspace
+
+`fixture`, `files` e `setup` definem aquilo em que um caso **coder** trabalha, e o que as checagens `command:` e `file_*` olham. Um caso de chat roda sem ferramentas, então nunca lê o sandbox.
+
+Como o `setup:` roda:
+
+- Cada linha roda com `sh -c` (`cmd /C` no Windows) dentro do sandbox, com o `env:` do caso, depois que `fixture` e `files` estão no lugar.
+- Cada linha tem um limite fixo de 2 minutos.
+- As linhas dos `defaults` rodam primeiro, depois as do próprio caso: as duas se somam.
+- Uma linha que sai com código diferente de zero marca a tentativa como **erro**, e o candidato nem roda. Acrescente `|| true` a um comando que deve falhar.
+- `defaults` não tem `fixture` nem `files`. Para compartilhá-los, repita a linha ou use uma âncora YAML (`fixture: &fx testdata/strutil` … `fixture: *fx`).
+
+Os exemplos abaixo vêm de uma única suíte. Os defaults dela dão a todo caso um repositório git e uma identidade de commit:
+
+```yaml
+defaults:
+  mode: coder
+  env:                                   # every setup line and the candidate see these
+    GIT_AUTHOR_NAME: eval
+    GIT_AUTHOR_EMAIL: eval@example.com
+    GIT_COMMITTER_NAME: eval
+    GIT_COMMITTER_EMAIL: eval@example.com
+  setup:
+    - "git init -q -b main"              # runs first, in every case
+```
+
+<AccordionGroup>
+<Accordion title="1. Só inline: alguns arquivos pequenos" icon="file-lines">
+**Quando:** o caso precisa de poucos arquivos curtos e nada mais.
+
+```yaml
+  - id: inline-config
+    files:
+      app.conf: |
+        port=8080
+        log_level=info
+    prompt: "Change the port in app.conf to 9090. Change nothing else."
+    checks:
+      - file_contains: {path: app.conf, text: "port=9090"}
+      - file_contains: {path: app.conf, text: "log_level=info"}
+```
+</Accordion>
+
+<Accordion title="2. Só fixture: um projeto inteiro como arquivos de verdade" icon="folder">
+**Quando:** o projeto tem mais que poucos arquivos, ou você quer editá-lo no IDE.
+
+```yaml
+  - id: fixture-module
+    fixture: testdata/strutil
+    setup:
+      - "git add -A && git commit -qm fixture"   # after the defaults' git init
+    prompt: "The tests fail on non-ASCII input. Fix Reverse. Do not modify the tests."
+    checks:
+      - command: {run: "go test ./..."}
+      - command: {run: "git diff --exit-code -- reverse_test.go"}
+```
+</Accordion>
+
+<Accordion title="3. Uma fixture compartilhada, com um arquivo trocado por caso" icon="code-branch">
+**Quando:** vários casos usam o mesmo projeto, mas cada um parte de um bug ou variante diferente. O `files:` é gravado por cima da fixture, então só o arquivo que muda fica no caso.
+
+```yaml
+  - id: fixture-other-bug
+    fixture: testdata/strutil
+    files:
+      reverse.go: |                      # written over the fixture's reverse.go
+        package strutil
+
+        // Reverse returns s with its characters in reverse order.
+        func Reverse(s string) string {
+        	r := []rune(s)
+        	for i, j := 0, len(r)-2; i < j; i, j = i+1, j-1 {
+        		r[i], r[j] = r[j], r[i]
+        	}
+        	return string(r)
+        }
+    setup:
+      - "git add -A && git commit -qm fixture"
+    prompt: "The tests fail. Fix Reverse. Do not modify the tests."
+    checks:
+      - command: {run: "go test ./..."}
+      - command: {run: "git diff --exit-code -- reverse_test.go"}
+```
+
+Confirme que os testes pegam o bug que você plantou. Um bug que eles não exercitam deixa o caso passar sem trabalho nenhum; a checagem com candidato que não faz nada, mais abaixo, encontra isso.
+</Accordion>
+
+<Accordion title="4. Arquivos avulsos de lugares diferentes, com !file" icon="file-import">
+**Quando:** os arquivos já existem no disco, em pastas diferentes, e copiar uma pasta inteira traria coisa demais.
+
+```yaml
+  - id: file-tags
+    files:
+      go.mod: !file testdata/strutil/go.mod
+      reverse.go: !file testdata/strutil/reverse.go
+      reverse_test.go: !file testdata/strutil/reverse_test.go
+      .editorconfig: !file testdata/shared/.editorconfig
+    prompt: "The tests fail on non-ASCII input. Fix Reverse. Do not modify the tests."
+    checks:
+      - command: {run: "go test ./..."}
+```
+</Accordion>
+
+<Accordion title="5. Setup que monta um estado: um conflito de merge" icon="code-merge">
+**Quando:** a tarefa parte de um estado do repositório que é mais fácil produzir com comandos do que escrever como arquivos: branches, histórico, um conflito.
+
+```yaml
+  - id: setup-merge-conflict
+    files:
+      greeting.txt: "hello\n"
+    setup:
+      - "git add -A && git commit -qm base"
+      - "git checkout -q -b feature && echo 'hello from feature' > greeting.txt && git commit -qam feature"
+      - "git checkout -q main && echo 'hello from main' > greeting.txt && git commit -qam main"
+      - "git merge -q feature || true"   # the merge fails on purpose; || true keeps setup green
+    prompt: "Resolve the merge conflict in greeting.txt by keeping both lines, main's first, and complete the merge."
+    checks:
+      - name: conflict resolved
+        command: {run: "test -z \"$(git diff --name-only --diff-filter=U)\""}
+      - name: no conflict markers
+        command: {run: "! grep -q '^<<<<<<<' greeting.txt"}
+      - file_regex: {path: greeting.txt, text: '(?s)hello from main.*hello from feature'}
+      - name: merge committed
+        command: {run: "git rev-parse -q --verify MERGE_HEAD", expect_exit: 1}
+```
+</Accordion>
+
+<Accordion title="6. Setup que gera os dados de entrada" icon="table">
+**Quando:** a entrada é grande ou repetitiva, e um comando a produz numa linha.
+
+```yaml
+  - id: setup-generated-data
+    setup:
+      - "seq 1 1000 > numbers.txt"
+    prompt: "Write the sum of the numbers in numbers.txt, one per line, into sum.txt. Only the number."
+    checks:
+      - file_regex: {path: sum.txt, text: '^\s*500500\s*$'}
+```
+</Accordion>
+
+<Accordion title="7. Um script executável lido com !file e rodado pelo setup" icon="terminal">
+**Quando:** preparar o estado leva mais que uma ou duas linhas. Mantenha o script no disco; o `!file` preserva o bit de execução, então o `setup:` consegue rodá-lo.
+
+```yaml
+  - id: setup-seed-script
+    files:
+      seed.sh: !file testdata/scripts/seed.sh   # keeps its exec bit
+    setup:
+      - "./seed.sh"
+    prompt: "Remove every inactive user from data/users.json. Keep the JSON valid and the rest unchanged."
+    checks:
+      - file_contains: {path: data/users.json, text: "ana"}
+      - command: {run: "! grep -q bruno data/users.json"}
+      - command: {run: "python3 -c 'import json; json.load(open(\"data/users.json\"))'"}
+```
+</Accordion>
+</AccordionGroup>
+
+Com o Claude Haiku 5.5 como candidato, os sete casos acima passam em uma tentativa cada, por cerca de US$ 0,04 no total.
+
+#### Confira o workspace sem modelo
+
+O `--bin` troca o binário que roda cada caso. Um substituto que não muda nada e só grava o registro que o harness lê permite exercitar `fixture`, `files`, `setup` e todas as checagens sem chamar modelo:
+
+```bash testdata/no-op-candidate
+#!/bin/sh
+# Stand-in candidate: changes nothing, only reports.
+printf '{"schema":1,"mode":"coder","final":"no-op","turns":1}' > "$CHATCLI_EVAL_RECORD"
+```
+
+```bash
+chmod +x testdata/no-op-candidate
+chatcli eval run patterns.yaml --bin ./testdata/no-op-candidate --quiet
+```
+
+Ele responde duas perguntas de graça:
+
+- **O workspace é o que você espera?** Rode uma cópia da suíte cujas checagens descrevem o estado preparado (o conflito de merge está pendente, o script é executável, os testes da fixture falham). Todos os casos devem passar.
+- **Toda checagem mede o trabalho do agente?** Rode a suíte real. **Todos os casos devem reprovar**, porque nada foi feito. Um caso que passa tem checagens que não dependem do agente, como um bug plantado que os testes nunca exercitam.
+
+```text
+✗ patterns/inline-config                   coder   0/1 trials  0.50  $0.0000
+✗ patterns/fixture-module                  coder   0/1 trials  0.50  $0.0000
+…
+Passed 0 of 7 (0.0%) · failed 7 · errors 0 · skipped 0 · flaky 0
+```
+
+Uma nota parcial é normal aqui: uma checagem como "os testes estão intactos" passa quando ninguém mexeu em nada.
+
 ---
 
 ## Checagens

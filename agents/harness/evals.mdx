@@ -193,6 +193,195 @@ For the whole directory, `fixture: testdata/strutil` does the same in one line.
   A misspelled tag is an error, never content: without that rule, `!fiel testdata/go.mod` would quietly become a file whose text is the path.
 - **Keep a broken fixture away from the host repository's tooling.** Name the directory `testdata/`, which `go build`, `go test ./...` and `go vet` skip, and give a Go fixture its own `go.mod`. In a repository whose gates scan every `.go` file anyway (coverage, license headers), keep small fixtures inline under `files:`. ChatCLI's starter suite does this.
 
+### Workspace patterns
+
+`fixture`, `files` and `setup` shape what a **coder** case works on, and what `command:` and `file_*` checks look at. A chat case runs without tools, so it never reads the sandbox.
+
+How `setup:` runs:
+
+- Each line runs with `sh -c` (`cmd /C` on Windows) inside the sandbox, with the case's `env:`, after `fixture` and `files` are in place.
+- Each line has a fixed 2-minute limit.
+- The `defaults` lines run first, then the case's own: the two add up.
+- A line that exits non-zero marks the trial as an **error**, and the candidate never runs. Append `|| true` to a command that is meant to fail.
+- `defaults` has no `fixture` or `files`. To share them, repeat the line or use a YAML anchor (`fixture: &fx testdata/strutil` … `fixture: *fx`).
+
+The examples below come from one suite. Its defaults give every case a git repository and a commit identity:
+
+```yaml
+defaults:
+  mode: coder
+  env:                                   # every setup line and the candidate see these
+    GIT_AUTHOR_NAME: eval
+    GIT_AUTHOR_EMAIL: eval@example.com
+    GIT_COMMITTER_NAME: eval
+    GIT_COMMITTER_EMAIL: eval@example.com
+  setup:
+    - "git init -q -b main"              # runs first, in every case
+```
+
+<AccordionGroup>
+<Accordion title="1. Inline only: a few small files" icon="file-lines">
+**When:** the case needs a handful of short files and nothing else.
+
+```yaml
+  - id: inline-config
+    files:
+      app.conf: |
+        port=8080
+        log_level=info
+    prompt: "Change the port in app.conf to 9090. Change nothing else."
+    checks:
+      - file_contains: {path: app.conf, text: "port=9090"}
+      - file_contains: {path: app.conf, text: "log_level=info"}
+```
+</Accordion>
+
+<Accordion title="2. Fixture only: a whole project as real files" icon="folder">
+**When:** the project is more than a few files, or you want to edit it in your IDE.
+
+```yaml
+  - id: fixture-module
+    fixture: testdata/strutil
+    setup:
+      - "git add -A && git commit -qm fixture"   # after the defaults' git init
+    prompt: "The tests fail on non-ASCII input. Fix Reverse. Do not modify the tests."
+    checks:
+      - command: {run: "go test ./..."}
+      - command: {run: "git diff --exit-code -- reverse_test.go"}
+```
+</Accordion>
+
+<Accordion title="3. A shared fixture, one file replaced per case" icon="code-branch">
+**When:** several cases share a project but each starts from a different bug or variant. `files:` is written over the fixture, so only the file that differs lives in the case.
+
+```yaml
+  - id: fixture-other-bug
+    fixture: testdata/strutil
+    files:
+      reverse.go: |                      # written over the fixture's reverse.go
+        package strutil
+
+        // Reverse returns s with its characters in reverse order.
+        func Reverse(s string) string {
+        	r := []rune(s)
+        	for i, j := 0, len(r)-2; i < j; i, j = i+1, j-1 {
+        		r[i], r[j] = r[j], r[i]
+        	}
+        	return string(r)
+        }
+    setup:
+      - "git add -A && git commit -qm fixture"
+    prompt: "The tests fail. Fix Reverse. Do not modify the tests."
+    checks:
+      - command: {run: "go test ./..."}
+      - command: {run: "git diff --exit-code -- reverse_test.go"}
+```
+
+Make sure the tests catch the bug you plant. A bug they do not exercise lets the case pass with no work at all; the no-op check below finds that.
+</Accordion>
+
+<Accordion title="4. Single files from different places, with !file" icon="file-import">
+**When:** the files already exist on disk, in different directories, and copying a whole directory would bring too much.
+
+```yaml
+  - id: file-tags
+    files:
+      go.mod: !file testdata/strutil/go.mod
+      reverse.go: !file testdata/strutil/reverse.go
+      reverse_test.go: !file testdata/strutil/reverse_test.go
+      .editorconfig: !file testdata/shared/.editorconfig
+    prompt: "The tests fail on non-ASCII input. Fix Reverse. Do not modify the tests."
+    checks:
+      - command: {run: "go test ./..."}
+```
+</Accordion>
+
+<Accordion title="5. Setup that builds a state: a merge conflict" icon="code-merge">
+**When:** the task starts from a repository state that is easier to produce with commands than to write as files: branches, history, a conflict.
+
+```yaml
+  - id: setup-merge-conflict
+    files:
+      greeting.txt: "hello\n"
+    setup:
+      - "git add -A && git commit -qm base"
+      - "git checkout -q -b feature && echo 'hello from feature' > greeting.txt && git commit -qam feature"
+      - "git checkout -q main && echo 'hello from main' > greeting.txt && git commit -qam main"
+      - "git merge -q feature || true"   # the merge fails on purpose; || true keeps setup green
+    prompt: "Resolve the merge conflict in greeting.txt by keeping both lines, main's first, and complete the merge."
+    checks:
+      - name: conflict resolved
+        command: {run: "test -z \"$(git diff --name-only --diff-filter=U)\""}
+      - name: no conflict markers
+        command: {run: "! grep -q '^<<<<<<<' greeting.txt"}
+      - file_regex: {path: greeting.txt, text: '(?s)hello from main.*hello from feature'}
+      - name: merge committed
+        command: {run: "git rev-parse -q --verify MERGE_HEAD", expect_exit: 1}
+```
+</Accordion>
+
+<Accordion title="6. Setup that generates input data" icon="table">
+**When:** the input is large or repetitive, and a command produces it in one line.
+
+```yaml
+  - id: setup-generated-data
+    setup:
+      - "seq 1 1000 > numbers.txt"
+    prompt: "Write the sum of the numbers in numbers.txt, one per line, into sum.txt. Only the number."
+    checks:
+      - file_regex: {path: sum.txt, text: '^\s*500500\s*$'}
+```
+</Accordion>
+
+<Accordion title="7. An executable script read with !file, run by setup" icon="terminal">
+**When:** preparing the state takes more than a line or two. Keep the script on disk; `!file` keeps its exec bit, so `setup:` can run it.
+
+```yaml
+  - id: setup-seed-script
+    files:
+      seed.sh: !file testdata/scripts/seed.sh   # keeps its exec bit
+    setup:
+      - "./seed.sh"
+    prompt: "Remove every inactive user from data/users.json. Keep the JSON valid and the rest unchanged."
+    checks:
+      - file_contains: {path: data/users.json, text: "ana"}
+      - command: {run: "! grep -q bruno data/users.json"}
+      - command: {run: "python3 -c 'import json; json.load(open(\"data/users.json\"))'"}
+```
+</Accordion>
+</AccordionGroup>
+
+With Claude Haiku 5.5 as the candidate, all seven cases above pass in one trial each, for about $0.04 in total.
+
+#### Check the workspace without a model
+
+`--bin` replaces the binary that runs each case. A stand-in that changes nothing and only writes the record the harness reads lets you exercise `fixture`, `files`, `setup` and every check without calling a model:
+
+```bash testdata/no-op-candidate
+#!/bin/sh
+# Stand-in candidate: changes nothing, only reports.
+printf '{"schema":1,"mode":"coder","final":"no-op","turns":1}' > "$CHATCLI_EVAL_RECORD"
+```
+
+```bash
+chmod +x testdata/no-op-candidate
+chatcli eval run patterns.yaml --bin ./testdata/no-op-candidate --quiet
+```
+
+It answers two questions for free:
+
+- **Is the workspace what you expect?** Run a copy of the suite whose checks describe the prepared state (the merge conflict is pending, the script is executable, the fixture's tests fail). Every case should pass.
+- **Does every check measure the agent's work?** Run the real suite. **Every case should fail**, because nothing was done. A case that passes has checks that do not depend on the agent, like a planted bug the tests never exercise.
+
+```text
+✗ patterns/inline-config                   coder   0/1 trials  0.50  $0.0000
+✗ patterns/fixture-module                  coder   0/1 trials  0.50  $0.0000
+…
+Passed 0 of 7 (0.0%) · failed 7 · errors 0 · skipped 0 · flaky 0
+```
+
+A partial score is normal here: a check such as "the tests are untouched" passes when nobody touched anything.
+
 ---
 
 ## Checks
