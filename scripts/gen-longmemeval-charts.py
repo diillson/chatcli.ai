@@ -5,7 +5,8 @@ Portuguese:
 - accuracy-r3: accuracy by type in the three rounds (page header);
 - validation: the validation half in every full run (third round);
 - accuracy-r2: accuracy by type, first against second round (second round);
-- flips: what happened to the first round's misses (second round).
+- flips: what happened to the first round's misses (second round);
+- flips-r3: what happened to the second round's misses (third round).
 
 Numbers come from evals/longmemeval/results/ in the chatcli repo
 (2026-10-20, 2026-10-22-merged, 2026-10-24, 2026-10-24-session-search);
@@ -35,6 +36,8 @@ THIRD = {"user": 70, "assistant": 56, "updates": 76, "temporal": 127, "preferenc
 THIRD_TOTAL, THIRD_VAL = 479, 247
 # Validation half (260) in every full run, in order.
 VALIDATION = [("v1", 237), ("v2", 243), ("v3base", 240), ("v3", 247)]
+# The second round's 27 misses in the third round: fixed, still wrong, new.
+FLIPS3 = {"fixed": 13, "stayed": 14, "new": 7}  # 27 misses before, 21 now
 
 TEXT = {
     "en": {
@@ -49,6 +52,10 @@ TEXT = {
         "val_sub": "Correct answers per full run · the base run of 2026-10-24 is main after the memory graph",
         "v1": "First round (2026-10-20)", "v2": "Second round, merged main (2026-10-22)",
         "v3base": "Main + memory graph (2026-10-24)", "v3": "+ session search (2026-10-24)",
+        "flip3": {"flip_title": "What happened to the 27 second-round misses",
+                  "flip_sub": "34 questions were wrong in at least one of the two rounds",
+                  "row1": "Second round: 27 misses", "row2": "Third round: 21 misses",
+                  "fixed": "13 fixed", "stayed": "14 still wrong", "new": "7 new"},
         "flip_title": "What happened to the 46 first-round misses",
         "flip_sub": "54 questions were wrong in at least one of the two rounds",
         "row1": "First round: 46 misses", "row2": "Now: 27 misses",
@@ -68,6 +75,10 @@ TEXT = {
         "val_sub": "Respostas corretas por rodada completa · a base de 24/10 é a main depois do grafo de memória",
         "v1": "Primeira rodada (20/10/2026)", "v2": "Segunda rodada, main mergeada (22/10/2026)",
         "v3base": "Main + grafo de memória (24/10/2026)", "v3": "+ busca de sessões (24/10/2026)",
+        "flip3": {"flip_title": "O que aconteceu com as 27 falhas da segunda rodada",
+                  "flip_sub": "34 perguntas erraram em pelo menos uma das duas rodadas",
+                  "row1": "Segunda rodada: 27 falhas", "row2": "Terceira rodada: 21 falhas",
+                  "fixed": "13 corrigidas", "stayed": "14 continuam", "new": "7 novas"},
         "flip_title": "O que aconteceu com as 46 falhas da primeira rodada",
         "flip_sub": "54 perguntas erraram em pelo menos uma das duas rodadas",
         "row1": "Primeira rodada: 46 falhas", "row2": "Agora: 27 falhas",
@@ -189,8 +200,13 @@ def validation(lang, mode):
     return "\n".join(out)
 
 
-def flips(lang, mode):
+def flips(lang, mode, counts=None, round_text=None):
+    """Misses of one round in the next. Defaults: the first round's misses in
+    the second round; counts/round_text draw another pair of rounds."""
     t, c = TEXT[lang], THEME[mode]
+    if round_text:
+        t = {**t, **t[round_text]}
+    FLIPS = counts or globals()["FLIPS"]
     W, H, unit = 760, 262, 10.0
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
            f'font-family="Inter, -apple-system, Segoe UI, sans-serif" role="img" aria-label="{t["flip_title"]}">',
@@ -224,7 +240,8 @@ def main():
             (OUT / f"flips-{lang}-{mode}.svg").write_text(flips(lang, mode) + "\n")
             (OUT / f"accuracy-r3-{lang}-{mode}.svg").write_text(accuracy3(lang, mode) + "\n")
             (OUT / f"validation-{lang}-{mode}.svg").write_text(validation(lang, mode) + "\n")
-    print("wrote", len(TEXT) * len(THEME) * 4, "charts to", OUT)
+            (OUT / f"flips-r3-{lang}-{mode}.svg").write_text(flips(lang, mode, FLIPS3, "flip3") + "\n")
+    print("wrote", len(TEXT) * len(THEME) * 5, "charts to", OUT)
 
 
 if __name__ == "__main__":
