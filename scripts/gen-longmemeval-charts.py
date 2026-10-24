@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Charts of the LongMemEval page, second round: accuracy by type against the
-first round, and what happened to the first round's misses. Plain SVG, light
-and dark, English and Portuguese. Numbers come from
-evals/longmemeval/results/2026-10-20 and 2026-10-22-merged in the chatcli repo;
-edit DATA when a new run lands.
+"""Charts of the LongMemEval page. Plain SVG, light and dark, English and
+Portuguese:
+
+- accuracy-r3: accuracy by type in the three rounds (page header);
+- validation: the validation half in every full run (third round);
+- accuracy-r2: accuracy by type, first against second round (second round);
+- flips: what happened to the first round's misses (second round).
+
+Numbers come from evals/longmemeval/results/ in the chatcli repo
+(2026-10-20, 2026-10-22-merged, 2026-10-24, 2026-10-24-session-search);
+add a column to DATA and a row to VALIDATION when a new run lands.
 
     python3 scripts/gen-longmemeval-charts.py
 """
@@ -24,6 +30,12 @@ FIRST_TOTAL, FINAL_TOTAL = 454, 473
 VAL_PASS, VAL_TOTAL = 243, 260
 FLIPS = {"fixed": 27, "stayed": 19, "new": 8}  # 46 misses before, 27 now
 
+# Third round (2026-10-24-session-search): pass per DATA key, and totals.
+THIRD = {"user": 70, "assistant": 56, "updates": 76, "temporal": 127, "preference": 28, "multi": 122}
+THIRD_TOTAL, THIRD_VAL = 479, 247
+# Validation half (260) in every full run, in order.
+VALIDATION = [("v1", 237), ("v2", 243), ("v3base", 240), ("v3", 247)]
+
 TEXT = {
     "en": {
         "labels": {"user": "Facts the user said", "assistant": "Facts the assistant said",
@@ -32,6 +44,11 @@ TEXT = {
         "title": "chatcli on LongMemEval-S — %d/500 = %s",
         "sub": "Accuracy by question type · validation half (260 never read): %d/%d = %s",
         "first": "First round (2026-10-20)", "final": "Second round, merged main (2026-10-22)",
+        "third": "Third round, session search (2026-10-24)",
+        "val_title": "Validation half: 260 questions never read while tuning",
+        "val_sub": "Correct answers per full run · the base run of 2026-10-24 is main after the memory graph",
+        "v1": "First round (2026-10-20)", "v2": "Second round, merged main (2026-10-22)",
+        "v3base": "Main + memory graph (2026-10-24)", "v3": "+ session search (2026-10-24)",
         "flip_title": "What happened to the 46 first-round misses",
         "flip_sub": "54 questions were wrong in at least one of the two rounds",
         "row1": "First round: 46 misses", "row2": "Now: 27 misses",
@@ -46,6 +63,11 @@ TEXT = {
         "title": "chatcli no LongMemEval-S — %d/500 = %s",
         "sub": "Acurácia por tipo · metade de validação (260 nunca lidas): %d/%d = %s",
         "first": "Primeira rodada (20/10/2026)", "final": "Segunda rodada, main mergeada (22/10/2026)",
+        "third": "Terceira rodada, busca de sessões (24/10/2026)",
+        "val_title": "Metade de validação: 260 perguntas nunca lidas durante o ajuste",
+        "val_sub": "Respostas corretas por rodada completa · a base de 24/10 é a main depois do grafo de memória",
+        "v1": "Primeira rodada (20/10/2026)", "v2": "Segunda rodada, main mergeada (22/10/2026)",
+        "v3base": "Main + grafo de memória (24/10/2026)", "v3": "+ busca de sessões (24/10/2026)",
         "flip_title": "O que aconteceu com as 46 falhas da primeira rodada",
         "flip_sub": "54 perguntas erraram em pelo menos uma das duas rodadas",
         "row1": "Primeira rodada: 46 falhas", "row2": "Agora: 27 falhas",
@@ -57,9 +79,11 @@ TEXT = {
 
 THEME = {
     "light": dict(bg="#F7F7F5", ink="#17171a", sub="#46464e", mute="#6b6b74", track="#e4e3df",
-                  teal="#0d9488", first="#aeb9b6", red="#e5533d", new="#17171a", onfill="#ffffff"),
+                  teal="#0d9488", first="#aeb9b6", red="#e5533d", new="#17171a", onfill="#ffffff",
+                  second="#7fc3ba"),
     "dark": dict(bg="#0E0F10", ink="#ededed", sub="#bcbcc4", mute="#8b8b94", track="#24262a",
-                 teal="#16a394", first="#4a5a57", red="#e05a45", new="#ededed", onfill="#0E0F10"),
+                 teal="#16a394", first="#4a5a57", red="#e05a45", new="#ededed", onfill="#0E0F10",
+                 second="#2f7d73"),
 }
 
 
@@ -102,6 +126,69 @@ def accuracy(lang, mode):
     return "\n".join(out)
 
 
+def accuracy3(lang, mode):
+    """Accuracy by type in the three rounds; the third round is emphasized."""
+    t, c = TEXT[lang], THEME[mode]
+    W, top, rowh = 760, 92, 64
+    H = top + len(DATA) * rowh + 84
+    dec = t["dec"]
+    title = t["title"] % (THIRD_TOTAL, pct(THIRD_TOTAL, 500, dec))
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+           f'font-family="Inter, -apple-system, Segoe UI, sans-serif" role="img" aria-label="{title}">',
+           f'<rect width="{W}" height="{H}" fill="{c["bg"]}"/>',
+           f'<text x="24" y="34" font-size="18" font-weight="600" fill="{c["ink"]}">{title}</text>',
+           f'<text x="24" y="56" font-size="13" fill="{c["sub"]}">'
+           f'{t["sub"] % (THIRD_VAL, VAL_TOTAL, pct(THIRD_VAL, VAL_TOTAL, dec))}</text>']
+    x0, bw = 232, 330
+    for i, (key, a, b, n) in enumerate(sorted(DATA, key=lambda r: -THIRD[r[0]] / r[3])):
+        y = top + i * rowh
+        out.append(f'<text x="220" y="{y + 23}" font-size="13" text-anchor="end" fill="{c["ink"]}">{t["labels"][key]}</text>')
+        for j, (v, col) in enumerate(((a, c["first"]), (b, c["second"]), (THIRD[key], c["teal"]))):
+            by = y + j * 15
+            last = j == 2
+            out.append(f'<rect x="{x0}" y="{by}" width="{bw}" height="11" rx="3" fill="{c["track"]}"/>')
+            out.append(f'<rect x="{x0}" y="{by}" width="{bw * v / n:.1f}" height="11" rx="3" fill="{col}">'
+                       f'<title>{t["labels"][key]}: {pct(v, n, dec)} ({v}/{n})</title></rect>')
+            out.append(f'<text x="{x0 + bw + 12}" y="{by + 10}" font-size="12" font-weight="{"600" if last else "400"}" '
+                       f'fill="{c["ink"] if last else c["mute"]}">{pct(v, n, dec)}  ·  {v}/{n}</text>')
+    ly = top + len(DATA) * rowh + 4
+    for k, (label, total, col) in enumerate(((t["first"], FIRST_TOTAL, c["first"]),
+                                             (t["final"], FINAL_TOTAL, c["second"]),
+                                             (t["third"], THIRD_TOTAL, c["teal"]))):
+        out.append(f'<rect x="24" y="{ly + k * 22}" width="12" height="12" rx="3" fill="{col}"/>')
+        out.append(f'<text x="44" y="{ly + k * 22 + 10}" font-size="12" fill="{c["sub"]}">{label}: {total}/500 = {pct(total, 500, dec)}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def validation(lang, mode):
+    """The validation half in every full run. Full scale on purpose: a cut
+    axis would make a few questions look like a large gap; the labels carry
+    the exact counts."""
+    t, c = TEXT[lang], THEME[mode]
+    W, top, step, x0, bw = 760, 84, 34, 300, 300
+    H = top + len(VALIDATION) * step + 8
+    dec = t["dec"]
+    cols = {"v1": c["first"], "v2": c["second"], "v3base": c["first"], "v3": c["teal"]}
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+           f'font-family="Inter, -apple-system, Segoe UI, sans-serif" role="img" aria-label="{t["val_title"]}">',
+           f'<rect width="{W}" height="{H}" fill="{c["bg"]}"/>',
+           f'<text x="24" y="34" font-size="18" font-weight="600" fill="{c["ink"]}">{t["val_title"]}</text>',
+           f'<text x="24" y="56" font-size="13" fill="{c["sub"]}">{t["val_sub"]}</text>']
+    for i, (key, v) in enumerate(VALIDATION):
+        y = top + i * step
+        last = i == len(VALIDATION) - 1
+        label = f"{pct(v, VAL_TOTAL, dec)}  ·  {v}/{VAL_TOTAL}"
+        out.append(f'<text x="{x0 - 12}" y="{y + 13}" font-size="13" text-anchor="end" fill="{c["ink"]}">{t[key]}</text>')
+        out.append(f'<rect x="{x0}" y="{y}" width="{bw}" height="18" rx="3" fill="{c["track"]}"/>')
+        out.append(f'<rect x="{x0}" y="{y}" width="{bw * v / VAL_TOTAL:.1f}" height="18" rx="3" fill="{cols[key]}">'
+                   f'<title>{t[key]}: {label}</title></rect>')
+        out.append(f'<text x="{x0 + bw + 12}" y="{y + 13}" font-size="12" font-weight="{"600" if last else "400"}" '
+                   f'fill="{c["ink"] if last else c["mute"]}">{label}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
 def flips(lang, mode):
     t, c = TEXT[lang], THEME[mode]
     W, H, unit = 760, 262, 10.0
@@ -135,7 +222,9 @@ def main():
         for mode in THEME:
             (OUT / f"accuracy-r2-{lang}-{mode}.svg").write_text(accuracy(lang, mode) + "\n")
             (OUT / f"flips-{lang}-{mode}.svg").write_text(flips(lang, mode) + "\n")
-    print("wrote", len(TEXT) * len(THEME) * 2, "charts to", OUT)
+            (OUT / f"accuracy-r3-{lang}-{mode}.svg").write_text(accuracy3(lang, mode) + "\n")
+            (OUT / f"validation-{lang}-{mode}.svg").write_text(validation(lang, mode) + "\n")
+    print("wrote", len(TEXT) * len(THEME) * 4, "charts to", OUT)
 
 
 if __name__ == "__main__":
