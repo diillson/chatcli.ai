@@ -174,7 +174,8 @@ Seven action types:
 | `--description` | text | Free-form description for `/jobs show` |
 | `--tag` | k=v | Tag for filtering in `/jobs list` |
 | `--on-timeout` | `fail\|fire_anyway\|fallback` | Wait-timeout behavior |
-| `--async` | — | Don't block — return the job ID |
+| `--notify` | — | Announce in the terminal when the job (or each cycle of a recurring one) ends |
+| `--async` | — | Accepted for compatibility; `/schedule` never holds the prompt |
 | `--i-know` | — | Acknowledge a dangerous shell command |
 | `--skill` | name (repeatable) | Persona skill(s) injected into the headless `agent:` run at fire time |
 </Expandable>
@@ -213,13 +214,36 @@ An `agent:` job fires with the same knowledge the creating run had. Skill **name
 
 ---
 
-## `/wait` — block until condition
+## `/wait` — wait for a condition in the background
 
 Sugar for "wait for X to happen and optionally do Y".
 
 ```bash
-/wait --until <condition> [--then <action>] [flags]
+/wait <condition> [--then <action>] [flags]
+/wait --until <condition> [--then <action>] [flags]   # same thing
 ```
+
+**`/wait` returns at once.** It registers the wait as a job, prints the job ID and gives the prompt back; the scheduler polls the condition with nobody watching. When the job ends, the terminal says so above the prompt — condition met (and what the `--then` action printed), timed out, or failed.
+
+| Flag | Meaning |
+|---|---|
+| `--then <action>` | Action to run once the condition holds (same DSL as `/schedule --do`). Omit for a bare wait |
+| `--every <duration>` | Poll interval (default 5s) |
+| `--timeout <duration>` | How long the condition may stay unmet (default 30m) |
+| `--action-timeout <duration>` | Timeout of the `--then` action |
+| `--max-polls <n>` | Give up after `n` checks |
+| `--on-timeout fail\|fire_anyway` | What a timed-out wait does |
+| `--name`, `--description`, `--tag k=v`, `--ttl` | Identity and housekeeping, as in `/schedule` |
+| `--depends-on <id>`, `--max-retries <n>`, `--skill <name>` | As in `/schedule` |
+| `--i-know` | Pre-authorize a shell condition or action that would otherwise ask |
+| `--block` | Hold the prompt until the wait ends (aliases `--sync`, `--foreground`) |
+| `--quiet` | Do not announce the end of the wait |
+
+`--block` is the opt-in for the old behavior. While it holds, a progress line prints every 20s, and **Ctrl+C lets go of the prompt without stopping the job** — it keeps running, and its end is announced like any other. On surfaces with no terminal to hold (web page, ACP, MCP) `--block` is declined and the job runs in the background.
+
+`--async` is still accepted: it is what `/wait` now does by default.
+
+Durations accept `30s`, `5m`, `2h`, `1d`, `"10 min"`, `"2 hours"`. A duration, number or `--on-timeout` value that cannot be read is an error — it is never replaced by a default in silence.
 
 ### Condition DSL
 
@@ -247,8 +271,11 @@ Sugar for "wait for X to happen and optionally do Y".
 # Wait for endpoint to be healthy and run smoke test
 /wait --until http://localhost:8080/health==200 --then "/run smoke" --every 5s --timeout 10m
 
-# Async: registers and returns immediately; see it in /jobs list
-/wait --until "k8s:pod/prod/api-*:Ready" --async --name api-ready
+# Named wait: follow it later with /jobs show api-ready
+/wait "k8s:pod/prod/api-*:Ready" --name api-ready
+
+# Hold the prompt until the database answers, then migrate
+/wait tcp://localhost:5432 --then "shell: make migrate" --block --i-know
 
 # Composite: port open AND lock file gone
 /wait --until "and(tcp://db:5432, not file:/tmp/migrating)" --then "/run app restart"
@@ -279,14 +306,25 @@ Sugar for "wait for X to happen and optionally do Y".
 /jobs cancel <id> [reason...]
 /jobs pause <id>
 /jobs resume <id>
+/jobs wait <id> [--timeout D] # hold the prompt until the job ends (Ctrl+C lets go)
+
+/jobs clear [--failed | --succeeded | --cancelled | --timed-out | --status S]
+            [--older-than D] [--name N] [--mine] [--yes]
+                              # drop finished jobs from history (preview first, --yes deletes)
 
 /jobs daemon                  # daemon or in-process status
 /jobs gc                      # force snapshot + WAL GC
 ```
 
+Wherever a command takes `<id>` it also takes the **job name** or the **start of the ID** (four characters or more): `/jobs show api-ready`, `/jobs cancel 5ef3`. A name several jobs carried resolves to the live one, else to the most recent.
+
+`/jobs clear` works against the daemon too.
+
+**Reading the listing.** `NEXT FIRE` says what the job is due to do: `in 4m` for a queued job, `polling, 9m left` for a job waiting on its condition (with the time until the wait gives up), `running` while the action runs, `after dependencies` for a blocked one. `overdue` is kept for a job still queued past its time. `LAST` shows how the latest execution went; for a job waiting on a condition it reads `not met yet ×12` or `check failed ×12` — the condition has been checked 12 times — instead of a bare `skipped` / `failed`, which described one check and read as a verdict on the job. `/jobs show` adds what the wait is for, its budget, the checks so far and what the last check reported.
+
 Autocomplete (press Tab) suggests:
-- Subcommands (`list`, `show`, `cancel`, …)
-- Live job IDs for `show`/`cancel`/`pause`/`resume`/`logs`
+- Subcommands (`list`, `show`, `cancel`, `wait`, …)
+- Live job IDs and names for `show`/`cancel`/`pause`/`resume`/`logs`/`wait`
 - Values for `--status` (pending, running, waiting, …) and `--owner` (me, user, agent, worker, system, hook)
 
 ---
@@ -344,16 +382,23 @@ Subcommands:
 | `cmd` | Args shape | Returns |
 |---|---|---|
 | `schedule` | `{name, when, do, wait?, timeout?, depends_on?, triggers?, ...}` | `{job_id, status, summary}` |
-| `wait` | `{until, every?, timeout?, async?, then?}` | Sync: `{outcome, job}` · Async: `{job_id, status}` |
-| `query` | `{id}` | Full job (status, history, transitions) |
+| `wait` | `{until, then?, every?, timeout?, max_polls?, on_timeout?, name?, notify?, i_know?, async?, max_block?}` | Sync: `{outcome, job}` · Async: `{job_id, status}` |
+| `query` | `{id}` — `id` is the job ID, its name, or the start of the ID (also for `cancel`/`pause`/`resume`) | Full job (status, history, transitions) |
 | `list` | `{filter?: {owner, statuses, tag, name_substr, include_terminal}}` | `{jobs: [...]}` |
 | `cancel` | `{id, reason?}` | `{ok, job_id}` |
 | `pause` | `{id, reason?}` — holds a pending/blocked/waiting job out of the queue (a running one must be cancelled) | `{ok, job_id, status: paused}` |
 | `resume` | `{id}` — puts a paused job back in the queue | `{ok, job_id, status: pending}` |
+| `clear` | `{filter?: {statuses, name_substr}, older_than?}` — drops **finished** jobs from history; live jobs are never touched, and an agent clears only its own | `{ok, removed: [...]}` |
 
 <Tip>
 Agent owner is preserved automatically — `filter.owner == OwnerAgent` by default in `list`, and agents can only cancel jobs they created (or jobs of child workers).
 </Tip>
+
+<Note>
+**The tool keeps the model in control of its own turn.** A `wait` without `async` holds the turn until the condition is met or the wait times out, which is right for seconds and wrong for minutes. `async: true` returns the job ID at once; `max_block: "60s"` holds for at most that long and then returns with the job still running. Either way the model checks back with `query` (by ID or by the `name` it chose), and `notify: true` has the user's terminal announce the end. A waiting job reports `wait_polls`, `wait_deadline` and `wait_detail` in `list`.
+
+In `wait`, `every` is the poll interval and `timeout` the wait's budget (the action's own timeout is `action_timeout`). `schedule` takes `wait_timeout`, `on_timeout` and `notify` as well. Durations accept `30s`, `5m`, `2h`, `1d`, `"10 min"`; one that cannot be read is an error.
+</Note>
 
 <Note>
 **Synchronous `wait` shows life signs.** While a sync `wait` polls, a ⏳ heartbeat line prints every 30s (streamed live to ACP/MCP clients) with the job status, elapsed time and when the wait gives up. If the wait budget runs out, the job is **not** cancelled — it keeps running in the background, and the tool result tells the model to pick it up later with `query` or to re-issue with `"async": true`.
