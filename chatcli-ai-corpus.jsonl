@@ -14692,7 +14692,7 @@ spec:
   syncIntervalMinutes: 30
 ```
 
-The Secret keys depend on `authType`: `token` for `token`, `username` and `password` for `basic`, `ssh-key` and `known_hosts` for `ssh`. HTTPS credentials reach git through a `GIT_ASKPASS` helper for each command and are never written to the clone's `.git/config`; a clone made by an earlier version, which kept the token in the origin URL, has it stripped from `origin` and its reflog expired on the next sync. The operator image ships `openssh-client`, and an SSH clone checks the server's host key against the Secret's `known_hosts` with `StrictHostKeyChecking=yes`:
+The Secret keys depend on `authType`: `token` for `token`, `username` and `password` for `basic`, `ssh-key` and `known_hosts` for `ssh`. Clones run in-process (go-git), so the operator image carries no git or ssh binaries. HTTPS credentials are sent from memory and never written to the clone's `.git/config`; a clone made by an earlier version, which kept the token in the origin URL, has it stripped from `origin` and its reflog dropped on the next sync. A server whose certificate comes from a private CA takes the CA's PEM chain in the Secret's `ca.crt` key. An SSH clone parses the key in memory and checks the server's host key against the Secret's `known_hosts`, refusing a key that is not listed:
 
 ```bash
 ssh-keyscan git.example.com > known_hosts
@@ -30034,7 +30034,7 @@ Code-aware diagnostics when `SourceRepository` CRD is configured:
 - **Suspected Commit**: identifies the most likely commit (score by temporal proximity + volume of changes)
 - **Code Extraction**: extracts code snippets referenced in stack traces (file path + line number → source code)
 - **Config Analysis**: reads Dockerfile, values.yaml, Chart.yaml for deploy context
-- **Credentials**: Secret keys `token`, `username` + `password`, or `ssh-key` + `known_hosts`; HTTPS credentials go through a `GIT_ASKPASS` helper and are never written to `.git/config`; SSH verifies host keys against `known_hosts` (`spec.sshHostKeyPolicy: acceptNew` trusts the first key when the Secret has none). See [Source repositories](/kubernetes/k8s-operator#source-repositories)
+- **Credentials**: Secret keys `token`, `username` + `password`, or `ssh-key` + `known_hosts`; HTTPS credentials are sent from memory and never written to `.git/config`; SSH verifies host keys against `known_hosts` (`spec.sshHostKeyPolicy: acceptNew` trusts the first key when the Secret has none). See [Source repositories](/kubernetes/k8s-operator#source-repositories)
 
 **CascadeAnalyzer (`cascade_analyzer.go`):**
 
@@ -31416,16 +31416,16 @@ The startup log line prints the default, custom and total counts and every custo
 
 ### Source repositories
 
-A `SourceRepository` links a workload to its git repository, so incident analysis sees the recent commits and the code around stack traces. Create it and its Secret in the workload's namespace. The operator makes a shallow clone under its writable `/tmp` emptyDir (chart value `tmpVolume.sizeLimit`, default `1Gi`) and re-syncs every `syncIntervalMinutes` (default 30). The operator image ships `git` and `openssh-client`.
+A `SourceRepository` links a workload to its git repository, so incident analysis sees the recent commits and the code around stack traces. Create it and its Secret in the workload's namespace. The operator makes a shallow clone under its writable `/tmp` emptyDir (chart value `tmpVolume.sizeLimit`, default `1Gi`) and re-syncs every `syncIntervalMinutes` (default 30). Clones run in-process (go-git): the operator image is distroless and ships no git or ssh binaries.
 
 | `authType` | Secret keys (`secretRef`) | How the credential is used |
 |------------|---------------------------|----------------------------|
 | `none` (default) | — | Public repository |
-| `token` | `token` | HTTPS, through a `GIT_ASKPASS` helper |
-| `basic` | `username`, `password` | HTTPS, through the same helper |
-| `ssh` | `ssh-key`, `known_hosts` | SSH, host key checked against `known_hosts` with `StrictHostKeyChecking=yes` |
+| `token` | `token` | HTTPS basic auth, sent from memory on each request |
+| `basic` | `username`, `password` | HTTPS basic auth, the same way |
+| `ssh` | `ssh-key`, `known_hosts` | SSH; the key is parsed in memory and the host key must be one `known_hosts` lists |
 
-Credentials are handed to git for each command and never written to the clone's `.git/config`. A clone made by an earlier version, which kept the token in the origin URL, has the token stripped from `origin` and its reflog expired on the next sync. Without `known_hosts` an SSH sync fails unless `spec.sshHostKeyPolicy: acceptNew` trusts the key the host presents on first contact (and rejects a different key afterwards, for the life of the operator pod); the default is `strict`.
+Credentials stay in memory for the sync and are never written to the clone's `.git/config` or anywhere else on disk; only `known_hosts` is written, for the host key check. A git server whose HTTPS certificate comes from a private CA takes the CA's PEM chain in the Secret's `ca.crt` key, with any `authType` (including `none`, with a Secret that holds only `ca.crt`). A clone made by an earlier version, which kept the token in the origin URL, has the token stripped from `origin` and its reflog dropped on the next sync. Without `known_hosts` an SSH sync fails unless `spec.sshHostKeyPolicy: acceptNew` trusts the key the host presents on first contact (and rejects a different key afterwards, for the life of the operator pod); the default is `strict`.
 
 ```bash
 ssh-keyscan github.com > known_hosts
@@ -31445,6 +31445,7 @@ kubectl get remediationplans -A     # ISSUE  ATTEMPT  STATE  AGE
 kubectl get postmortems -A          # ISSUE  SEVERITY  STATE  AGE
 kubectl get approvalrequests -A     # ISSUE  PLAN  STATE  RULE  AGE
 ```
+
 
 ## Authentication options
 
@@ -31516,7 +31517,6 @@ Loopback-only servers (`security.bindAddress: "127.0.0.1"`) may run without a cr
 ## Instance spec reference
 
 Only `spec.provider` is required. The CRD schema is the only validation: there is no admission webhook.
-
 
 ### Top level
 
@@ -31631,6 +31631,7 @@ The AIOps pipeline reads these settings from the pinned AIOps Instance (`CHATCLI
 | `features.logRotation.*` | `CHATCLI_LOG_MAX_SIZE_MB`, `_MAX_BACKUPS`, `_MAX_AGE_DAYS`, `_COMPRESS` | Rotation of the server's log file (defaults 100 MB, 3 backups, 28 days, compressed); the same entries also go to stderr, so `kubectl logs` carries them |
 | `pipeline.enabled` | `CHATCLI_SERVER_PIPELINE=true` | Serve the [pipeline RPCs](/server/server-mode#pipeline-rpcs) (the exec RPCs require the admin role) |
 
+
 ### `spec.mcp`, `spec.agents`, `spec.plugins`
 
 | Field | Description |
@@ -31678,7 +31679,6 @@ Everything is named after the Instance, labeled `app.kubernetes.io/name: chatcli
 - pod security context `runAsNonRoot`, UID 1000, `fsGroup: 1000` with `fsGroupChangePolicy: OnRootMismatch` (so a fresh sessions volume is writable whatever the provisioner does), `seccompProfile: RuntimeDefault` (unless `spec.securityContext`), and for every container, the `plugin-loader` init container included, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, all capabilities dropped: the pod passes the `restricted` Pod Security Standard;
 - writable emptyDirs `/tmp` (100Mi) and `/home/chatcli/.chatcli` (200Mi); anything outside the sessions PVC is lost when the pod restarts;
 - `HOME=/home/chatcli`, the `<name>` ConfigMap and the `apiKeys` Secret as `envFrom`, then `extraEnv`, then the typed credential and feature variables. Secret references are optional, so a missing Secret does not block the pod: it starts without the value.
-
 
 ### Rollout triggers
 
@@ -31783,6 +31783,7 @@ For a layout that combines a persistent AIOps Instance with a stateless pool, an
 
 Instance pods and the operator pod meet the `restricted` Pod Security Standard with the defaults, so you can label their namespaces `pod-security.kubernetes.io/enforce: restricted`. If you set `spec.securityContext`, it replaces the default entirely: keep `runAsNonRoot: true` and `seccompProfile: {type: RuntimeDefault}` in it. The default also sets `fsGroup: 1000` with `fsGroupChangePolicy: OnRootMismatch`, so a fresh sessions volume is writable whatever the provisioner does; keep `fsGroup: 1000` in your own context when you enable persistence.
 
+
 ### Metrics and monitoring
 
 - The server exposes `/metrics` (and `/healthz`) on the Instance Service port `metrics` (9090); the operator exposes controller and AIOps metrics (`chatcli_operator_*`) on 8080 (`serviceMonitor.enabled: true` in the chart).
@@ -31856,7 +31857,6 @@ An upgrade replaces the operator and, for every Instance that follows the operat
 
 **Upgrading with no AIOps config turns AIOps off.** This release no longer attaches to an implicit "first ready" Instance: unless you set `CHATCLI_OPERATOR_AIOPS_INSTANCE` (chart `aiops.instance.namespace`/`name`), the incident pipeline does not run after the upgrade. Remediation also defaults to `approve` mode, so plans wait for an ApprovalPolicy or the decision engine and high-risk actions always wait for a human — set `remediationMode: auto` only if you deliberately want the previous unattended behavior. See the [security hardening upgrade](/security/hardening-upgrade).
 
-
 ### Before you start
 
 1. Back up the custom resources and Secrets (see [Backup](#backup)).
@@ -31923,6 +31923,7 @@ All five conditions should read `True`. If `ServerReachable` still shows the `Fa
 ### Uninstall
 
 Delete the Instances first, while the operator still runs: their finalizer (`platform.chatcli.io/finalizer`) is removed by the operator, and an Instance deleted after the operator is gone stays `Terminating` until you remove it by hand (`kubectl patch instance <name> -n <ns> --type merge -p '{"metadata":{"finalizers":null}}'`). Then run `helm uninstall chatcli-operator -n chatcli-system` (or `make undeploy` for the raw manifests, which also deletes the CRDs). `helm uninstall` leaves the CRDs (Helm never deletes `crds/`); deleting them deletes every custom resource.
+
 
 ## Troubleshooting
 
@@ -31992,7 +31993,6 @@ helm install chatcli-operator ../deploy/helm/chatcli-operator -n chatcli-system 
 ```
 
 `make manifests` only prints the `controller-gen` command; the generated CRDs are committed in `config/crd/bases/` and copied into both charts' `crds/`.
-
 
 ## Next steps
 
@@ -48982,7 +48982,7 @@ spec:
   syncIntervalMinutes: 30
 ```
 
-As chaves do Secret dependem do `authType`: `token` para `token`, `username` e `password` para `basic`, `ssh-key` e `known_hosts` para `ssh`. As credenciais HTTPS chegam ao git por um helper `GIT_ASKPASS` a cada comando e nunca são gravadas no `.git/config` do clone; um clone feito por uma versão anterior, que guardava o token na URL do origin, tem o token removido do `origin` e o reflog expirado na próxima sincronização. A imagem do operator traz o `openssh-client`, e um clone por SSH confere a chave do host do servidor contra o `known_hosts` do Secret com `StrictHostKeyChecking=yes`:
+As chaves do Secret dependem do `authType`: `token` para `token`, `username` e `password` para `basic`, `ssh-key` e `known_hosts` para `ssh`. Os clones rodam dentro do processo (go-git), então a imagem do operator não traz binários git nem ssh. As credenciais HTTPS são enviadas da memória e nunca gravadas no `.git/config` do clone; um clone feito por uma versão anterior, que guardava o token na URL do origin, tem o token removido do `origin` e o reflog descartado na próxima sincronização. Um servidor cujo certificado vem de uma CA privada recebe a cadeia PEM da CA na chave `ca.crt` do Secret. Um clone por SSH lê a chave em memória e confere a chave do host do servidor contra o `known_hosts` do Secret, recusando uma chave que não esteja listada:
 
 ```bash
 ssh-keyscan git.example.com > known_hosts
@@ -49102,6 +49102,7 @@ Como uma escalação se comporta:
 
 ## 7. SLOs e SLAs
 
+
 ### SLO
 
 Os SLOs são calculados a partir das próprias Issues e Anomalies do operator para o recurso, não a partir do Prometheus. Crie o SLO no namespace da carga.
@@ -49144,7 +49145,6 @@ Uma janela de burn rate que dispara abre uma Issue com `signalType: slo_violatio
 - `pageOnBudgetExhausted: true` abre uma Issue crítica quando o budget chega a zero. Ele só aciona de novo depois que o budget volta a ficar acima de zero e se esgota outra vez; enquanto essa Issue de esgotamento estiver aberta, nenhuma segunda é criada.
 - As Issues `slo_violation` do próprio SLO não contam como indisponibilidade, então um acionamento não aprofunda a violação que ele reporta.
 - `metricSource: prometheus` não é consultado: o SLI continua sendo calculado a partir de Issues e Anomalies, e o SLO reporta a condição `MetricSourceSupported=False`. `prometheusQuery`, `latencyPercentile` e `latencyThresholdMs` não são avaliados, e `alertPolicy.notificationPolicyRef` é reservado: as Issues do SLO são notificadas por toda NotificationPolicy cujas regras casem com elas.
-
 
 ### SLA
 
@@ -64144,7 +64144,7 @@ Diagnóstico code-aware quando `SourceRepository` CRD está configurado:
 - **Suspected Commit**: identifica o commit mais provável (score por proximidade temporal + volume de mudanças)
 - **Code Extraction**: extrai trechos de código referenciados em stack traces (file path + line number → código fonte)
 - **Config Analysis**: lê Dockerfile, values.yaml, Chart.yaml para contexto de deploy
-- **Credenciais**: chaves do Secret `token`, `username` + `password`, ou `ssh-key` + `known_hosts`; as credenciais HTTPS passam por um helper `GIT_ASKPASS` e nunca são gravadas no `.git/config`; o SSH confere as chaves do host contra o `known_hosts` (`spec.sshHostKeyPolicy: acceptNew` confia na primeira chave quando o Secret não tem nenhuma). Veja [Repositórios de código](/pt/kubernetes/k8s-operator#repositórios-de-código)
+- **Credenciais**: chaves do Secret `token`, `username` + `password`, ou `ssh-key` + `known_hosts`; as credenciais HTTPS são enviadas da memória e nunca gravadas no `.git/config`; o SSH confere as chaves do host contra o `known_hosts` (`spec.sshHostKeyPolicy: acceptNew` confia na primeira chave quando o Secret não tem nenhuma). Veja [Repositórios de código](/pt/kubernetes/k8s-operator#repositórios-de-código)
 
 **CascadeAnalyzer (`cascade_analyzer.go`):**
 
@@ -65526,16 +65526,16 @@ A linha de log da subida mostra as contagens de padrão, customizados e total, e
 
 ### Repositórios de código
 
-Um `SourceRepository` vincula uma carga ao repositório git dela, para que a análise de incidentes veja os commits recentes e o código em volta dos stack traces. Crie-o, e o Secret dele, no namespace da carga. O operator faz um clone raso no emptyDir gravável `/tmp` dele (valor `tmpVolume.sizeLimit` do chart, padrão `1Gi`) e sincroniza de novo a cada `syncIntervalMinutes` (padrão 30). A imagem do operator traz `git` e `openssh-client`.
+Um `SourceRepository` vincula uma carga ao repositório git dela, para que a análise de incidentes veja os commits recentes e o código em volta dos stack traces. Crie-o, e o Secret dele, no namespace da carga. O operator faz um clone raso no emptyDir gravável `/tmp` dele (valor `tmpVolume.sizeLimit` do chart, padrão `1Gi`) e sincroniza de novo a cada `syncIntervalMinutes` (padrão 30). Os clones rodam dentro do processo (go-git): a imagem do operator é distroless e não traz binários git nem ssh.
 
 | `authType` | Chaves do Secret (`secretRef`) | Como a credencial é usada |
 |------------|--------------------------------|---------------------------|
 | `none` (padrão) | — | Repositório público |
-| `token` | `token` | HTTPS, por um helper `GIT_ASKPASS` |
-| `basic` | `username`, `password` | HTTPS, pelo mesmo helper |
-| `ssh` | `ssh-key`, `known_hosts` | SSH, chave do host conferida contra o `known_hosts` com `StrictHostKeyChecking=yes` |
+| `token` | `token` | HTTPS basic auth, enviada da memória a cada requisição |
+| `basic` | `username`, `password` | HTTPS basic auth, do mesmo jeito |
+| `ssh` | `ssh-key`, `known_hosts` | SSH; a chave é lida em memória e a chave do host tem de ser uma das listadas no `known_hosts` |
 
-As credenciais são entregues ao git a cada comando e nunca gravadas no `.git/config` do clone. Um clone feito por uma versão anterior, que guardava o token na URL do origin, tem o token removido do `origin` e o reflog expirado na próxima sincronização. Sem `known_hosts` uma sincronização por SSH falha, a menos que `spec.sshHostKeyPolicy: acceptNew` confie na chave que o host apresenta no primeiro contato (e rejeite uma chave diferente depois, enquanto durar o pod do operator); o padrão é `strict`.
+As credenciais ficam em memória durante a sincronização e nunca são gravadas no `.git/config` do clone nem em outro lugar do disco; só o `known_hosts` vai ao disco, para a conferência da chave do host. Um servidor git cujo certificado HTTPS vem de uma CA privada recebe a cadeia PEM da CA na chave `ca.crt` do Secret, com qualquer `authType` (inclusive `none`, com um Secret que só tenha `ca.crt`). Um clone feito por uma versão anterior, que guardava o token na URL do origin, tem o token removido do `origin` e o reflog descartado na próxima sincronização. Sem `known_hosts` uma sincronização por SSH falha, a menos que `spec.sshHostKeyPolicy: acceptNew` confie na chave que o host apresenta no primeiro contato (e rejeite uma chave diferente depois, enquanto durar o pod do operator); o padrão é `strict`.
 
 ```bash
 ssh-keyscan github.com > known_hosts
@@ -92229,7 +92229,7 @@ services:
 | `no-new-privileges` | Impede que processos filhos ganhem mais privilégios que o pai |
 | Limites de recursos | Impede consumo excessivo de CPU/memória (DoS) |
 
-A imagem do servidor é distroless (`gcr.io/distroless/static-debian13:nonroot`, UID `65532`) e traz um binário só, o `chatcli`, que também é o `HEALTHCHECK` dela (`chatcli healthcheck`). A imagem do operator é baseada em Alpine e roda como `65532`.
+A imagem do servidor é distroless (`gcr.io/distroless/static-debian13:nonroot`, UID `65532`) e traz um binário só, o `chatcli`, que também é o `HEALTHCHECK` dela (`chatcli healthcheck`). A imagem do operator é a mesma base distroless com um binário só, o `manager`, como `65532`; os clones de SourceRepository rodam dentro do processo (go-git), então ela não traz binários git nem ssh.
 
 ---
 
@@ -94195,7 +94195,7 @@ Todas as receitas abaixo definem uma credencial. Um servidor que escuta além do
 | Imagem | Tags | Runtime |
 |---|---|---|
 | `ghcr.io/diillson/chatcli` | `<versão>` (sem `v`, ex.: `1.229.0`) e `latest` | `gcr.io/distroless/static-debian13:nonroot`, UID 65532, sem shell |
-| `ghcr.io/diillson/chatcli-operator` | `<versão>` e `latest` | Alpine (o `SourceRepository` precisa de git e, com `authType: ssh`, de `openssh-client`), UID 65532 |
+| `ghcr.io/diillson/chatcli-operator` | `<versão>` e `latest` | `gcr.io/distroless/static-debian13:nonroot`, UID 65532, sem shell (o `SourceRepository` clona dentro do processo; sem binários git ou ssh) |
 
 ```bash
 docker pull ghcr.io/diillson/chatcli:1.229.0
@@ -123070,7 +123070,7 @@ services:
 | `no-new-privileges` | Prevents child processes from gaining more privileges than the parent |
 | Resource limits | Prevents excessive CPU/memory consumption (DoS) |
 
-The server image is distroless (`gcr.io/distroless/static-debian13:nonroot`, UID `65532`) and carries a single binary, `chatcli`, which is also its `HEALTHCHECK` (`chatcli healthcheck`). The operator image is Alpine-based and runs as `65532`.
+The server image is distroless (`gcr.io/distroless/static-debian13:nonroot`, UID `65532`) and carries a single binary, `chatcli`, which is also its `HEALTHCHECK` (`chatcli healthcheck`). The operator image is the same distroless base with a single binary, `manager`, as `65532`; SourceRepository clones run in-process (go-git), so it ships no git or ssh binaries.
 
 ---
 
@@ -123247,6 +123247,7 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_ENV_REDACT_MODE` | Secret redaction on the LLM path: `permissive`, `strict`, `off` | `permissive` |
 | `CHATCLI_REDACT_PATTERNS` | Extra name fragments treated as sensitive (comma-separated, case-insensitive substring match) | `""` |
 
+
 ### Operator Security
 
 | Variable | Description | Default |
@@ -123266,7 +123267,6 @@ Complete reference of all security-related environment variables:
 | `CHATCLI_CORS_ALLOW_CREDENTIALS` | Allow cookies and `Authorization` on cross-origin requests | `false` |
 
 ---
-
 
 ## Version Check
 
@@ -125035,7 +125035,7 @@ Every recipe below sets a credential. A server that listens beyond loopback (any
 | Image | Tags | Runtime |
 |---|---|---|
 | `ghcr.io/diillson/chatcli` | `<version>` (no `v`, e.g. `1.229.0`) and `latest` | `gcr.io/distroless/static-debian13:nonroot`, UID 65532, no shell |
-| `ghcr.io/diillson/chatcli-operator` | `<version>` and `latest` | Alpine (`SourceRepository` needs git and, for `authType: ssh`, `openssh-client`), UID 65532 |
+| `ghcr.io/diillson/chatcli-operator` | `<version>` and `latest` | `gcr.io/distroless/static-debian13:nonroot`, UID 65532, no shell (`SourceRepository` clones in-process; no git or ssh binaries) |
 
 ```bash
 docker pull ghcr.io/diillson/chatcli:1.229.0
