@@ -466,7 +466,125 @@ def flips(lang, mode, counts=None, round_text=None):
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Same model, another harness: Claude Code 2.1.330 against chatcli v1.232.0,
+# both on 2026-11-22 (results/2026-11-22-claude-code and results/2026-11-22).
+# Per DATA key: both right, only chatcli, only Claude Code, neither.
+VERSUS = {"user": (69, 1, 0, 0), "assistant": (55, 0, 1, 0), "updates": (72, 5, 1, 0),
+          "temporal": (118, 9, 2, 4), "preference": (27, 1, 1, 1), "multi": (115, 9, 2, 7)}
+VERSUS_TOTAL = {"chatcli": 481, "claude": 463}
+# Per question: cost (US$, answer + judge), median seconds, tool calls.
+VERSUS_COST = {"chatcli": dict(cost=0.102, secs=19.1, tools=3.5), "claude": dict(cost=0.046, secs=8.1, tools=2.0)}
+
+TEXT["en"].update({
+    "vs_chatcli": "chatcli v1.232.0", "vs_claude": "Claude Code 2.1.330",
+    "vs_acc_title": "Same model, two harnesses: accuracy by question type",
+    "vs_acc_sub": "LongMemEval-S, 500 questions, Claude Sonnet 5.5 answering and judging on both sides · 2026-11-22",
+    "vs_grid_title": "The same 500 questions, answered by both",
+    "vs_grid_sub": "One square per question, grouped by type · same model, same judge",
+    "vs_both": "%d both right", "vs_only_chatcli": "%d only chatcli right",
+    "vs_only_claude": "%d only Claude Code right", "vs_neither": "%d neither right",
+    "vs_row": "%d apart",
+    "vs_cost_title": "What each harness spends per question",
+    "vs_cost_sub": "Averages over the 500 questions · Claude Code answers from the search lines, chatcli opens the sessions",
+    "vs_m_cost": "Cost per question", "vs_m_secs": "Median time per question", "vs_m_tools": "Tool calls per question",
+})
+TEXT["pt"].update({
+    "vs_chatcli": "chatcli v1.232.0", "vs_claude": "Claude Code 2.1.330",
+    "vs_acc_title": "Mesmo modelo, dois harnesses: acurácia por tipo de pergunta",
+    "vs_acc_sub": "LongMemEval-S, 500 perguntas, Claude Sonnet 5.5 respondendo e julgando nos dois lados · 22/11/2026",
+    "vs_grid_title": "As mesmas 500 perguntas, respondidas pelos dois",
+    "vs_grid_sub": "Um quadrado por pergunta, agrupado por tipo · mesmo modelo, mesmo juiz",
+    "vs_both": "%d os dois acertaram", "vs_only_chatcli": "%d só o chatcli acertou",
+    "vs_only_claude": "%d só o Claude Code acertou", "vs_neither": "%d nenhum acertou",
+    "vs_row": "%d de diferença",
+    "vs_cost_title": "Quanto cada harness gasta por pergunta",
+    "vs_cost_sub": "Médias sobre as 500 perguntas · o Claude Code responde pelas linhas da busca, o chatcli abre as sessões",
+    "vs_m_cost": "Custo por pergunta", "vs_m_secs": "Tempo mediano por pergunta", "vs_m_tools": "Ferramentas por pergunta",
+})
+
+
+def versus_accuracy(lang, mode):
+    """Accuracy by type, the two agents side by side. Identity is carried by
+    the legend and by the order (chatcli first), not by color alone."""
+    t, c = TEXT[lang], THEME[mode]
+    W, top, rowh, dec = 760, 92, 50, t["dec"]
+    H = top + len(TYPE_ORDER) * rowh + 62
+    out = svg_open(W, H, t["vs_acc_title"], t["vs_acc_sub"], c)
+    x0, bw = 232, 330
+    for i, key in enumerate(TYPE_ORDER):
+        both, only_h, only_c, _ = VERSUS[key]
+        n, y = TYPE_N[key], top + i * rowh
+        out.append(f'<text x="220" y="{y + 15}" font-size="13" text-anchor="end" fill="{c["ink"]}">{t["labels"][key]}</text>')
+        for j, (v, col, name) in enumerate(((both + only_h, c["teal"], t["vs_chatcli"]), (both + only_c, c["flip"], t["vs_claude"]))):
+            by = y + j * 15
+            out.append(f'<rect x="{x0}" y="{by}" width="{bw}" height="11" rx="3" fill="{c["track"]}"/>')
+            out.append(f'<rect x="{x0}" y="{by}" width="{bw * v / n:.1f}" height="11" rx="3" fill="{col}">'
+                       f'<title>{name}, {t["labels"][key]}: {pct(v, n, dec)} ({v}/{n})</title></rect>')
+            out.append(f'<text x="{x0 + bw + 12}" y="{by + 10}" font-size="12" font-weight="{"600" if j == 0 else "400"}" '
+                       f'fill="{c["ink"] if j == 0 else c["sub"]}">{pct(v, n, dec)}  ·  {v}/{n}</text>')
+    ly = top + len(TYPE_ORDER) * rowh + 18
+    for j, (col, name, tot) in enumerate(((c["teal"], t["vs_chatcli"], VERSUS_TOTAL["chatcli"]), (c["flip"], t["vs_claude"], VERSUS_TOTAL["claude"]))):
+        out.append(f'<rect x="24" y="{ly + j * 22}" width="12" height="12" rx="3" fill="{col}"/>')
+        out.append(f'<text x="44" y="{ly + j * 22 + 10}" font-size="12" fill="{c["sub"]}">{name}: {tot}/500 = {pct(tot, 500, dec)}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def versus_grid(lang, mode):
+    """One square per question: both right, only one of them, neither."""
+    t, c = TEXT[lang], THEME[mode]
+    W, per_line, pitch, cell, x0 = 760, 45, 11, 9, 232
+    body, y = [], 84
+    for key in TYPE_ORDER:
+        both, only_h, only_c, neither = VERSUS[key]
+        n = both + only_h + only_c + neither
+        cols = [c["first"]] * both + [c["teal"]] * only_h + [c["flip"]] * only_c + [c["red"]] * neither
+        for i, col in enumerate(cols):
+            body.append(f'<rect x="{x0 + (i % per_line) * pitch}" y="{y + (i // per_line) * pitch}" width="{cell}" height="{cell}" rx="2" fill="{col}"/>')
+        body.append(f'<text x="220" y="{y + 9}" font-size="13" text-anchor="end" fill="{c["ink"]}">{t["labels"][key]}</text>')
+        body.append(f'<text x="220" y="{y + 24}" font-size="11" text-anchor="end" fill="{c["mute"]}">{t["vs_row"] % (only_h + only_c)}</text>')
+        y += max(-(-n // per_line) * pitch, 28) + 12
+    tot = [sum(v[j] for v in VERSUS.values()) for j in range(4)]
+    legend = ((c["first"], t["vs_both"] % tot[0]), (c["teal"], t["vs_only_chatcli"] % tot[1]),
+              (c["flip"], t["vs_only_claude"] % tot[2]), (c["red"], t["vs_neither"] % tot[3]))
+    for j, (col, label) in enumerate(legend):
+        lx, ly = 24 + (j % 2) * 300, y + 6 + (j // 2) * 22
+        body.append(f'<rect x="{lx}" y="{ly}" width="12" height="12" rx="3" fill="{col}"/>')
+        body.append(f'<text x="{lx + 20}" y="{ly + 10}" font-size="12" fill="{c["sub"]}">{label}</text>')
+    H = y + 6 + 2 * 22 + 8
+    return "\n".join(svg_open(W, H, t["vs_grid_title"], t["vs_grid_sub"], c) + body + ["</svg>"])
+
+
+def versus_cost(lang, mode):
+    """Three measures per question, one panel each, bars from zero."""
+    t, c = TEXT[lang], THEME[mode]
+    W, H, dec = 760, 262, t["dec"]
+    out = svg_open(W, H, t["vs_cost_title"], t["vs_cost_sub"], c)
+    fmts = {"cost": t["f_cost"], "secs": t["f_secs"], "tools": t["f_tools"]}
+    for k, field in enumerate(("cost", "secs", "tools")):
+        px, py = 24 + k * 244, 84
+        base, maxh = py + 124, 78
+        top = max(v[field] for v in VERSUS_COST.values())
+        out.append(f'<text x="{px}" y="{py + 12}" font-size="13" font-weight="600" fill="{c["ink"]}">{t["vs_m_" + field]}</text>')
+        out.append(f'<line x1="{px}" y1="{base}" x2="{px + 212}" y2="{base}" stroke="{c["track"]}" stroke-width="1"/>')
+        for i, (who, col) in enumerate((("chatcli", c["teal"]), ("claude", c["flip"]))):
+            v = VERSUS_COST[who][field]
+            x, h = px + 26 + i * 96, maxh * v / top
+            label = (fmts[field] % v).replace(".", dec)
+            out.append(f'<path d="M{x},{base} v{-(h - 4):.1f} q0,-4 4,-4 h48 q4,0 4,4 v{h - 4:.1f} z" fill="{col}"><title>{t["vs_" + who]}: {label}</title></path>')
+            out.append(f'<text x="{x + 28}" y="{base - h - 7:.1f}" font-size="12" text-anchor="middle" font-weight="600" fill="{c["ink"]}">{label}</text>')
+            out.append(f'<text x="{x + 28}" y="{base + 16}" font-size="11" text-anchor="middle" fill="{c["sub"]}">{t["vs_" + who].split(" ")[0] if who == "chatcli" else "Claude Code"}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
 def main():
+    for lang in TEXT:
+        for mode in THEME:
+            (OUT / f"vs-claude-code-accuracy-{lang}-{mode}.svg").write_text(versus_accuracy(lang, mode) + "\n")
+            (OUT / f"vs-claude-code-questions-{lang}-{mode}.svg").write_text(versus_grid(lang, mode) + "\n")
+            (OUT / f"vs-claude-code-cost-{lang}-{mode}.svg").write_text(versus_cost(lang, mode) + "\n")
     for lang in TEXT:
         for mode in THEME:
             (OUT / f"accuracy-r2-{lang}-{mode}.svg").write_text(accuracy(lang, mode) + "\n")
