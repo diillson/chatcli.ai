@@ -6,11 +6,18 @@ Portuguese:
 - validation: the validation half in every full run (third round);
 - accuracy-r2: accuracy by type, first against second round (second round);
 - flips: what happened to the first round's misses (second round);
-- flips-r3: what happened to the second round's misses (third round).
+- flips-r3: what happened to the second round's misses (third round);
+- history: every full run, all 500 and the validation half, with intervals
+  (page header, monthly checks);
+- types-history: accuracy by type across the full runs (monthly checks);
+- cost-history: cost, tool calls, input and time per question (monthly checks);
+- stability: the 500 questions across every published run (monthly checks);
+- flips-<yyyy-mm>: the previous run's misses in that month's run.
 
-Numbers come from evals/longmemeval/results/ in the chatcli repo
-(2026-10-20, 2026-10-22-merged, 2026-10-24, 2026-10-24-session-search);
-add a column to DATA and a row to VALIDATION when a new run lands.
+Numbers come from evals/longmemeval/results/ in the chatcli repo. A new
+monthly run is one more entry in RUNS, STABILITY recounted over all packs
+and one more flips-<yyyy-mm> pair; the charts of earlier rounds (DATA,
+THIRD, VALIDATION, FLIPS, FLIPS3) stay as they are, byte for byte.
 
     python3 scripts/gen-longmemeval-charts.py
 """
@@ -98,8 +105,234 @@ THEME = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Monthly checks. Every full run on main, in order; a new monthly run is one
+# more entry in RUNS (plus STABILITY and a FLIPS pair recomputed from the
+# packs). Per run: correct of 500, correct of the 260 validation questions,
+# correct per DATA key, cost per question (answer + judge, US$), tool calls
+# per question, input tokens per question (thousands), median seconds.
+RUNS = [
+    dict(key="r1", total=454, val=237, cost=0.087, tools=4.9, intok=71.3, secs=22.0,
+         types={"user": 70, "assistant": 56, "updates": 74, "temporal": 117, "preference": 26, "multi": 111}),
+    dict(key="r2", total=473, val=243, cost=0.101, tools=5.0, intok=77.6, secs=22.1,
+         types={"user": 70, "assistant": 55, "updates": 77, "temporal": 123, "preference": 29, "multi": 119}),
+    dict(key="r3base", total=475, val=240, cost=0.099, tools=4.7, intok=77.0, secs=19.2,
+         types={"user": 69, "assistant": 55, "updates": 74, "temporal": 127, "preference": 27, "multi": 123}),
+    dict(key="r3", total=479, val=247, cost=0.100, tools=3.4, intok=78.0, secs=20.2,
+         types={"user": 70, "assistant": 56, "updates": 76, "temporal": 127, "preference": 28, "multi": 122}),
+    dict(key="m2611", total=481, val=246, cost=0.102, tools=3.5, intok=78.6, secs=19.1,
+         types={"user": 70, "assistant": 55, "updates": 77, "temporal": 127, "preference": 28, "multi": 124}),
+]
+TYPE_N = {"user": 70, "assistant": 56, "updates": 78, "temporal": 133, "preference": 30, "multi": 133}
+TYPE_ORDER = ["user", "assistant", "updates", "temporal", "preference", "multi"]
+# Each question across the six published packs (the five runs above plus the
+# pre-merge run of 2026-10-22): right in all six, changed, wrong in all six.
+STABILITY = {"user": (69, 1, 0), "assistant": (54, 2, 0), "updates": (71, 7, 0),
+             "temporal": (111, 19, 3), "preference": (26, 3, 1), "multi": (103, 27, 3)}
+STABILITY_RUNS = 6
+# The 21 misses of 2026-10-24-session-search in the 2026-11-22 run.
+FLIPS4 = {"fixed": 10, "stayed": 11, "new": 8}  # 21 misses before, 19 now
+
+TEXT["en"].update({
+    "run_date": {"r1": "Oct 20", "r2": "Oct 22", "r3base": "Oct 24", "r3": "Oct 24", "m2611": "Nov 22"},
+    "run_tag": {"r1": "round 1", "r2": "round 2", "r3base": "+ graph", "r3": "+ search", "m2611": "v1.232.0"},
+    "hist_title": "chatcli on LongMemEval-S, run after run",
+    "hist_sub": "Correct answers per full run, with the 95% interval · latest: v1.232.0 on 2026-11-22",
+    "hist_all": "All 500 questions", "hist_val": "Validation half (260, never read while tuning)",
+    "types_title": "Accuracy by question type, run after run",
+    "types_sub": "Five full runs, 2026-10-20 to 2026-11-22 (v1.232.0) · each panel from 80% to 100%",
+    "questions": "%d questions",
+    "cost_title": "What a question costs, run after run",
+    "cost_sub": "Averages over the 500 questions of each full run · latest: v1.232.0 on 2026-11-22",
+    "m_cost": "Cost per question (answer + judge)", "m_tools": "Tool calls per question",
+    "m_intok": "Input tokens per question", "m_secs": "Median time per question",
+    "f_cost": "$%.3f", "f_tools": "%.1f", "f_intok": "%.1fk", "f_secs": "%.1f s",
+    "stab_title": "The 500 questions across six published runs",
+    "stab_sub": "One square per question, grouped by type · 2026-10-20 to 2026-11-22",
+    "stab_row": "%d of %d every run",
+    "stab_always": "%d right in all six runs",
+    "stab_flip": "%d changed between runs (product fixes and run-to-run variation)",
+    "stab_never": "%d wrong in all six runs",
+    "flip4": {"flip_title": "What happened to the 21 misses of the October run",
+              "flip_sub": "29 questions were wrong in at least one of the two runs",
+              "row1": "2026-10-24, session search: 21 misses", "row2": "2026-11-22, v1.232.0: 19 misses",
+              "fixed": "10 now right", "stayed": "11 still wrong", "new": "8 new",
+              "legend": "No change was aimed at these questions: both directions are run-to-run variation"},
+})
+TEXT["pt"].update({
+    "run_date": {"r1": "20/10", "r2": "22/10", "r3base": "24/10", "r3": "24/10", "m2611": "22/11"},
+    "run_tag": {"r1": "rodada 1", "r2": "rodada 2", "r3base": "+ grafo", "r3": "+ busca", "m2611": "v1.232.0"},
+    "hist_title": "chatcli no LongMemEval-S, rodada após rodada",
+    "hist_sub": "Respostas corretas por rodada completa, com o intervalo de 95% · mais recente: v1.232.0 em 22/11/2026",
+    "hist_all": "Todas as 500 perguntas", "hist_val": "Metade de validação (260, nunca lidas no ajuste)",
+    "types_title": "Acurácia por tipo de pergunta, rodada após rodada",
+    "types_sub": "Cinco rodadas completas, de 20/10 a 22/11/2026 (v1.232.0) · cada painel vai de 80% a 100%",
+    "questions": "%d perguntas",
+    "cost_title": "Quanto custa uma pergunta, rodada após rodada",
+    "cost_sub": "Médias sobre as 500 perguntas de cada rodada completa · mais recente: v1.232.0 em 22/11/2026",
+    "m_cost": "Custo por pergunta (resposta + juiz)", "m_tools": "Chamadas de ferramenta por pergunta",
+    "m_intok": "Tokens de entrada por pergunta", "m_secs": "Tempo mediano por pergunta",
+    "f_cost": "US$ %.3f", "f_tools": "%.1f", "f_intok": "%.1f mil", "f_secs": "%.1f s",
+    "stab_title": "As 500 perguntas em seis rodadas publicadas",
+    "stab_sub": "Um quadrado por pergunta, agrupado por tipo · de 20/10 a 22/11/2026",
+    "stab_row": "%d de %d em todas",
+    "stab_always": "%d certas nas seis rodadas",
+    "stab_flip": "%d mudaram entre rodadas (correções no produto e variação entre rodadas)",
+    "stab_never": "%d erradas nas seis rodadas",
+    "flip4": {"flip_title": "O que aconteceu com as 21 falhas da rodada de outubro",
+              "flip_sub": "29 perguntas erraram em pelo menos uma das duas rodadas",
+              "row1": "24/10/2026, busca de sessões: 21 falhas", "row2": "22/11/2026, v1.232.0: 19 falhas",
+              "fixed": "10 acertam", "stayed": "11 continuam", "new": "8 novas",
+              "legend": "Nenhuma mudança mirou essas perguntas: os dois sentidos são variação entre rodadas"},
+})
+# "Changed between runs" in the stability grid. Validated with the dataviz
+# palette checker against each surface, next to teal and red.
+THEME["light"]["flip"] = "#6d5fd0"
+THEME["dark"]["flip"] = "#8b7fe8"
+
+
 def pct(a, b, dec):
     return ("%.1f%%" % (100 * a / b)).replace(".", dec)
+
+
+def wilson(k, n, z=1.96):
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    m = z * (p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5
+    return 100 * (c - m) / d, 100 * (c + m) / d
+
+
+def svg_open(W, H, title, sub, c):
+    return [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+            f'font-family="Inter, -apple-system, Segoe UI, sans-serif" role="img" aria-label="{title}">',
+            f'<rect width="{W}" height="{H}" fill="{c["bg"]}"/>',
+            f'<text x="24" y="34" font-size="18" font-weight="600" fill="{c["ink"]}">{title}</text>',
+            f'<text x="24" y="56" font-size="13" fill="{c["sub"]}">{sub}</text>']
+
+
+def history(lang, mode):
+    """Every full run: all 500 and the validation half, each with its 95%
+    interval. The axis starts at 84% because the marks are points with
+    intervals, not bars; the labels carry the exact values."""
+    t, c = TEXT[lang], THEME[mode]
+    W, H, dec = 760, 336, t["dec"]
+    out = svg_open(W, H, t["hist_title"], t["hist_sub"], c)
+    lo_axis, hi_axis, ptop, ph = 84.0, 100.0, 118, 140
+
+    def ypos(v):
+        return ptop + (hi_axis - v) / (hi_axis - lo_axis) * ph
+
+    for p, (label, field, n) in enumerate(((t["hist_all"], "total", 500), (t["hist_val"], "val", 260))):
+        px = 24 + p * 372
+        out.append(f'<text x="{px}" y="88" font-size="13" font-weight="600" fill="{c["ink"]}">{label}</text>')
+        for g in (85, 90, 95, 100):
+            out.append(f'<line x1="{px + 34}" y1="{ypos(g):.1f}" x2="{px + 340}" y2="{ypos(g):.1f}" stroke="{c["track"]}" stroke-width="1"/>')
+            out.append(f'<text x="{px + 28}" y="{ypos(g) + 4:.1f}" font-size="11" text-anchor="end" fill="{c["mute"]}">{g}%</text>')
+        xs = [px + 66 + i * 62 for i in range(len(RUNS))]
+        vals = [100 * r[field] / n for r in RUNS]
+        path = " ".join(f'{"M" if i == 0 else "L"}{x},{ypos(v):.1f}' for i, (x, v) in enumerate(zip(xs, vals)))
+        out.append(f'<path d="{path}" fill="none" stroke="{c["second"]}" stroke-width="2" stroke-linejoin="round"/>')
+        for i, (r, x, v) in enumerate(zip(RUNS, xs, vals)):
+            last = i == len(RUNS) - 1
+            lo, hi = wilson(r[field], n)
+            tip = f'{t["run_date"][r["key"]]} {t["run_tag"][r["key"]]}: {pct(r[field], n, dec)} ({r[field]}/{n})'
+            out.append(f'<line x1="{x}" y1="{ypos(lo):.1f}" x2="{x}" y2="{ypos(hi):.1f}" stroke="{c["mute"]}" stroke-width="2" stroke-linecap="round"/>')
+            out.append(f'<circle cx="{x}" cy="{ypos(v):.1f}" r="{6 if last else 4.5}" fill="{c["teal"]}" stroke="{c["bg"]}" stroke-width="2"><title>{tip}</title></circle>')
+            out.append(f'<text x="{x}" y="{ypos(hi) - 8:.1f}" font-size="11.5" text-anchor="middle" font-weight="{"600" if last else "400"}" '
+                       f'fill="{c["ink"] if last else c["mute"]}">{pct(r[field], n, dec)}</text>')
+            by = ptop + ph + 22
+            out.append(f'<text x="{x}" y="{by}" font-size="11.5" text-anchor="middle" font-weight="{"600" if last else "400"}" fill="{c["ink"] if last else c["sub"]}">{t["run_date"][r["key"]]}</text>')
+            out.append(f'<text x="{x}" y="{by + 15}" font-size="10.5" text-anchor="middle" fill="{c["mute"]}">{t["run_tag"][r["key"]]}</text>')
+            out.append(f'<text x="{x}" y="{by + 30}" font-size="10.5" text-anchor="middle" fill="{c["mute"]}">{r[field]}/{n}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def types_history(lang, mode):
+    """Small multiples: one panel per question type, the five full runs."""
+    t, c = TEXT[lang], THEME[mode]
+    W, rows_h, dec = 760, 152, t["dec"]
+    H = 84 + 2 * rows_h + 4
+    out = svg_open(W, H, t["types_title"], t["types_sub"], c)
+    lo_axis, ph = 80.0, 70
+    for k, key in enumerate(TYPE_ORDER):
+        px, py = 24 + (k % 3) * 244, 84 + (k // 3) * rows_h
+        n = TYPE_N[key]
+        ptop = py + 40
+
+        def ypos(v):
+            return ptop + (100.0 - v) / (100.0 - lo_axis) * ph
+
+        out.append(f'<text x="{px}" y="{py + 12}" font-size="13" font-weight="600" fill="{c["ink"]}">{t["labels"][key]}</text>')
+        out.append(f'<text x="{px}" y="{py + 27}" font-size="11" fill="{c["mute"]}">{t["questions"] % n}</text>')
+        for g in (80, 90, 100):
+            out.append(f'<line x1="{px + 30}" y1="{ypos(g):.1f}" x2="{px + 176}" y2="{ypos(g):.1f}" stroke="{c["track"]}" stroke-width="1"/>')
+            out.append(f'<text x="{px + 25}" y="{ypos(g) + 4:.1f}" font-size="10.5" text-anchor="end" fill="{c["mute"]}">{g}%</text>')
+        xs = [px + 40 + i * 32 for i in range(len(RUNS))]
+        vals = [100 * r["types"][key] / n for r in RUNS]
+        path = " ".join(f'{"M" if i == 0 else "L"}{x},{ypos(v):.1f}' for i, (x, v) in enumerate(zip(xs, vals)))
+        out.append(f'<path d="{path}" fill="none" stroke="{c["teal"]}" stroke-width="2" stroke-linejoin="round"/>')
+        for i, (r, x, v) in enumerate(zip(RUNS, xs, vals)):
+            last = i == len(RUNS) - 1
+            tip = f'{t["run_date"][r["key"]]} {t["run_tag"][r["key"]]}: {pct(r["types"][key], n, dec)} ({r["types"][key]}/{n})'
+            out.append(f'<circle cx="{x}" cy="{ypos(v):.1f}" r="{5 if last else 3.5}" fill="{c["teal"]}" stroke="{c["bg"]}" stroke-width="2"><title>{tip}</title></circle>')
+        out.append(f'<text x="{xs[-1] + 11}" y="{ypos(vals[-1]) + 4:.1f}" font-size="12" font-weight="600" fill="{c["ink"]}">{pct(RUNS[-1]["types"][key], n, dec)}</text>')
+        out.append(f'<text x="{xs[0]}" y="{ptop + ph + 20}" font-size="10.5" text-anchor="middle" fill="{c["mute"]}">{t["run_date"]["r1"]} · {pct(RUNS[0]["types"][key], n, dec)}</text>')
+        out.append(f'<text x="{xs[-1]}" y="{ptop + ph + 20}" font-size="10.5" text-anchor="middle" fill="{c["mute"]}">{t["run_date"][RUNS[-1]["key"]]}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def cost_history(lang, mode):
+    """Small multiples: four per-question averages over the full runs. Bars
+    start at zero; one panel per measure, so no scale is shared."""
+    t, c = TEXT[lang], THEME[mode]
+    W, rows_h, dec = 760, 172, t["dec"]
+    H = 84 + 2 * rows_h
+    out = svg_open(W, H, t["cost_title"], t["cost_sub"], c)
+    for k, field in enumerate(("cost", "tools", "intok", "secs")):
+        px, py = 24 + (k % 2) * 372, 84 + (k // 2) * rows_h
+        base, maxh = py + 124, 78
+        top = max(r[field] for r in RUNS)
+        out.append(f'<text x="{px}" y="{py + 12}" font-size="13" font-weight="600" fill="{c["ink"]}">{t["m_" + field]}</text>')
+        out.append(f'<line x1="{px}" y1="{base}" x2="{px + 340}" y2="{base}" stroke="{c["track"]}" stroke-width="1"/>')
+        for i, r in enumerate(RUNS):
+            last = i == len(RUNS) - 1
+            x, h = px + 18 + i * 64, maxh * r[field] / top
+            label = (t["f_" + field] % r[field]).replace(".", dec)
+            tip = f'{t["run_date"][r["key"]]} {t["run_tag"][r["key"]]}: {label}'
+            out.append(f'<path d="M{x},{base} v{-(h - 4):.1f} q0,-4 4,-4 h28 q4,0 4,4 v{h - 4:.1f} z" fill="{c["teal"] if last else c["first"]}"><title>{tip}</title></path>')
+            out.append(f'<text x="{x + 18}" y="{base - h - 7:.1f}" font-size="11.5" text-anchor="middle" font-weight="{"600" if last else "400"}" '
+                       f'fill="{c["ink"] if last else c["mute"]}">{label}</text>')
+            out.append(f'<text x="{x + 18}" y="{base + 15}" font-size="10.5" text-anchor="middle" fill="{c["ink"] if last else c["mute"]}">{t["run_date"][r["key"]]}</text>')
+            out.append(f'<text x="{x + 18}" y="{base + 28}" font-size="10" text-anchor="middle" fill="{c["mute"]}">{t["run_tag"][r["key"]]}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def stability(lang, mode):
+    """One square per question: right in every published run, changed, or
+    wrong in every one. Identity is carried by the legend and its counts."""
+    t, c = TEXT[lang], THEME[mode]
+    W, per_line, pitch, cell, x0 = 760, 45, 11, 9, 232
+    body, y = [], 84
+    for key in TYPE_ORDER:
+        always, flip, never = STABILITY[key]
+        n = always + flip + never
+        cols = [c["teal"]] * always + [c["flip"]] * flip + [c["red"]] * never
+        for i, col in enumerate(cols):
+            body.append(f'<rect x="{x0 + (i % per_line) * pitch}" y="{y + (i // per_line) * pitch}" width="{cell}" height="{cell}" rx="2" fill="{col}"/>')
+        body.append(f'<text x="220" y="{y + 9}" font-size="13" text-anchor="end" fill="{c["ink"]}">{t["labels"][key]}</text>')
+        body.append(f'<text x="220" y="{y + 24}" font-size="11" text-anchor="end" fill="{c["mute"]}">{t["stab_row"] % (always, n)}</text>')
+        y += max(-(-n // per_line) * pitch, 28) + 12
+    tot = [sum(v[j] for v in STABILITY.values()) for j in range(3)]
+    for j, (col, label) in enumerate(((c["teal"], t["stab_always"] % tot[0]), (c["flip"], t["stab_flip"] % tot[1]),
+                                      (c["red"], t["stab_never"] % tot[2]))):
+        body.append(f'<rect x="24" y="{y + 6 + j * 22}" width="12" height="12" rx="3" fill="{col}"/>')
+        body.append(f'<text x="44" y="{y + 16 + j * 22}" font-size="12" fill="{c["sub"]}">{label}</text>')
+    H = y + 6 + 3 * 22 + 8
+    return "\n".join(svg_open(W, H, t["stab_title"], t["stab_sub"], c) + body + ["</svg>"])
 
 
 def accuracy(lang, mode):
@@ -241,7 +474,12 @@ def main():
             (OUT / f"accuracy-r3-{lang}-{mode}.svg").write_text(accuracy3(lang, mode) + "\n")
             (OUT / f"validation-{lang}-{mode}.svg").write_text(validation(lang, mode) + "\n")
             (OUT / f"flips-r3-{lang}-{mode}.svg").write_text(flips(lang, mode, FLIPS3, "flip3") + "\n")
-    print("wrote", len(TEXT) * len(THEME) * 5, "charts to", OUT)
+            (OUT / f"history-{lang}-{mode}.svg").write_text(history(lang, mode) + "\n")
+            (OUT / f"types-history-{lang}-{mode}.svg").write_text(types_history(lang, mode) + "\n")
+            (OUT / f"cost-history-{lang}-{mode}.svg").write_text(cost_history(lang, mode) + "\n")
+            (OUT / f"stability-{lang}-{mode}.svg").write_text(stability(lang, mode) + "\n")
+            (OUT / f"flips-2026-11-{lang}-{mode}.svg").write_text(flips(lang, mode, FLIPS4, "flip4") + "\n")
+    print("wrote", len(TEXT) * len(THEME) * 10, "charts to", OUT)
 
 
 if __name__ == "__main__":
